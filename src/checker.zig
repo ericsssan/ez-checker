@@ -1034,6 +1034,14 @@ pub const Checker = struct {
         _ = &sym_side;
         const removed = self.narrowKindFromLiteral(lit_side);
         if (removed == .none) return ty;
+        // Loose equality: `x == null` / `x != null` (and `== undefined`) narrows
+        // both null and undefined — TS treats `== null` as `=== null || === undefined`.
+        if ((tag == .equal or tag == .not_equal) and
+            (removed == .null_t or removed == .undefined_t))
+        {
+            const remove_nullish = (!is_neq) == negate;
+            return self.narrowNullish(ty, remove_nullish);
+        }
         const keep_only = (!is_neq) != negate;
         return self.narrowUnion(ty, removed, keep_only);
     }
@@ -1112,6 +1120,34 @@ pub const Checker = struct {
         }
         if (tag == .void_expr) return .undefined_t;
         return .none;
+    }
+
+    /// Loose-equality nullish narrowing: `== null` / `== undefined` treats null
+    /// and undefined interchangeably.  `remove=true` strips both; `remove=false`
+    /// keeps only members that are null or undefined.
+    fn narrowNullish(self: *Checker, ty: TypeId, remove: bool) TypeId {
+        const t = self.store.get(ty);
+        if (t.kind != .union_t) {
+            const is_nullish = self.idMatchesNarrowable(ty, .null_t) or
+                self.idMatchesNarrowable(ty, .undefined_t);
+            if (remove) return if (is_nullish) tymod.ID_NEVER else ty;
+            return if (is_nullish) ty else tymod.ID_NEVER;
+        }
+        var buf: [16]TypeId = undefined;
+        var n: usize = 0;
+        for (self.store.idsOf(t.list_data)) |m| {
+            const is_nullish = self.idMatchesNarrowable(m, .null_t) or
+                self.idMatchesNarrowable(m, .undefined_t);
+            const keep = if (remove) !is_nullish else is_nullish;
+            if (keep) {
+                if (n >= buf.len) return ty;
+                buf[n] = m;
+                n += 1;
+            }
+        }
+        if (n == 0) return tymod.ID_NEVER;
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch ty;
     }
 
     /// Remove a kind from a union, or keep only that kind.
