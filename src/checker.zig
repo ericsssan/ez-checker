@@ -517,9 +517,10 @@ pub const Checker = struct {
     /// rather than a value position.
     fn identifierInTypePosition(self: *Checker, node: NodeIndex) bool {
         const parents = self.semantic.parent_indices;
-        if (parents.len == 0) return false;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return false;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
-        var p = parents[node.toInt()];
+        var p = parents[nidx];
         var guard: u8 = 0;
         while (p != NONE and guard < 8) : (guard += 1) {
             switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
@@ -1329,8 +1330,9 @@ pub const Checker = struct {
             }
         }
         const parents = self.semantic.parent_indices;
-        if (parents.len == 0) return tymod.ID_ANY;
-        const pidx = parents[binding.toInt()];
+        const bidx = binding.toInt();
+        if (bidx >= parents.len) return tymod.ID_ANY;
+        const pidx = parents[bidx];
         if (pidx == @intFromEnum(NodeIndex.none)) return tymod.ID_ANY;
         const parent: NodeIndex = @enumFromInt(pidx);
         const ptag = self.ast_ref.nodeTag(parent);
@@ -1432,10 +1434,11 @@ pub const Checker = struct {
     /// their declared param types.
     fn contextualPromiseRejectionParamType(self: *Checker, binding: NodeIndex) ?TypeId {
         const parents = self.semantic.parent_indices;
-        if (parents.len == 0) return null;
+        const bidx = binding.toInt();
+        if (bidx >= parents.len) return null;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         // binding → arrow/fn-expr (the callback).
-        var cur = parents[binding.toInt()];
+        var cur = parents[bidx];
         if (cur == NONE) return null;
         var fn_node: NodeIndex = .none;
         var depth: u32 = 0;
@@ -1502,10 +1505,11 @@ pub const Checker = struct {
     /// the array's element type.  Otherwise null.
     fn contextualArrayPredicateParamType(self: *Checker, binding: NodeIndex) ?TypeId {
         const parents = self.semantic.parent_indices;
-        if (parents.len == 0) return null;
+        const bidx = binding.toInt();
+        if (bidx >= parents.len) return null;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         // Walk up: identifier → arrow_fn/fn_expr (the callback).
-        var cur = parents[binding.toInt()];
+        var cur = parents[bidx];
         if (cur == NONE) return null;
         // Skip through patterns / ts_parameter_property / rest_element.
         var fn_node: NodeIndex = .none;
@@ -1587,10 +1591,11 @@ pub const Checker = struct {
     /// `x` should get type `Foo` from the callee's signature.
     fn contextualCallbackParamType(self: *Checker, binding: NodeIndex) ?TypeId {
         const parents = self.semantic.parent_indices;
-        if (parents.len == 0) return null;
+        const bidx = binding.toInt();
+        if (bidx >= parents.len) return null;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         // Walk up: binding → arrow_fn / fn_expr.
-        var cur = parents[binding.toInt()];
+        var cur = parents[bidx];
         if (cur == NONE) return null;
         var fn_node: NodeIndex = .none;
         var depth: u32 = 0;
@@ -4376,12 +4381,13 @@ pub const Checker = struct {
         // position for "before ty_node" comparison).
         const tree = self.ast_ref;
         const parents = self.semantic.parent_indices;
-        if (parents.len == 0) return null;
+        const tni = ty_node.toInt();
+        if (tni >= parents.len) return null;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         // Collect ancestors in a buffer for cheap containment checks.
         var anc_buf: [16]u32 = undefined;
         var nanc: usize = 0;
-        var p = parents[ty_node.toInt()];
+        var p = parents[tni];
         while (p != NONE and nanc < anc_buf.len) : (p = parents[p]) {
             anc_buf[nanc] = p;
             nanc += 1;
@@ -5052,7 +5058,10 @@ pub const Checker = struct {
             return imported;
         };
         // Insert sentinel to break cycles (e.g. `interface Node { children: Node[] }`).
-        self.declared_type_cache.put(self.gpa, name, tymod.ID_UNKNOWN) catch return null;
+        // On OOM, skip the sentinel rather than returning null — a missing sentinel
+        // risks deeper recursion on recursive types but won't silently drop results
+        // for non-recursive types under memory pressure.
+        self.declared_type_cache.put(self.gpa, name, tymod.ID_UNKNOWN) catch {};
         const result = switch (self.ast_ref.nodeTag(decl)) {
             .ts_interface_decl => self.buildInterfaceType(decl),
             .class_decl => self.buildClassInstanceType(decl, name),
@@ -7310,11 +7319,12 @@ pub const Checker = struct {
     fn findTypeParameterDecl(self: *Checker, ref_node: NodeIndex, name: []const u8) ?NodeIndex {
         const tree = self.ast_ref;
         const parents = self.semantic.parent_indices;
-        if (parents.len == 0) return null;
+        const rni = ref_node.toInt();
+        if (rni >= parents.len) return null;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         var anc_buf: [16]u32 = undefined;
         var nanc: usize = 0;
-        var p = parents[ref_node.toInt()];
+        var p = parents[rni];
         while (p != NONE and nanc < anc_buf.len) : (p = parents[p]) {
             anc_buf[nanc] = p;
             nanc += 1;
@@ -7329,11 +7339,13 @@ pub const Checker = struct {
             if (!std.mem.eql(u8, tree.tokenText(tree.nodeMainToken(ni)), name)) continue;
             const tp_pos = tree.tokenStart(tree.nodeMainToken(ni));
             if (tp_pos >= ref_pos) continue;
-            const tp_parent = parents[ni.toInt()];
+            const tpni = ni.toInt();
+            if (tpni >= parents.len) continue;
+            const tp_parent = parents[tpni];
             if (tp_parent == NONE) continue;
             var tp_p = tp_parent;
             var in_scope = false;
-            while (tp_p != NONE) : (tp_p = parents[tp_p]) {
+            while (tp_p != NONE and @as(usize, tp_p) < parents.len) : (tp_p = parents[tp_p]) {
                 for (anc_buf[0..nanc]) |anc| {
                     if (anc == tp_p) { in_scope = true; break; }
                 }
@@ -7711,8 +7723,9 @@ pub const Checker = struct {
     /// `this` is its `this: T` annotation, else implicit `any` (strict).
     fn inferThis(self: *Checker, node: NodeIndex) TypeId {
         const parents = self.semantic.parent_indices;
-        if (parents.len == 0) return tymod.ID_UNKNOWN;
-        var p = parents[node.toInt()];
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return tymod.ID_UNKNOWN;
+        var p = parents[nidx];
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         while (p != NONE) : (p = parents[p]) {
             const pn: NodeIndex = @enumFromInt(p);
