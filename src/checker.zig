@@ -4021,7 +4021,17 @@ pub const Checker = struct {
                         const tok = self.ast_ref.nodeMainToken(cd.name);
                         const name = self.ast_ref.tokenText(tok);
                         try self.known_type_names.put(self.gpa, name, {});
-                        try self.type_decl_nodes.put(self.gpa, name, ni);
+                        const gop = try self.type_decl_nodes.getOrPut(self.gpa, name);
+                        if (!gop.found_existing) {
+                            gop.value_ptr.* = ni;
+                        } else {
+                            // If a same-named interface was registered first, rescue it
+                            // into merged_iface_extra so buildClassInstanceType can merge it.
+                            if (self.ast_ref.nodeTag(gop.value_ptr.*) == .ts_interface_decl) {
+                                try self.merged_iface_extra.append(self.gpa, .{ .name = name, .node = gop.value_ptr.* });
+                            }
+                            gop.value_ptr.* = ni;
+                        }
                     }
                 },
                 .ts_namespace_decl, .ts_module_decl => {
@@ -5658,6 +5668,21 @@ pub const Checker = struct {
                     }
                 }
                 props.append(self.gpa, p) catch {};
+            }
+        }
+        // Declaration merging: merge members from any same-named interface declarations.
+        for (self.merged_iface_extra.items) |entry| {
+            if (!std.mem.eql(u8, entry.name, name)) continue;
+            const extra_data = self.ast_ref.nodeData(entry.node);
+            const extra_id = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(extra_data.lhs));
+            if (extra_id.body_end > extra_id.body_start) {
+                const extra_body = self.ast_ref.extra_data[extra_id.body_start..extra_id.body_end];
+                for (extra_body) |raw| {
+                    const member: NodeIndex = @enumFromInt(raw);
+                    if (self.interfaceMemberToProp(member)) |p| {
+                        props.append(self.gpa, p) catch {};
+                    }
+                }
             }
         }
         const list = self.store.appendObjectProps(props.items) catch return tymod.ID_UNKNOWN;
