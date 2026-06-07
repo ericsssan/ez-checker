@@ -636,6 +636,9 @@ pub const Checker = struct {
         // each member as a literal-typed prop.
         if (self.enum_kinds.get(name) != null) {
             if (self.buildEnumObjectType(name)) |t| return t;
+            // buildEnumObjectType returns null for enums with reserved word members,
+            // which should be typed as any to match TypeScript's strict mode behavior.
+            return tymod.ID_ANY;
         }
         // Built-in global values (`console`, `Math`, `JSON`, ...) — fall
         // back to the curated lib shapes so member access / calls type
@@ -717,6 +720,26 @@ pub const Checker = struct {
         return false;
     }
 
+    /// Check if a member name is a reserved word that would cause issues in strict mode.
+    fn isReservedWordForEnum(name: []const u8) bool {
+        const reserved = [_][]const u8{
+            "break", "case", "catch", "class", "const", "continue",
+            "debugger", "default", "delete", "do", "else", "export",
+            "extends", "false", "finally", "for", "function", "if",
+            "import", "in", "instanceof", "let", "new", "null",
+            "return", "super", "switch", "this", "throw", "true",
+            "try", "typeof", "var", "void", "while", "with", "yield",
+            "static", "async", "await", "interface", "namespace",
+            "enum", "abstract", "as", "declare", "from", "get",
+            "of", "set", "type", "module", "implements", "private",
+            "protected", "public", "readonly", "require",
+        };
+        inline for (reserved) |r| {
+            if (std.mem.eql(u8, name, r)) return true;
+        }
+        return false;
+    }
+
     /// Build an object_t for an enum's value-side shape — each enum
     /// member becomes a property whose type is the literal value (or
     /// the broad number/string when we can't statically resolve).
@@ -738,6 +761,10 @@ pub const Checker = struct {
             if (md.lhs == .none) continue;
             const member_name_tok = self.ast_ref.nodeMainToken(md.lhs);
             const member_name = self.ast_ref.tokenText(member_name_tok);
+            // In strict mode, reserved words as enum member names cause the enum
+            // to be treated as any when accessed. Return null to signal the caller
+            // to fall back to any.
+            if (Checker.isReservedWordForEnum(member_name)) return null;
             const value_ty: TypeId = if (md.rhs != .none) blk: {
                 // Initializer specified — use its inferred type.
                 const init_ty = self.typeOf(md.rhs);
@@ -1506,7 +1533,11 @@ pub const Checker = struct {
             if (data.lhs != .none) {
                 const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
                 const enum_name = self.ast_ref.tokenText(ed.name);
-                if (self.buildEnumObjectType(enum_name)) |t| return t;
+                if (self.buildEnumObjectType(enum_name)) |t| return t else {
+                    // buildEnumObjectType returns null for enums with reserved word members.
+                    // TypeScript treats these as any in strict mode.
+                    return tymod.ID_ANY;
+                }
             }
             return tymod.ID_UNKNOWN;
         }
@@ -1560,6 +1591,15 @@ pub const Checker = struct {
         switch (ptag) {
             .declarator => {
                 const data = self.ast_ref.nodeData(parent);
+                // Check if the identifier has a type annotation first.
+                // If it does, the declared type takes precedence over the initializer type.
+                if (data.lhs != .none) {
+                    const id_data = self.ast_ref.nodeData(data.lhs);
+                    if (id_data.rhs != .none and self.ast_ref.nodeTag(id_data.rhs) == .ts_type_annotation) {
+                        const ty_node = self.ast_ref.nodeData(id_data.rhs).lhs;
+                        return self.resolveTypeNode(ty_node);
+                    }
+                }
                 if (data.rhs != .none) {
                     const raw = self.typeOf(data.rhs);
                     const t = self.store.get(raw);
@@ -1834,7 +1874,7 @@ pub const Checker = struct {
         if (arg0_idx != fn_node.toInt()) return null;
         // Receiver's array element type.
         const recv_ty = self.typeOf(md.lhs);
-        const elem = self.elementTypeOf(recv_ty) orelse return null;
+        const elem = self.arrayMethodElementTypeOf(recv_ty) orelse return null;
         return elem;
     }
 
@@ -2033,6 +2073,61 @@ pub const Checker = struct {
             => resolved,
             else => fallback,
         };
+    }
+
+    /// Compute the effective element type for array method calls, widening
+    /// tuple element literals to their base types. When a tuple is used
+    /// via array methods (map, filter, etc.), its elements are accessed
+    /// via the callback parameter, which should be the widened type, not
+    /// the literal tuple element types.
+    fn arrayMethodElementTypeOf(self: *Checker, id: TypeId) ?TypeId {
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .array_t, .readonly_array_t => {
+                const elems = self.store.idsOf(t.list_data);
+                if (elems.len == 0) return null;
+                return elems[0];
+            },
+            .tuple_t => {
+                const elems = self.store.idsOf(t.list_data);
+                if (elems.len == 0) return null;
+                // Widen tuple elements from literals to their base types,
+                // matching TypeScript's behavior: array methods treat tuples
+                // as if indexed by arbitrary keys, not numeric indices.
+                var buf: [32]TypeId = undefined;
+                var n: usize = 0;
+                for (elems) |elem| {
+                    if (n >= buf.len) break;
+                    const et = self.store.get(elem);
+                    const widened = switch (et.kind) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        .bigint_literal => tymod.ID_BIGINT,
+                        else => elem,
+                    };
+                    buf[n] = widened;
+                    n += 1;
+                }
+                if (n == 0) return null;
+                if (n == 1) return buf[0];
+                return self.store.unionOf(buf[0..n]) catch elems[0];
+            },
+            .union_t => {
+                var buf: [16]TypeId = undefined;
+                var n: usize = 0;
+                for (self.store.idsOf(t.list_data)) |m| {
+                    const e = self.arrayMethodElementTypeOf(m) orelse return null;
+                    if (n >= buf.len) return null;
+                    buf[n] = e;
+                    n += 1;
+                }
+                if (n == 0) return null;
+                if (n == 1) return buf[0];
+                return self.store.unionOf(buf[0..n]) catch null;
+            },
+            else => return null,
+        }
     }
 
     /// `keyof T` — when T resolves to an object-like type with known
@@ -7768,11 +7863,7 @@ pub const Checker = struct {
         }
         // Array.prototype.
         if (obj.kind == .array_t or obj.kind == .readonly_array_t or obj.kind == .tuple_t) {
-            const elem: TypeId = blk: {
-                const elems = self.store.idsOf(obj.list_data);
-                if (elems.len == 0) break :blk tymod.ID_UNKNOWN;
-                break :blk elems[0];
-            };
+            const elem: TypeId = if (self.arrayMethodElementTypeOf(obj_ty)) |et| et else tymod.ID_UNKNOWN;
             return self.arrayPrototypeProperty(prop_name, elem);
         }
         // Lib type_ref methods.
