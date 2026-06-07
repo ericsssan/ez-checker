@@ -1,0 +1,16 @@
+.{
+    .name = .ez_checker,
+    .version = "0.0.1",
+    .dependencies = .{
+        .es_parser = .{
+            .path = "../es-parser",
+        },
+    },
+    .minimum_zig_version = "0.17.0-dev.607+456b2ec07",
+    .fingerprint = 0xf974dfcf3a670103,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
