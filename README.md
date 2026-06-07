@@ -1,6 +1,8 @@
 # ez-checker
 
-A reimplementation of the TypeScript type checker for the [Ez](https://github.com/ericsssan/Ez) linter. Not a compiler — no emit, no diagnostics, no `tsconfig.json`. Just the type system: infer the type of any expression, resolve declarations, narrow through control flow.
+A reimplementation of the TypeScript type checker. Just the type system: infer the type of any expression, resolve declarations, narrow through control flow. No emit, no diagnostics, no `tsconfig.json`.
+
+Originally extracted from the [Ez](https://github.com/ericsssan/Ez) linter, but the type inference engine is general-purpose — usable by linters, compilers, language servers, or any tool that needs to reason about TypeScript types.
 
 Built on [es-parser](https://github.com/ericsssan/es-parser). Written in Zig.
 
