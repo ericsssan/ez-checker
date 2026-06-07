@@ -91,6 +91,29 @@ pub const Checker = struct {
     /// generic-dense code.
     type_param_nodes: std.ArrayListUnmanaged(NodeIndex) = .empty,
 
+    /// Bounded stack of class decls currently inside `buildClassInstanceType`.
+    /// Breaks `this`-type / inheritance recursion: a re-entrant build of a
+    /// class already on the stack resolves to a cheap `type_ref` placeholder
+    /// instead of rebuilding the class. Without this, `this` in a class method
+    /// rebuilds the whole class on every resolution — unboundedly, and
+    /// *exponentially* when a method has both a `this` param and `this` return.
+    building_classes: [32]NodeIndex = undefined,
+    building_n: u8 = 0,
+
+    /// Bounded stack of names currently being resolved by `resolveTypeofType`.
+    /// Breaks `typeof`-recursion: `declare function f(): typeof f` and its
+    /// overloaded/mutually-recursive cousins reference their own value type,
+    /// which rebuilds the same function type — unboundedly without this guard.
+    typeof_names: [32][]const u8 = undefined,
+    typeof_n: u8 = 0,
+
+    /// Bounded stack of type-parameter names currently being resolved by
+    /// `resolveTypeParameterConstraint`. Breaks self-referential constraints
+    /// like `<T extends null extends T ? any : never>`, where resolving T's
+    /// constraint resolves T, which resolves its constraint again.
+    tparam_names: [32][]const u8 = undefined,
+    tparam_n: u8 = 0,
+
     /// Index: declaration name → `declarator` / `fn_decl`-family nodes that
     /// bind it, in node order.  Built once during `buildKnownTypeNames`.
     /// The by-name lookups on the call path (`findCalleeFnDecl`,
@@ -250,6 +273,11 @@ pub const Checker = struct {
         const idx = node.toInt();
         const cached = self.node_types[idx];
         if (!cached.eq(TypeId.none)) return cached;
+        // Mark in-progress before recursing so a cyclic expression (e.g.
+        // `static bar = A.foo + 1` where resolving `A`'s static side needs
+        // `bar`'s type, which needs `A.foo`…) resolves to `unknown` on the
+        // back-edge instead of recursing until the stack overflows.
+        self.node_types[idx] = tymod.ID_UNKNOWN;
         const computed = self.inferExpr(node);
         self.node_types[idx] = computed;
         return computed;
@@ -1873,6 +1901,15 @@ pub const Checker = struct {
         if (inner_tag != .identifier and inner_tag != .ts_type_reference) return tymod.ID_UNKNOWN;
         const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(inner));
         if (name.len == 0) return tymod.ID_UNKNOWN;
+        // Cycle break: a `typeof name` that re-enters while already resolving the
+        // same name (self/mutually-recursive function types) resolves to unknown.
+        for (self.typeof_names[0..self.typeof_n]) |n| {
+            if (std.mem.eql(u8, n, name)) return tymod.ID_UNKNOWN;
+        }
+        if (self.typeof_n >= self.typeof_names.len) return tymod.ID_UNKNOWN;
+        self.typeof_names[self.typeof_n] = name;
+        self.typeof_n += 1;
+        defer self.typeof_n -= 1;
         // `typeof ClassName` → the static (constructor) type so prefer-readonly's
         // getTypeToClassRelation returns Class (objectFlags.Anonymous) rather than
         // Instance (Interface) for modifications via `that = {} as typeof Foo & …`.
@@ -3920,6 +3957,105 @@ pub const Checker = struct {
         try self.natively_bound_type_ids.put(self.gpa, window_ty, {});
         try self.global_value_types.put(self.gpa, "document", tymod.ID_ANY);
         try self.global_value_types.put(self.gpa, "self", tymod.ID_ANY);
+
+        // Error constructors — callable, return any so `new Error()` is accepted
+        // by prefer-promise-reject-errors without forcing us to model Error instances.
+        const error_fn = try h.fnTypeWithParams(&.{tymod.ID_STRING}, tymod.ID_ANY);
+        for ([_][]const u8{
+            "Error", "TypeError", "RangeError", "SyntaxError",
+            "ReferenceError", "URIError", "EvalError", "AggregateError",
+        }) |ename| {
+            try self.global_value_types.put(self.gpa, ename, error_fn);
+        }
+
+        // Object — static namespace with commonly-needed methods.
+        const object_props = [_]tymod.ObjectProp{
+            .{ .name = "keys",                     .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY) },
+            .{ .name = "values",                   .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY) },
+            .{ .name = "entries",                  .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY) },
+            .{ .name = "assign",                   .type_id = try h.fnType(tymod.ID_ANY) },
+            .{ .name = "freeze",                   .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY) },
+            .{ .name = "isFrozen",                 .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_BOOLEAN) },
+            .{ .name = "create",                   .type_id = try h.fnType(tymod.ID_ANY) },
+            .{ .name = "getPrototypeOf",           .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY) },
+            .{ .name = "setPrototypeOf",           .type_id = try h.fnType(tymod.ID_ANY) },
+            .{ .name = "defineProperty",           .type_id = try h.fnType(tymod.ID_ANY) },
+            .{ .name = "getOwnPropertyNames",      .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY) },
+            .{ .name = "getOwnPropertyDescriptor", .type_id = try h.fnType(tymod.ID_ANY) },
+            .{ .name = "hasOwn",                   .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY, tymod.ID_STRING}, tymod.ID_BOOLEAN) },
+            .{ .name = "fromEntries",              .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY) },
+            .{ .name = "is",                       .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY, tymod.ID_ANY}, tymod.ID_BOOLEAN) },
+        };
+        const object_ty = try h.objType(&object_props);
+        try self.global_value_types.put(self.gpa, "Object", object_ty);
+        try self.natively_bound_type_ids.put(self.gpa, object_ty, {});
+
+        // Array — static namespace (instance methods resolved per-expression).
+        const array_props = [_]tymod.ObjectProp{
+            .{ .name = "isArray", .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_BOOLEAN) },
+            .{ .name = "from",    .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY) },
+            .{ .name = "of",      .type_id = try h.fnType(tymod.ID_ANY) },
+        };
+        const array_ty = try h.objType(&array_props);
+        try self.global_value_types.put(self.gpa, "Array", array_ty);
+        try self.natively_bound_type_ids.put(self.gpa, array_ty, {});
+
+        // Collection constructors — named type refs so isBuiltinSymbolLike works.
+        try self.global_value_types.put(self.gpa, "Map",     try self.store.typeRef("MapConstructor",     &.{}));
+        try self.global_value_types.put(self.gpa, "Set",     try self.store.typeRef("SetConstructor",     &.{}));
+        try self.global_value_types.put(self.gpa, "WeakMap", try self.store.typeRef("WeakMapConstructor", &.{}));
+        try self.global_value_types.put(self.gpa, "WeakSet", try self.store.typeRef("WeakSetConstructor", &.{}));
+        try self.global_value_types.put(self.gpa, "WeakRef", try self.store.typeRef("WeakRefConstructor", &.{}));
+        try self.global_value_types.put(self.gpa, "FinalizationRegistry", try self.store.typeRef("FinalizationRegistry", &.{}));
+        try self.global_value_types.put(self.gpa, "Symbol",  try self.store.typeRef("SymbolConstructor",  &.{}));
+        try self.global_value_types.put(self.gpa, "Proxy",   try self.store.typeRef("ProxyConstructor",   &.{}));
+        try self.global_value_types.put(self.gpa, "Reflect", try self.store.typeRef("Reflect",             &.{}));
+        try self.global_value_types.put(self.gpa, "Date",    try self.store.typeRef("DateConstructor",    &.{}));
+        try self.global_value_types.put(self.gpa, "RegExp",  try self.store.typeRef("RegExpConstructor",  &.{}));
+        try self.global_value_types.put(self.gpa, "URL",     try self.store.typeRef("URLConstructor",     &.{}));
+        try self.global_value_types.put(self.gpa, "URLSearchParams",     try self.store.typeRef("URLSearchParamsConstructor", &.{}));
+        try self.global_value_types.put(self.gpa, "AbortController",     try self.store.typeRef("AbortController",            &.{}));
+        try self.global_value_types.put(self.gpa, "AbortSignal",         try self.store.typeRef("AbortSignal",                &.{}));
+        try self.global_value_types.put(self.gpa, "TextEncoder",         try self.store.typeRef("TextEncoder",                &.{}));
+        try self.global_value_types.put(self.gpa, "TextDecoder",         try self.store.typeRef("TextDecoder",                &.{}));
+        try self.global_value_types.put(self.gpa, "SharedArrayBuffer",   try self.store.typeRef("SharedArrayBuffer",          &.{}));
+        try self.global_value_types.put(self.gpa, "Atomics",             try self.store.typeRef("Atomics",                    &.{}));
+        try self.global_value_types.put(self.gpa, "Buffer",              try self.store.typeRef("BufferConstructor",          &.{}));
+
+        // Timer functions.
+        try self.global_value_types.put(self.gpa, "setTimeout",            try h.fnTypeWithParams(&.{tymod.ID_ANY, tymod.ID_NUMBER}, tymod.ID_NUMBER));
+        try self.global_value_types.put(self.gpa, "setInterval",           try h.fnTypeWithParams(&.{tymod.ID_ANY, tymod.ID_NUMBER}, tymod.ID_NUMBER));
+        try self.global_value_types.put(self.gpa, "clearTimeout",          try h.fnTypeWithParams(&.{tymod.ID_NUMBER}, tymod.ID_VOID));
+        try self.global_value_types.put(self.gpa, "clearInterval",         try h.fnTypeWithParams(&.{tymod.ID_NUMBER}, tymod.ID_VOID));
+        try self.global_value_types.put(self.gpa, "queueMicrotask",        try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_VOID));
+        try self.global_value_types.put(self.gpa, "setImmediate",          try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_NUMBER));
+        try self.global_value_types.put(self.gpa, "clearImmediate",        try h.fnTypeWithParams(&.{tymod.ID_NUMBER}, tymod.ID_VOID));
+        try self.global_value_types.put(self.gpa, "requestAnimationFrame", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_NUMBER));
+        try self.global_value_types.put(self.gpa, "cancelAnimationFrame",  try h.fnTypeWithParams(&.{tymod.ID_NUMBER}, tymod.ID_VOID));
+
+        // Fetch API — returns any (Promise<Response> approximated as any for now).
+        try self.global_value_types.put(self.gpa, "fetch", try h.fnTypeWithParams(&.{tymod.ID_ANY, tymod.ID_ANY}, tymod.ID_ANY));
+
+        // URI encoding / decoding.
+        try self.global_value_types.put(self.gpa, "encodeURIComponent", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_STRING));
+        try self.global_value_types.put(self.gpa, "decodeURIComponent", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_STRING));
+        try self.global_value_types.put(self.gpa, "encodeURI",          try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_STRING));
+        try self.global_value_types.put(self.gpa, "decodeURI",          try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_STRING));
+
+        // Base64.
+        try self.global_value_types.put(self.gpa, "atob", try h.fnTypeWithParams(&.{tymod.ID_STRING}, tymod.ID_STRING));
+        try self.global_value_types.put(self.gpa, "btoa", try h.fnTypeWithParams(&.{tymod.ID_STRING}, tymod.ID_STRING));
+
+        // Miscellaneous.
+        try self.global_value_types.put(self.gpa, "structuredClone", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY));
+        try self.global_value_types.put(self.gpa, "eval",             try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY));
+
+        // Node.js globals.
+        try self.global_value_types.put(self.gpa, "__dirname",  tymod.ID_STRING);
+        try self.global_value_types.put(self.gpa, "__filename", tymod.ID_STRING);
+        try self.global_value_types.put(self.gpa, "require",    try h.fnTypeWithParams(&.{tymod.ID_STRING}, tymod.ID_ANY));
+        try self.global_value_types.put(self.gpa, "module",     tymod.ID_ANY);
+        try self.global_value_types.put(self.gpa, "exports",    tymod.ID_ANY);
     }
 
     /// Append `node` to the value-declaration index under `name`.
@@ -3954,6 +4090,10 @@ pub const Checker = struct {
             "TemplateStringsArray", "Buffer", "URL", "URLSearchParams",
             "Element", "HTMLElement", "Node", "Event", "Window", "Document",
             "console", "process",
+            "WeakRef", "FinalizationRegistry",
+            "AbortController", "AbortSignal",
+            "TextEncoder", "TextDecoder",
+            "SharedArrayBuffer", "Atomics", "Reflect",
         };
         for (lib_types) |name| try self.known_type_names.put(self.gpa, name, {});
 
@@ -4413,7 +4553,16 @@ pub const Checker = struct {
     /// back to null when no such parameter is found or it has no
     /// constraint.
     fn resolveTypeParameterConstraint(self: *Checker, ty_node: NodeIndex, name: []const u8) ?TypeId {
+        // Cycle break: a constraint that refers back to its own type parameter
+        // (`<T extends null extends T ? any : never>`) would recurse forever.
+        for (self.tparam_names[0..self.tparam_n]) |n| {
+            if (std.mem.eql(u8, n, name)) return null;
+        }
+        if (self.tparam_n >= self.tparam_names.len) return null;
         const best_constraint = self.typeParamConstraintNode(ty_node, name) orelse return null;
+        self.tparam_names[self.tparam_n] = name;
+        self.tparam_n += 1;
+        defer self.tparam_n -= 1;
         const resolved = self.resolveTypeNode(best_constraint);
         // Don't substitute when the constraint is `any` — TS treats
         // `<T extends any>` as an unconstrained type parameter.
@@ -4641,6 +4790,27 @@ pub const Checker = struct {
             return self.store.unionOf(buf[0..n]) catch id;
         }
         return id;
+    }
+
+    /// Walk `sigs` and return the index of the first signature whose parameter
+    /// types are compatible with `arg_types`.  "Compatible" means: for each
+    /// positional argument, the argument type is assignable to the parameter
+    /// type (any/unknown on either side is always compatible).  Falls back to
+    /// index 0 when nothing matches or when the function is not overloaded.
+    fn pickOverload(self: *Checker, sigs: []const tymod.Signature, arg_types: []const TypeId) usize {
+        if (sigs.len <= 1) return 0;
+        outer: for (sigs, 0..) |sig, si| {
+            const params = self.store.signatureParamsOf(sig);
+            if (arg_types.len > params.len) continue;
+            for (arg_types, 0..) |arg_ty, ai| {
+                const param_ty = params[ai];
+                if (tymod.isAny(&self.store, param_ty)) continue;
+                if (tymod.isAny(&self.store, arg_ty) or tymod.isUnknown(&self.store, arg_ty)) continue;
+                if (self.structuralAssignable(arg_ty, param_ty, 0) == .no) continue :outer;
+            }
+            return si;
+        }
+        return 0;
     }
 
     fn resolveReturnType(self: *Checker, id: TypeId) TypeId {
@@ -5607,6 +5777,19 @@ pub const Checker = struct {
     /// `extends ParentClass` contributes the parent's instance props so
     /// structural assignability (subclass → superclass) holds.
     fn buildClassInstanceType(self: *Checker, decl: NodeIndex, name: []const u8) TypeId {
+        // Cycle break: if this class is already being built (reached via a
+        // `this` annotation on one of its own members, or an inheritance
+        // cycle), resolve to a `type_ref` by name rather than rebuilding it.
+        for (self.building_classes[0..self.building_n]) |d| {
+            if (d == decl) return self.store.typeRef(name, &.{}) catch tymod.ID_UNKNOWN;
+        }
+        if (self.building_n >= self.building_classes.len) {
+            return self.store.typeRef(name, &.{}) catch tymod.ID_UNKNOWN;
+        }
+        self.building_classes[self.building_n] = decl;
+        self.building_n += 1;
+        defer self.building_n -= 1;
+
         const data = self.ast_ref.nodeData(decl);
         const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(data.lhs));
         var props: std.ArrayList(tymod.ObjectProp) = .empty;
@@ -5728,6 +5911,19 @@ pub const Checker = struct {
     /// itself flows through `newExprInstanceType`, so omitting a construct
     /// signature here is fine.
     pub fn buildClassStaticType(self: *Checker, decl: NodeIndex, name: []const u8) TypeId {
+        // Same cycle break as buildClassInstanceType: a static initializer that
+        // references the class's own static side (`static bar = A.foo`) must not
+        // rebuild the static type re-entrantly.
+        for (self.building_classes[0..self.building_n]) |d| {
+            if (d == decl) return self.store.typeRef(name, &.{}) catch tymod.ID_UNKNOWN;
+        }
+        if (self.building_n >= self.building_classes.len) {
+            return self.store.typeRef(name, &.{}) catch tymod.ID_UNKNOWN;
+        }
+        self.building_classes[self.building_n] = decl;
+        self.building_n += 1;
+        defer self.building_n -= 1;
+
         const data = self.ast_ref.nodeData(decl);
         const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(data.lhs));
         if (cd.body == .none) return tymod.ID_UNKNOWN;
@@ -6237,7 +6433,24 @@ pub const Checker = struct {
         var result: TypeId = tymod.ID_UNKNOWN;
         if (t.kind == .function_t) {
             const sigs = self.store.signaturesOf(t.signatures);
-            if (sigs.len > 0) result = sigs[0].return_type;
+            if (sigs.len > 0) {
+                const best: usize = blk: {
+                    if (sigs.len == 1) break :blk 0;
+                    const args_range = self.safeSubRange(data.rhs) orelse break :blk 0;
+                    const extra = self.ast_ref.extra_data;
+                    if (args_range.start > extra.len or args_range.end > extra.len) break :blk 0;
+                    const args_slice = extra[args_range.start..args_range.end];
+                    var arg_types_buf: [16]TypeId = undefined;
+                    var argc: usize = 0;
+                    for (args_slice) |raw| {
+                        if (argc >= arg_types_buf.len) break;
+                        arg_types_buf[argc] = self.typeOf(@enumFromInt(raw));
+                        argc += 1;
+                    }
+                    break :blk self.pickOverload(sigs, arg_types_buf[0..argc]);
+                };
+                result = sigs[best].return_type;
+            }
         }
         // Generic call-site inference — if the callee is a generic
         // function declaration in this file, infer its type parameters
@@ -7897,6 +8110,126 @@ pub const Checker = struct {
             i = j - 1; // move before the `@`
         }
         return false;
+    }
+
+    /// Convert a TypeId to a tsc-compatible type string.  Union members are
+    /// sorted alphabetically so the output is stable for baseline comparison.
+    /// The caller owns the returned slice (allocated from `gpa`).
+    pub fn typeToString(self: *Checker, id: TypeId) ![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(self.gpa);
+        try self.typeToStringInner(id, &buf, 0);
+        return buf.toOwnedSlice(self.gpa);
+    }
+
+    fn typeToStringInner(self: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8) !void {
+        const gpa = self.gpa;
+        if (depth > 8) {
+            try buf.appendSlice(gpa, "...");
+            return;
+        }
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .any         => try buf.appendSlice(gpa, "any"),
+            .unknown     => try buf.appendSlice(gpa, "unknown"),
+            .never       => try buf.appendSlice(gpa, "never"),
+            .null_t      => try buf.appendSlice(gpa, "null"),
+            .undefined_t => try buf.appendSlice(gpa, "undefined"),
+            .void_t      => try buf.appendSlice(gpa, "void"),
+            .number      => try buf.appendSlice(gpa, "number"),
+            .string      => try buf.appendSlice(gpa, "string"),
+            .boolean     => try buf.appendSlice(gpa, "boolean"),
+            .bigint      => try buf.appendSlice(gpa, "bigint"),
+            .symbol      => try buf.appendSlice(gpa, "symbol"),
+            .object_keyword => try buf.appendSlice(gpa, "object"),
+            .error_t     => try buf.appendSlice(gpa, "error"),
+            .type_ref    => try buf.appendSlice(gpa, t.name),
+            .type_param  => try buf.appendSlice(gpa, t.name),
+            .string_literal => try buf.print(gpa, "\"{s}\"", .{t.literal_value.string}),
+            .number_literal => {
+                const n = t.literal_value.number;
+                // Integer-valued literals print without a decimal point — but
+                // only when in i64 range, else @intFromFloat is illegal behavior
+                // (e.g. 1e300). Out-of-range/fractional fall back to float fmt.
+                const i64_min: f64 = -9223372036854775808.0; // -2^63
+                const i64_max: f64 = 9223372036854775808.0; //  2^63 (exclusive)
+                if (n == @trunc(n) and !std.math.isInf(n) and !std.math.isNan(n) and
+                    n >= i64_min and n < i64_max)
+                {
+                    try buf.print(gpa, "{d}", .{@as(i64, @intFromFloat(n))});
+                } else {
+                    try buf.print(gpa, "{d}", .{n});
+                }
+            },
+            .boolean_literal => try buf.appendSlice(gpa, if (t.literal_value.boolean) "true" else "false"),
+            .bigint_literal  => try buf.print(gpa, "{s}n", .{t.literal_value.bigint}),
+            .array_t => {
+                const ids = self.store.idsOf(t.list_data);
+                if (ids.len > 0) {
+                    try self.typeToStringInner(ids[0], buf, depth + 1);
+                } else {
+                    try buf.appendSlice(gpa, "unknown");
+                }
+                try buf.appendSlice(gpa, "[]");
+            },
+            .readonly_array_t => {
+                try buf.appendSlice(gpa, "readonly ");
+                const ids = self.store.idsOf(t.list_data);
+                if (ids.len > 0) {
+                    try self.typeToStringInner(ids[0], buf, depth + 1);
+                } else {
+                    try buf.appendSlice(gpa, "unknown");
+                }
+                try buf.appendSlice(gpa, "[]");
+            },
+            .tuple_t => {
+                try buf.appendSlice(gpa, "[");
+                for (self.store.idsOf(t.list_data), 0..) |m, i| {
+                    if (i > 0) try buf.appendSlice(gpa, ", ");
+                    try self.typeToStringInner(m, buf, depth + 1);
+                }
+                try buf.appendSlice(gpa, "]");
+            },
+            .function_t => {
+                const sigs = self.store.signaturesOf(t.signatures);
+                if (sigs.len > 0) {
+                    try buf.appendSlice(gpa, "(...) => ");
+                    try self.typeToStringInner(sigs[0].return_type, buf, depth + 1);
+                } else {
+                    try buf.appendSlice(gpa, "(...) => unknown");
+                }
+            },
+            .object_t => try buf.appendSlice(gpa, "object"),
+            .intersection_t => {
+                for (self.store.idsOf(t.list_data), 0..) |m, i| {
+                    if (i > 0) try buf.appendSlice(gpa, " & ");
+                    try self.typeToStringInner(m, buf, depth + 1);
+                }
+            },
+            .union_t => {
+                const ids = self.store.idsOf(t.list_data);
+                // Collect member strings, sort for stability.
+                var strs: std.ArrayList([]u8) = .empty;
+                defer {
+                    for (strs.items) |s| self.gpa.free(s);
+                    strs.deinit(self.gpa);
+                }
+                for (ids) |m| {
+                    var member_buf: std.ArrayList(u8) = .empty;
+                    try self.typeToStringInner(m, &member_buf, depth + 1);
+                    try strs.append(self.gpa, try member_buf.toOwnedSlice(self.gpa));
+                }
+                std.mem.sort([]u8, strs.items, {}, struct {
+                    fn lt(_: void, a: []u8, b: []u8) bool {
+                        return std.mem.order(u8, a, b) == .lt;
+                    }
+                }.lt);
+                for (strs.items, 0..) |s, i| {
+                    if (i > 0) try buf.appendSlice(gpa, " | ");
+                    try buf.appendSlice(gpa, s);
+                }
+            },
+        }
     }
 };
 
