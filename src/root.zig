@@ -1,12 +1,12 @@
-//! ez-checker — minimal TS-flavored type inference and assignability
-//! sufficient for the `no-unsafe-*` family of typescript-eslint rules.
+//! ez-checker — TypeScript type checker for lint rules.
 //!
-//! Not a full TS implementation: we lean on annotations, do not perform
-//! generic inference, and treat unresolved references as `any`.
+//! Per-file inference over a parsed AST: literals, unions, intersections,
+//! generics, conditional types, mapped types, utility types, control-flow
+//! narrowing, and structural inheritance.  Unresolved references produce
+//! `error` or `unknown` (not `any`) so rules can distinguish them.
 //!
-//! Cross-file module resolution is NOT included here.  Callers that need
-//! it should implement `Checker.ModuleResolver` and supply it via the
-//! `module_resolver` field after `Checker.init`.
+//! Cross-file resolution is optional: implement `ModuleResolver` and set
+//! `Checker.module_resolver` to enable lazy import type resolution.
 
 pub const types = @import("types.zig");
 pub const Checker = @import("checker.zig").Checker;
