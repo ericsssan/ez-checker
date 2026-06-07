@@ -2166,7 +2166,13 @@ pub const Checker = struct {
                 result = self.store.unionOf(&ids) catch result;
             }
         }
-        if (result.eq(TypeId.none)) return tymod.ID_VOID;
+        if (result.eq(TypeId.none)) {
+            // No return stmts — body may only throw. A body that never
+            // falls through (last stmt is throw/guaranteed-terminator) has
+            // return type `never`, matching tsc's inference for always-throwing
+            // functions.  Otherwise it implicitly returns undefined → void.
+            return if (!self.bodyCanFallThrough(body)) tymod.ID_NEVER else tymod.ID_VOID;
+        }
         if (has_bare_return) {
             const ids = [_]TypeId{ result, tymod.ID_UNDEFINED };
             result = self.store.unionOf(&ids) catch result;
