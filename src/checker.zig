@@ -353,10 +353,24 @@ pub const Checker = struct {
 
             .equal, .not_equal, .strict_equal, .strict_not_equal,
             .less_than, .greater_than, .less_equal, .greater_equal,
-            .instanceof_expr, .in_expr,
-            .logical_not => tymod.ID_BOOLEAN,
+            .instanceof_expr, .in_expr => tymod.ID_BOOLEAN,
 
-            .typeof_expr => tymod.ID_STRING,
+            // Fold `!<boolean literal>` to the opposite literal so that
+            // `!true` → `false` and `!!true` → `true`.
+            .logical_not => blk: {
+                const operand = self.ast_ref.nodeData(node).lhs;
+                if (operand == .none) break :blk tymod.ID_BOOLEAN;
+                const ot = self.typeOf(operand);
+                const lit = self.store.get(ot);
+                if (lit.kind != .boolean_literal) break :blk tymod.ID_BOOLEAN;
+                break :blk self.store.booleanLiteral(!lit.literal_value.boolean) catch tymod.ID_BOOLEAN;
+            },
+
+            .typeof_expr => blk: {
+                const operand = self.ast_ref.nodeData(node).lhs;
+                if (operand == .none) break :blk tymod.ID_STRING;
+                break :blk self.typeofStringIdOf(self.typeOf(operand));
+            },
             .void_expr => tymod.ID_UNDEFINED,
             .delete_expr => tymod.ID_BOOLEAN,
 
@@ -451,6 +465,48 @@ pub const Checker = struct {
 
     fn regexpRefType(self: *Checker) TypeId {
         return self.store.typeRef("RegExp", &.{}) catch tymod.ID_ANY;
+    }
+
+    /// Map a value-side TypeId to the string-literal type(s) that `typeof`
+    /// produces at runtime.  Returns a string_literal TypeId, a union of
+    /// string_literal TypeIds, or plain `ID_STRING` when the operand type is
+    /// too broad to narrow (any / unknown / unresolved).
+    fn typeofStringIdOf(self: *Checker, ty: TypeId) TypeId {
+        const t = self.store.get(ty);
+        return switch (t.kind) {
+            .number, .number_literal => self.store.stringLiteral("number") catch tymod.ID_STRING,
+            .string, .string_literal => self.store.stringLiteral("string") catch tymod.ID_STRING,
+            .boolean, .boolean_literal => self.store.stringLiteral("boolean") catch tymod.ID_STRING,
+            .bigint, .bigint_literal => self.store.stringLiteral("bigint") catch tymod.ID_STRING,
+            .symbol => self.store.stringLiteral("symbol") catch tymod.ID_STRING,
+            .undefined_t, .void_t => self.store.stringLiteral("undefined") catch tymod.ID_STRING,
+            .function_t => self.store.stringLiteral("function") catch tymod.ID_STRING,
+            // null, object types, arrays, tuples, type refs → "object"
+            .null_t, .object_t, .object_keyword, .array_t, .readonly_array_t,
+            .tuple_t, .type_ref, .intersection_t => self.store.stringLiteral("object") catch tymod.ID_STRING,
+            // Union: recursively compute typeof for each member and deduplicate
+            .union_t => blk: {
+                var buf: [16]TypeId = undefined;
+                var n: usize = 0;
+                for (self.store.idsOf(t.list_data)) |m| {
+                    const ms = self.typeofStringIdOf(m);
+                    var dup = false;
+                    for (buf[0..n]) |existing| {
+                        if (existing.eq(ms)) { dup = true; break; }
+                    }
+                    if (!dup) {
+                        if (n >= buf.len) break :blk tymod.ID_STRING;
+                        buf[n] = ms;
+                        n += 1;
+                    }
+                }
+                if (n == 0) break :blk tymod.ID_STRING;
+                if (n == 1) break :blk buf[0];
+                break :blk self.store.unionOf(buf[0..n]) catch tymod.ID_STRING;
+            },
+            // any / unknown / never / error / type_param: too broad — fall back
+            else => tymod.ID_STRING,
+        };
     }
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
@@ -1403,7 +1459,39 @@ pub const Checker = struct {
         switch (ptag) {
             .declarator => {
                 const data = self.ast_ref.nodeData(parent);
-                if (data.rhs != .none) return self.typeOf(data.rhs);
+                if (data.rhs != .none) {
+                    const raw = self.typeOf(data.rhs);
+                    const t = self.store.get(raw);
+                    // Array/tuple literals are always widened to T[] — TypeScript
+                    // widens `['c', 'd']` to `string[]` for both let and const
+                    // (only `as const` produces a readonly tuple literal type).
+                    if (t.kind == .tuple_t) {
+                        const elems = self.store.idsOf(t.list_data);
+                        const elem_t = if (elems.len == 0)
+                            tymod.ID_NEVER
+                        else
+                            self.store.unionOf(elems) catch elems[0];
+                        return self.store.arrayOf(elem_t) catch raw;
+                    }
+                    // Primitive literals are widened to their base type for
+                    // let/var declarations; const preserves the literal type.
+                    const decl_idx = parent.toInt();
+                    const is_mutable = blk: {
+                        if (decl_idx >= parents.len) break :blk false;
+                        const gidx = parents[decl_idx];
+                        if (gidx == @intFromEnum(NodeIndex.none)) break :blk false;
+                        const gtag = self.ast_ref.nodeTag(@enumFromInt(gidx));
+                        break :blk gtag == .let_decl or gtag == .var_decl;
+                    };
+                    if (is_mutable) return switch (t.kind) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        .bigint_literal => tymod.ID_BIGINT,
+                        else => raw,
+                    };
+                    return raw;
+                }
                 return tymod.ID_UNKNOWN;
             },
             .rest_element => {
@@ -7054,9 +7142,15 @@ pub const Checker = struct {
     fn inferArrayLiteral(self: *Checker, node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(node);
         const slice = self.directRange(data.lhs, data.rhs) orelse {
-            return self.store.arrayOf(self.emptyArrayElem(node)) catch tymod.ID_ANY;
+            const elem = self.emptyArrayElem(node);
+            if (tymod.isAny(&self.store, elem)) return tymod.ID_ANY;
+            return self.store.arrayOf(elem) catch tymod.ID_ANY;
         };
-        if (slice.len == 0) return self.store.arrayOf(self.emptyArrayElem(node)) catch tymod.ID_ANY;
+        if (slice.len == 0) {
+            const elem = self.emptyArrayElem(node);
+            if (tymod.isAny(&self.store, elem)) return tymod.ID_ANY;
+            return self.store.arrayOf(elem) catch tymod.ID_ANY;
+        }
         // Element type = union of element types.
         var buf: [32]TypeId = undefined;
         const n = @min(slice.len, buf.len);
