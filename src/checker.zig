@@ -564,8 +564,19 @@ pub const Checker = struct {
                 if (n == 1) break :blk buf[0];
                 break :blk self.store.unionOf(buf[0..n]) catch tymod.ID_STRING;
             },
-            // any / unknown / never / error / type_param: too broad — fall back
-            else => tymod.ID_STRING,
+            // any / unknown / never / error / type_param: typeof returns the full union
+            else => blk: {
+                var buf: [8]TypeId = undefined;
+                buf[0] = self.store.stringLiteral("bigint") catch tymod.ID_STRING;
+                buf[1] = self.store.stringLiteral("boolean") catch tymod.ID_STRING;
+                buf[2] = self.store.stringLiteral("function") catch tymod.ID_STRING;
+                buf[3] = self.store.stringLiteral("number") catch tymod.ID_STRING;
+                buf[4] = self.store.stringLiteral("object") catch tymod.ID_STRING;
+                buf[5] = self.store.stringLiteral("string") catch tymod.ID_STRING;
+                buf[6] = self.store.stringLiteral("symbol") catch tymod.ID_STRING;
+                buf[7] = self.store.stringLiteral("undefined") catch tymod.ID_STRING;
+                break :blk self.store.unionOf(&buf) catch tymod.ID_STRING;
+            },
         };
     }
 
@@ -802,7 +813,11 @@ pub const Checker = struct {
                         if (ann != .none and self.ast_ref.nodeTag(ann) == .ts_type_annotation) {
                             return self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs);
                         }
-                        return null;
+                        // Explicit declaration with no annotation and no initializer
+                        // (e.g., `declare var x;` or `var x;` in a function) → any.
+                        // This prevents falling through to global_value_types lookups
+                        // for explicitly declared names that should resolve to any.
+                        return tymod.ID_ANY;
                     }
                     return self.typeOf(data.rhs);
                 },
@@ -1572,7 +1587,6 @@ pub const Checker = struct {
                     if (is_mutable) return switch (t.kind) {
                         .string_literal => tymod.ID_STRING,
                         .number_literal => tymod.ID_NUMBER,
-                        .boolean_literal => tymod.ID_BOOLEAN,
                         .bigint_literal => tymod.ID_BIGINT,
                         else => raw,
                     };
@@ -2460,6 +2474,7 @@ pub const Checker = struct {
         return false;
     }
 
+
     fn paramDeclaredType(self: *Checker, param: NodeIndex) TypeId {
         var node = param;
         // Peel assignment_pattern (default value) — the binding side
@@ -2477,11 +2492,21 @@ pub const Checker = struct {
                 const ty = self.ast_ref.nodeData(rdata.rhs).lhs;
                 return self.resolveTypeNode(ty);
             }
-            return tymod.ID_UNKNOWN;
+            // Unannotated rest parameters default to `any` to match TypeScript's
+            // behavior when noImplicitAny is off (the default). The original design
+            // returned `unknown` to avoid spurious unsafe-* fires, but this causes
+            // mismatches with tsc's actual inferred type.
+            return tymod.ID_ANY;
         }
         if (self.ast_ref.nodeTag(node) != .identifier) return tymod.ID_UNKNOWN;
         const bd = self.ast_ref.nodeData(node);
-        if (bd.rhs == .none) return tymod.ID_UNKNOWN;
+        if (bd.rhs == .none) {
+            // Unannotated parameters default to `any` to match TypeScript's
+            // behavior when noImplicitAny is off (the default). The original design
+            // returned `unknown` to avoid spurious unsafe-* fires, but this causes
+            // mismatches with tsc's actual inferred type.
+            return tymod.ID_ANY;
+        }
         if (self.ast_ref.nodeTag(bd.rhs) != .ts_type_annotation) return tymod.ID_UNKNOWN;
         const ty = self.ast_ref.nodeData(bd.rhs).lhs;
         return self.resolveTypeNode(ty);
@@ -6405,6 +6430,11 @@ pub const Checker = struct {
         const data = self.ast_ref.nodeData(node);
         const range = self.safeSubRange(data.lhs) orelse return tymod.ID_UNDEFINED;
         if (range.end <= range.start) return tymod.ID_UNDEFINED;
+        // A sequence expression should have at least 2 elements (comma operator).
+        // If there's only 1 element (e.g., `(NUMBER, )` with missing second operand),
+        // the result type is `any` to represent the syntax error / missing operand.
+        const num_elements = range.end - range.start;
+        if (num_elements < 2) return tymod.ID_ANY;
         const last_idx = self.ast_ref.extra_data[range.end - 1];
         return self.typeOf(@enumFromInt(last_idx));
     }
@@ -7551,7 +7581,44 @@ pub const Checker = struct {
             }
             const elems = self.store.idsOf(obj.list_data);
             if (elems.len == 0) return tymod.ID_UNKNOWN;
-            return elems[0];
+            const elem_ty = elems[0];
+            // Non-numeric index (symbol, variable, etc.) on an array: widen
+            // element literals to their base types, since array[nonNumericKey]
+            // can't access a specific numeric index.
+            if (self.ast_ref.nodeTag(key_node) != .number_literal) {
+                const et = self.store.get(elem_ty);
+                // Handle unions of literals by widening each member.
+                if (et.kind == .union_t) {
+                    var buf: [32]TypeId = undefined;
+                    var n: usize = 0;
+                    for (self.store.idsOf(et.list_data)) |member| {
+                        if (n >= buf.len) break;
+                        const mt = self.store.get(member);
+                        const widened = switch (mt.kind) {
+                            .string_literal => tymod.ID_STRING,
+                            .number_literal => tymod.ID_NUMBER,
+                            .boolean_literal => tymod.ID_BOOLEAN,
+                            .bigint_literal => tymod.ID_BIGINT,
+                            else => member,
+                        };
+                        buf[n] = widened;
+                        n += 1;
+                    }
+                    if (n == 0) return elem_ty;
+                    if (n == 1) return buf[0];
+                    return self.store.unionOf(buf[0..n]) catch elem_ty;
+                }
+                // Single literal type: widen directly.
+                const widened = switch (et.kind) {
+                    .string_literal => tymod.ID_STRING,
+                    .number_literal => tymod.ID_NUMBER,
+                    .boolean_literal => tymod.ID_BOOLEAN,
+                    .bigint_literal => tymod.ID_BIGINT,
+                    else => elem_ty,
+                };
+                return widened;
+            }
+            return elem_ty;
         }
         if (obj.kind == .tuple_t) {
             const elems = self.store.idsOf(obj.list_data);
@@ -7856,9 +7923,8 @@ pub const Checker = struct {
     fn substituteAliasArgs(self: *Checker, decl: NodeIndex, ref_node: NodeIndex, alias_body: TypeId) ?TypeId {
         const tad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
         if (tad.type_params_end <= tad.type_params) return null;
-        const ref_rhs = self.ast_ref.nodeData(ref_node).rhs;
-        if (ref_rhs == .none) return null;
-        const arg_range = self.ast_ref.extraData(ast.SubRange, @intFromEnum(ref_rhs));
+        const ref_data = self.ast_ref.nodeData(ref_node);
+        const arg_range = self.safeSubRange(ref_data.rhs) orelse return null;
         if (arg_range.end <= arg_range.start) return null;
         // Build substitution map: param name → TypeId.
         var keys_buf: [4][]const u8 = undefined;
