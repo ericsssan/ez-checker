@@ -302,7 +302,7 @@ pub const Checker = struct {
             .boolean_literal => self.literalBoolean(node),
             .null_literal => tymod.ID_NULL,
             .regex_literal => self.regexpRefType(),
-            .template_literal => tymod.ID_STRING,
+            .template_literal => self.inferTemplateLiteral(node),
             .tagged_template => blk: {
                 const tag = self.ast_ref.nodeData(node).lhs;
                 if (tag == .none) break :blk tymod.ID_UNKNOWN;
@@ -463,6 +463,66 @@ pub const Checker = struct {
         return self.store.booleanLiteral(v) catch tymod.ID_BOOLEAN;
     }
 
+    /// Evaluate a template literal to a string literal when all
+    /// substitutions are string/number/boolean literals.
+    /// Otherwise returns ID_STRING (plain string type).
+    fn inferTemplateLiteral(self: *Checker, node: NodeIndex) TypeId {
+        const data = self.ast_ref.nodeData(node);
+        const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_STRING;
+
+        // Parts alternate template_element (quasi) and expression (interpolation).
+        // Accumulate the concatenated string if all substitutions are literals.
+        var result: std.ArrayList(u8) = .empty;
+        defer result.deinit(self.gpa);
+
+        for (slice) |raw| {
+            const part: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(part) == .template_element) {
+                // Extract template element text
+                const tok = self.ast_ref.nodeMainToken(part);
+                const start = self.ast_ref.tokenStart(tok);
+                const len = self.ast_ref.tokens.items(.len)[tok];
+                const src = self.ast_ref.source;
+                if (start + len > src.len) return tymod.ID_STRING;
+
+                var span_start = start;
+                var span_end: u32 = start + len;
+                if (span_start < span_end and (src[span_start] == '`' or src[span_start] == '}')) span_start += 1;
+                if (span_end >= span_start + 2 and src[span_end - 1] == '{' and src[span_end - 2] == '$') {
+                    span_end -= 2;
+                } else if (span_end > span_start and src[span_end - 1] == '`') {
+                    span_end -= 1;
+                }
+                const quasi_text = src[span_start..span_end];
+                result.appendSlice(self.gpa, quasi_text) catch return tymod.ID_STRING;
+                continue;
+            }
+
+            // Interpolation expression — try to evaluate as a literal
+            const expr_ty = self.typeOf(part);
+            const t = self.store.get(expr_ty);
+
+            const expr_str = switch (t.kind) {
+                .string_literal => switch (t.literal_value) { .string => |s| s, else => return tymod.ID_STRING },
+                .number_literal => blk: {
+                    const num = switch (t.literal_value) { .number => |n| n, else => return tymod.ID_STRING };
+                    // Format number as it would appear in template literal
+                    // Use allocPrint to format the number
+                    const formatted = std.fmt.allocPrint(self.gpa, "{}", .{num}) catch return tymod.ID_STRING;
+                    break :blk formatted;
+                },
+                .boolean_literal => switch (t.literal_value) { .boolean => |b| if (b) "true" else "false", else => return tymod.ID_STRING },
+                else => return tymod.ID_STRING,
+            };
+
+            result.appendSlice(self.gpa, expr_str) catch return tymod.ID_STRING;
+        }
+
+        // Finalize as string literal
+        const owned = self.gpa.dupe(u8, result.items) catch return tymod.ID_STRING;
+        return self.store.stringLiteral(owned) catch tymod.ID_STRING;
+    }
+
     fn regexpRefType(self: *Checker) TypeId {
         return self.store.typeRef("RegExp", &.{}) catch tymod.ID_ANY;
     }
@@ -513,22 +573,24 @@ pub const Checker = struct {
         if (self.symbolForIdentRef(node)) |sym| {
             const base = self.declaredTypeForSymbol(sym);
             if (!base.eq(tymod.ID_UNKNOWN)) return self.narrowAtUse(node, sym, base);
-            // Symbol resolves but has no declared type — likely an
-            // implicit global.  Try the curated lib globals next.
+            // Symbol resolves but has no declared type — distinguish between
+            // explicit declarations (return any) and implicit globals (try lib).
             const decl_node = self.semantic.symbols.getDeclNode(sym);
-            if (decl_node == .none) {
-                const tok2 = self.ast_ref.nodeMainToken(node);
-                const name2 = self.ast_ref.tokenText(tok2);
-                if (self.global_value_types.get(name2)) |t| return t;
+            if (decl_node != .none) {
+                // Explicitly declared in the file with no type annotation → any
+                return tymod.ID_ANY;
             }
+            // Implicit global — try the curated lib globals next.
+            const tok2 = self.ast_ref.nodeMainToken(node);
+            const name2 = self.ast_ref.tokenText(tok2);
+            if (self.global_value_types.get(name2)) |t| return t;
             // `ClassName.staticMember` — the class *value* is its static side.
             // Restricted to the object position of a member access so heritage
             // (`extends ClassName`), type, and `new` positions still resolve to
             // the instance type (which shares this same symbol).  decl_node is
             // the class *name* binding; walk up to the enclosing class_decl.
-            if (decl_node != .none and self.identifierIsMemberObject(node)) {
+            if (self.identifierIsMemberObject(node)) {
                 const class_decl = blk: {
-                    if (self.ast_ref.nodeTag(decl_node) == .class_decl) break :blk decl_node;
                     const parents = self.semantic.parent_indices;
                     if (decl_node.toInt() < parents.len) {
                         const pidx = parents[decl_node.toInt()];
@@ -549,7 +611,7 @@ pub const Checker = struct {
                     }
                 }
             }
-            return self.narrowAtUse(node, sym, base);
+            return tymod.ID_ANY;
         }
         // Fallback: semantic didn't resolve the reference (common for
         // identifiers used in TS-specific contexts like enum member
@@ -1433,9 +1495,33 @@ pub const Checker = struct {
             }
             return tymod.ID_UNKNOWN;
         }
-        // Direct annotation on the identifier.
-        if (self.ast_ref.nodeTag(binding) == .identifier) {
-            const bd = self.ast_ref.nodeData(binding);
+        // Try to find a type annotation by peeling wrappers and checking the binding or its lhs.
+        var node = binding;
+        // Peel wrappers: assignment_pattern (default value), ts_parameter_property, rest_element.
+        while (true) {
+            const tag = self.ast_ref.nodeTag(node);
+            if (tag == .assignment_pattern or tag == .ts_parameter_property) {
+                node = self.ast_ref.nodeData(node).lhs;
+            } else if (tag == .rest_element) {
+                // rest_element: annotation is on the rest_element itself
+                const data = self.ast_ref.nodeData(node);
+                if (data.rhs != .none and self.ast_ref.nodeTag(data.rhs) == .ts_type_annotation) {
+                    const ty_node = self.ast_ref.nodeData(data.rhs).lhs;
+                    return self.resolveTypeNode(ty_node);
+                }
+                // If no annotation, peel to lhs
+                node = data.lhs;
+            } else if (tag == .declarator) {
+                // declarator: check the lhs (which is the identifier)
+                const data = self.ast_ref.nodeData(node);
+                node = data.lhs;
+            } else {
+                break;
+            }
+        }
+        // Check the final node for a direct annotation
+        if (node != .none) {
+            const bd = self.ast_ref.nodeData(node);
             if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
                 const ty_node = self.ast_ref.nodeData(bd.rhs).lhs;
                 var ty = self.resolveTypeNode(ty_node);
@@ -6063,7 +6149,17 @@ pub const Checker = struct {
                     const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
                     ty = self.resolveTypeNode(ty_node);
                 } else if (pd.value != .none) {
-                    ty = self.typeOf(pd.value);
+                    const raw = self.typeOf(pd.value);
+                    const t = self.store.get(raw);
+                    // Class properties without explicit type annotations are widened
+                    // from literal types to their base types, like let declarations.
+                    ty = switch (t.kind) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        .bigint_literal => tymod.ID_BIGINT,
+                        else => raw,
+                    };
                 }
                 // A class field whose initializer is a regular
                 // `function () {}` is a method that uses `this`.  Mark
@@ -7468,8 +7564,26 @@ pub const Checker = struct {
                 if (idx < elems.len) return elems[idx];
                 return tymod.ID_UNDEFINED;
             }
-            // Non-literal index → first element type (approximation).
-            return elems[0];
+            // Non-numeric index (symbol, variable, etc.) → union of all
+            // element types, widened from literals to their base types.
+            var buf: [32]TypeId = undefined;
+            var n: usize = 0;
+            for (elems) |elem| {
+                if (n >= buf.len) break;
+                const et = self.store.get(elem);
+                const widened = switch (et.kind) {
+                    .string_literal => tymod.ID_STRING,
+                    .number_literal => tymod.ID_NUMBER,
+                    .boolean_literal => tymod.ID_BOOLEAN,
+                    .bigint_literal => tymod.ID_BIGINT,
+                    else => elem,
+                };
+                buf[n] = widened;
+                n += 1;
+            }
+            if (n == 0) return tymod.ID_UNKNOWN;
+            if (n == 1) return buf[0];
+            return self.store.unionOf(buf[0..n]) catch elems[0];
         }
         // String literal key into object — look up by name.
         if (obj.kind == .object_t and self.ast_ref.nodeTag(key_node) == .string_literal) {
