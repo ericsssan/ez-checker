@@ -9151,8 +9151,11 @@ pub const Checker = struct {
             .string_literal => {
                 try buf.append(gpa, '"');
                 for (t.literal_value.string) |byte| {
-                    if (byte < 0x20 or byte == 0x7F) {
-                        // Encode control characters as \uXXXX
+                    if (byte == 0x00) {
+                        // TypeScript renders the null byte as \0
+                        try buf.appendSlice(gpa, "\\0");
+                    } else if (byte < 0x20 or byte == 0x7F) {
+                        // Encode other control characters as \uXXXX
                         try buf.print(gpa, "\\u{x:0>4}", .{byte});
                     } else if (byte == '"') {
                         try buf.appendSlice(gpa, "\\\"");
