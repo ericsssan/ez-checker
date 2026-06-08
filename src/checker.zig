@@ -8160,8 +8160,6 @@ pub const Checker = struct {
     fn inferComputedMember(self: *Checker, obj_ty: TypeId, key_node: NodeIndex, obj_node: NodeIndex) TypeId {
         if (key_node == .none) return tymod.ID_UNKNOWN;
         const obj = self.store.get(obj_ty);
-        // Track if input was unresolved so we return ID_ANY for unresolved keys.
-        const input_was_unknown = obj_ty.eq(tymod.ID_UNKNOWN) or obj_ty.eq(tymod.ID_ERROR);
         // Array element access — index by number → element type.
         // For tuples, a numeric literal selects a specific element;
         // otherwise return the union of all elements.
