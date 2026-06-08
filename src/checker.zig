@@ -790,6 +790,24 @@ pub const Checker = struct {
     /// TypeId for the class name type.  Non-generic: `C` → typeRef("C").
     /// Generic: `class C<T, U>` → typeRef("C", [typeParam("T"), typeParam("U")])
     /// so it renders as "C<T, U>" matching tsc's annotation on the name.
+    /// Returns `typeRef("typeof NS")` when `node` is the name identifier of a
+    /// `ts_namespace_decl` or `ts_module_decl` (the fallback path, where semantic
+    /// has no reference entry for the declaration name itself).
+    fn typeForNamespaceDeclarationName(self: *Checker, node: NodeIndex, name: []const u8) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        const ptag = self.ast_ref.nodeTag(parent);
+        if (ptag != .ts_namespace_decl and ptag != .ts_module_decl) return null;
+        const data = self.ast_ref.nodeData(parent);
+        if (data.lhs != node) return null;
+        const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return null;
+        return self.store.typeRef(typeof_name, &.{}) catch null;
+    }
+
     fn typeForClassDeclarationName(self: *Checker, node: NodeIndex, name: []const u8) ?TypeId {
         const parents = self.semantic.parent_indices;
         const nidx = node.toInt();
@@ -818,6 +836,19 @@ pub const Checker = struct {
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
         if (self.symbolForIdentRef(node)) |sym| {
+            // Namespace identifier in value position → `typeof NamespaceName`.
+            // Guard: skip type-annotation positions (where tsc says `any`).
+            if (self.semantic.symbols.getBindingKind(sym) == .namespace_decl and
+                !self.identifierInTypePosition(node))
+            {
+                const tok = self.ast_ref.nodeMainToken(node);
+                const ns_name = self.ast_ref.tokenText(tok);
+                if (ns_name.len > 0) {
+                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
+                    return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                }
+                return tymod.ID_ANY;
+            }
             const base = self.declaredTypeForSymbol(sym);
             if (!base.eq(tymod.ID_UNKNOWN)) return self.narrowAtUse(node, sym, base);
             // Symbol resolves but has no declared type — distinguish between
@@ -881,6 +912,8 @@ pub const Checker = struct {
         // Class declaration name: `class C { }` or `class C<T>` — return the
         // named type matching tsc's annotation (e.g. `>C : C` / `>C : C<T>`).
         if (self.typeForClassDeclarationName(node, name)) |ty| return ty;
+        // Namespace/module declaration name: `namespace NS { }` → `typeof NS`.
+        if (self.typeForNamespaceDeclarationName(node, name)) |ty| return ty;
         // When an enum identifier appears, it should be typed as the union of its members
         // (the type-side), not the object type (which is for member access like `Foo.Bar`).
         if (self.enum_kinds.get(name) != null) {
