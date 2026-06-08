@@ -938,12 +938,21 @@ pub const Checker = struct {
         // back to the curated lib shapes so member access / calls type
         // correctly without modelling the full lib.d.ts.
         if (self.global_value_types.get(name)) |t| {
-            // Math and JSON appear as named types in tsc's oracle (not structural
-            // objects). Return typeRef lazily so the intern map isn't seeded during
-            // setup (which would shift the resize threshold and expose a latent bug).
-            if (std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "JSON")) {
-                return self.store.typeRef(name, &.{}) catch t;
-            }
+            // Several globals appear as named constructor/singleton types in tsc's
+            // oracle rather than their structural forms. Return typeRef lazily (not
+            // at setup) to avoid seeding the intern map early and exposing latent
+            // bugs in substituteTypeId's intern-rehash path.
+            const named_form: ?[]const u8 = if (std.mem.eql(u8, name, "Math") or
+                std.mem.eql(u8, name, "JSON") or
+                std.mem.eql(u8, name, "console"))
+                name
+            else if (std.mem.eql(u8, name, "Array"))
+                "ArrayConstructor"
+            else if (std.mem.eql(u8, name, "Object"))
+                "ObjectConstructor"
+            else
+                null;
+            if (named_form) |nf| return self.store.typeRef(nf, &.{}) catch t;
             return t;
         }
         // A known lib.d.ts global we don't model structurally (`Map`, `Reflect`,
@@ -5117,6 +5126,7 @@ pub const Checker = struct {
             console_props[i] = .{ .name = name, .type_id = void_fn };
         }
         const console_ty = try h.objType(&console_props);
+        try self.global_value_types.put(self.gpa, "__console_struct", console_ty);
         try self.global_value_types.put(self.gpa, "console", console_ty);
         try self.natively_bound_type_ids.put(self.gpa, console_ty, {});
 
@@ -5261,6 +5271,7 @@ pub const Checker = struct {
             .{ .name = "is",                       .type_id = try h.fnTypeWithParams(&.{tymod.ID_ANY, tymod.ID_ANY}, tymod.ID_BOOLEAN) },
         };
         const object_ty = try h.objType(&object_props);
+        try self.global_value_types.put(self.gpa, "__Object_struct", object_ty);
         try self.global_value_types.put(self.gpa, "Object", object_ty);
         try self.natively_bound_type_ids.put(self.gpa, object_ty, {});
 
@@ -5271,6 +5282,7 @@ pub const Checker = struct {
             .{ .name = "of",      .type_id = try h.fnType(tymod.ID_ANY) },
         };
         const array_ty = try h.objType(&array_props);
+        try self.global_value_types.put(self.gpa, "__Array_struct", array_ty);
         try self.global_value_types.put(self.gpa, "Array", array_ty);
         try self.natively_bound_type_ids.put(self.gpa, array_ty, {});
 
@@ -9432,15 +9444,21 @@ pub const Checker = struct {
             const inner = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
             return self.promisePrototypeProperty(name, inner);
         }
-        if (std.mem.eql(u8, t.name, "Math")) {
-            if (self.global_value_types.get("__Math_struct")) |math_struct| {
-                if (self.propertyTypeOfTypeId(math_struct, name)) |prop_ty| return prop_ty;
-            }
-            return null;
-        }
-        if (std.mem.eql(u8, t.name, "JSON")) {
-            if (self.global_value_types.get("__JSON_struct")) |json_struct| {
-                if (self.propertyTypeOfTypeId(json_struct, name)) |prop_ty| return prop_ty;
+        const struct_key: ?[]const u8 = if (std.mem.eql(u8, t.name, "Math"))
+            "__Math_struct"
+        else if (std.mem.eql(u8, t.name, "JSON"))
+            "__JSON_struct"
+        else if (std.mem.eql(u8, t.name, "ArrayConstructor"))
+            "__Array_struct"
+        else if (std.mem.eql(u8, t.name, "ObjectConstructor"))
+            "__Object_struct"
+        else if (std.mem.eql(u8, t.name, "console") or std.mem.eql(u8, t.name, "Console"))
+            "__console_struct"
+        else
+            null;
+        if (struct_key) |sk| {
+            if (self.global_value_types.get(sk)) |struct_ty| {
+                if (self.propertyTypeOfTypeId(struct_ty, name)) |prop_ty| return prop_ty;
             }
             return null;
         }
