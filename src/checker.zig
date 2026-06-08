@@ -8313,7 +8313,17 @@ pub const Checker = struct {
         {
             return self.store.typeRef(name, args) catch null;
         }
-        // User class — return the class instance type.
+        // User-declared class or interface — return typeRef so the instance
+        // type renders as the class name (matching tsc) rather than expanding
+        // to the structural object shape.  Member access resolves lazily via
+        // memberOnApparentType → resolveDeclaredType.
+        if (self.type_decl_nodes.get(name)) |decl| {
+            const dtag = self.ast_ref.nodeTag(decl);
+            if (dtag == .class_decl or dtag == .ts_interface_decl) {
+                return self.store.typeRef(name, args) catch null;
+            }
+        }
+        // Type alias or enum (structural resolve).
         if (self.resolveDeclaredType(name)) |ty| return ty;
         return null;
     }
