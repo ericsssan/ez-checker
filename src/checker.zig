@@ -935,6 +935,26 @@ pub const Checker = struct {
         // Check before typeOfNameByAstSearch so the property value type takes precedence over
         // an outer variable with the same name.
         if (self.identifierAsObjectLiteralPropertyKey(node)) |ty| return ty;
+        // For-in loop binding (declaration node): `for (var a in obj)` or destructuring.
+        // Must precede typeOfNameByAstSearch which returns any for uninitialised declarators.
+        // Only trigger when the immediate parent is a pattern/declarator/var-decl node
+        // (not an expression) — this avoids false positives for unresolved identifiers
+        // in the for-in iterable expression (e.g. `foo` in `for (var a in foo.bar)`).
+        blk: {
+            const parents_arr = self.semantic.parent_indices;
+            const nidx = node.toInt();
+            if (nidx >= parents_arr.len) break :blk;
+            const pidx = parents_arr[nidx];
+            if (pidx == @intFromEnum(NodeIndex.none)) break :blk;
+            const par_tag = self.ast_ref.nodeTag(@enumFromInt(pidx));
+            // Only binding-context parents are acceptable.
+            switch (par_tag) {
+                .declarator, .array_pattern, .object_pattern, .rest_element,
+                .var_decl, .let_decl, .const_decl => {},
+                else => break :blk,
+            }
+            if (self.isForInLoopBinding(node)) return tymod.ID_STRING;
+        }
         if (self.typeOfNameByAstSearch(name)) |t| return t;
         // Class declaration name: `class C { }` or `class C<T>` — return the
         // named type matching tsc's annotation (e.g. `>C : C` / `>C : C<T>`).
