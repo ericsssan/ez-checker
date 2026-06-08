@@ -8522,10 +8522,38 @@ pub const Checker = struct {
                 buf[i] = self.typeOf(elem_node);
             }
         }
-        // A fresh array literal with no spread is a fixed-length *tuple* (TS types
-        // it so before any widening). Preserving each element's type lets
-        // no-unsafe-assignment's destructuring walk recurse into nested patterns
-        // (`[[[[x]]]] = [[[[1 as any]]]]`). With a spread, fall back to array-of-union.
+        // For homogeneous primitive-literal arrays (all string, all number, all boolean,
+        // all bigint), tsc returns T[] not a tuple. Widen and return T[].
+        // For heterogeneous or non-literal arrays, keep the tuple so destructuring
+        // can use per-element types.
+        var all_same_kind = true;
+        const first_kind = self.store.get(buf[0]).kind;
+        const is_primitive_literal = switch (first_kind) {
+            .string_literal, .number_literal, .bigint_literal, .boolean_literal => true,
+            else => false,
+        };
+        if (is_primitive_literal) {
+            for (1..n) |j| {
+                if (self.store.get(buf[j]).kind != first_kind) {
+                    all_same_kind = false;
+                    break;
+                }
+            }
+        } else {
+            all_same_kind = false;
+        }
+        if (all_same_kind) {
+            // All elements same primitive literal kind → T[]
+            const elem_t: TypeId = switch (first_kind) {
+                .string_literal => tymod.ID_STRING,
+                .number_literal => tymod.ID_NUMBER,
+                .bigint_literal => tymod.ID_BIGINT,
+                .boolean_literal => tymod.ID_BOOLEAN,
+                else => unreachable,
+            };
+            return self.store.arrayOf(elem_t) catch tymod.ID_ANY;
+        }
+        // Heterogeneous or non-literal: keep tuple for precise destructuring.
         if (!has_spread) {
             const list = self.store.appendTypeIds(buf[0..n]) catch
                 return self.store.arrayOf(self.store.unionOf(buf[0..n]) catch tymod.ID_ANY) catch tymod.ID_ANY;
