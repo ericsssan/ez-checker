@@ -8951,7 +8951,7 @@ pub const Checker = struct {
                         md.params_start,
                         md.params_end,
                         md.return_type,
-                        .none,
+                        md.body,
                         is_async,
                         is_generator,
                     );
