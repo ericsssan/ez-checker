@@ -9150,10 +9150,19 @@ pub const Checker = struct {
             .type_param  => try buf.appendSlice(gpa, t.name),
             .string_literal => {
                 try buf.append(gpa, '"');
-                for (t.literal_value.string) |byte| {
+                const slit = t.literal_value.string;
+                var si: usize = 0;
+                while (si < slit.len) : (si += 1) {
+                    const byte = slit[si];
                     if (byte == 0x00) {
-                        // TypeScript renders the null byte as \0
-                        try buf.appendSlice(gpa, "\\0");
+                        // TypeScript renders the null byte as \0, but uses \x00 when
+                        // followed by a decimal digit to avoid ambiguity.
+                        const next_is_digit = si + 1 < slit.len and slit[si + 1] >= '0' and slit[si + 1] <= '9';
+                        if (next_is_digit) {
+                            try buf.appendSlice(gpa, "\\x00");
+                        } else {
+                            try buf.appendSlice(gpa, "\\0");
+                        }
                     } else if (byte < 0x20) {
                         // Encode C0 control characters as \uXXXX (uppercase hex, matching tsc)
                         try buf.print(gpa, "\\u{X:0>4}", .{byte});
