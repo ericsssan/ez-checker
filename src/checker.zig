@@ -2547,7 +2547,8 @@ pub const Checker = struct {
             return t;
         }
         if (self.global_value_types.get(name)) |t| return t;
-        return tymod.ID_UNKNOWN;
+        // Unresolved typeof reference → `any` (safe default for unmodeled types).
+        return tymod.ID_ANY;
     }
 
     /// Returns the class_decl AST node for the class named `name`, or null.
@@ -3022,7 +3023,8 @@ pub const Checker = struct {
             .boolean_literal => self.literalBoolean(ty_node),
             .bigint_literal => self.literalBigint(ty_node),
             .null_literal => tymod.ID_NULL,
-            else => tymod.ID_UNKNOWN,
+            // Unhandled type node tags → `any` (safe default for unmodeled syntax).
+            else => tymod.ID_ANY,
         };
     }
 
@@ -5038,11 +5040,13 @@ pub const Checker = struct {
                         const cname = if (cd.name != .none) self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name)) else "";
                         return self.buildClassInstanceType(pn, cname);
                     }
-                    return tymod.ID_UNKNOWN;
+                    // Class found but instance type couldn't be built → `any`.
+                    return tymod.ID_ANY;
                 }
                 p = if (@intFromEnum(pn) < parents.len) parents[@intFromEnum(pn)] else NONE;
             }
-            return tymod.ID_UNKNOWN;
+            // `this` outside class context → `any`.
+            return tymod.ID_ANY;
         }
         // Unknown name (not built-in, not declared anywhere in the file
         // or a known lib type) → error type, unless it matches a
@@ -8156,6 +8160,8 @@ pub const Checker = struct {
     fn inferComputedMember(self: *Checker, obj_ty: TypeId, key_node: NodeIndex, obj_node: NodeIndex) TypeId {
         if (key_node == .none) return tymod.ID_UNKNOWN;
         const obj = self.store.get(obj_ty);
+        // Track if input was unresolved so we return ID_ANY for unresolved keys.
+        const input_was_unknown = obj_ty.eq(tymod.ID_UNKNOWN) or obj_ty.eq(tymod.ID_ERROR);
         // Array element access — index by number → element type.
         // For tuples, a numeric literal selects a specific element;
         // otherwise return the union of all elements.
