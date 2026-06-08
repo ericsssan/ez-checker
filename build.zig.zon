@@ -3,7 +3,8 @@
     .version = "0.1.1",
     .dependencies = .{
         .es_parser = .{
-            .path = "../es-parser",
+            .url = "git+https://github.com/ericsssan/es-parser.git?ref=v0.2.6#ad32c7ba9c770551a16abb8f68a33460c07a5ac3",
+            .hash = "es_parser-0.2.6-C15LK4HWFwAz5RM0q25bEESA5Uj7681S_z0liDaZFYdI",
         },
     },
     .minimum_zig_version = "0.17.0-dev.607+456b2ec07",
