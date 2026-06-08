@@ -836,6 +836,7 @@ pub const Checker = struct {
         // annotation rather than falling through to AST search which may find
         // an unrelated variable with the same name.
         if (self.identifierAsPropertySignatureKey(node)) |ty| return ty;
+        if (self.identifierAsClassPropertyKey(node)) |ty| return ty;
         if (self.typeOfNameByAstSearch(name)) |t| return t;
         // When an enum identifier appears, it should be typed as the union of its members
         // (the type-side), not the object type (which is for member access like `Foo.Bar`).
@@ -890,6 +891,41 @@ pub const Checker = struct {
         // Use resolveSimpleTypeNode to avoid triggering deep conditional/recursive resolution.
         // Complex types (generics, conditionals) fall back to any to avoid panics.
         return self.resolveSimpleTypeNodeSafe(ty_node);
+    }
+
+    /// Returns the declared type of an identifier that is the key of a `property_def`
+    /// (e.g., `pp1` in `class C { pp1: string | number }`). Returns null otherwise.
+    fn identifierAsClassPropertyKey(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .property_def) return null;
+        const pdata = self.ast_ref.nodeData(parent);
+        if (pdata.lhs != node) return null;
+        const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(pdata.rhs));
+        if (pd.type_annotation != .none and
+            self.ast_ref.nodeTag(pd.type_annotation) == .ts_type_annotation)
+        {
+            const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
+            if (self.resolveSimpleTypeNodeSafe(ty_node)) |t| return t;
+            return self.resolveTypeNode(ty_node);
+        }
+        if (pd.value != .none) {
+            // Widen literal types for un-annotated class properties (like let).
+            const raw = self.typeOf(pd.value);
+            const t = self.store.get(raw);
+            return switch (t.kind) {
+                .string_literal => tymod.ID_STRING,
+                .number_literal => tymod.ID_NUMBER,
+                .boolean_literal => tymod.ID_BOOLEAN,
+                .bigint_literal => tymod.ID_BIGINT,
+                else => raw,
+            };
+        }
+        return tymod.ID_ANY;
     }
 
     /// Resolve a type annotation node to a TypeId, but only for simple/primitive types.
