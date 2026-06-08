@@ -5330,7 +5330,8 @@ pub const Checker = struct {
             // user-declared so they never appear in known_type_names, but
             // they still have structural shapes we can resolve.
             if (self.resolveLibType(ty_node, name)) |resolved| return resolved;
-            return tymod.ID_ERROR;
+            // Unresolved type name → `any` to match TypeScript's permissive behavior.
+            return tymod.ID_ANY;
         }
         // User-declared interface or class → resolve to its structural
         // shape (object_t with field/method ObjectProps).
