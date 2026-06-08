@@ -459,8 +459,123 @@ pub const Checker = struct {
         const tok = self.ast_ref.nodeMainToken(node);
         const raw = self.ast_ref.tokenText(tok);
         if (raw.len < 2) return tymod.ID_STRING;
-        const value = raw[1 .. raw.len - 1];
-        return self.store.stringLiteral(value) catch tymod.ID_STRING;
+        const inner = raw[1 .. raw.len - 1];
+        // If the string has no backslashes, use it directly (fast path).
+        if (std.mem.indexOfScalar(u8, inner, '\\') == null) {
+            return self.store.stringLiteral(inner) catch tymod.ID_STRING;
+        }
+        // Decode escape sequences so the stored value matches TypeScript's
+        // canonical string value (e.g. "\5" → U+0005, "\n" → newline).
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        var i: usize = 0;
+        outer: while (i < inner.len) {
+            if (inner[i] != '\\' or i + 1 >= inner.len) {
+                buf.append(self.gpa, inner[i]) catch { i = inner.len; break :outer; };
+                i += 1;
+                continue;
+            }
+            const esc = inner[i + 1];
+            switch (esc) {
+                'n' => { buf.append(self.gpa, '\n') catch { i = inner.len; break :outer; }; i += 2; },
+                'r' => { buf.append(self.gpa, '\r') catch { i = inner.len; break :outer; }; i += 2; },
+                't' => { buf.append(self.gpa, '\t') catch { i = inner.len; break :outer; }; i += 2; },
+                'b' => { buf.append(self.gpa, 0x08) catch { i = inner.len; break :outer; }; i += 2; },
+                'f' => { buf.append(self.gpa, 0x0C) catch { i = inner.len; break :outer; }; i += 2; },
+                'v' => { buf.append(self.gpa, 0x0B) catch { i = inner.len; break :outer; }; i += 2; },
+                '0'...'7' => {
+                    // Octal escape: \N, \NN, or \NNN
+                    var val: u32 = esc - '0';
+                    var j: usize = i + 2;
+                    if (j < inner.len and inner[j] >= '0' and inner[j] <= '7') {
+                        val = val * 8 + (inner[j] - '0');
+                        j += 1;
+                        if (j < inner.len and inner[j] >= '0' and inner[j] <= '7' and val < 32) {
+                            val = val * 8 + (inner[j] - '0');
+                            j += 1;
+                        }
+                    }
+                    // Encode as UTF-8
+                    var tbuf: [4]u8 = undefined;
+                    const len2 = std.unicode.utf8Encode(@intCast(val), &tbuf) catch {
+                        buf.append(self.gpa, '?') catch { i = inner.len; break :outer; };
+                        i = j;
+                        continue;
+                    };
+                    buf.appendSlice(self.gpa, tbuf[0..len2]) catch { i = inner.len; break :outer; };
+                    i = j;
+                },
+                'x' => {
+                    // \xNN hex escape
+                    if (i + 3 < inner.len) {
+                        const h1 = std.fmt.charToDigit(inner[i + 2], 16) catch 255;
+                        const h2 = std.fmt.charToDigit(inner[i + 3], 16) catch 255;
+                        if (h1 <= 15 and h2 <= 15) {
+                            buf.append(self.gpa, h1 * 16 + h2) catch { i = inner.len; break :outer; };
+                            i += 4;
+                            continue;
+                        }
+                    }
+                    buf.appendSlice(self.gpa, "\\x") catch { i = inner.len; break :outer; };
+                    i += 2;
+                },
+                'u' => {
+                    // \uNNNN or \u{NNNN}
+                    if (i + 2 < inner.len and inner[i + 2] == '{') {
+                        // \u{NNNN}
+                        const end_brace = std.mem.indexOfScalarPos(u8, inner, i + 3, '}') orelse {
+                            buf.appendSlice(self.gpa, "\\u{") catch { i = inner.len; break :outer; };
+                            i += 3;
+                            continue;
+                        };
+                        const hex_str = inner[i + 3 .. end_brace];
+                        const code_point = std.fmt.parseInt(u21, hex_str, 16) catch {
+                            buf.appendSlice(self.gpa, inner[i .. end_brace + 1]) catch { i = inner.len; break :outer; };
+                            i = end_brace + 1;
+                            continue;
+                        };
+                        var tbuf: [4]u8 = undefined;
+                        const len2 = std.unicode.utf8Encode(code_point, &tbuf) catch {
+                            buf.append(self.gpa, '?') catch { i = inner.len; break :outer; };
+                            i = end_brace + 1;
+                            continue;
+                        };
+                        buf.appendSlice(self.gpa, tbuf[0..len2]) catch { i = inner.len; break :outer; };
+                        i = end_brace + 1;
+                    } else if (i + 5 < inner.len) {
+                        // \uNNNN (4 hex digits)
+                        const hex_str = inner[i + 2 .. i + 6];
+                        const code_point = std.fmt.parseInt(u21, hex_str, 16) catch {
+                            buf.appendSlice(self.gpa, "\\u") catch { i = inner.len; break :outer; };
+                            i += 2;
+                            continue;
+                        };
+                        var tbuf: [4]u8 = undefined;
+                        const len2 = std.unicode.utf8Encode(code_point, &tbuf) catch {
+                            buf.append(self.gpa, '?') catch { i = inner.len; break :outer; };
+                            i += 6;
+                            continue;
+                        };
+                        buf.appendSlice(self.gpa, tbuf[0..len2]) catch { i = inner.len; break :outer; };
+                        i += 6;
+                    } else {
+                        buf.appendSlice(self.gpa, "\\u") catch { i = inner.len; break :outer; };
+                        i += 2;
+                    }
+                },
+                else => {
+                    // Other escapes: \' \\ \" etc. — just use the escaped char
+                    buf.append(self.gpa, esc) catch { i = inner.len; break :outer; };
+                    i += 2;
+                },
+            }
+        }
+        // If we didn't process all characters (loop broke early), fall back to raw
+        if (i < inner.len) {
+            return self.store.stringLiteral(inner) catch tymod.ID_STRING;
+        }
+        const decoded = self.gpa.dupe(u8, buf.items) catch return self.store.stringLiteral(inner) catch tymod.ID_STRING;
+        return self.store.stringLiteral(decoded) catch tymod.ID_STRING;
     }
 
     fn stringLiteralIsPropertyKey(self: *Checker, node: NodeIndex) bool {
@@ -7463,21 +7578,10 @@ pub const Checker = struct {
                     // any-wins: if any inference candidate for this type
                     // parameter is `any`, the inferred type is `any` (TS
                     // semantics).  Otherwise first-write-wins.
-                    // Widen numeric/boolean literals during generic type inference:
-                    // `foo(1)` where `foo<T>(x: T)` infers T=number, not T=1.
-                    // String literals are NOT widened — `foo<T extends string>(x: T): T`
-                    // called with "hello" preserves T="hello".
-                    const at = self.store.get(arg_ty);
-                    const widened_arg = switch (at.kind) {
-                        .number_literal => tymod.ID_NUMBER,
-                        .boolean_literal => tymod.ID_BOOLEAN,
-                        .bigint_literal => tymod.ID_BIGINT,
-                        else => arg_ty,
-                    };
-                    if (tymod.isAny(&self.store, widened_arg)) {
+                    if (tymod.isAny(&self.store, arg_ty)) {
                         bindings[i] = tymod.ID_ANY;
                     } else if (bindings[i].eq(TypeId.none)) {
-                        bindings[i] = widened_arg;
+                        bindings[i] = arg_ty;
                     }
                     return;
                 }
@@ -9044,7 +9148,22 @@ pub const Checker = struct {
             .error_t     => try buf.appendSlice(gpa, "error"),
             .type_ref    => try buf.appendSlice(gpa, t.name),
             .type_param  => try buf.appendSlice(gpa, t.name),
-            .string_literal => try buf.print(gpa, "\"{s}\"", .{t.literal_value.string}),
+            .string_literal => {
+                try buf.append(gpa, '"');
+                for (t.literal_value.string) |byte| {
+                    if (byte < 0x20 or byte == 0x7F) {
+                        // Encode control characters as \uXXXX
+                        try buf.print(gpa, "\\u{x:0>4}", .{byte});
+                    } else if (byte == '"') {
+                        try buf.appendSlice(gpa, "\\\"");
+                    } else if (byte == '\\') {
+                        try buf.appendSlice(gpa, "\\\\");
+                    } else {
+                        try buf.append(gpa, byte);
+                    }
+                }
+                try buf.append(gpa, '"');
+            },
             .number_literal => {
                 const n = t.literal_value.number;
                 // Integer-valued literals print without a decimal point — but
