@@ -683,8 +683,7 @@ pub const Checker = struct {
                 var span_start = start;
                 var span_end: u32 = start + len;
                 if (span_start < span_end and (src[span_start] == '`' or src[span_start] == '}')) span_start += 1;
-                if (span_end >= span_start + 2 and src[span_end - 1] == '{' and src[span_end - 2] == '$') {
-                    span_end -= 2;
+                if (span_end >= span_start + 2 and src[span_end - 1] == '{' and src[span_end - 2] == '$') {                    span_end -= 2;
                 } else if (span_end > span_start and src[span_end - 1] == '`') {
                     span_end -= 1;
                 }
@@ -1134,7 +1133,7 @@ pub const Checker = struct {
             // (no-unsafe-enum-comparison). Broad number/string members (no
             // statically-known value) stay untagged.
             const member_ty: TypeId = switch (self.store.get(value_ty).kind) {
-                .number_literal, .string_literal => self.store.enumMemberLiteral(value_ty, enum_name) catch value_ty,
+                .number_literal, .string_literal => self.store.enumMemberLiteral(value_ty, enum_name, member_name) catch value_ty,
                 else => value_ty,
             };
             props_buf[n] = .{ .name = member_name, .type_id = member_ty };
@@ -2960,6 +2959,8 @@ pub const Checker = struct {
     ) ?tymod.Signature {
         // Resolve each param's type from its annotation.
         var param_buf: [16]tymod.TypeId = undefined;
+        var name_buf: [16][]const u8 = undefined;
+        var opt_buf: [16]bool = undefined;
         var count: usize = 0;
         var rest_idx: u16 = 0xFFFF;
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
@@ -2971,7 +2972,8 @@ pub const Checker = struct {
                 // Detect a rest parameter (`...args`) — peel default-value and
                 // parameter-property wrappers, then check for rest_element.
                 var pn = param;
-                if (self.ast_ref.nodeTag(pn) == .assignment_pattern) pn = self.ast_ref.nodeData(pn).lhs;
+                const is_default = self.ast_ref.nodeTag(pn) == .assignment_pattern;
+                if (is_default) pn = self.ast_ref.nodeData(pn).lhs;
                 if (self.ast_ref.nodeTag(pn) == .ts_parameter_property) pn = self.ast_ref.nodeData(pn).lhs;
                 if (self.ast_ref.nodeTag(pn) == .rest_element) rest_idx = @intCast(count);
                 var pty = self.paramDeclaredType(param);
@@ -2982,6 +2984,10 @@ pub const Checker = struct {
                     if (self.contextualPromiseRejectionParamType(param)) |t| pty = t;
                 }
                 param_buf[count] = pty;
+                name_buf[count] = self.paramName(param);
+                // A param is optional if it has a default value, or has an
+                // explicit `?` marker between the identifier and the annotation.
+                opt_buf[count] = is_default or self.paramHasOptionalMarker(pn);
                 count += 1;
             }
         }
@@ -3077,7 +3083,7 @@ pub const Checker = struct {
         } else if (is_async and ret_ty.eq(tymod.ID_UNKNOWN)) {
             ret_ty = self.store.typeRef("Promise", &.{tymod.ID_UNKNOWN}) catch ret_ty;
         }
-        const param_range = self.store.appendSignatureParams(param_buf[0..count]) catch return null;
+        const param_range = self.store.appendSignatureParamsFull(param_buf[0..count], name_buf[0..count], opt_buf[0..count]) catch return null;
         return .{
             .params_start = param_range.start,
             .params_end = param_range.end,
@@ -3142,6 +3148,21 @@ pub const Checker = struct {
         if (self.ast_ref.nodeTag(n) == .rest_element) n = self.ast_ref.nodeData(n).lhs;
         if (self.ast_ref.nodeTag(n) != .identifier) return &.{};
         return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(n));
+    }
+
+    /// True when an identifier-type param node has an explicit `?` optional marker
+    /// between the identifier token and the `:` or end of its span.
+    fn paramHasOptionalMarker(self: *Checker, ident_node: NodeIndex) bool {
+        if (self.ast_ref.nodeTag(ident_node) != .identifier) return false;
+        const span = self.ast_ref.nodeSpan(ident_node);
+        const src = self.ast_ref.source;
+        var i: usize = span.end;
+        while (i < src.len) : (i += 1) {
+            const c = src[i];
+            if (c == ' ' or c == '\t') continue;
+            return c == '?';
+        }
+        return false;
     }
 
     /// Infer the return type of a block body by union-ing the types
@@ -3229,8 +3250,7 @@ pub const Checker = struct {
         const s = @intFromEnum(d.lhs);
         const e = @intFromEnum(d.rhs);
         if (e <= s or e > self.ast_ref.extra_data.len) return true;
-        const last_raw = self.ast_ref.extra_data[e - 1];
-        const last: NodeIndex = @enumFromInt(last_raw);
+        const last_raw = self.ast_ref.extra_data[e - 1];        const last: NodeIndex = @enumFromInt(last_raw);
         return !stmtGuaranteesReturn(self, last);
     }
 
@@ -3252,8 +3272,11 @@ pub const Checker = struct {
         var node = param;
         // Peel assignment_pattern (default value) — the binding side
         // is what carries the annotation.
+        var default_val: NodeIndex = .none;
         if (self.ast_ref.nodeTag(node) == .assignment_pattern) {
-            node = self.ast_ref.nodeData(node).lhs;
+            const apd = self.ast_ref.nodeData(node);
+            default_val = apd.rhs;
+            node = apd.lhs;
         }
         // Peel ts_parameter_property (constructor access modifiers).
         if (self.ast_ref.nodeTag(node) == .ts_parameter_property) {
@@ -3273,16 +3296,28 @@ pub const Checker = struct {
         }
         if (self.ast_ref.nodeTag(node) != .identifier) return tymod.ID_UNKNOWN;
         const bd = self.ast_ref.nodeData(node);
-        if (bd.rhs == .none) {
-            // Unannotated parameters default to `any` to match TypeScript's
-            // behavior when noImplicitAny is off (the default). The original design
-            // returned `unknown` to avoid spurious unsafe-* fires, but this causes
-            // mismatches with tsc's actual inferred type.
-            return tymod.ID_ANY;
+        if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
+            const ty = self.ast_ref.nodeData(bd.rhs).lhs;
+            return self.resolveTypeNode(ty);
         }
-        if (self.ast_ref.nodeTag(bd.rhs) != .ts_type_annotation) return tymod.ID_UNKNOWN;
-        const ty = self.ast_ref.nodeData(bd.rhs).lhs;
-        return self.resolveTypeNode(ty);
+        // No annotation. If there's a default value, infer its widened type —
+        // `(a = 3)` → number, `(a = "x")` → string, `(a = true)` → boolean.
+        // `null` / `undefined` defaults leave the param as `any` (non-strict).
+        if (default_val != .none) {
+            const raw = self.typeOf(default_val);
+            return switch (self.store.get(raw).kind) {
+                .string_literal => tymod.ID_STRING,
+                .number_literal => tymod.ID_NUMBER,
+                .bigint_literal => tymod.ID_BIGINT,
+                .boolean_literal => tymod.ID_BOOLEAN,
+                else => tymod.ID_ANY,
+            };
+        }
+        // Unannotated parameters default to `any` to match TypeScript's
+        // behavior when noImplicitAny is off (the default). The original design
+        // returned `unknown` to avoid spurious unsafe-* fires, but this causes
+        // mismatches with tsc's actual inferred type.
+        return tymod.ID_ANY;
     }
 
     /// Map a TS type-position AST node to a TypeId.
@@ -3361,6 +3396,7 @@ pub const Checker = struct {
         const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(data.lhs));
         // Resolve params from FnData.params..params_end.
         var param_buf: [16]TypeId = undefined;
+        var name_buf: [16][]const u8 = undefined;
         var count: usize = 0;
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
         if (fd.params <= fd.params_end and fd.params_end <= ext_len) {
@@ -3369,6 +3405,7 @@ pub const Checker = struct {
                 if (count >= param_buf.len) break;
                 const param: NodeIndex = @enumFromInt(raw);
                 param_buf[count] = self.paramDeclaredType(param);
+                name_buf[count] = self.paramName(param);
                 count += 1;
             }
         }
@@ -3386,7 +3423,7 @@ pub const Checker = struct {
         if (fd.body != .none and self.store.get(ret_ty).kind == .type_ref) {
             ret_ty = self.foldTypeParamLiteralConstraint(fd.body, ret_ty);
         }
-        const param_range = self.store.appendSignatureParams(param_buf[0..count]) catch {
+        const param_range = self.store.appendSignatureParams(param_buf[0..count], name_buf[0..count]) catch {
             return tymod.ID_UNKNOWN;
         };
         const sig: tymod.Signature = .{
@@ -3545,8 +3582,7 @@ pub const Checker = struct {
                 var span_start = start;
                 var span_end: u32 = start + len;
                 if (span_start < span_end and (src[span_start] == '`' or src[span_start] == '}')) span_start += 1;
-                if (span_end >= span_start + 2 and src[span_end - 1] == '{' and src[span_end - 2] == '$') {
-                    span_end -= 2;
+                if (span_end >= span_start + 2 and src[span_end - 1] == '{' and src[span_end - 2] == '$') {                    span_end -= 2;
                 } else if (span_end > span_start and src[span_end - 1] == '`') {
                     span_end -= 1;
                 }
@@ -4782,7 +4818,7 @@ pub const Checker = struct {
                 return try h.checker.store.functionType(sig);
             }
             fn fnTypeWithParams(h: @This(), params: []const TypeId, ret: TypeId) !TypeId {
-                const pr = try h.checker.store.appendSignatureParams(params);
+                const pr = try h.checker.store.appendSignatureParams(params, &.{});
                 const sig = tymod.Signature{
                     .params_start = pr.start,
                     .params_end = pr.end,
@@ -7243,8 +7279,7 @@ pub const Checker = struct {
         // the result type is `any` to represent the syntax error / missing operand.
         const num_elements = range.end - range.start;
         if (num_elements < 2) return tymod.ID_ANY;
-        const last_idx = self.ast_ref.extra_data[range.end - 1];
-        // If last operand is missing (represented as .none), result is any
+        const last_idx = self.ast_ref.extra_data[range.end - 1]; // zbc-disable-line: index-minus-one-without-zero-guard
         if (last_idx == @intFromEnum(NodeIndex.none)) return tymod.ID_ANY;
         return self.typeOf(@enumFromInt(last_idx));
     }
@@ -8979,7 +9014,8 @@ pub const Checker = struct {
                     }
                     const new_ret = self.substituteTypeId(sig.return_type, keys, vals);
                     if (!new_ret.eq(sig.return_type)) changed = true;
-                    const pr = self.store.appendSignatureParams(new_params_buf[0..old_params.len]) catch return id;
+                    const old_names = self.store.signatureParamNamesOf(sig);
+                    const pr = self.store.appendSignatureParams(new_params_buf[0..old_params.len], old_names) catch return id;
                     // Preserve all other signature fields (is_construct, predicate,
                     // assertion) — only the param range and return type change.
                     var ns = sig;
@@ -9201,7 +9237,7 @@ pub const Checker = struct {
     }
 
     fn makeNullaryFn(self: *Checker, ret: TypeId) TypeId {
-        const param_range = self.store.appendSignatureParams(&.{}) catch return tymod.ID_UNKNOWN;
+        const param_range = self.store.appendSignatureParams(&.{}, &.{}) catch return tymod.ID_UNKNOWN;
         const sig: tymod.Signature = .{
             .params_start = param_range.start,
             .params_end = param_range.end,
@@ -9372,9 +9408,26 @@ pub const Checker = struct {
             .symbol      => try buf.appendSlice(gpa, "symbol"),
             .object_keyword => try buf.appendSlice(gpa, "object"),
             .error_t     => try buf.appendSlice(gpa, "error"),
-            .type_ref    => try buf.appendSlice(gpa, t.name),
+            .type_ref => {
+                try buf.appendSlice(gpa, t.name);
+                const args = self.store.idsOf(t.list_data);
+                if (args.len > 0) {
+                    try buf.append(gpa, '<');
+                    for (args, 0..) |arg, ai| {
+                        if (ai > 0) try buf.appendSlice(gpa, ", ");
+                        try self.typeToStringInner(arg, buf, depth + 1);
+                    }
+                    try buf.append(gpa, '>');
+                }
+            },
             .type_param  => try buf.appendSlice(gpa, t.name),
             .string_literal => {
+                // String enum members render as EnumName.MemberName.
+                if (t.enum_name.len > 0 and t.name.len > 0) {
+                    try buf.appendSlice(gpa, t.enum_name);
+                    try buf.append(gpa, '.');
+                    try buf.appendSlice(gpa, t.name);
+                } else {
                 try buf.append(gpa, '"');
                 const slit = t.literal_value.string;
                 var si: usize = 0;
@@ -9401,20 +9454,28 @@ pub const Checker = struct {
                     }
                 }
                 try buf.append(gpa, '"');
+                } // end else (not an enum member)
             },
             .number_literal => {
-                const n = t.literal_value.number;
-                // Integer-valued literals print without a decimal point — but
-                // only when in i64 range, else @intFromFloat is illegal behavior
-                // (e.g. 1e300). Out-of-range/fractional fall back to float fmt.
-                const i64_min: f64 = -9223372036854775808.0; // -2^63
-                const i64_max: f64 = 9223372036854775808.0; //  2^63 (exclusive)
-                if (n == @trunc(n) and !std.math.isInf(n) and !std.math.isNan(n) and
-                    n >= i64_min and n < i64_max)
-                {
-                    try buf.print(gpa, "{d}", .{@as(i64, @intFromFloat(n))});
+                // Enum member literals render as EnumName.MemberName (e.g. E.B).
+                if (t.enum_name.len > 0 and t.name.len > 0) {
+                    try buf.appendSlice(gpa, t.enum_name);
+                    try buf.append(gpa, '.');
+                    try buf.appendSlice(gpa, t.name);
                 } else {
-                    try buf.print(gpa, "{d}", .{n});
+                    const n = t.literal_value.number;
+                    // Integer-valued literals print without a decimal point — but
+                    // only when in i64 range, else @intFromFloat is illegal behavior
+                    // (e.g. 1e300). Out-of-range/fractional fall back to float fmt.
+                    const i64_min: f64 = -9223372036854775808.0; // -2^63
+                    const i64_max: f64 = 9223372036854775808.0; //  2^63 (exclusive)
+                    if (n == @trunc(n) and !std.math.isInf(n) and !std.math.isNan(n) and
+                        n >= i64_min and n < i64_max)
+                    {
+                        try buf.print(gpa, "{d}", .{@as(i64, @intFromFloat(n))});
+                    } else {
+                        try buf.print(gpa, "{d}", .{n});
+                    }
                 }
             },
             .boolean_literal => try buf.appendSlice(gpa, if (t.literal_value.boolean) "true" else "false"),
@@ -9448,14 +9509,108 @@ pub const Checker = struct {
             },
             .function_t => {
                 const sigs = self.store.signaturesOf(t.signatures);
-                if (sigs.len > 0) {
-                    try buf.appendSlice(gpa, "(...) => ");
-                    try self.typeToStringInner(sigs[0].return_type, buf, depth + 1);
+                if (sigs.len == 0) {
+                    try buf.appendSlice(gpa, "() => unknown");
+                } else if (sigs.len == 1) {
+                    const sig = sigs[0];
+                    const params = self.store.signatureParamsOf(sig);
+                    const names = self.store.signatureParamNamesOf(sig);
+                    const opts = self.store.signatureParamOptionalsOf(sig);
+                    try buf.append(gpa, '(');
+                    for (params, 0..) |param_ty, pi| {
+                        if (pi > 0) try buf.appendSlice(gpa, ", ");
+                        const is_rest = sig.rest_param_index != 0xFFFF and pi == sig.rest_param_index;
+                        if (is_rest) try buf.appendSlice(gpa, "...");
+                        const pname = if (pi < names.len) names[pi] else "";
+                        const is_opt = !is_rest and pi < opts.len and opts[pi];
+                        if (pname.len > 0) {
+                            try buf.appendSlice(gpa, pname);
+                            if (is_opt) try buf.append(gpa, '?');
+                            try buf.appendSlice(gpa, ": ");
+                        }
+                        try self.typeToStringInner(param_ty, buf, depth + 1);
+                    }
+                    try buf.appendSlice(gpa, ") => ");
+                    try self.typeToStringInner(sig.return_type, buf, depth + 1);
                 } else {
-                    try buf.appendSlice(gpa, "(...) => unknown");
+                    // Multi-signature (overloads) — tsc renders as { (p): T; (p): T; }
+                    try buf.appendSlice(gpa, "{ ");
+                    for (sigs, 0..) |sig, si| {
+                        if (si > 0) try buf.appendSlice(gpa, "; ");
+                        const params = self.store.signatureParamsOf(sig);
+                        const names = self.store.signatureParamNamesOf(sig);
+                        const opts = self.store.signatureParamOptionalsOf(sig);
+                        try buf.append(gpa, '(');
+                        for (params, 0..) |param_ty, pi| {
+                            if (pi > 0) try buf.appendSlice(gpa, ", ");
+                            const is_rest = sig.rest_param_index != 0xFFFF and pi == sig.rest_param_index;
+                            if (is_rest) try buf.appendSlice(gpa, "...");
+                            const pname = if (pi < names.len) names[pi] else "";
+                            const is_opt = !is_rest and pi < opts.len and opts[pi];
+                            if (pname.len > 0) {
+                                try buf.appendSlice(gpa, pname);
+                                if (is_opt) try buf.append(gpa, '?');
+                                try buf.appendSlice(gpa, ": ");
+                            }
+                            try self.typeToStringInner(param_ty, buf, depth + 1);
+                        }
+                        try buf.appendSlice(gpa, "): ");
+                        try self.typeToStringInner(sig.return_type, buf, depth + 1);
+                    }
+                    try buf.appendSlice(gpa, "; }");
                 }
             },
-            .object_t => try buf.appendSlice(gpa, "object"),
+            .object_t => {
+                const props = self.store.propsOf(t.object_props);
+                // Count renderable properties (skip index-signature sentinels).
+                var real_count: usize = 0;
+                for (props) |p| {
+                    if (!std.mem.startsWith(u8, p.name, "[]")) real_count += 1;
+                }
+                if (real_count == 0) {
+                    try buf.appendSlice(gpa, "{}");
+                } else {
+                    try buf.appendSlice(gpa, "{ ");
+                    var first = true;
+                    for (props) |p| {
+                        if (std.mem.startsWith(u8, p.name, "[]")) continue;
+                        if (!first) try buf.appendSlice(gpa, "; ");
+                        first = false;
+                        if (p.readonly) try buf.appendSlice(gpa, "readonly ");
+                        try buf.appendSlice(gpa, p.name);
+                        const pv = self.store.get(p.type_id);
+                        if (p.is_method and pv.kind == .function_t) {
+                            // Render method shorthand: name(): T
+                            const msigs = self.store.signaturesOf(pv.signatures);
+                            if (p.optional) try buf.append(gpa, '?');
+                            if (msigs.len == 1) {
+                                const msig = msigs[0];
+                                const mparams = self.store.signatureParamsOf(msig);
+                                const mnames = self.store.signatureParamNamesOf(msig);
+                                try buf.append(gpa, '(');
+                                for (mparams, 0..) |mp, mi| {
+                                    if (mi > 0) try buf.appendSlice(gpa, ", ");
+                                    const mn = if (mi < mnames.len) mnames[mi] else "";
+                                    if (mn.len > 0) {
+                                        try buf.appendSlice(gpa, mn);
+                                        try buf.appendSlice(gpa, ": ");
+                                    }
+                                    try self.typeToStringInner(mp, buf, depth + 1);
+                                }
+                                try buf.appendSlice(gpa, "): ");
+                                try self.typeToStringInner(msig.return_type, buf, depth + 1);
+                            } else {
+                                try buf.appendSlice(gpa, "(): unknown");
+                            }
+                        } else {
+                            if (p.optional) try buf.append(gpa, '?');
+                            try buf.appendSlice(gpa, ": ");
+                            try self.typeToStringInner(p.type_id, buf, depth + 1);
+                        }
+                    }
+                    try buf.appendSlice(gpa, "; }");
+                }
+            },
             .intersection_t => {
                 for (self.store.idsOf(t.list_data), 0..) |m, i| {
                     if (i > 0) try buf.appendSlice(gpa, " & ");

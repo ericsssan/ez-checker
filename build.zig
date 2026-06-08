@@ -66,4 +66,43 @@ pub fn build(b: *std.Build) void {
     save_baseline.addArg("--save-baseline");
     const save_baseline_step = b.step("save-baseline", "Overwrite oracle/baseline.lock with the current conformance numbers");
     save_baseline_step.dependOn(&save_baseline.step);
+
+    // Fuzz smoke test — runs each seed once under the normal test runner.
+    const fuzz_mod = b.createModule(.{
+        .root_source_file = b.path("src/fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    fuzz_mod.addImport("es_parser", es_parser_mod);
+    const fuzz_tests = b.addTest(.{ .root_module = fuzz_mod });
+    test_step.dependOn(&b.addRunArtifact(fuzz_tests).step);
+
+    // `zig build fuzz` — stdin-reading binary for AFL++ / honggfuzz.
+    //
+    // Quick start:
+    //   zig build fuzz
+    //   mkdir -p corpus && cp src/fuzz.zig corpus/  # bootstrap seed
+    //   afl-fuzz -i corpus/ -o findings/ -- ./zig-out/bin/fuzz-ez
+    const fuzz_step = b.step("fuzz", "Build AFL++/honggfuzz stdin fuzz target");
+    const fuzz_exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/fuzz.zig"),
+        .target = target,
+        .optimize = .Debug,
+    });
+    fuzz_exe_mod.addImport("es_parser", es_parser_mod);
+    const fuzz_exe = b.addExecutable(.{ .name = "fuzz-ez", .root_module = fuzz_exe_mod });
+    b.installArtifact(fuzz_exe);
+    fuzz_step.dependOn(&b.addInstallArtifact(fuzz_exe, .{}).step);
+
+    // zbc: run the Zig bug checker over src/.
+    const zbc_dep = b.dependency("zbc", .{
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    const zbc_exe = zbc_dep.artifact("zbc");
+    const run_zbc = b.addRunArtifact(zbc_exe);
+    run_zbc.addDirectoryArg(b.path("src"));
+    const zbc_step = b.step("zbc", "Run zbc bug checker on src/");
+    zbc_step.dependOn(&run_zbc.step);
+    b.default_step.dependOn(&run_zbc.step);
 }

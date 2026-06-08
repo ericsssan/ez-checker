@@ -372,6 +372,13 @@ pub const TypeStore = struct {
     /// Backing storage for signature_params (TypeIds packed).
     signature_pool: std.ArrayList(Signature) = .empty,
     signature_param_pool: std.ArrayList(TypeId) = .empty,
+    /// Parallel to signature_param_pool: source-text name for each param slot.
+    /// Slices point into the AST source buffer (no allocation needed).
+    /// Indexed by the same params_start..params_end range as signature_param_pool.
+    signature_param_name_pool: std.ArrayList([]const u8) = .empty,
+    /// Parallel to signature_param_pool: whether each param is optional (has `?`
+    /// or a default value).  Indexed by the same params_start..params_end range.
+    signature_param_optional_pool: std.ArrayList(bool) = .empty,
 
     /// "Committed" pool lengths — the prefix referenced by KEPT (interned)
     /// types. The dedup reclaim in `add` may only give back tail ranges that lie
@@ -416,6 +423,8 @@ pub const TypeStore = struct {
         self.object_prop_pool.deinit(self.gpa);
         self.signature_pool.deinit(self.gpa);
         self.signature_param_pool.deinit(self.gpa);
+        self.signature_param_name_pool.deinit(self.gpa);
+        self.signature_param_optional_pool.deinit(self.gpa);
     }
 
     pub inline fn get(self: *const TypeStore, id: TypeId) *const Type {
@@ -474,17 +483,55 @@ pub const TypeStore = struct {
         return self.object_prop_pool.items[list.start..list.end];
     }
 
-    /// Append a slice of signature param TypeIds and return a range.
-    /// Used when building a Signature's params slice in `signature_param_pool`.
-    pub fn appendSignatureParams(self: *TypeStore, params: []const TypeId) !struct { start: u32, end: u32 } {
+    pub const ParamRange = struct { start: u32, end: u32 };
+
+    /// Append a slice of signature param TypeIds (and optional parallel names and
+    /// optional-flags) and return a range.  `names` and `optionals` must each be
+    /// the same length as `params` or empty; empty slices produce placeholders.
+    pub fn appendSignatureParams(
+        self: *TypeStore,
+        params: []const TypeId,
+        names: []const []const u8,
+    ) !ParamRange {
+        return self.appendSignatureParamsFull(params, names, &.{});
+    }
+
+    pub fn appendSignatureParamsFull(
+        self: *TypeStore,
+        params: []const TypeId,
+        names: []const []const u8,
+        optionals: []const bool,
+    ) !ParamRange {
         const start: u32 = @intCast(self.signature_param_pool.items.len);
         try self.signature_param_pool.appendSlice(self.gpa, params);
         const end: u32 = @intCast(self.signature_param_pool.items.len);
+        if (names.len == params.len) {
+            try self.signature_param_name_pool.appendSlice(self.gpa, names);
+        } else {
+            for (params) |_| try self.signature_param_name_pool.append(self.gpa, "");
+        }
+        if (optionals.len == params.len) {
+            try self.signature_param_optional_pool.appendSlice(self.gpa, optionals);
+        } else {
+            for (params) |_| try self.signature_param_optional_pool.append(self.gpa, false);
+        }
         return .{ .start = start, .end = end };
     }
 
     pub fn signatureParamsOf(self: *const TypeStore, sig: Signature) []const TypeId {
         return self.signature_param_pool.items[sig.params_start..sig.params_end];
+    }
+
+    pub fn signatureParamNamesOf(self: *const TypeStore, sig: Signature) []const []const u8 {
+        const end = sig.params_end;
+        if (end > self.signature_param_name_pool.items.len) return &.{};
+        return self.signature_param_name_pool.items[sig.params_start..end];
+    }
+
+    pub fn signatureParamOptionalsOf(self: *const TypeStore, sig: Signature) []const bool {
+        const end = sig.params_end;
+        if (end > self.signature_param_optional_pool.items.len) return &.{};
+        return self.signature_param_optional_pool.items[sig.params_start..end];
     }
 
     pub fn appendSignatures(self: *TypeStore, sigs: []const Signature) !SignatureList {
@@ -526,9 +573,10 @@ pub const TypeStore = struct {
     /// `enum_name`, so the facade can surface ts.TypeFlags.EnumLiteral and an
     /// EnumMember symbol. The enum tag is part of interning identity, so the
     /// enum member stays distinct from the bare literal of the same value.
-    pub fn enumMemberLiteral(self: *TypeStore, lit: TypeId, enum_name: []const u8) !TypeId {
+    pub fn enumMemberLiteral(self: *TypeStore, lit: TypeId, enum_name: []const u8, member_name: []const u8) !TypeId {
         var t = self.get(lit).*;
         t.enum_name = enum_name;
+        t.name = member_name;
         return try self.add(t);
     }
 
