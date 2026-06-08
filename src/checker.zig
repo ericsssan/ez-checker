@@ -1827,7 +1827,18 @@ pub const Checker = struct {
                 // Only apply this for simple identifiers (not destructuring patterns).
                 if (data.lhs != .none and self.ast_ref.nodeTag(data.lhs) == .identifier and data.rhs != .none) {
                     const rhs_tag = self.ast_ref.nodeTag(data.rhs);
-                    return switch (rhs_tag) {
+                    switch (rhs_tag) {
+                        .string_literal => return tymod.ID_STRING,
+                        .number_literal => return tymod.ID_NUMBER,
+                        .bigint_literal => return tymod.ID_BIGINT,
+                        .boolean_literal => return tymod.ID_BOOLEAN,
+                        else => {},
+                    }
+                    // Composed default (e.g. `x = arr[0]`): infer, then widen
+                    // fresh literal types to their base, matching declaration
+                    // widening.  Non-literals fall through to unknown.
+                    const raw = self.typeOf(data.rhs);
+                    return switch (self.store.get(raw).kind) {
                         .string_literal => tymod.ID_STRING,
                         .number_literal => tymod.ID_NUMBER,
                         .bigint_literal => tymod.ID_BIGINT,
