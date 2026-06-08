@@ -2245,28 +2245,43 @@ pub const Checker = struct {
                         const rhs_type = self.typeOf(data.rhs);
                         const rhs_t = self.store.get(rhs_type);
 
-                        // For tuples and arrays, try to extract the element type
-                        // corresponding to binding's position within the pattern.
+                        // Array destructuring: `const [x, y] = tuple_or_array`
                         if (rhs_t.kind == .tuple_t or rhs_t.kind == .array_t or rhs_t.kind == .readonly_array_t) {
                             if (self.findBindingIndexInPattern(binding, @enumFromInt(cur))) |idx| {
+                                var elem_ty: TypeId = tymod.ID_ANY;
                                 if (rhs_t.kind == .tuple_t) {
                                     const elems = self.store.idsOf(rhs_t.list_data);
-                                    if (idx < elems.len) {
-                                        return elems[idx];
-                                    }
+                                    if (idx < elems.len) elem_ty = elems[idx];
                                 } else {
-                                    // Array: return element type (which is a TypeId, not TypeIdList)
-                                    // The list_data for arrays contains the single element type.
-                                    // We need to get the actual element TypeId.
                                     const elem_list = self.store.idsOf(rhs_t.list_data);
-                                    if (elem_list.len > 0) {
-                                        return elem_list[0];
-                                    }
+                                    if (elem_list.len > 0) elem_ty = elem_list[0];
+                                }
+                                // Widen literal types: TypeScript widens literals in destructuring
+                                // unless the source has `as const`. This is the default behavior.
+                                return switch (self.store.get(elem_ty).kind) {
+                                    .number_literal => tymod.ID_NUMBER,
+                                    .string_literal => tymod.ID_STRING,
+                                    .boolean_literal => tymod.ID_BOOLEAN,
+                                    .bigint_literal => tymod.ID_BIGINT,
+                                    else => elem_ty,
+                                };
+                            }
+                        }
+                        // Object destructuring: `const { j } = obj`
+                        if (rhs_t.kind == .object_t) {
+                            if (self.findBindingPropertyName(binding, pattern_node)) |key| {
+                                if (self.propertyTypeOfTypeId(rhs_type, key)) |prop_ty| {
+                                    // Widen literal types for object destructuring too
+                                    return switch (self.store.get(prop_ty).kind) {
+                                        .number_literal => tymod.ID_NUMBER,
+                                        .string_literal => tymod.ID_STRING,
+                                        .boolean_literal => tymod.ID_BOOLEAN,
+                                        .bigint_literal => tymod.ID_BIGINT,
+                                        else => prop_ty,
+                                    };
                                 }
                             }
                         }
-                        // Can't determine binding's position in pattern, return null
-                        // to fall through to ID_ANY
                         return null;
                     }
                     return null;
@@ -2299,31 +2314,83 @@ pub const Checker = struct {
         return self.findBindingIndexInPatternNode(binding, data.lhs, 0);
     }
 
-    /// Recursively find binding's index within a pattern node.
-    /// For array patterns, counts elements left-to-right.
-    /// index_hint is updated as we scan and the return value is the final index.
+    /// Find binding's 0-based index within an array_pattern (flat, one level).
+    /// For `[x, y, z]`, returns 0/1/2 for the respective bindings.
     fn findBindingIndexInPatternNode(self: *Checker, binding: NodeIndex, pattern: NodeIndex, index_start: usize) ?usize {
-        if (binding == pattern) {
-            // Found it at this position
-            return index_start;
-        }
+        if (binding == pattern) return index_start;
 
-        // For array/object patterns, we'd need to enumerate their elements.
-        // Since we don't have direct element list access without more AST metadata,
-        // we'll use a simple heuristic: scan immediate children in order.
-        // This is a simplified version that handles common cases.
-
-        // Try to get children by inspecting the pattern's structure.
         const tag = self.ast_ref.nodeTag(pattern);
-        if (tag == .identifier or tag == .assignment_pattern or tag == .rest_element) {
-            // These are leaf pattern nodes, not containers.
-            if (binding == pattern) return index_start;
-            return null;
+        switch (tag) {
+            .assignment_pattern => {
+                // `elem = default` — the real binding is lhs (unwrap one level)
+                const d = self.ast_ref.nodeData(pattern);
+                if (d.lhs == binding) return index_start;
+                return null;
+            },
+            .array_pattern => {
+                // array_pattern stores lhs=start, rhs=end (direct range into extra_data)
+                const d = self.ast_ref.nodeData(pattern);
+                const slice = self.directRange(d.lhs, d.rhs) orelse return null;
+                for (slice, 0..) |raw, i| {
+                    const elem: NodeIndex = @enumFromInt(raw);
+                    if (elem == .none) continue; // elision hole
+                    if (elem == binding) return index_start + i;
+                    // Unwrap assignment_pattern (default values): `[x = 0]`
+                    const etag = self.ast_ref.nodeTag(elem);
+                    if (etag == .assignment_pattern) {
+                        const ed = self.ast_ref.nodeData(elem);
+                        if (ed.lhs == binding) return index_start + i;
+                    }
+                }
+                return null;
+            },
+            else => return null,
         }
+    }
 
-        // For other pattern types (array_pattern, object_pattern, etc.),
-        // we'd need to walk their element list. Without easy AST metadata,
-        // we return null and fall back to whole-RHS-type inference.
+    /// Find the property key name for a binding inside an object_pattern.
+    /// For `{ j }` → "j"; for `{ j: k }` and binding=k → "j".
+    fn findBindingPropertyName(self: *Checker, binding: NodeIndex, pattern: NodeIndex) ?[]const u8 {
+        if (self.ast_ref.nodeTag(pattern) != .object_pattern) return null;
+        // object_pattern stores lhs=start, rhs=end (direct range into extra_data)
+        const d = self.ast_ref.nodeData(pattern);
+        const slice = self.directRange(d.lhs, d.rhs) orelse return null;
+        for (slice) |raw| {
+            const prop: NodeIndex = @enumFromInt(raw);
+            if (prop == .none) continue;
+            const ptag = self.ast_ref.nodeTag(prop);
+            switch (ptag) {
+                .shorthand_property => {
+                    // `{ j }` — lhs is identifier (= key = value)
+                    const pd = self.ast_ref.nodeData(prop);
+                    if (pd.lhs == binding) {
+                        return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs));
+                    }
+                    // Shorthand with default `{ j = default }` — lhs is assignment_pattern
+                    if (pd.lhs != .none and self.ast_ref.nodeTag(pd.lhs) == .assignment_pattern) {
+                        const ad = self.ast_ref.nodeData(pd.lhs);
+                        if (ad.lhs == binding) {
+                            return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ad.lhs));
+                        }
+                    }
+                },
+                .property => {
+                    // `{ j: k }` — lhs is key node, rhs is value/binding
+                    const pd = self.ast_ref.nodeData(prop);
+                    if (pd.rhs == binding) {
+                        return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs));
+                    }
+                    // rhs might be assignment_pattern wrapping the binding
+                    if (pd.rhs != .none and self.ast_ref.nodeTag(pd.rhs) == .assignment_pattern) {
+                        const ad = self.ast_ref.nodeData(pd.rhs);
+                        if (ad.lhs == binding) {
+                            return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs));
+                        }
+                    }
+                },
+                else => {},
+            }
+        }
         return null;
     }
 

@@ -8,8 +8,8 @@
 #   * any section raises a pipeline error           (sections_errored must be 0)
 #
 # Full corpus snapshot (every primitive expression bucketed):
-#   primitive correct = 267850/372262 (72.0%)   wrong = 11790   gap = 67380   no-node = 25242
-#   all-types match   = 276067/593635 (46.5% of comparable)
+#   primitive correct = 268775/372262 (72.2%)   wrong = 11844   gap = 66381   no-node = 25262
+#   all-types match   = 277001/593615 (46.7% of comparable)
 sections_eval_min 18921
-prim_match_min 267850
-prim_wrong_max 11790
+prim_match_min 268775
+prim_wrong_max 11844
