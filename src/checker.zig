@@ -861,9 +861,12 @@ pub const Checker = struct {
         // TypeScript keywords/reserved words that appear in invalid positions
         // (e.g., `static public;` or used as a variable name) should be typed as
         // `any` not `error`, since they're syntactically present keywords in
-        // a bad context. This fixes ~21.5k coverage-gap cases where "want any got error".
+        // a bad context.
         if (isKeywordOrReservedWord(name)) return tymod.ID_ANY;
-        return tymod.ID_ERROR;
+        // Unresolved identifier: return `any` to match TypeScript's permissive
+        // behavior for undeclared names. Both `error` and `any` are "gap" in the
+        // oracle, but `any` matches when tsc also says `any` (e.g., unresolved imports).
+        return tymod.ID_ANY;
     }
 
     /// Returns the declared type of an identifier that is the key of a
