@@ -2652,7 +2652,7 @@ pub const Checker = struct {
                                 var elem_ty: TypeId = tymod.ID_ANY;
                                 if (rhs_t.kind == .tuple_t) {
                                     const elems = self.store.idsOf(rhs_t.list_data);
-                                    if (idx < elems.len) elem_ty = elems[idx];
+                                    if (idx < elems.len) elem_ty = self.peelRestElem(elems[idx]);
                                 } else {
                                     const elem_list = self.store.idsOf(rhs_t.list_data);
                                     if (elem_list.len > 0) elem_ty = elem_list[0];
@@ -3102,13 +3102,14 @@ pub const Checker = struct {
                 var n: usize = 0;
                 for (elems) |elem| {
                     if (n >= buf.len) break;
-                    const et = self.store.get(elem);
+                    const peeled = self.peelRestElem(elem);
+                    const et = self.store.get(peeled);
                     const widened = switch (et.kind) {
                         .string_literal => tymod.ID_STRING,
                         .number_literal => tymod.ID_NUMBER,
                         .boolean_literal => tymod.ID_BOOLEAN,
                         .bigint_literal => tymod.ID_BIGINT,
-                        else => elem,
+                        else => peeled,
                     };
                     buf[n] = widened;
                     n += 1;
@@ -4133,7 +4134,13 @@ pub const Checker = struct {
                 const n = @min(slice.len, buf.len);
                 var i: usize = 0;
                 while (i < n) : (i += 1) {
-                    buf[i] = self.resolveTypeNodeWithSubst(@enumFromInt(slice[i]), keys, vals);
+                    const m: NodeIndex = @enumFromInt(slice[i]);
+                    if (self.ast_ref.nodeTag(m) == .spread_element) {
+                        const inner = self.resolveTypeNodeWithSubst(self.ast_ref.nodeData(m).lhs, keys, vals);
+                        buf[i] = self.store.restOf(inner) catch tymod.ID_ANY;
+                    } else {
+                        buf[i] = self.resolveTypeNodeWithSubst(m, keys, vals);
+                    }
                 }
                 const list = self.store.appendTypeIds(buf[0..n]) catch return tymod.ID_UNKNOWN;
                 return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_UNKNOWN;
@@ -7556,10 +7563,32 @@ pub const Checker = struct {
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const m: NodeIndex = @enumFromInt(slice[i]);
-            buf[i] = self.resolveTypeNode(m);
+            if (self.ast_ref.nodeTag(m) == .spread_element) {
+                // Rest element in tuple type: `...T[]` — resolve inner type and wrap.
+                const inner = self.resolveTypeNode(self.ast_ref.nodeData(m).lhs);
+                buf[i] = self.store.restOf(inner) catch tymod.ID_ANY;
+            } else {
+                buf[i] = self.resolveTypeNode(m);
+            }
         }
         const list = self.store.appendTypeIds(buf[0..n]) catch return tymod.ID_UNKNOWN;
         return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_UNKNOWN;
+    }
+
+    /// Unwrap a `rest_t` tuple element to its usable element type.
+    /// `rest_t(array_t(T))` → T;  `rest_t(T)` → T;  anything else → id.
+    fn peelRestElem(self: *Checker, id: TypeId) TypeId {
+        const t = self.store.get(id);
+        if (t.kind != .rest_t) return id;
+        const inner_ids = self.store.idsOf(t.list_data);
+        if (inner_ids.len == 0) return tymod.ID_ANY;
+        const inner = inner_ids[0];
+        const it = self.store.get(inner);
+        if (it.kind == .array_t or it.kind == .readonly_array_t) {
+            const elem_ids = self.store.idsOf(it.list_data);
+            return if (elem_ids.len > 0) elem_ids[0] else tymod.ID_ANY;
+        }
+        return inner;
     }
 
     fn resolveIntersection(self: *Checker, ty_node: NodeIndex) TypeId {
@@ -9105,7 +9134,7 @@ pub const Checker = struct {
                 const tok = self.ast_ref.nodeMainToken(key_node);
                 const text = self.ast_ref.tokenText(tok);
                 const idx = std.fmt.parseInt(usize, text, 10) catch return tymod.ID_UNKNOWN;
-                if (idx < elems.len) return elems[idx];
+                if (idx < elems.len) return self.peelRestElem(elems[idx]);
                 return tymod.ID_UNDEFINED;
             }
             // Non-numeric index (symbol, variable, etc.) → union of all
@@ -9114,13 +9143,14 @@ pub const Checker = struct {
             var n: usize = 0;
             for (elems) |elem| {
                 if (n >= buf.len) break;
-                const et = self.store.get(elem);
+                const peeled = self.peelRestElem(elem);
+                const et = self.store.get(peeled);
                 const widened = switch (et.kind) {
                     .string_literal => tymod.ID_STRING,
                     .number_literal => tymod.ID_NUMBER,
                     .boolean_literal => tymod.ID_BOOLEAN,
                     .bigint_literal => tymod.ID_BIGINT,
-                    else => elem,
+                    else => peeled,
                 };
                 buf[n] = widened;
                 n += 1;
@@ -9499,7 +9529,7 @@ pub const Checker = struct {
             },
             .union_t => return self.substituteList(id, t, keys, vals, .union_t),
             .intersection_t => return self.substituteList(id, t, keys, vals, .intersection_t),
-            .array_t, .readonly_array_t, .tuple_t => return self.substituteArrayLike(id, t, keys, vals),
+            .array_t, .readonly_array_t, .tuple_t, .rest_t => return self.substituteArrayLike(id, t, keys, vals),
             .object_t => return self.substituteObject(id, t, keys, vals),
             .function_t => {
                 // Substitute type params into each signature's param types and return type.
@@ -9595,6 +9625,7 @@ pub const Checker = struct {
         const new_elem = self.substituteTypeId(elem0, keys, vals);
         if (new_elem.eq(elem0)) return id;
         if (t.kind == .readonly_array_t) return self.store.readonlyArrayOf(new_elem) catch id;
+        if (t.kind == .rest_t) return self.store.restOf(new_elem) catch id;
         return self.store.arrayOf(new_elem) catch id;
     }
 
@@ -10131,9 +10162,26 @@ pub const Checker = struct {
                 try buf.appendSlice(gpa, "[");
                 for (self.store.idsOf(t.list_data), 0..) |m, i| {
                     if (i > 0) try buf.appendSlice(gpa, ", ");
-                    try self.typeToStringInner(m, buf, depth + 1);
+                    const mt = self.store.get(m);
+                    if (mt.kind == .rest_t) {
+                        try buf.appendSlice(gpa, "...");
+                        const inner_ids = self.store.idsOf(mt.list_data);
+                        if (inner_ids.len > 0) {
+                            try self.typeToStringInner(inner_ids[0], buf, depth + 1);
+                        }
+                    } else {
+                        try self.typeToStringInner(m, buf, depth + 1);
+                    }
                 }
                 try buf.appendSlice(gpa, "]");
+            },
+            .rest_t => {
+                // Shouldn't appear outside tuple context; serialize as `...T`.
+                try buf.appendSlice(gpa, "...");
+                const inner_ids = self.store.idsOf(t.list_data);
+                if (inner_ids.len > 0) {
+                    try self.typeToStringInner(inner_ids[0], buf, depth + 1);
+                }
             },
             .function_t => {
                 const sigs = self.store.signaturesOf(t.signatures);

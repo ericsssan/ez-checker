@@ -66,6 +66,9 @@ pub const TypeKind = enum(u8) {
     readonly_array_t,
     /// [A, B, C].  Element TypeIds at [extra_start .. extra_end).
     tuple_t,
+    /// Rest element inside a tuple type annotation: `...T[]`.
+    /// list_data.start = single slot holding the wrapped array TypeId.
+    rest_t,
     /// Named reference: Foo, Foo<T>, etc.  `name` holds the textual name,
     /// type args at [extra_start .. extra_end).  Used pre-resolution and
     /// for type-parameter references that we can't resolve fully.
@@ -661,6 +664,11 @@ pub const TypeStore = struct {
     pub fn readonlyArrayOf(self: *TypeStore, elem: TypeId) !TypeId {
         const list = try self.appendTypeIds(&.{elem});
         return try self.add(.{ .kind = .readonly_array_t, .list_data = list });
+    }
+
+    pub fn restOf(self: *TypeStore, inner: TypeId) !TypeId {
+        const list = try self.appendTypeIds(&.{inner});
+        return try self.add(.{ .kind = .rest_t, .list_data = list });
     }
 
     pub fn tupleOf(self: *TypeStore, elems: []const TypeId) !TypeId {
