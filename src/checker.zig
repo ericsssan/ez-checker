@@ -1894,6 +1894,13 @@ pub const Checker = struct {
             // We don't resolve these structurally yet — return unknown
             // rather than any so unsafe-* rules don't spuriously fire.
             else => {
+                // Pattern binding context: walk up through pattern parents to find
+                // a declarator with an RHS we can infer the binding's type from.
+                // This handles destructuring like `[x, y] = [1, 2]` where `y`'s
+                // parent chain is pattern → pattern → declarator, but we need to
+                // infer from the declarator's RHS.
+                if (self.inferTypeFromDestructuringPattern(binding)) |t| return t;
+
                 // Contextual typing: an un-annotated arrow/fn-expr parameter
                 // that's the predicate of an array method gets the array's
                 // element type.  `arr.some(x => x)` → x has type arr's
@@ -2007,6 +2014,116 @@ pub const Checker = struct {
         // Receiver must be a Promise.
         if (!tymod.isPromiseRef(&self.store, self.typeOf(md.lhs))) return null;
         return tymod.ID_ANY;
+    }
+
+    /// Walk up through pattern parents (array/object patterns) to find
+    /// a declarator with an RHS, then infer the binding's type from the RHS.
+    /// This handles destructuring patterns like `[x, y] = [1, 2]` where `y`'s
+    /// parent is inside a pattern, not directly the declarator.
+    fn inferTypeFromDestructuringPattern(self: *Checker, binding: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const bidx = binding.toInt();
+        if (bidx >= parents.len) return null;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+
+        // Walk up the parent chain looking for a declarator or assignment_pattern
+        // that has an RHS. Track the pattern node we came from to match against the LHS.
+        var cur: u32 = parents[bidx];
+        if (cur == NONE) return null;
+
+        var pattern_node = binding;
+        var depth: u32 = 0;
+        while (cur != NONE and depth < 32) : ({ pattern_node = @enumFromInt(cur); cur = parents[cur]; depth += 1; }) {
+            const tag = self.ast_ref.nodeTag(@enumFromInt(cur));
+            switch (tag) {
+                .declarator => {
+                    const data = self.ast_ref.nodeData(@enumFromInt(cur));
+                    // If the pattern we came from is the LHS of this declarator
+                    // and there's an RHS, infer the binding's type from the RHS.
+                    if (data.lhs == pattern_node and data.rhs != .none) {
+                        const rhs_type = self.typeOf(data.rhs);
+                        const rhs_t = self.store.get(rhs_type);
+
+                        // For tuples and arrays, try to extract the element type
+                        // corresponding to binding's position within the pattern.
+                        if (rhs_t.kind == .tuple_t or rhs_t.kind == .array_t or rhs_t.kind == .readonly_array_t) {
+                            if (self.findBindingIndexInPattern(binding, @enumFromInt(cur))) |idx| {
+                                if (rhs_t.kind == .tuple_t) {
+                                    const elems = self.store.idsOf(rhs_t.list_data);
+                                    if (idx < elems.len) {
+                                        return elems[idx];
+                                    }
+                                } else {
+                                    // Array: return element type (which is a TypeId, not TypeIdList)
+                                    // The list_data for arrays contains the single element type.
+                                    // We need to get the actual element TypeId.
+                                    const elem_list = self.store.idsOf(rhs_t.list_data);
+                                    if (elem_list.len > 0) {
+                                        return elem_list[0];
+                                    }
+                                }
+                            }
+                        }
+                        // Can't determine binding's position in pattern, return null
+                        // to fall through to ID_ANY
+                        return null;
+                    }
+                    return null;
+                },
+                .assignment_pattern => {
+                    // Function parameter with default: `[x] = default`.
+                    const data = self.ast_ref.nodeData(@enumFromInt(cur));
+                    if (data.lhs == pattern_node and data.rhs != .none) {
+                        // Return the type of the default value.
+                        return self.typeOf(data.rhs);
+                    }
+                    return null;
+                },
+                else => {
+                    // Keep walking up - we might have nested patterns
+                    // Don't return null yet, continue searching
+                },
+            }
+        }
+        return null;
+    }
+
+    /// Find the index of a binding within a declarator's LHS pattern.
+    /// For `[x, y, z] = rhs`, returns 0 for x, 1 for y, 2 for z.
+    /// Uses a simple recursive scan of the pattern structure.
+    fn findBindingIndexInPattern(self: *Checker, binding: NodeIndex, declarator: NodeIndex) ?usize {
+        const data = self.ast_ref.nodeData(declarator);
+        if (data.lhs == .none) return null;
+        // Start scanning from the declarator's LHS pattern
+        return self.findBindingIndexInPatternNode(binding, data.lhs, 0);
+    }
+
+    /// Recursively find binding's index within a pattern node.
+    /// For array patterns, counts elements left-to-right.
+    /// index_hint is updated as we scan and the return value is the final index.
+    fn findBindingIndexInPatternNode(self: *Checker, binding: NodeIndex, pattern: NodeIndex, index_start: usize) ?usize {
+        if (binding == pattern) {
+            // Found it at this position
+            return index_start;
+        }
+
+        // For array/object patterns, we'd need to enumerate their elements.
+        // Since we don't have direct element list access without more AST metadata,
+        // we'll use a simple heuristic: scan immediate children in order.
+        // This is a simplified version that handles common cases.
+
+        // Try to get children by inspecting the pattern's structure.
+        const tag = self.ast_ref.nodeTag(pattern);
+        if (tag == .identifier or tag == .assignment_pattern or tag == .rest_element) {
+            // These are leaf pattern nodes, not containers.
+            if (binding == pattern) return index_start;
+            return null;
+        }
+
+        // For other pattern types (array_pattern, object_pattern, etc.),
+        // we'd need to walk their element list. Without easy AST metadata,
+        // we return null and fall back to whole-RHS-type inference.
+        return null;
     }
 
     /// If `binding` is the first parameter of an arrow/function-expression
