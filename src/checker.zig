@@ -836,18 +836,30 @@ pub const Checker = struct {
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
         if (self.symbolForIdentRef(node)) |sym| {
-            // Namespace identifier in value position → `typeof NamespaceName`.
+            // Namespace or class identifier in value position → `typeof Name`.
             // Guard: skip type-annotation positions (where tsc says `any`).
-            if (self.semantic.symbols.getBindingKind(sym) == .namespace_decl and
+            const bkind = self.semantic.symbols.getBindingKind(sym);
+            if ((bkind == .namespace_decl or bkind == .class_decl) and
                 !self.identifierInTypePosition(node))
             {
-                const tok = self.ast_ref.nodeMainToken(node);
-                const ns_name = self.ast_ref.tokenText(tok);
-                if (ns_name.len > 0) {
-                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
-                    return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                if (bkind == .namespace_decl) {
+                    const tok = self.ast_ref.nodeMainToken(node);
+                    const ns_name = self.ast_ref.tokenText(tok);
+                    if (ns_name.len > 0) {
+                        const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
+                        return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                    }
+                    return tymod.ID_ANY;
                 }
-                return tymod.ID_ANY;
+                // class_decl: base is typeRef("C"); return typeof-prefixed form
+                const base_c = self.declaredTypeForSymbol(sym);
+                const stored_c = self.store.get(base_c);
+                if (stored_c.kind == .type_ref) {
+                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{stored_c.name}) catch
+                        return self.narrowAtUse(node, sym, base_c);
+                    return self.store.typeRef(typeof_name, &.{}) catch self.narrowAtUse(node, sym, base_c);
+                }
+                return self.narrowAtUse(node, sym, base_c);
             }
             const base = self.declaredTypeForSymbol(sym);
             if (!base.eq(tymod.ID_UNKNOWN)) return self.narrowAtUse(node, sym, base);

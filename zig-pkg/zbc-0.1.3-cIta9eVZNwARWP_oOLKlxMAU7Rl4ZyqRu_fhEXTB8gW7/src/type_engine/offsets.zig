@@ -1,0 +1,1293 @@
+//! Conversion functions between the following Units:
+//! - A "index" or "source index" is a offset into a utf-8 encoding source file.
+//! - `Loc`
+//! - `Position`
+//! - `Range`
+//! - `std.zig.Ast.TokenIndex`
+//! - `std.zig.Ast.Node.Index`
+
+const std = @import("std");
+const ast = @import("ast.zig");
+const Ast = std.zig.Ast;
+
+/// Specifies how the `character` field in `Position` is defined.
+/// The Character encoding is negotiated during initialization with the Client/Editor.
+pub const Encoding = enum {
+    /// Character offsets count UTF-8 code units (e.g. bytes).
+    @"utf-8",
+    /// Character offsets count UTF-16 code units.
+    ///
+    /// This is the default and must always be supported
+    /// by servers
+    @"utf-16",
+    /// Character offsets count UTF-32 code units.
+    ///
+    /// Implementation note: these are the same as Unicode codepoints,
+    /// so this `PositionEncodingKind` may also be used for an
+    /// encoding-agnostic representation of character offsets.
+    @"utf-32",
+};
+
+/// A pair of two source indexes into a document.
+/// Asserts that `start <= end`.
+pub const Loc = std.zig.Token.Loc;
+pub const Position = struct { line: u32, character: u32 };
+pub const Range = struct { start: Position, end: Position };
+
+pub fn indexToPosition(text: []const u8, index: usize, encoding: Encoding) Position {
+    const last_line_start = if (std.mem.findScalarLast(u8, text[0..index], '\n')) |line| line + 1 else 0;
+    const line_count = std.mem.count(u8, text[0..last_line_start], "\n");
+
+    return .{
+        .line = @intCast(line_count),
+        .character = @intCast(countCodeUnits(text[last_line_start..index], encoding)),
+    };
+}
+
+pub fn positionToIndex(text: []const u8, position: Position, encoding: Encoding) usize {
+    var line: u32 = 0;
+    var line_start_index: usize = 0;
+    for (text, 0..) |c, i| {
+        if (line == position.line) break;
+        if (c == '\n') {
+            line += 1;
+            line_start_index = i + 1;
+        }
+    } else return text.len;
+
+    const line_text = std.mem.sliceTo(text[line_start_index..], '\n');
+    const line_byte_length = getNCodeUnitByteCount(line_text, position.character, encoding);
+
+    return line_start_index + line_byte_length;
+}
+
+test "index <-> Position" {
+    try testIndexPosition("", 0, 0, .{ 0, 0, 0 });
+
+    try testIndexPosition("hello from zig", 10, 0, .{ 10, 10, 10 });
+
+    try testIndexPosition("\n", 0, 0, .{ 0, 0, 0 });
+    try testIndexPosition("\n", 1, 1, .{ 0, 0, 0 });
+
+    try testIndexPosition("hello\nfrom\nzig\n", 5, 0, .{ 5, 5, 5 });
+    try testIndexPosition("hello\nfrom\nzig\n", 6, 1, .{ 0, 0, 0 });
+    try testIndexPosition("hello\nfrom\nzig\n", 8, 1, .{ 2, 2, 2 });
+    try testIndexPosition("\nhello\nfrom\nzig", 15, 3, .{ 3, 3, 3 });
+
+    try testIndexPosition("a¶↉🠁", 10, 0, .{ 10, 5, 4 });
+    try testIndexPosition("🇺🇸 🇩🇪", 17, 0, .{ 17, 9, 5 });
+
+    try testIndexPosition("a¶↉🠁\na¶↉🠁", 10, 0, .{ 10, 5, 4 });
+    try testIndexPosition("a¶↉🠁\na¶↉🠁", 11, 1, .{ 0, 0, 0 });
+    try testIndexPosition("a¶↉🠁\na¶↉🠁", 21, 1, .{ 10, 5, 4 });
+
+    try testIndexPosition("\na¶↉🠁", 4, 1, .{ 3, 2, 2 });
+    try testIndexPosition("a¶↉🠁\n", 6, 0, .{ 6, 3, 3 });
+    try testIndexPosition("a¶↉🠁\n", 11, 1, .{ 0, 0, 0 });
+}
+
+fn testIndexPosition(text: []const u8, index: usize, line: u32, characters: [3]u32) !void {
+    const position8: Position = .{ .line = line, .character = characters[0] };
+    const position16: Position = .{ .line = line, .character = characters[1] };
+    const position32: Position = .{ .line = line, .character = characters[2] };
+
+    try std.testing.expectEqual(position8, indexToPosition(text, index, .@"utf-8"));
+    try std.testing.expectEqual(position16, indexToPosition(text, index, .@"utf-16"));
+    try std.testing.expectEqual(position32, indexToPosition(text, index, .@"utf-32"));
+
+    try std.testing.expectEqual(index, positionToIndex(text, position8, .@"utf-8"));
+    try std.testing.expectEqual(index, positionToIndex(text, position16, .@"utf-16"));
+    try std.testing.expectEqual(index, positionToIndex(text, position32, .@"utf-32"));
+}
+
+test "positionToIndex where character value is greater than the line length" {
+    try testPositionToIndex("", 0, 0, .{ 1, 1, 1 });
+
+    try testPositionToIndex("\n", 0, 0, .{ 1, 1, 1 });
+    try testPositionToIndex("\n", 0, 0, .{ 2, 2, 2 });
+    try testPositionToIndex("\n", 0, 0, .{ 3, 3, 3 });
+
+    try testPositionToIndex("\n", 1, 1, .{ 1, 1, 1 });
+    try testPositionToIndex("\n", 1, 1, .{ 2, 2, 2 });
+    try testPositionToIndex("\n", 1, 1, .{ 3, 3, 3 });
+
+    try testPositionToIndex("hello\nfrom\nzig\n", 5, 0, .{ 6, 6, 6 });
+    try testPositionToIndex("hello\nfrom\nzig\n", 10, 1, .{ 5, 5, 5 });
+
+    try testPositionToIndex("a¶↉🠁\na¶↉🠁", 21, 1, .{ 11, 6, 5 });
+    try testPositionToIndex("a¶↉🠁\na¶↉🠁\n", 21, 1, .{ 11, 6, 5 });
+}
+
+test "positionToIndex where line value is greater than the number of lines" {
+    try testPositionToIndex("", 0, 1, .{ 0, 0, 0 });
+    try testPositionToIndex("", 0, 1, .{ 3, 2, 1 });
+
+    try testPositionToIndex("hello", 5, 1, .{ 0, 0, 0 });
+    try testPositionToIndex("hello", 5, 1, .{ 3, 2, 1 });
+
+    try testPositionToIndex("hello\nfrom\nzig", 14, 3, .{ 0, 0, 0 });
+    try testPositionToIndex("hello\nfrom\nzig", 14, 3, .{ 3, 2, 1 });
+}
+
+fn testPositionToIndex(text: []const u8, index: usize, line: u32, characters: [3]u32) !void {
+    const position8: Position = .{ .line = line, .character = characters[0] };
+    const position16: Position = .{ .line = line, .character = characters[1] };
+    const position32: Position = .{ .line = line, .character = characters[2] };
+
+    try std.testing.expectEqual(index, positionToIndex(text, position8, .@"utf-8"));
+    try std.testing.expectEqual(index, positionToIndex(text, position16, .@"utf-16"));
+    try std.testing.expectEqual(index, positionToIndex(text, position32, .@"utf-32"));
+}
+
+pub fn locLength(text: []const u8, loc: Loc, encoding: Encoding) usize {
+    return countCodeUnits(text[loc.start..loc.end], encoding);
+}
+
+test locLength {
+    const text = "a¶↉🠁";
+    try std.testing.expectEqual(10, locLength(text, .{ .start = 0, .end = text.len }, .@"utf-8"));
+    try std.testing.expectEqual(5, locLength(text, .{ .start = 0, .end = text.len }, .@"utf-16"));
+    try std.testing.expectEqual(4, locLength(text, .{ .start = 0, .end = text.len }, .@"utf-32"));
+}
+
+pub fn rangeLength(text: []const u8, range: Range, encoding: Encoding) usize {
+    const loc = rangeToLoc(text, range, encoding);
+    return locLength(text, loc, encoding);
+}
+
+test rangeLength {
+    const text = "a¶↉🠁";
+    try std.testing.expectEqual(10, rangeLength(text, .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 10 } }, .@"utf-8"));
+    try std.testing.expectEqual(5, rangeLength(text, .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 5 } }, .@"utf-16"));
+    try std.testing.expectEqual(4, rangeLength(text, .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 4 } }, .@"utf-32"));
+}
+
+pub fn locToSlice(text: []const u8, loc: Loc) []const u8 {
+    return text[loc.start..loc.end];
+}
+
+test locToSlice {
+    try std.testing.expectEqualStrings("per", locToSlice("Superstition", .{ .start = 2, .end = 5 }));
+}
+
+pub fn locToRange(text: []const u8, loc: Loc, encoding: Encoding) Range {
+    std.debug.assert(loc.start <= loc.end and loc.end <= text.len);
+    const start = indexToPosition(text, loc.start, encoding);
+    return .{
+        .start = start,
+        .end = advancePosition(text, start, loc.start, loc.end, encoding),
+    };
+}
+
+test locToRange {
+    const utf8_range: Range = .{
+        .start = .{ .line = 0, .character = 4 }, // '𐀀'
+        .end = .{ .line = 0, .character = 4 + 1 + 2 }, // '𐀀' + 'a' + '¶'
+    };
+
+    const utf16_range: Range = .{
+        .start = .{ .line = 0, .character = 2 }, // '𐀀'
+        .end = .{ .line = 0, .character = 2 + 1 + 1 }, // '𐀀' + 'a' + '¶'
+    };
+
+    const utf32_range: Range = .{
+        .start = .{ .line = 0, .character = 1 }, // '𐀀'
+        .end = .{ .line = 0, .character = 1 + 1 + 1 }, // '𐀀' + 'a' + '¶'
+    };
+
+    try std.testing.expectEqualDeep(utf8_range, locToRange("𐀀a¶↉", .{ .start = 4, .end = 7 }, .@"utf-8"));
+    try std.testing.expectEqualDeep(utf16_range, locToRange("𐀀a¶↉", .{ .start = 4, .end = 7 }, .@"utf-16"));
+    try std.testing.expectEqualDeep(utf32_range, locToRange("𐀀a¶↉", .{ .start = 4, .end = 7 }, .@"utf-32"));
+}
+
+pub fn rangeToSlice(text: []const u8, range: Range, encoding: Encoding) []const u8 {
+    return locToSlice(text, rangeToLoc(text, range, encoding));
+}
+
+pub fn rangeToLoc(text: []const u8, range: Range, encoding: Encoding) Loc {
+    std.debug.assert(orderPosition(range.start, range.end) != .gt);
+    const start = positionToIndex(text, range.start, encoding);
+
+    const end_position_relative_to_start: Position = .{
+        .line = range.end.line - range.start.line,
+        .character = if (range.start.line == range.end.line)
+            range.end.character - range.start.character
+        else
+            range.end.character,
+    };
+
+    const relative_end = positionToIndex(text[start..], end_position_relative_to_start, encoding);
+    return .{ .start = start, .end = start + relative_end };
+}
+
+test rangeToSlice {
+    const expect = std.testing.expectEqualStrings;
+
+    try expect("", rangeToSlice(
+        "",
+        .{
+            .start = .{ .line = 0, .character = 0 },
+            .end = .{ .line = 0, .character = 0 },
+        },
+        .@"utf-8",
+    ));
+    try expect("-A-", rangeToSlice(
+        "Peek-A-Boo",
+        .{
+            .start = .{ .line = 0, .character = 4 },
+            .end = .{ .line = 0, .character = 7 },
+        },
+        .@"utf-8",
+    ));
+    try expect("ek\nA\nB", rangeToSlice(
+        "Peek\nA\nBoo",
+        .{
+            .start = .{ .line = 0, .character = 2 },
+            .end = .{ .line = 2, .character = 1 },
+        },
+        .@"utf-8",
+    ));
+}
+
+pub fn lineLocAtIndex(text: []const u8, index: usize) Loc {
+    return .{
+        .start = if (std.mem.findScalarLast(u8, text[0..index], '\n')) |idx| idx + 1 else 0,
+        .end = std.mem.findScalarPos(u8, text, index, '\n') orelse text.len,
+    };
+}
+
+test lineLocAtIndex {
+    const expect = std.testing.expectEqual;
+
+    try expect(Loc{ .start = 0, .end = 0 }, lineLocAtIndex("", 0));
+    try expect(Loc{ .start = 0, .end = 0 }, lineLocAtIndex("\n", 0));
+    try expect(Loc{ .start = 1, .end = 1 }, lineLocAtIndex("\n", 1));
+
+    try expect(Loc{ .start = 0, .end = 3 }, lineLocAtIndex("foo\n", 3));
+    try expect(Loc{ .start = 4, .end = 4 }, lineLocAtIndex("foo\n", 4));
+
+    try expect(Loc{ .start = 0, .end = 3 }, lineLocAtIndex("foo\nbar", 0));
+    try expect(Loc{ .start = 0, .end = 3 }, lineLocAtIndex("foo\nbar", 3));
+    try expect(Loc{ .start = 4, .end = 7 }, lineLocAtIndex("foo\nbar", 4));
+    try expect(Loc{ .start = 4, .end = 7 }, lineLocAtIndex("foo\nbar", 5));
+    try expect(Loc{ .start = 4, .end = 7 }, lineLocAtIndex("foo\nbar", 7));
+}
+
+pub fn lineSliceAtIndex(text: []const u8, index: usize) []const u8 {
+    return locToSlice(text, lineLocAtIndex(text, index));
+}
+
+test lineSliceAtIndex {
+    try std.testing.expectEqualStrings("Sealed", lineSliceAtIndex("Signed\nSealed\nDelivered", 10));
+}
+
+pub fn lineLocAtPosition(text: []const u8, position: Position, encoding: Encoding) Loc {
+    return lineLocAtIndex(text, positionToIndex(text, position, encoding));
+}
+
+test lineLocAtPosition {
+    try std.testing.expectEqual(Loc{ .start = 7, .end = 10 }, lineLocAtPosition("Living\nFor\nThe\nCity", .{ .line = 1, .character = 2 }, .@"utf-8"));
+}
+
+pub fn lineSliceAtPosition(text: []const u8, position: Position, encoding: Encoding) []const u8 {
+    return locToSlice(text, lineLocAtPosition(text, position, encoding));
+}
+
+test lineSliceAtPosition {
+    try std.testing.expectEqualStrings("The", lineSliceAtPosition("Ribbon\nIn\nThe\nSky", .{ .line = 2, .character = 3 }, .@"utf-8"));
+}
+
+pub fn lineLocUntilIndex(text: []const u8, index: usize) Loc {
+    return .{
+        .start = if (std.mem.findScalarLast(u8, text[0..index], '\n')) |idx| idx + 1 else 0,
+        .end = index,
+    };
+}
+
+test lineLocUntilIndex {
+    const expect = std.testing.expectEqual;
+
+    try expect(Loc{ .start = 0, .end = 0 }, lineLocUntilIndex("", 0));
+
+    try expect(Loc{ .start = 0, .end = 0 }, lineLocUntilIndex("hello", 0));
+    try expect(Loc{ .start = 0, .end = 3 }, lineLocUntilIndex("hello", 3));
+    try expect(Loc{ .start = 0, .end = 5 }, lineLocUntilIndex("hello", 5));
+
+    try expect(Loc{ .start = 0, .end = 5 }, lineLocUntilIndex("hello\nworld", 5));
+    try expect(Loc{ .start = 6, .end = 6 }, lineLocUntilIndex("hello\nworld", 6));
+    try expect(Loc{ .start = 6, .end = 11 }, lineLocUntilIndex("hello\nworld", 11));
+}
+
+pub fn lineSliceUntilIndex(text: []const u8, index: usize) []const u8 {
+    return locToSlice(text, lineLocUntilIndex(text, index));
+}
+
+test lineSliceUntilIndex {
+    try std.testing.expectEqualStrings("O", lineSliceUntilIndex("One\nOf\nA\nKind", 5));
+}
+
+pub fn lineLocUntilPosition(text: []const u8, position: Position, encoding: Encoding) Loc {
+    return lineLocUntilIndex(text, positionToIndex(text, position, encoding));
+}
+
+test lineLocUntilPosition {
+    try std.testing.expectEqual(Loc{ .start = 4, .end = 8 }, lineLocUntilPosition("You\nHavent\nDone\nNothin", .{ .line = 1, .character = 4 }, .@"utf-8"));
+}
+
+pub fn lineSliceUntilPosition(text: []const u8, position: Position, encoding: Encoding) []const u8 {
+    return locToSlice(text, lineLocUntilPosition(text, position, encoding));
+}
+
+test lineSliceUntilPosition {
+    try std.testing.expectEqualStrings("Dr", lineSliceUntilPosition("Dont\nDrive\nDrunk", .{ .line = 1, .character = 2 }, .@"utf-8"));
+}
+
+pub fn convertPositionEncoding(text: []const u8, position: Position, from_encoding: Encoding, to_encoding: Encoding) Position {
+    if (from_encoding == to_encoding) return position;
+
+    const line_loc = lineLocUntilPosition(text, position, from_encoding);
+
+    return .{
+        .line = position.line,
+        .character = @intCast(locLength(text, line_loc, to_encoding)),
+    };
+}
+
+test convertPositionEncoding {
+    try testConvertPositionEncoding("", .{ .line = 0, .character = 0 }, .{ .utf8 = 0, .utf16 = 0, .utf32 = 0 });
+    try testConvertPositionEncoding("\n", .{ .line = 0, .character = 0 }, .{ .utf8 = 0, .utf16 = 0, .utf32 = 0 });
+    try testConvertPositionEncoding("\n", .{ .line = 1, .character = 0 }, .{ .utf8 = 0, .utf16 = 0, .utf32 = 0 });
+    try testConvertPositionEncoding("foo", .{ .line = 0, .character = 3 }, .{ .utf8 = 3, .utf16 = 3, .utf32 = 3 });
+    try testConvertPositionEncoding("a¶↉🠁", .{ .line = 0, .character = 10 }, .{ .utf8 = 10, .utf16 = 5, .utf32 = 4 });
+    try testConvertPositionEncoding("a¶↉🠁\na¶↉🠁", .{ .line = 1, .character = 6 }, .{ .utf8 = 6, .utf16 = 3, .utf32 = 3 });
+}
+
+fn testConvertPositionEncoding(text: [:0]const u8, position: Position, new_characters: struct { utf8: u32, utf16: u32, utf32: u32 }) !void {
+    const position8 = convertPositionEncoding(text, position, .@"utf-8", .@"utf-8");
+    const position16 = convertPositionEncoding(text, position, .@"utf-8", .@"utf-16");
+    const position32 = convertPositionEncoding(text, position, .@"utf-8", .@"utf-32");
+
+    try std.testing.expectEqual(position.line, position8.line);
+    try std.testing.expectEqual(position.line, position16.line);
+    try std.testing.expectEqual(position.line, position32.line);
+
+    try std.testing.expectEqual(new_characters.utf8, position8.character);
+    try std.testing.expectEqual(new_characters.utf16, position16.character);
+    try std.testing.expectEqual(new_characters.utf32, position32.character);
+}
+
+pub fn convertRangeEncoding(text: []const u8, range: Range, from_encoding: Encoding, to_encoding: Encoding) Range {
+    std.debug.assert(orderPosition(range.start, range.end) != .gt);
+    if (from_encoding == to_encoding) return range;
+    return .{
+        .start = convertPositionEncoding(text, range.start, from_encoding, to_encoding),
+        .end = convertPositionEncoding(text, range.end, from_encoding, to_encoding),
+    };
+}
+
+test convertRangeEncoding {
+    const utf8_range: Range = .{
+        .start = .{ .line = 0, .character = 1 + 2 }, // 'a' + '¶'
+        .end = .{ .line = 0, .character = 1 + 2 + 3 + 4 }, // 'a' + '¶' + '↉' + '🠁'
+    };
+
+    const utf16_range: Range = .{
+        .start = .{ .line = 0, .character = 1 + 1 }, // 'a' + '¶'
+        .end = .{ .line = 0, .character = 1 + 1 + 1 + 2 }, // 'a' + '¶' + '↉' + '🠁'
+    };
+
+    try std.testing.expectEqualDeep(utf8_range, convertRangeEncoding("a¶↉🠁", utf16_range, .@"utf-16", .@"utf-8"));
+    try std.testing.expectEqualDeep(utf16_range, convertRangeEncoding("a¶↉🠁", utf8_range, .@"utf-8", .@"utf-16"));
+}
+
+pub fn orderPosition(a: Position, b: Position) std.math.Order {
+    const line_order = std.math.order(a.line, b.line);
+    if (line_order != .eq) return line_order;
+    return std.math.order(a.character, b.character);
+}
+
+test orderPosition {
+    const expect = std.testing.expectEqual;
+
+    try expect(.lt, orderPosition(.{ .line = 1, .character = 0 }, .{ .line = 3, .character = 5 }));
+    try expect(.lt, orderPosition(.{ .line = 1, .character = 3 }, .{ .line = 3, .character = 5 }));
+    try expect(.lt, orderPosition(.{ .line = 1, .character = 6 }, .{ .line = 3, .character = 5 }));
+    try expect(.lt, orderPosition(.{ .line = 3, .character = 0 }, .{ .line = 3, .character = 5 }));
+
+    try expect(.eq, orderPosition(.{ .line = 3, .character = 3 }, .{ .line = 3, .character = 3 }));
+
+    try expect(.gt, orderPosition(.{ .line = 3, .character = 6 }, .{ .line = 3, .character = 3 }));
+    try expect(.gt, orderPosition(.{ .line = 5, .character = 0 }, .{ .line = 3, .character = 5 }));
+    try expect(.gt, orderPosition(.{ .line = 5, .character = 3 }, .{ .line = 3, .character = 5 }));
+    try expect(.gt, orderPosition(.{ .line = 5, .character = 6 }, .{ .line = 3, .character = 5 }));
+}
+
+/// Advance `position` which starts at `from_index` to `to_index` accounting for line breaks.
+/// The return value will always be `indexToPosition(text, to_index, encoding)`.
+pub fn advancePosition(text: []const u8, position: Position, from_index: usize, to_index: usize, encoding: Encoding) Position {
+    var line = position.line;
+
+    for (text[from_index..to_index]) |c| {
+        if (c == '\n') {
+            line += 1;
+        }
+    }
+
+    const line_loc = lineLocUntilIndex(text, to_index);
+
+    return .{
+        .line = line,
+        .character = @intCast(locLength(text, line_loc, encoding)),
+    };
+}
+
+test advancePosition {
+    try testAdvancePosition("", .{ .line = 0, .character = 0 }, 0, 0);
+    try testAdvancePosition("foo", .{ .line = 0, .character = 0 }, 0, 3);
+    try testAdvancePosition("\n", .{ .line = 0, .character = 0 }, 0, 1);
+    try testAdvancePosition("foo\nbar", .{ .line = 0, .character = 1 }, 1, 6);
+    try testAdvancePosition("foo\nbar", .{ .line = 1, .character = 0 }, 4, 7);
+}
+
+fn testAdvancePosition(text: []const u8, position: Position, from: usize, to: usize) !void {
+    try std.testing.expectEqual(indexToPosition(text, to, .@"utf-16"), advancePosition(text, position, from, to, .@"utf-16"));
+}
+
+/// returns the number of code units in `text`
+pub fn countCodeUnits(text: []const u8, encoding: Encoding) usize {
+    switch (encoding) {
+        .@"utf-8" => return text.len,
+        .@"utf-16" => {
+            var iter: std.unicode.Utf8Iterator = .{ .bytes = text, .i = 0 };
+
+            var utf16_len: usize = 0;
+            while (iter.nextCodepoint()) |codepoint| {
+                if (codepoint < 0x10000) {
+                    utf16_len += 1;
+                } else {
+                    utf16_len += 2;
+                }
+            }
+            return utf16_len;
+        },
+        .@"utf-32" => return std.unicode.utf8CountCodepoints(text) catch unreachable,
+    }
+}
+
+test countCodeUnits {
+    try testCountCodeUnits("", .{ .utf8 = 0, .utf16 = 0, .utf32 = 0 });
+    try testCountCodeUnits("a\na", .{ .utf8 = 3, .utf16 = 3, .utf32 = 3 });
+    try testCountCodeUnits("a¶↉🠁", .{ .utf8 = 10, .utf16 = 5, .utf32 = 4 });
+    try testCountCodeUnits("🠁↉¶a", .{ .utf8 = 10, .utf16 = 5, .utf32 = 4 });
+    try testCountCodeUnits("🇺🇸 🇩🇪", .{ .utf8 = 17, .utf16 = 9, .utf32 = 5 });
+}
+
+fn testCountCodeUnits(text: []const u8, expected: struct { utf8: usize, utf16: usize, utf32: usize }) !void {
+    try std.testing.expectEqual(expected.utf8, countCodeUnits(text, .@"utf-8"));
+    try std.testing.expectEqual(expected.utf16, countCodeUnits(text, .@"utf-16"));
+    try std.testing.expectEqual(expected.utf32, countCodeUnits(text, .@"utf-32"));
+}
+
+/// Returns the number of (utf-8 code units / bytes) that represent `n` code units in `text`.
+/// If `text` has less than `n` code units then the number of code units in
+/// `text` are returned, i.e. the result is being clamped.
+pub fn getNCodeUnitByteCount(text: []const u8, n: usize, encoding: Encoding) usize {
+    switch (encoding) {
+        .@"utf-8" => return @min(text.len, n),
+        .@"utf-16" => {
+            if (n == 0) return 0;
+            var iter: std.unicode.Utf8Iterator = .{ .bytes = text, .i = 0 };
+
+            var utf16_len: usize = 0;
+            while (iter.nextCodepoint()) |codepoint| {
+                if (codepoint < 0x10000) {
+                    utf16_len += 1;
+                } else {
+                    utf16_len += 2;
+                }
+                if (utf16_len >= n) break;
+            }
+            return iter.i;
+        },
+        .@"utf-32" => {
+            var i: usize = 0;
+            var count: usize = 0;
+            while (count != n) : (count += 1) {
+                if (i >= text.len) break;
+                i += std.unicode.utf8ByteSequenceLength(text[i]) catch unreachable;
+            }
+            return i;
+        },
+    }
+}
+
+test getNCodeUnitByteCount {
+    try testGetNCodeUnitByteCount("", .{ .utf8 = 0, .utf16 = 0, .utf32 = 0 });
+    try testGetNCodeUnitByteCount("foo", .{ .utf8 = 2, .utf16 = 2, .utf32 = 2 });
+    try testGetNCodeUnitByteCount("a¶🠁🠁", .{ .utf8 = 7, .utf16 = 4, .utf32 = 3 });
+    try testGetNCodeUnitByteCount("🇺🇸 🇩🇪", .{ .utf8 = 9, .utf16 = 5, .utf32 = 3 });
+}
+
+fn testGetNCodeUnitByteCount(text: []const u8, expected: struct { utf8: usize, utf16: usize, utf32: usize }) !void {
+    try std.testing.expectEqual(expected.utf8, getNCodeUnitByteCount(text, expected.utf8, .@"utf-8"));
+    try std.testing.expectEqual(expected.utf8, getNCodeUnitByteCount(text, expected.utf16, .@"utf-16"));
+    try std.testing.expectEqual(expected.utf8, getNCodeUnitByteCount(text, expected.utf32, .@"utf-32"));
+}
+
+pub const SourceIndexToTokenIndexResult = union(enum) {
+    /// The source index is inside of whitespace.
+    none: struct {
+        /// The the first token to the left of the source index, if any.
+        left: ?Ast.TokenIndex,
+        /// The the first token to the right of the source index, if any.
+        /// Will ignore the `.eof` token.
+        right: ?Ast.TokenIndex,
+    },
+    /// The source index is on the edge or inside of a token.
+    one: Ast.TokenIndex,
+    /// The source index is between two tokens.
+    between: struct {
+        /// The the first token to the left of the source index.
+        left: Ast.TokenIndex,
+        /// The the first token to the right of the source index.
+        right: Ast.TokenIndex,
+    },
+
+    pub fn pickTokenTag(
+        result: SourceIndexToTokenIndexResult,
+        wanted_token_tag: std.zig.Token.Tag,
+        tree: *const Ast,
+    ) ?Ast.TokenIndex {
+        switch (result) {
+            .none => return null,
+            .one => |token| return if (tree.tokenTag(token) == wanted_token_tag) token else null,
+            .between => |data| {
+                if (tree.tokenTag(data.left) == wanted_token_tag) return data.left;
+                if (tree.tokenTag(data.right) == wanted_token_tag) return data.right;
+                return null;
+            },
+        }
+    }
+
+    pub fn pickPreferred(
+        result: SourceIndexToTokenIndexResult,
+        preferred_tags: []const std.zig.Token.Tag,
+        tree: *const Ast,
+    ) ?Ast.TokenIndex {
+        switch (result) {
+            .none => return null,
+            .one => |token| return token,
+            .between => |data| {
+                if (std.mem.findScalar(std.zig.Token.Tag, preferred_tags, tree.tokenTag(data.left)) != null) {
+                    return data.left;
+                }
+                if (std.mem.findScalar(std.zig.Token.Tag, preferred_tags, tree.tokenTag(data.right)) != null) {
+                    return data.right;
+                }
+                return null;
+            },
+        }
+    }
+
+    pub fn preferLeft(result: SourceIndexToTokenIndexResult) Ast.TokenIndex {
+        switch (result) {
+            .none => |data| return data.left orelse 0,
+            .one => |token| return token,
+            .between => |data| return data.left,
+        }
+    }
+
+    pub fn preferRight(result: SourceIndexToTokenIndexResult, tree: *const Ast) Ast.TokenIndex {
+        switch (result) {
+            .none => |data| return data.right orelse @intCast(tree.tokens.len - 1),
+            .one => |token| return token,
+            .between => |data| return data.right,
+        }
+    }
+};
+
+pub fn sourceIndexToTokenIndex(tree: *const Ast, source_index: usize) SourceIndexToTokenIndexResult {
+    std.debug.assert(source_index <= tree.source.len);
+
+    var upper_index: Ast.TokenIndex = @intCast(tree.tokens.len - 1);
+    var lower_index: Ast.TokenIndex = 0;
+    while (upper_index - lower_index > 64) {
+        const mid = lower_index + (upper_index - lower_index) / 2;
+        if (tree.tokenStart(mid) < source_index) {
+            lower_index = mid;
+        } else {
+            upper_index = mid;
+        }
+    }
+
+    var tokenizer: std.zig.Tokenizer = .{
+        .buffer = tree.source,
+        .index = tree.tokenStart(lower_index),
+    };
+
+    var previous_token_index: ?Ast.TokenIndex = null;
+    var previous_token_loc: ?Loc = null;
+    var current_token_index: Ast.TokenIndex = lower_index;
+    while (current_token_index <= upper_index) {
+        const current_token = tokenizer.next();
+
+        if (previous_token_loc) |previous_loc| {
+            if (previous_loc.end == source_index) {
+                if (source_index == current_token.loc.start and current_token.tag != .eof) {
+                    return .{ .between = .{ .left = previous_token_index.?, .right = current_token_index } };
+                } else {
+                    return .{ .one = previous_token_index.? };
+                }
+            }
+            if (previous_loc.end < source_index and source_index < current_token.loc.start) {
+                return .{ .none = .{ .left = previous_token_index.?, .right = current_token_index } };
+            }
+        }
+
+        if (current_token.tag == .eof) {
+            return .{ .none = .{ .left = previous_token_index, .right = null } };
+        }
+
+        if (source_index < current_token.loc.start) {
+            return .{ .none = .{ .left = previous_token_index, .right = current_token_index } };
+        } else if (source_index < current_token.loc.end) {
+            return .{ .one = current_token_index };
+        } else {
+            // continue to the next iteration
+        }
+
+        previous_token_index = current_token_index;
+        previous_token_loc = current_token.loc;
+        current_token_index += 1;
+    }
+
+    unreachable;
+}
+
+test sourceIndexToTokenIndex {
+    var tree: Ast = try .parse(std.testing.allocator, " a  bb; ", .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(
+        std.zig.Token.Tag,
+        &.{ .identifier, .identifier, .semicolon, .eof },
+        tree.tokens.items(.tag),
+    );
+
+    const Result = SourceIndexToTokenIndexResult;
+    const expectEqual = std.testing.expectEqual;
+
+    // zig fmt: off
+    try expectEqual(Result{ .none    = .{ .left = null, .right = 0    } }, sourceIndexToTokenIndex(&tree, 0));
+    try expectEqual(Result{ .one     = 0                                }, sourceIndexToTokenIndex(&tree, 1));
+    try expectEqual(Result{ .one     = 0                                }, sourceIndexToTokenIndex(&tree, 2));
+    try expectEqual(Result{ .none    = .{ .left = 0,    .right = 1    } }, sourceIndexToTokenIndex(&tree, 3));
+    try expectEqual(Result{ .one     = 1                                }, sourceIndexToTokenIndex(&tree, 4));
+    try expectEqual(Result{ .one     = 1                                }, sourceIndexToTokenIndex(&tree, 5));
+    try expectEqual(Result{ .between = .{ .left = 1,    .right = 2    } }, sourceIndexToTokenIndex(&tree, 6));
+    try expectEqual(Result{ .one     = 2                                }, sourceIndexToTokenIndex(&tree, 7));
+    try expectEqual(Result{ .none    = .{ .left = 2,    .right = null } }, sourceIndexToTokenIndex(&tree, 8));
+    // zig fmt: on
+}
+
+test "sourceIndexToTokenIndex - token at end" {
+    var tree: Ast = try .parse(std.testing.allocator, " a", .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(
+        std.zig.Token.Tag,
+        &.{ .identifier, .eof },
+        tree.tokens.items(.tag),
+    );
+
+    const Result = SourceIndexToTokenIndexResult;
+    const expectEqual = std.testing.expectEqual;
+
+    try expectEqual(Result{ .none = .{ .left = null, .right = 0 } }, sourceIndexToTokenIndex(&tree, 0));
+    try expectEqual(Result{ .one = 0 }, sourceIndexToTokenIndex(&tree, 1));
+    try expectEqual(Result{ .one = 0 }, sourceIndexToTokenIndex(&tree, 2));
+}
+
+pub const IdentifierIndexRange = enum {
+    /// delimiting `@` and `"`s are excluded
+    name,
+    /// delimiting `@` and `"`s are included
+    full,
+};
+
+/// The source index must be at the start of the valid identifier.
+///
+/// Supported formats:
+/// - `foo`
+/// - `@"foo"`
+/// - `@foo`
+pub fn identifierIndexToLoc(text: [:0]const u8, source_index: usize, range: IdentifierIndexRange) Loc {
+    if (text[source_index] == '@' and text[source_index + 1] == '"') {
+        const start_index = source_index + 2;
+        var index: usize = start_index;
+        while (true) : (index += 1) {
+            switch (text[index]) {
+                '\n' => break,
+                '\\' => index += 1,
+                '"' => {
+                    // include the closing quote
+                    if (range == .full) index += 1;
+                    break;
+                },
+                else => {},
+            }
+        }
+        return .{ .start = if (range == .full) source_index else start_index, .end = index };
+    } else {
+        const start: usize = source_index + @intFromBool(text[source_index] == '@');
+        var index = start;
+        while (isSymbolChar(text[index])) : (index += 1) {}
+        return .{ .start = if (range == .full) source_index else start, .end = index };
+    }
+}
+
+test identifierIndexToLoc {
+    try std.testing.expectEqualStrings("", identifierIndexToSlice("", 0, .name));
+    try std.testing.expectEqualStrings("", identifierIndexToSlice(" ", 0, .name));
+    try std.testing.expectEqualStrings("", identifierIndexToSlice(" world", 0, .name));
+
+    try std.testing.expectEqualStrings("hello", identifierIndexToSlice("hello", 0, .name));
+    try std.testing.expectEqualStrings("hello", identifierIndexToSlice("hello world", 0, .name));
+    try std.testing.expectEqualStrings("world", identifierIndexToSlice("hello world", 6, .name));
+
+    try std.testing.expectEqualStrings("hello", identifierIndexToSlice("@\"hello\"", 0, .name));
+    try std.testing.expectEqualStrings("hello", identifierIndexToSlice("@\"hello\" world", 0, .name));
+    try std.testing.expectEqualStrings("world", identifierIndexToSlice("@\"hello\" @\"world\"", 9, .name));
+
+    try std.testing.expectEqualStrings("hello", identifierIndexToSlice("@hello", 0, .name));
+
+    try std.testing.expectEqualStrings("\\\"", identifierIndexToSlice("@\"\\\"\"", 0, .name));
+
+    try std.testing.expectEqualStrings("@hello", identifierIndexToSlice("@hello", 0, .full));
+    try std.testing.expectEqualStrings("@\"hello\"", identifierIndexToSlice("@\"hello\"", 0, .full));
+    try std.testing.expectEqualStrings(
+        \\@"\"\\\""
+    , identifierIndexToSlice(
+        \\@"\"\\\""
+    , 0, .full));
+}
+
+pub fn identifierIndexToSlice(text: [:0]const u8, source_index: usize, range: IdentifierIndexRange) []const u8 {
+    return locToSlice(text, identifierIndexToLoc(text, source_index, range));
+}
+
+pub fn identifierTokenToNameLoc(tree: *const Ast, identifier_token: Ast.TokenIndex) Loc {
+    std.debug.assert(switch (tree.tokenTag(identifier_token)) {
+        .builtin => true, // The Zig parser likes to emit .builtin where a identifier would be expected
+        .identifier => true,
+        else => false,
+    });
+    return identifierIndexToLoc(tree.source, tree.tokenStart(identifier_token), .name);
+}
+
+pub fn identifierTokenToNameSlice(tree: *const Ast, identifier_token: Ast.TokenIndex) []const u8 {
+    return locToSlice(tree.source, identifierTokenToNameLoc(tree, identifier_token));
+}
+
+/// See `identifierTokenAndLocFromIndex`.
+pub fn identifierLocFromIndex(tree: *const Ast, source_index: usize) ?Loc {
+    _, const loc = identifierTokenAndLocFromIndex(tree, source_index) orelse return null;
+    return loc;
+}
+
+/// Returns the source location of `foo` if the source index is on a valid identifier.
+///
+/// Supported formats:
+/// - `foo`    (identifier)
+/// - `@"foo"` (escaped identifier)
+/// - `@foo`   (builtin)
+pub fn identifierTokenAndLocFromIndex(tree: *const Ast, source_index: usize) ?struct { Ast.TokenIndex, Loc } {
+    const token = sourceIndexToTokenIndex(tree, source_index).pickPreferred(&.{ .identifier, .builtin }, tree) orelse return null;
+    switch (tree.tokenTag(token)) {
+        .identifier, .builtin => {},
+        else => return null,
+    }
+    const token_loc = tokenToLoc(tree, token);
+    std.debug.assert(token_loc.start <= source_index and source_index <= token_loc.end);
+    return .{ token, identifierIndexToLoc(tree.source, token_loc.start, .name) };
+}
+
+test identifierLocFromIndex {
+    var tree = try Ast.parse(std.testing.allocator,
+        \\ name  @builtin  @"escaped"  @"s p a c e"  end
+    , .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualSlices(
+        std.zig.Token.Tag,
+        &.{ .identifier, .builtin, .identifier, .identifier, .identifier, .eof },
+        tree.tokens.items(.tag),
+    );
+
+    {
+        const expected_loc: Loc = .{ .start = 1, .end = 5 };
+        std.debug.assert(std.mem.eql(u8, "name", locToSlice(tree.source, expected_loc)));
+
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 1));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 2));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 5));
+    }
+
+    {
+        const expected_loc: Loc = .{ .start = 8, .end = 15 };
+        std.debug.assert(std.mem.eql(u8, "builtin", locToSlice(tree.source, expected_loc)));
+
+        try std.testing.expectEqual(@as(?Loc, null), identifierLocFromIndex(&tree, 6));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 7));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 8));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 11));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 15));
+        try std.testing.expectEqual(@as(?Loc, null), identifierLocFromIndex(&tree, 16));
+    }
+
+    {
+        const expected_loc: Loc = .{ .start = 19, .end = 26 };
+        std.debug.assert(std.mem.eql(u8, "escaped", locToSlice(tree.source, expected_loc)));
+
+        try std.testing.expectEqual(@as(?Loc, null), identifierLocFromIndex(&tree, 16));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 17));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 18));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 19));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 23));
+        try std.testing.expectEqual(expected_loc, identifierLocFromIndex(&tree, 27));
+        try std.testing.expectEqual(@as(?Loc, null), identifierLocFromIndex(&tree, 28));
+    }
+
+    {
+        const expected_loc: Loc = .{ .start = 43, .end = 46 };
+        std.debug.assert(std.mem.eql(u8, "end", locToSlice(tree.source, expected_loc)));
+
+        try std.testing.expectEqual(@as(?Loc, null), identifierLocFromIndex(&tree, 42));
+        try std.testing.expectEqual(@as(?Loc, expected_loc), identifierLocFromIndex(&tree, 43));
+        try std.testing.expectEqual(@as(?Loc, expected_loc), identifierLocFromIndex(&tree, 45));
+        try std.testing.expectEqual(@as(?Loc, expected_loc), identifierLocFromIndex(&tree, 46));
+    }
+}
+
+pub fn isSymbolChar(char: u8) bool {
+    return switch (char) {
+        'a'...'z', 'A'...'Z', '_', '0'...'9' => true,
+        else => false,
+    };
+}
+
+pub fn tokensToLoc(tree: *const Ast, first_token: Ast.TokenIndex, last_token: Ast.TokenIndex) Loc {
+    return .{ .start = tree.tokenStart(first_token), .end = tokenToLoc(tree, last_token).end };
+}
+
+pub fn tokenToLoc(tree: *const Ast, token_index: Ast.TokenIndex) Loc {
+    const start = tree.tokenStart(token_index);
+    const tag = tree.tokenTag(token_index);
+
+    // Many tokens can be determined entirely by their tag.
+    if (tag == .identifier or tag == .builtin) {
+        // fast path for identifiers
+        return identifierIndexToLoc(tree.source, start, .full);
+    } else if (tag.lexeme()) |lexeme| {
+        return .{
+            .start = start,
+            .end = start + lexeme.len,
+        };
+    } else if (tag == .invalid) {
+        // invalid tokens are one byte sized so we scan left and right to find the
+        // source location that contains complete code units
+        // this assumes that `tree.source` is valid utf8
+        var begin = token_index;
+        while (begin > 0 and tree.tokenTag(begin - 1) == .invalid) : (begin -= 1) {}
+
+        var end = token_index;
+        while (end < tree.tokens.len and tree.tokenTag(end) == .invalid) : (end += 1) {}
+        return .{
+            .start = tree.tokenStart(begin),
+            .end = tree.tokenStart(end),
+        };
+    }
+
+    // For some tokens, re-tokenization is needed to find the end.
+    var tokenizer: std.zig.Tokenizer = .{
+        .buffer = tree.source,
+        .index = start,
+    };
+
+    const token = tokenizer.next();
+    // A failure would indicate a corrupted tree.source
+    std.debug.assert(token.tag == tag);
+    return token.loc;
+}
+
+test tokenToLoc {
+    try testTokenToLoc("foo", 0, 0, 3);
+    try testTokenToLoc("foo\n", 0, 0, 3);
+    try testTokenToLoc("\nfoo", 0, 1, 4);
+    try testTokenToLoc("foo:", 0, 0, 3);
+    try testTokenToLoc(";;", 1, 1, 2);
+}
+
+fn testTokenToLoc(text: [:0]const u8, token_index: Ast.TokenIndex, start: usize, end: usize) !void {
+    var tree = try Ast.parse(std.testing.allocator, text, .zig);
+    defer tree.deinit(std.testing.allocator);
+
+    const actual = tokenToLoc(&tree, token_index);
+
+    try std.testing.expectEqual(start, actual.start);
+    try std.testing.expectEqual(end, actual.end);
+}
+
+pub fn tokenToSlice(tree: *const Ast, token_index: Ast.TokenIndex) []const u8 {
+    return locToSlice(tree.source, tokenToLoc(tree, token_index));
+}
+
+pub fn tokensToSlice(tree: *const Ast, first_token: Ast.TokenIndex, last_token: Ast.TokenIndex) []const u8 {
+    std.debug.assert(first_token <= last_token);
+    return locToSlice(tree.source, tokensToLoc(tree, first_token, last_token));
+}
+
+pub fn tokenToPosition(tree: *const Ast, token_index: Ast.TokenIndex, encoding: Encoding) Position {
+    const start = tree.tokenStart(token_index);
+    return indexToPosition(tree.source, start, encoding);
+}
+
+pub fn tokenToRange(tree: *const Ast, token_index: Ast.TokenIndex, encoding: Encoding) Range {
+    const start = tokenToPosition(tree, token_index, encoding);
+    const loc = tokenToLoc(tree, token_index);
+
+    return .{
+        .start = start,
+        .end = advancePosition(tree.source, start, loc.start, loc.end, encoding),
+    };
+}
+
+pub fn tokenLength(tree: *const Ast, token_index: Ast.TokenIndex, encoding: Encoding) usize {
+    const loc = tokenToLoc(tree, token_index);
+    return locLength(tree.source, loc, encoding);
+}
+
+pub fn tokenIndexLength(text: [:0]const u8, index: usize, encoding: Encoding) usize {
+    const loc = tokenIndexToLoc(text, index);
+    return locLength(text, loc, encoding);
+}
+
+pub fn tokenIndexToLoc(text: [:0]const u8, index: usize) Loc {
+    var tokenizer: std.zig.Tokenizer = .{
+        .buffer = text,
+        .index = index,
+    };
+
+    const token = tokenizer.next();
+    return .{ .start = token.loc.start, .end = token.loc.end };
+}
+
+test tokenIndexToLoc {
+    try std.testing.expectEqual(Loc{ .start = 0, .end = 0 }, tokenIndexToLoc("", 0));
+    try std.testing.expectEqual(Loc{ .start = 0, .end = 3 }, tokenIndexToLoc("foo", 0));
+    try std.testing.expectEqual(Loc{ .start = 3, .end = 4 }, tokenIndexToLoc("0, 0", 3));
+    try std.testing.expectEqual(Loc{ .start = 1, .end = 4 }, tokenIndexToLoc(" bar ", 0));
+}
+
+pub fn tokenPositionToLoc(text: [:0]const u8, position: Position, encoding: Encoding) Loc {
+    const index = positionToIndex(text, position, encoding);
+    return tokenIndexToLoc(text, index);
+}
+
+pub fn tokenIndexToSlice(text: [:0]const u8, index: usize) []const u8 {
+    return locToSlice(text, tokenIndexToLoc(text, index));
+}
+
+pub fn tokenPositionToSlice(text: [:0]const u8, position: Position) []const u8 {
+    return locToSlice(text, tokenPositionToLoc(text, position));
+}
+
+pub fn tokenIndexToRange(text: [:0]const u8, index: usize, encoding: Encoding) Range {
+    const start = indexToPosition(text, index, encoding);
+    const loc = tokenIndexToLoc(text, index);
+
+    return .{
+        .start = start,
+        .end = advancePosition(text, start, loc.start, loc.end, encoding),
+    };
+}
+
+pub fn tokenPositionToRange(text: [:0]const u8, position: Position, encoding: Encoding) Range {
+    const index = positionToIndex(text, position, encoding);
+    const loc = tokenIndexToLoc(text, index);
+
+    return .{
+        .start = position,
+        .end = advancePosition(text, position, loc.start, loc.end, encoding),
+    };
+}
+
+pub fn nodeToLoc(tree: *const Ast, node: Ast.Node.Index) Loc {
+    return tokensToLoc(tree, tree.firstToken(node), ast.lastToken(tree, node));
+}
+
+pub fn nodeToSlice(tree: *const Ast, node: Ast.Node.Index) []const u8 {
+    return locToSlice(tree.source, nodeToLoc(tree, node));
+}
+
+pub fn nodeToRange(tree: *const Ast, node: Ast.Node.Index, encoding: Encoding) Range {
+    return locToRange(tree.source, nodeToLoc(tree, node), encoding);
+}
+
+/// return the source location
+/// that starts `n` lines before the line at which `index` is located
+/// and    ends `n` lines after  the line at which `index` is located.
+/// `n == 0` is equivalent to calling `lineLocAtIndex`.
+pub fn multilineLocAtIndex(text: []const u8, index: usize, n: usize) Loc {
+    const start = blk: {
+        var i: usize = index;
+        var num_lines: usize = 0;
+        while (i != 0) : (i -= 1) {
+            if (text[i - 1] != '\n') continue;
+            if (num_lines >= n) break :blk i;
+            num_lines += 1;
+        }
+        break :blk 0;
+    };
+    const end = blk: {
+        var i: usize = index;
+        var num_lines: usize = 0;
+        while (i < text.len) : (i += 1) {
+            if (text[i] != '\n') continue;
+            if (num_lines >= n) break :blk i;
+            num_lines += 1;
+        }
+        break :blk text.len;
+    };
+
+    return .{
+        .start = start,
+        .end = end,
+    };
+}
+
+test multilineLocAtIndex {
+    const text =
+        \\line0
+        \\line1
+        \\line2
+        \\line3
+        \\line4
+    ;
+    try std.testing.expectEqualStrings(lineSliceAtIndex(text, 0), multilineSliceAtIndex(text, 0, 0));
+    try std.testing.expectEqualStrings(lineSliceAtIndex(text, 5), multilineSliceAtIndex(text, 5, 0));
+    try std.testing.expectEqualStrings(lineSliceAtIndex(text, 6), multilineSliceAtIndex(text, 6, 0));
+
+    try std.testing.expectEqualStrings("line1\nline2\nline3", multilineSliceAtIndex(text, 15, 1));
+    try std.testing.expectEqualStrings("line0\nline1", multilineSliceAtIndex(text, 3, 1));
+    try std.testing.expectEqualStrings("line3\nline4", multilineSliceAtIndex(text, 27, 1));
+}
+
+/// see `multilineLocAtIndex`
+pub fn multilineSliceAtIndex(text: []const u8, index: usize, n: usize) []const u8 {
+    return locToSlice(text, multilineLocAtIndex(text, index, n));
+}
+
+/// see `multilineLocAtIndex`
+pub fn multilineLocAtPosition(text: []const u8, position: Position, n: usize, encoding: Encoding) Loc {
+    return multilineLocAtIndex(text, positionToIndex(text, position, encoding), n);
+}
+
+/// see `multilineLocAtIndex`
+pub fn multilineSliceAtPosition(text: []const u8, position: Position, n: usize, encoding: Encoding) []const u8 {
+    return locToSlice(text, multilineLocAtPosition(text, position, n, encoding));
+}
+
+/// returns true if a and b intersect
+pub fn locIntersect(a: Loc, b: Loc) bool {
+    std.debug.assert(a.start <= a.end and b.start <= b.end);
+    return a.start < b.end and a.end > b.start;
+}
+
+test locIntersect {
+    const a: Loc = .{ .start = 2, .end = 5 };
+    try std.testing.expect(locIntersect(a, .{ .start = 0, .end = 2 }) == false);
+    try std.testing.expect(locIntersect(a, .{ .start = 1, .end = 3 }) == true);
+    try std.testing.expect(locIntersect(a, .{ .start = 2, .end = 4 }) == true);
+    try std.testing.expect(locIntersect(a, .{ .start = 3, .end = 5 }) == true);
+    try std.testing.expect(locIntersect(a, .{ .start = 4, .end = 6 }) == true);
+    try std.testing.expect(locIntersect(a, .{ .start = 5, .end = 7 }) == false);
+}
+
+/// returns true if a is inside b
+pub fn locInside(inner: Loc, outer: Loc) bool {
+    std.debug.assert(inner.start <= inner.end and outer.start <= outer.end);
+    return outer.start <= inner.start and inner.end <= outer.end;
+}
+
+test locInside {
+    const outer: Loc = .{ .start = 2, .end = 5 };
+    try std.testing.expect(locInside(.{ .start = 0, .end = 2 }, outer) == false);
+    try std.testing.expect(locInside(.{ .start = 1, .end = 3 }, outer) == false);
+    try std.testing.expect(locInside(.{ .start = 2, .end = 4 }, outer) == true);
+    try std.testing.expect(locInside(.{ .start = 3, .end = 5 }, outer) == true);
+    try std.testing.expect(locInside(.{ .start = 4, .end = 6 }, outer) == false);
+    try std.testing.expect(locInside(.{ .start = 5, .end = 7 }, outer) == false);
+}
+
+/// returns the union of a and b
+pub fn locMerge(a: Loc, b: Loc) Loc {
+    std.debug.assert(a.start <= a.end and b.start <= b.end);
+    return .{
+        .start = @min(a.start, b.start),
+        .end = @max(a.end, b.end),
+    };
+}
+
+test locMerge {
+    const a: Loc = .{ .start = 2, .end = 5 };
+    try std.testing.expectEqualDeep(locMerge(a, .{ .start = 0, .end = 2 }), Loc{ .start = 0, .end = 5 });
+    try std.testing.expectEqualDeep(locMerge(a, .{ .start = 1, .end = 3 }), Loc{ .start = 1, .end = 5 });
+    try std.testing.expectEqualDeep(locMerge(a, .{ .start = 2, .end = 4 }), Loc{ .start = 2, .end = 5 });
+    try std.testing.expectEqualDeep(locMerge(a, .{ .start = 3, .end = 5 }), Loc{ .start = 2, .end = 5 });
+    try std.testing.expectEqualDeep(locMerge(a, .{ .start = 4, .end = 6 }), Loc{ .start = 2, .end = 6 });
+    try std.testing.expectEqualDeep(locMerge(a, .{ .start = 5, .end = 7 }), Loc{ .start = 2, .end = 7 });
+}
+
+pub fn positionInsideRange(inner: Position, outer: Range) bool {
+    std.debug.assert(orderPosition(outer.start, outer.end) != .gt);
+    return orderPosition(outer.start, inner) != .gt and orderPosition(inner, outer.end) != .gt;
+}
+
+test positionInsideRange {
+    const range: Range = .{
+        .start = .{ .line = 1, .character = 2 },
+        .end = .{ .line = 2, .character = 4 },
+    };
+    try std.testing.expect(!positionInsideRange(.{ .line = 0, .character = 0 }, range));
+    try std.testing.expect(!positionInsideRange(.{ .line = 0, .character = 2 }, range));
+    try std.testing.expect(!positionInsideRange(.{ .line = 0, .character = 4 }, range));
+    try std.testing.expect(!positionInsideRange(.{ .line = 1, .character = 0 }, range));
+    try std.testing.expect(!positionInsideRange(.{ .line = 1, .character = 1 }, range));
+
+    try std.testing.expect(positionInsideRange(.{ .line = 1, .character = 2 }, range));
+    try std.testing.expect(positionInsideRange(.{ .line = 1, .character = 4 }, range));
+    try std.testing.expect(positionInsideRange(.{ .line = 2, .character = 0 }, range));
+    try std.testing.expect(positionInsideRange(.{ .line = 2, .character = 2 }, range));
+    try std.testing.expect(positionInsideRange(.{ .line = 2, .character = 4 }, range));
+
+    try std.testing.expect(!positionInsideRange(.{ .line = 2, .character = 6 }, range));
+    try std.testing.expect(!positionInsideRange(.{ .line = 3, .character = 0 }, range));
+    try std.testing.expect(!positionInsideRange(.{ .line = 3, .character = 2 }, range));
+    try std.testing.expect(!positionInsideRange(.{ .line = 3, .character = 4 }, range));
+    try std.testing.expect(!positionInsideRange(.{ .line = 3, .character = 6 }, range));
+}
+
+/// More efficient conversion functions that operate on multiple elements.
+pub const multiple = struct {
+    /// a mapping from a source index to a line character pair
+    pub const IndexToPositionMapping = struct {
+        output: *Position,
+        source_index: usize,
+
+        fn lessThan(_: void, lhs: IndexToPositionMapping, rhs: IndexToPositionMapping) bool {
+            return lhs.source_index < rhs.source_index;
+        }
+    };
+
+    pub fn indexToPositionWithMappings(
+        text: []const u8,
+        mappings: []IndexToPositionMapping,
+        encoding: Encoding,
+    ) void {
+        std.mem.sort(IndexToPositionMapping, mappings, {}, IndexToPositionMapping.lessThan);
+
+        var last_index: usize = 0;
+        var last_position: Position = .{ .line = 0, .character = 0 };
+        for (mappings) |mapping| {
+            const index = mapping.source_index;
+            const position = advancePosition(text, last_position, last_index, index, encoding);
+            defer last_index = index;
+            defer last_position = position;
+
+            mapping.output.* = position;
+        }
+    }
+
+    pub fn indexToPosition(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        source_indices: []const usize,
+        result_positions: []Position,
+        encoding: Encoding,
+    ) error{OutOfMemory}!void {
+        std.debug.assert(source_indices.len == result_positions.len);
+
+        // one mapping for every start and end position
+        const mappings = try allocator.alloc(IndexToPositionMapping, source_indices.len);
+        defer allocator.free(mappings);
+
+        for (mappings, source_indices, result_positions) |*mapping, index, *position| {
+            mapping.* = .{ .output = position, .source_index = index };
+        }
+
+        indexToPositionWithMappings(text, mappings, encoding);
+    }
+
+    test "indexToPosition" {
+        const text =
+            \\hello
+            \\world
+        ;
+
+        const source_indices: []const usize = &.{ 3, 9, 6, 0 };
+        var result_positions: [4]Position = undefined;
+        try multiple.indexToPosition(std.testing.allocator, text, source_indices, &result_positions, .@"utf-16");
+
+        try std.testing.expectEqualSlices(Position, &.{
+            .{ .line = 0, .character = 3 },
+            .{ .line = 1, .character = 3 },
+            .{ .line = 1, .character = 0 },
+            .{ .line = 0, .character = 0 },
+        }, &result_positions);
+    }
+
+    pub fn locToRange(
+        allocator: std.mem.Allocator,
+        text: []const u8,
+        locs: []const Loc,
+        ranges: []Range,
+        encoding: Encoding,
+    ) error{OutOfMemory}!void {
+        std.debug.assert(locs.len == ranges.len);
+
+        // one mapping for every start and end position
+        var mappings = try allocator.alloc(IndexToPositionMapping, locs.len * 2);
+        defer allocator.free(mappings);
+
+        for (locs, ranges, 0..) |loc, *range, i| {
+            mappings[2 * i + 0] = .{ .output = &range.start, .source_index = loc.start };
+            mappings[2 * i + 1] = .{ .output = &range.end, .source_index = loc.end };
+        }
+
+        indexToPositionWithMappings(text, mappings, encoding);
+    }
+
+    test "locToRange" {
+        const text =
+            \\hello
+            \\world
+        ;
+
+        const locs: []const Loc = &.{
+            .{ .start = 3, .end = 9 },
+            .{ .start = 6, .end = 0 },
+        };
+        var result_ranges: [2]Range = undefined;
+        try multiple.locToRange(std.testing.allocator, text, locs, &result_ranges, .@"utf-16");
+
+        try std.testing.expectEqualSlices(Range, &.{
+            .{ .start = .{ .line = 0, .character = 3 }, .end = .{ .line = 1, .character = 3 } },
+            .{ .start = .{ .line = 1, .character = 0 }, .end = .{ .line = 0, .character = 0 } },
+        }, &result_ranges);
+    }
+};
+
+comptime {
+    std.testing.refAllDecls(multiple);
+}
