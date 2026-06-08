@@ -9011,7 +9011,7 @@ pub const Checker = struct {
     fn inferThis(self: *Checker, node: NodeIndex) TypeId {
         const parents = self.semantic.parent_indices;
         const nidx = node.toInt();
-        if (nidx >= parents.len) return tymod.ID_UNKNOWN;
+        if (nidx >= parents.len) return tymod.ID_ANY;
         var p = parents[nidx];
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         while (p != NONE) : (p = parents[p]) {
@@ -9039,7 +9039,7 @@ pub const Checker = struct {
                         if (qtag == .class_body) continue;
                         // Other intermediate nodes (computed key wrappers?) — keep walking.
                     }
-                    return tymod.ID_UNKNOWN;
+                    return tymod.ID_ANY;
                 },
                 // Hit a function context that owns its own `this` binding —
                 // `this` here doesn't belong to an enclosing class. A `this: T`
@@ -9054,7 +9054,7 @@ pub const Checker = struct {
                 else => {},
             }
         }
-        return tymod.ID_UNKNOWN;
+        return tymod.ID_ANY;
     }
 
     fn inferAwait(self: *Checker, node: NodeIndex) TypeId {
