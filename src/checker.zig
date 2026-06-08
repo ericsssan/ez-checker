@@ -929,13 +929,19 @@ pub const Checker = struct {
             },
             .getter_def => {
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
-                if (md.return_type == .none) return null;
-                // Use annotation return type for getter key — only simple types to avoid wrong answers.
-                if (self.ast_ref.nodeTag(md.return_type) == .ts_type_annotation) {
-                    const ty_node = self.ast_ref.nodeData(md.return_type).lhs;
-                    return self.resolveSimpleTypeNodeSafe(ty_node);
+                const fn_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, false, false);
+                const ft = self.store.get(fn_ty);
+                if (ft.kind == .function_t) {
+                    const sigs = self.store.signaturesOf(ft.signatures);
+                    if (sigs.len > 0) return sigs[0].return_type;
                 }
-                return null;
+                return tymod.ID_ANY;
+            },
+            .method_def, .computed_method_def => {
+                const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
+                const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
+                const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
+                return self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator);
             },
             else => return null,
         }
@@ -2137,6 +2143,63 @@ pub const Checker = struct {
                     }
                 }
                 return self.functionTypeFromFnDecl(parent);
+            },
+            // Class member keys: return the member's type so that
+            // `typeOf(method_key_ident)` resolves correctly via the symbol path.
+            .method_def, .computed_method_def => {
+                const pdata = self.ast_ref.nodeData(parent);
+                if (pdata.lhs != binding) return tymod.ID_ANY;
+                const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
+                const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
+                const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
+                return self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator);
+            },
+            .getter_def => {
+                const pdata = self.ast_ref.nodeData(parent);
+                if (pdata.lhs != binding) return tymod.ID_ANY;
+                const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
+                const fn_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, false, false);
+                const ft = self.store.get(fn_ty);
+                if (ft.kind == .function_t) {
+                    const sigs = self.store.signaturesOf(ft.signatures);
+                    if (sigs.len > 0) return sigs[0].return_type;
+                }
+                return tymod.ID_ANY;
+            },
+            .setter_def => {
+                const pdata = self.ast_ref.nodeData(parent);
+                if (pdata.lhs != binding) return tymod.ID_ANY;
+                const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
+                const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+                if (md.params_start < md.params_end and md.params_end <= ext_len) {
+                    const param: NodeIndex = @enumFromInt(self.ast_ref.extra_data[md.params_start]);
+                    const pty = self.paramDeclaredType(param);
+                    if (!pty.eq(tymod.ID_UNKNOWN)) return pty;
+                }
+                return tymod.ID_ANY;
+            },
+            .property_def => {
+                const pdata = self.ast_ref.nodeData(parent);
+                if (pdata.lhs != binding) return tymod.ID_ANY;
+                const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(pdata.rhs));
+                if (pd.type_annotation != .none and
+                    self.ast_ref.nodeTag(pd.type_annotation) == .ts_type_annotation)
+                {
+                    const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
+                    return self.resolveTypeNode(ty_node);
+                }
+                if (pd.value != .none) {
+                    const raw = self.typeOf(pd.value);
+                    const t = self.store.get(raw);
+                    return switch (t.kind) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        .bigint_literal => tymod.ID_BIGINT,
+                        else => raw,
+                    };
+                }
+                return tymod.ID_ANY;
             },
             // The class binding's *declared* type stays unknown here; the
             // static side is resolved position-sensitively in inferIdentifier
@@ -7053,7 +7116,7 @@ pub const Checker = struct {
                     md.params_start,
                     md.params_end,
                     md.return_type,
-                    .none,
+                    md.body,
                     is_async,
                     is_generator,
                 );
