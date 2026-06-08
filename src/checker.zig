@@ -5829,6 +5829,50 @@ pub const Checker = struct {
                     } else {
                         if (self.substituteAliasArgs(decl, ty_node, resolved)) |inst| result = inst;
                     }
+                    // For a generic alias instantiation like `Lazy<string>`, tag
+                    // the expanded result with the FULL alias string (e.g.
+                    // "Lazy<string>") rather than just the bare name. This keeps the
+                    // expanded type internally (so member access still works) while
+                    // making typeToString emit "Lazy<string>" matching tsc.
+                    // Guard: only when the expanded result is "structurally rich"
+                    // (union with complex members, intersection, object, function, or
+                    // type_ref). TypeScript resolves through simple aliases like
+                    // `type Id<T> = T` or `type Strange<T> = string`, so we skip the
+                    // full alias string for those and let tagAliasName use bare "name".
+                    var use_args_buf: [8]TypeId = undefined;
+                    const use_args = self.collectTypeArgsParamAware(ty_node, &use_args_buf);
+                    if (use_args.len > 0) {
+                        const rt = self.store.get(result);
+                        const is_complex_result: bool = switch (rt.kind) {
+                            .intersection_t, .object_t, .function_t, .type_ref => true,
+                            .union_t => for (self.store.idsOf(rt.list_data)) |m| {
+                                const mk = self.store.get(m).kind;
+                                switch (mk) {
+                                    .type_ref, .object_t, .function_t, .intersection_t,
+                                    .array_t, .readonly_array_t, .tuple_t, .type_param => break true,
+                                    else => {},
+                                }
+                            } else false,
+                            else => false,
+                        };
+                        if (is_complex_result) {
+                            // Build "Lazy<string>" as the alias name so serialization
+                            // outputs the full generic form without changing internal type.
+                            var alias_buf: std.ArrayList(u8) = .empty;
+                            defer alias_buf.deinit(self.gpa);
+                            alias_buf.appendSlice(self.gpa, name) catch {};
+                            alias_buf.append(self.gpa, '<') catch {};
+                            for (use_args, 0..) |a, ai| {
+                                if (ai > 0) alias_buf.appendSlice(self.gpa, ", ") catch {};
+                                if (self.typeToString(a)) |arg_str| {
+                                    alias_buf.appendSlice(self.gpa, arg_str) catch {};
+                                } else |_| {}
+                            }
+                            alias_buf.append(self.gpa, '>') catch {};
+                            const alias_str = alias_buf.toOwnedSlice(self.gpa) catch name;
+                            return self.tagAliasName(result, alias_str);
+                        }
+                    }
                     return self.tagAliasName(result, name);
                 }
             }
