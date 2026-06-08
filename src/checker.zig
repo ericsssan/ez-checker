@@ -8362,11 +8362,11 @@ pub const Checker = struct {
                 const mk = self.store.get(m).kind;
                 if (mk == .null_t or mk == .undefined_t or mk == .void_t) continue;
                 const t = self.memberOnApparentType(m, prop_name, obj_node);
-                if (tymod.isUnknown(&self.store, t)) return tymod.ID_UNKNOWN;
+                if (tymod.isUnknown(&self.store, t)) return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
                 buf[n] = t;
                 n += 1;
             }
-            if (n == 0) return tymod.ID_UNKNOWN;
+            if (n == 0) return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
             if (n == 1) return buf[0];
             return self.store.unionOf(buf[0..n]) catch tymod.ID_UNKNOWN;
         }
@@ -8375,7 +8375,7 @@ pub const Checker = struct {
                 const t = self.memberOnApparentType(m, prop_name, obj_node);
                 if (!tymod.isUnknown(&self.store, t)) return t;
             }
-            return tymod.ID_UNKNOWN;
+            return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
         }
         // Array.prototype.
         if (obj.kind == .array_t or obj.kind == .readonly_array_t or obj.kind == .tuple_t) {
@@ -8399,7 +8399,7 @@ pub const Checker = struct {
                     return self.memberOnApparentType(c, prop_name, obj_node);
                 }
             }
-            return tymod.ID_UNKNOWN;
+            return tymod.ID_ANY;
         }
         if (obj.kind == .object_t) {
             for (self.store.propsOf(obj.object_props)) |p| {
