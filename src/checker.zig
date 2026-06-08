@@ -8492,7 +8492,7 @@ pub const Checker = struct {
             }
             if (n == 0) return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
             if (n == 1) return buf[0];
-            return self.store.unionOf(buf[0..n]) catch tymod.ID_UNKNOWN;
+            return self.store.unionOf(buf[0..n]) catch if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
         }
         if (obj.kind == .intersection_t) {
             for (self.store.idsOf(obj.list_data)) |m| {
