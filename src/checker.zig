@@ -425,7 +425,7 @@ pub const Checker = struct {
                 );
             },
             .class_expr => tymod.ID_UNKNOWN,
-            else => tymod.ID_UNKNOWN,
+            else => tymod.ID_ANY,
         };
     }
 
@@ -1624,13 +1624,81 @@ pub const Checker = struct {
                         const gtag = self.ast_ref.nodeTag(@enumFromInt(gidx));
                         break :blk gtag == .let_decl or gtag == .var_decl;
                     };
-                    if (is_mutable) return switch (t.kind) {
-                        .string_literal => tymod.ID_STRING,
-                        .number_literal => tymod.ID_NUMBER,
-                        .bigint_literal => tymod.ID_BIGINT,
-                        else => raw,
+                    const is_as_const = blk: {
+                        if (!is_mutable) break :blk false;
+                        const init_tag = self.ast_ref.nodeTag(data.rhs);
+                        if (init_tag != .ts_as_expr) break :blk false;
+                        const init_data = self.ast_ref.nodeData(data.rhs);
+                        if (init_data.rhs == .none) break :blk false;
+                        if (self.ast_ref.nodeTag(init_data.rhs) != .ts_type_reference) break :blk false;
+                        const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(init_data.rhs));
+                        break :blk std.mem.eql(u8, name, "const");
                     };
+                    if (is_mutable and !is_as_const) {
+                        // Handle primitive literals
+                        const widened_prim = switch (t.kind) {
+                            .string_literal => tymod.ID_STRING,
+                            .number_literal => tymod.ID_NUMBER,
+                            .bigint_literal => tymod.ID_BIGINT,
+                            else => raw,
+                        };
+                        if (widened_prim != raw) return widened_prim;
+
+                        // Handle object literals with literal properties
+                        if (t.kind == .object_t) {
+                            const props = self.store.propsOf(t.object_props);
+                            var has_literals = false;
+                            for (props) |p| {
+                                const pt = self.store.get(p.type_id);
+                                if (pt.kind == .string_literal or pt.kind == .number_literal or pt.kind == .boolean_literal) {
+                                    has_literals = true;
+                                    break;
+                                }
+                            }
+                            if (has_literals) {
+                                var buf: [16]tymod.ObjectProp = undefined;
+                                var n: usize = 0;
+                                for (props) |p| {
+                                    if (n >= buf.len) break;
+                                    const pt = self.store.get(p.type_id);
+                                    const widened_prop_ty = switch (pt.kind) {
+                                        .string_literal => tymod.ID_STRING,
+                                        .number_literal => tymod.ID_NUMBER,
+                                        .boolean_literal => tymod.ID_BOOLEAN,
+                                        else => p.type_id,
+                                    };
+                                    buf[n] = p;
+                                    buf[n].type_id = widened_prop_ty;
+                                    n += 1;
+                                }
+                                return self.store.objectOf(buf[0..n]) catch raw;
+                            }
+                        }
+                        return raw;
+                    }
                     return raw;
+                }
+                return tymod.ID_UNKNOWN;
+            },
+            .assignment_pattern => {
+                // Function parameter with default value: `a: T = default_value`.
+                // Type annotation is on the identifier (lhs), not the default value (rhs).
+                // Return the annotation type if present; otherwise unknown (don't infer from default).
+                const data = self.ast_ref.nodeData(parent);
+                if (data.lhs != .none) {
+                    const id_data = self.ast_ref.nodeData(data.lhs);
+                    if (id_data.rhs != .none and self.ast_ref.nodeTag(id_data.rhs) == .ts_type_annotation) {
+                        const ty_node = self.ast_ref.nodeData(id_data.rhs).lhs;
+                        var ty = self.resolveTypeNode(ty_node);
+                        // Optional parameter (`x?: T`) — parser marks the identifier
+                        // by setting lhs to `.root`.  Union the annotation type
+                        // with `undefined` to match TS's behavior.
+                        if (id_data.lhs == .root) {
+                            const ids = [_]TypeId{ ty, tymod.ID_UNDEFINED };
+                            ty = self.store.unionOf(&ids) catch ty;
+                        }
+                        return ty;
+                    }
                 }
                 return tymod.ID_UNKNOWN;
             },
