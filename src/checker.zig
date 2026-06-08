@@ -649,11 +649,11 @@ pub const Checker = struct {
         const name = self.ast_ref.tokenText(tok);
         if (name.len == 0) return tymod.ID_UNKNOWN;
         if (self.typeOfNameByAstSearch(name)) |t| return t;
-        // Enum value access: `Foo.member` — synthesize an object_t with
-        // each member as a literal-typed prop.
+        // When an enum identifier appears, it should be typed as the union of its members
+        // (the type-side), not the object type (which is for member access like `Foo.Bar`).
         if (self.enum_kinds.get(name) != null) {
-            if (self.buildEnumObjectType(name)) |t| return t;
-            // buildEnumObjectType returns null for enums with reserved word members,
+            if (self.buildEnumUnionType(name)) |t| return t;
+            // buildEnumUnionType returns null for enums with reserved word members or no members,
             // which should be typed as any to match TypeScript's strict mode behavior.
             return tymod.ID_ANY;
         }
@@ -1718,6 +1718,18 @@ pub const Checker = struct {
                         return ty;
                     }
                 }
+                // No annotation: for simple literal defaults, return the base type.
+                // Only apply this for simple identifiers (not destructuring patterns).
+                if (data.lhs != .none and self.ast_ref.nodeTag(data.lhs) == .identifier and data.rhs != .none) {
+                    const rhs_tag = self.ast_ref.nodeTag(data.rhs);
+                    return switch (rhs_tag) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .bigint_literal => tymod.ID_BIGINT,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        else => tymod.ID_UNKNOWN,
+                    };
+                }
                 return tymod.ID_UNKNOWN;
             },
             .rest_element => {
@@ -1741,6 +1753,21 @@ pub const Checker = struct {
                 const pdata = self.ast_ref.nodeData(parent);
                 if (pdata.lhs != .none) {
                     const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(pdata.lhs));
+                    // Check if the binding is actually a parameter of this function.
+                    // If so, return ID_ANY for an unannotated parameter rather than the function's type.
+                    if (fd.params <= fd.params_end and fd.params_end <= self.ast_ref.extra_data.len) {
+                        const params = self.ast_ref.extra_data[fd.params..fd.params_end];
+                        for (params) |raw| {
+                            if (raw == binding.toInt()) {
+                                // The binding is a parameter of this function.
+                                // Unannotated parameters should be any, not the function type.
+                                // But if the binding is a parameter wrapper (assignment_pattern, rest_element, etc.),
+                                // those cases should have been handled by their respective switch arms.
+                                // This case handles simple parameter identifiers with no annotation.
+                                return tymod.ID_ANY;
+                            }
+                        }
+                    }
                     if (fd.name != .none) {
                         // An overloaded function's type is its overload signatures —
                         // exposed on EVERY declaration including the implementation
@@ -6801,6 +6828,8 @@ pub const Checker = struct {
         // `Promise.resolve<T>(...)` → `Promise<T>` (uses the explicit type arg) so
         // no-unsafe-return's Promise<any> detection fires.
         if (self.promiseResolveReturn(callee)) |ty| return ty;
+        // `super()` calls the superclass constructor, which returns void.
+        if (self.ast_ref.nodeTag(callee) == .super_expr) return tymod.ID_VOID;
         if (self.ast_ref.nodeTag(node) == .new_expr or
             self.calleeIsConstructible(callee))
         {
