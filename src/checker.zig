@@ -8880,10 +8880,13 @@ pub const Checker = struct {
                     // PropertyAssignment in TS — `unbound-method` reports
                     // it with messageId "unboundWithoutThisAnnotation",
                     // NOT "unbound" (which is reserved for class fields).
+                    // TypeScript displays `{ k: function(){} }` as property
+                    // style `{ k: () => T }`, not method shorthand `{ k(): T }`.
+                    _ = is_fn;
                     buf[n] = .{
                         .name = key_name,
                         .type_id = widened_ty,
-                        .is_method = is_fn,
+                        .is_method = false,
                         .is_fn_property = false,
                     };
                     n += 1;
