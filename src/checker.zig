@@ -729,11 +729,11 @@ pub const Checker = struct {
         // a TypedArray, …) → Unknown (FP-safe), NOT the error type. A name that
         // is neither in scope nor a known global is genuinely undeclared, which
         // TS types as the *error* type — the type-aware rules flag using it.
-        if (isKnownGlobalValue(name)) return tymod.ID_UNKNOWN;
+        if (isKnownGlobalValue(name)) return tymod.ID_ANY;
         // …unless it's in a type position (`implements FG.A`, `x: Foo`) — a
         // type/namespace reference, not a value, so don't read it as an unsafe
         // value (no-unsafe-member-access excludes heritage member expressions).
-        if (self.identifierInTypePosition(node)) return tymod.ID_UNKNOWN;
+        if (self.identifierInTypePosition(node)) return tymod.ID_ANY;
         // TypeScript keywords/reserved words that appear in invalid positions
         // (e.g., `static public;` or used as a variable name) should be typed as
         // `any` not `error`, since they're syntactically present keywords in
@@ -1636,7 +1636,7 @@ pub const Checker = struct {
     /// the ts_type_annotation node in identifier.data.rhs), or by walking
     /// up to the declarator and falling back to the initializer.
     pub fn declaredTypeAtBinding(self: *Checker, binding: NodeIndex) TypeId {
-        if (binding == .none) return tymod.ID_UNKNOWN;
+        if (binding == .none) return tymod.ID_ANY;
         // Enum binding: the symbol's decl node is the ts_enum_decl itself
         // (the parser declares the enum name so forward references resolve).
         // Type its value side as the enum object shape — each member a
@@ -1889,7 +1889,7 @@ pub const Checker = struct {
             // static side is resolved position-sensitively in inferIdentifier
             // (value references only — heritage/type positions want the
             // instance type, which shares this same cached symbol type).
-            .class_decl => return tymod.ID_UNKNOWN,
+            .class_decl => return tymod.ID_ANY,
             // Function/method/getter/setter parameter, class field, etc.
             // We don't resolve these structurally yet — return unknown
             // rather than any so unsafe-* rules don't spuriously fire.
@@ -1908,7 +1908,7 @@ pub const Checker = struct {
                 // `p.then(onF, e => …)` (arg 1) — `e` is the rejection reason,
                 // contextually `any` (lib.es5 onrejected is `(reason: any)`).
                 if (self.contextualPromiseRejectionParamType(binding)) |t| return t;
-                return tymod.ID_UNKNOWN;
+                return tymod.ID_ANY;
             },
         }
     }
@@ -6586,7 +6586,7 @@ pub const Checker = struct {
 
     fn resolveUnion(self: *Checker, ty_node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(ty_node);
-        const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
+        const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_ANY;
         var buf: [16]TypeId = undefined;
         const n = @min(slice.len, buf.len);
         var i: usize = 0;
@@ -6594,7 +6594,7 @@ pub const Checker = struct {
             const m: NodeIndex = @enumFromInt(slice[i]);
             buf[i] = self.resolveTypeNode(m);
         }
-        return self.store.unionOf(buf[0..n]) catch tymod.ID_UNKNOWN;
+        return self.store.unionOf(buf[0..n]) catch tymod.ID_ANY;
     }
 
     fn resolveTupleType(self: *Checker, ty_node: NodeIndex) TypeId {
