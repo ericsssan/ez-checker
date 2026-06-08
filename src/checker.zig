@@ -10162,7 +10162,11 @@ pub const Checker = struct {
             .array_t => {
                 const ids = self.store.idsOf(t.list_data);
                 if (ids.len > 0) {
+                    const elem = self.store.get(ids[0]);
+                    const needs_parens = elem.kind == .union_t or elem.kind == .intersection_t or elem.kind == .function_t;
+                    if (needs_parens) try buf.appendSlice(gpa, "(");
                     try self.typeToStringInner(ids[0], buf, depth + 1);
+                    if (needs_parens) try buf.appendSlice(gpa, ")");
                 } else {
                     try buf.appendSlice(gpa, "unknown");
                 }
@@ -10172,7 +10176,11 @@ pub const Checker = struct {
                 try buf.appendSlice(gpa, "readonly ");
                 const ids = self.store.idsOf(t.list_data);
                 if (ids.len > 0) {
+                    const elem = self.store.get(ids[0]);
+                    const needs_parens = elem.kind == .union_t or elem.kind == .intersection_t or elem.kind == .function_t;
+                    if (needs_parens) try buf.appendSlice(gpa, "(");
                     try self.typeToStringInner(ids[0], buf, depth + 1);
+                    if (needs_parens) try buf.appendSlice(gpa, ")");
                 } else {
                     try buf.appendSlice(gpa, "unknown");
                 }
