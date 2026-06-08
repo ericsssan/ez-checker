@@ -8169,7 +8169,8 @@ pub const Checker = struct {
     /// the element type; for objects with a static string key, returns
     /// that property's type; otherwise unknown.
     fn inferComputedMember(self: *Checker, obj_ty: TypeId, key_node: NodeIndex, obj_node: NodeIndex) TypeId {
-        if (key_node == .none) return tymod.ID_UNKNOWN;
+        const input_was_unknown = obj_ty.eq(tymod.ID_UNKNOWN) or obj_ty.eq(tymod.ID_ERROR);
+        if (key_node == .none) return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
         const obj = self.store.get(obj_ty);
         // Array element access — index by number → element type.
         // For tuples, a numeric literal selects a specific element;
@@ -8317,6 +8318,8 @@ pub const Checker = struct {
                 const args = self.store.idsOf(obj.list_data);
                 if (args.len > 1) return args[1];
             }
+            // Unresolved/unmodeled type_ref: computed access yields any.
+            return tymod.ID_ANY;
         }
         // Union/intersection: walk members, take first concrete result.
         if (obj.kind == .union_t or obj.kind == .intersection_t) {
@@ -8325,7 +8328,7 @@ pub const Checker = struct {
                 if (!tymod.isUnknown(&self.store, t)) return t;
             }
         }
-        return tymod.ID_UNKNOWN;
+        return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
     }
 
     /// Look up `prop_name` on the apparent type of `obj_ty`.  Handles:
