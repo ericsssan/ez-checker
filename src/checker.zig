@@ -2281,11 +2281,18 @@ pub const Checker = struct {
                 }
                 return tymod.ID_ANY;
             },
-            // The class binding's *declared* type stays unknown here; the
-            // static side is resolved position-sensitively in inferIdentifier
-            // (value references only — heritage/type positions want the
-            // instance type, which shares this same cached symbol type).
-            .class_decl => return tymod.ID_ANY,
+            // The class/interface/type-alias name identifier's declared type
+            // IS the named type itself.  Return a type_ref so that
+            // `typeOf(C_decl_node)` serializes as "C" (matching the TypeScript
+            // baseline format) instead of falling through to any.
+            // NOTE: this also makes all identifier REFERENCES to class C return
+            // type_ref("C") via the sym_types cache in declaredTypeForSymbol.
+            .class_decl, .ts_interface_decl, .ts_type_alias_decl => {
+                const tok = self.ast_ref.nodeMainToken(binding);
+                const name = self.ast_ref.tokenText(tok);
+                if (name.len > 0) return self.store.typeRef(name, &.{}) catch tymod.ID_ANY;
+                return tymod.ID_ANY;
+            },
             // Function/method/getter/setter parameter, class field, etc.
             // We don't resolve these structurally yet — return unknown
             // rather than any so unsafe-* rules don't spuriously fire.
@@ -8816,6 +8823,9 @@ pub const Checker = struct {
         // `const k = 'fn'; obj[k]`).  Resolve the key node's value type and,
         // when it's a single string-literal, look the property up by name.
         if (obj.kind == .object_t and self.ast_ref.nodeTag(key_node) != .string_literal) {
+            // Snapshot object_props BEFORE typeOf — that call may grow types.items,
+            // making the `obj` pointer stale.
+            const snap_props = obj.object_props;
             const key_ty = self.typeOf(key_node);
             const kt = self.store.get(key_ty);
             if (kt.kind == .string_literal) {
@@ -8824,39 +8834,42 @@ pub const Checker = struct {
                     else => "",
                 };
                 if (name.len > 0) {
-                    for (self.store.propsOf(obj.object_props)) |p| {
+                    for (self.store.propsOf(snap_props)) |p| {
                         if (std.mem.eql(u8, p.name, name)) return p.type_id;
                     }
                 }
             }
         }
+        // Re-read obj after potential type additions from typeOf above.
+        const obj2 = self.store.get(obj_ty);
         // Index signature `{[k: T]: V}` — match ANY key against the "[]"
         // sentinel prop stashed by `resolveTypeLiteral`.
-        if (obj.kind == .object_t) {
-            for (self.store.propsOf(obj.object_props)) |p| {
+        if (obj2.kind == .object_t) {
+            for (self.store.propsOf(obj2.object_props)) |p| {
                 if (std.mem.eql(u8, p.name, "[]")) return p.type_id;
             }
         }
         // Type reference (Promise / Array / etc.): resolve to the
         // underlying structural shape, then retry.
-        if (obj.kind == .type_ref) {
-            if (self.resolveDeclaredType(obj.name)) |resolved| {
+        if (obj2.kind == .type_ref) {
+            const ref_name2 = obj2.name;  // snapshot before resolveDeclaredType may grow store
+            if (self.resolveDeclaredType(ref_name2)) |resolved| {
                 if (!resolved.eq(obj_ty)) {
                     return self.inferComputedMember(resolved, key_node, obj_node);
                 }
             }
             // `ArrayLike<T>` / `Array<T>` / `ReadonlyArray<T>`: numeric
             // index returns the type argument.
-            if (std.mem.eql(u8, obj.name, "ArrayLike") or
-                std.mem.eql(u8, obj.name, "Array") or
-                std.mem.eql(u8, obj.name, "ReadonlyArray"))
+            if (std.mem.eql(u8, ref_name2, "ArrayLike") or
+                std.mem.eql(u8, ref_name2, "Array") or
+                std.mem.eql(u8, ref_name2, "ReadonlyArray"))
             {
-                const args = self.store.idsOf(obj.list_data);
+                const args = self.store.idsOf(obj2.list_data);
                 if (args.len > 0) return args[0];
             }
             // Record<K, V>: any key access returns V (the value type, arg[1]).
-            if (std.mem.eql(u8, obj.name, "Record")) {
-                const args = self.store.idsOf(obj.list_data);
+            if (std.mem.eql(u8, ref_name2, "Record")) {
+                const args = self.store.idsOf(obj2.list_data);
                 if (args.len > 1) return args[1];
             }
             // Unresolved/unmodeled type_ref: computed access yields any.
@@ -8928,16 +8941,19 @@ pub const Checker = struct {
         }
         // Lib type_ref methods.
         if (obj.kind == .type_ref) {
+            // Snapshot name before any type-adding calls — libTypeRefProperty/resolveDeclaredType
+            // may grow types.items, invalidating the `obj` pointer obtained from store.get().
+            const ref_name = obj.name;
             if (self.libTypeRefProperty(obj_ty, prop_name)) |ty| return ty;
             // User-declared types — resolve via the declared cache.
-            if (self.resolveDeclaredType(obj.name)) |resolved| {
+            if (self.resolveDeclaredType(ref_name)) |resolved| {
                 if (!resolved.eq(obj_ty)) {
                     const t = self.memberOnApparentType(resolved, prop_name, obj_node);
                     if (!tymod.isUnknown(&self.store, t)) return t;
                 }
             }
             // Type parameter: chase constraint (apparent type).
-            const constraint = self.typeParameterConstraintFromName(obj.name, obj_node);
+            const constraint = self.typeParameterConstraintFromName(ref_name, obj_node);
             if (constraint) |c| {
                 if (!c.eq(obj_ty)) {
                     return self.memberOnApparentType(c, prop_name, obj_node);
