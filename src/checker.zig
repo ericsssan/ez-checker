@@ -7463,10 +7463,20 @@ pub const Checker = struct {
                     // any-wins: if any inference candidate for this type
                     // parameter is `any`, the inferred type is `any` (TS
                     // semantics).  Otherwise first-write-wins.
-                    if (tymod.isAny(&self.store, arg_ty)) {
+                    // Widen literals during generic type inference: `foo(1)`
+                    // where `foo<T>(x: T)` infers T=number, not T=1.
+                    const at = self.store.get(arg_ty);
+                    const widened_arg = switch (at.kind) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        .bigint_literal => tymod.ID_BIGINT,
+                        else => arg_ty,
+                    };
+                    if (tymod.isAny(&self.store, widened_arg)) {
                         bindings[i] = tymod.ID_ANY;
                     } else if (bindings[i].eq(TypeId.none)) {
-                        bindings[i] = arg_ty;
+                        bindings[i] = widened_arg;
                     }
                     return;
                 }
