@@ -8750,8 +8750,9 @@ pub const Checker = struct {
             };
             return self.store.arrayOf(elem_t) catch tymod.ID_ANY;
         }
-        // Heterogeneous: widen any literal elements to their base types.
-        // TypeScript widens `[1, "a", true]` to `[number, string, boolean]`.
+        // Widen any literal elements to their base types, then check for
+        // homogeneity. TypeScript widens `[1, "a", true]` to `[number, string, boolean]`
+        // and widens `[f, f, f]` (identical elements) to `T[]`.
         var widened_elems_buf: [32]TypeId = undefined;
         var any_widened = false;
         for (0..n_used) |j| {
@@ -8764,6 +8765,18 @@ pub const Checker = struct {
                 else => buf[j],
             };
             widened_elems_buf[j] = w;
+        }
+        // If all (post-widening) elements are the same type, return T[].
+        // Covers [C, C, C] → (typeof C)[], [f, g] when f≡g → (() => T)[].
+        if (!has_spread) {
+            var all_same_id = true;
+            for (1..n_used) |j| {
+                if (!widened_elems_buf[j].eq(widened_elems_buf[0])) {
+                    all_same_id = false;
+                    break;
+                }
+            }
+            if (all_same_id) return self.store.arrayOf(widened_elems_buf[0]) catch tymod.ID_ANY;
         }
         if (any_widened and !has_spread) {
             const list = self.store.appendTypeIds(widened_elems_buf[0..n_used]) catch
