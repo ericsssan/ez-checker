@@ -6046,6 +6046,28 @@ pub const Checker = struct {
     /// type-aware family we care about.
     fn resolveLibType(self: *Checker, ty_node: NodeIndex, name: []const u8) ?TypeId {
         var args_buf: [4]TypeId = undefined;
+        // For structural utility types whose output is always object/generic
+        // (never a primitive), use param-aware arg collection. When any arg
+        // is an in-scope type parameter we return a generic typeRef (e.g.
+        // `Readonly<P>`) rather than expanding structurally, matching tsc.
+        // Excluded: Exclude/Extract/NonNullable/ReturnType/Parameters which
+        // can produce primitive types and must stay structural.
+        const is_structural_util = for ([_][]const u8{
+            "Readonly", "Partial", "Required", "Pick", "Omit",
+            "Promise", "Set", "ReadonlySet", "Map", "ReadonlyMap",
+            "Record", "Awaited",
+        }) |n| {
+            if (std.mem.eql(u8, name, n)) break true;
+        } else false;
+        if (is_structural_util) {
+            const param_args = self.collectTypeArgsParamAware(ty_node, &args_buf);
+            const has_type_param_arg = for (param_args) |a| {
+                if (self.store.get(a).kind == .type_param) break true;
+            } else false;
+            if (has_type_param_arg) {
+                return self.store.typeRef(name, param_args) catch null;
+            }
+        }
         const args = self.collectTypeArgs(ty_node, &args_buf);
         if (std.mem.eql(u8, name, "Promise")) {
             const t = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
@@ -7450,6 +7472,21 @@ pub const Checker = struct {
         while (i < n) : (i += 1) {
             const arg_node: NodeIndex = @enumFromInt(slice[i]);
             buf[i] = self.resolveTypeNode(arg_node);
+        }
+        return buf[0..n];
+    }
+
+    /// Like collectTypeArgs but preserves in-scope type parameters as
+    /// type_param TypeIds instead of widening them to their constraints.
+    fn collectTypeArgsParamAware(self: *Checker, ref_node: NodeIndex, buf: []TypeId) []TypeId {
+        const data = self.ast_ref.nodeData(ref_node);
+        const range = self.safeSubRange(data.rhs) orelse return buf[0..0];
+        const slice = self.ast_ref.extra_data[range.start..range.end];
+        const n = @min(slice.len, buf.len);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const arg_node: NodeIndex = @enumFromInt(slice[i]);
+            buf[i] = self.resolveTypeNodeParamAware(arg_node);
         }
         return buf[0..n];
     }
