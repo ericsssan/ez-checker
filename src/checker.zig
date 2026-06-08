@@ -8654,14 +8654,17 @@ pub const Checker = struct {
             return self.store.arrayOf(elem) catch tymod.ID_ANY;
         }
         // Element type = union of element types.
+        // For type inference, TypeScript excludes hole elements (elisions) — e.g.
+        // `[,, 2, 3, 4]` infers as `number[]`, not a tuple with undefined holes.
         var buf: [32]TypeId = undefined;
+        var n_used: usize = 0;
         const n = @min(slice.len, buf.len);
         var has_spread = false;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const elem_node: NodeIndex = @enumFromInt(slice[i]);
             if (elem_node == .none) {
-                buf[i] = tymod.ID_UNDEFINED;
+                // Hole/elision: skip for type inference (TypeScript ignores holes).
                 continue;
             }
             const elem_tag = self.ast_ref.nodeTag(elem_node);
@@ -8672,13 +8675,20 @@ pub const Checker = struct {
                 const t = self.store.get(inner);
                 if (t.kind == .array_t or t.kind == .readonly_array_t) {
                     const elems = self.store.idsOf(t.list_data);
-                    buf[i] = if (elems.len == 0) tymod.ID_ANY else elems[0];
+                    buf[n_used] = if (elems.len == 0) tymod.ID_ANY else elems[0];
                 } else {
-                    buf[i] = tymod.ID_ANY;
+                    buf[n_used] = tymod.ID_ANY;
                 }
             } else {
-                buf[i] = self.typeOf(elem_node);
+                buf[n_used] = self.typeOf(elem_node);
             }
+            n_used += 1;
+        }
+        // If ALL elements were holes, treat as empty array.
+        if (n_used == 0) {
+            const elem = self.emptyArrayElem(node);
+            if (tymod.isAny(&self.store, elem)) return tymod.ID_ANY;
+            return self.store.arrayOf(elem) catch tymod.ID_ANY;
         }
         // For homogeneous primitive-literal arrays (all string, all number, all boolean,
         // all bigint), tsc returns T[] not a tuple. Widen and return T[].
@@ -8691,7 +8701,7 @@ pub const Checker = struct {
             else => false,
         };
         if (is_primitive_literal) {
-            for (1..n) |j| {
+            for (1..n_used) |j| {
                 if (self.store.get(buf[j]).kind != first_kind) {
                     all_same_kind = false;
                     break;
@@ -8713,12 +8723,12 @@ pub const Checker = struct {
         }
         // Heterogeneous or non-literal: keep tuple for precise destructuring.
         if (!has_spread) {
-            const list = self.store.appendTypeIds(buf[0..n]) catch
-                return self.store.arrayOf(self.store.unionOf(buf[0..n]) catch tymod.ID_ANY) catch tymod.ID_ANY;
+            const list = self.store.appendTypeIds(buf[0..n_used]) catch
+                return self.store.arrayOf(self.store.unionOf(buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
             return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
         }
         var widened_buf: [32]TypeId = undefined;
-        for (0..n) |j| {
+        for (0..n_used) |j| {
             const elem_t = self.store.get(buf[j]);
             const widened = switch (elem_t.kind) {
                 .string_literal => tymod.ID_STRING,
@@ -8729,7 +8739,7 @@ pub const Checker = struct {
             };
             widened_buf[j] = widened;
         }
-        const elem_t = self.store.unionOf(widened_buf[0..n]) catch tymod.ID_ANY;
+        const elem_t = self.store.unionOf(widened_buf[0..n_used]) catch tymod.ID_ANY;
         return self.store.arrayOf(elem_t) catch tymod.ID_ANY;
     }
 
