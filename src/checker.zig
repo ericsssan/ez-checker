@@ -937,7 +937,15 @@ pub const Checker = struct {
         // Built-in global values (`console`, `Math`, `JSON`, ...) — fall
         // back to the curated lib shapes so member access / calls type
         // correctly without modelling the full lib.d.ts.
-        if (self.global_value_types.get(name)) |t| return t;
+        if (self.global_value_types.get(name)) |t| {
+            // Math and JSON appear as named types in tsc's oracle (not structural
+            // objects). Return typeRef lazily so the intern map isn't seeded during
+            // setup (which would shift the resize threshold and expose a latent bug).
+            if (std.mem.eql(u8, name, "Math") or std.mem.eql(u8, name, "JSON")) {
+                return self.store.typeRef(name, &.{}) catch t;
+            }
+            return t;
+        }
         // A known lib.d.ts global we don't model structurally (`Map`, `Reflect`,
         // a TypedArray, …) → Unknown (FP-safe), NOT the error type. A name that
         // is neither in scope nor a known global is genuinely undeclared, which
@@ -5138,6 +5146,7 @@ pub const Checker = struct {
             math_n += 1;
         }
         const math_ty = try h.objType(math_props_buf[0..math_n]);
+        try self.global_value_types.put(self.gpa, "__Math_struct", math_ty);
         try self.global_value_types.put(self.gpa, "Math", math_ty);
         try self.natively_bound_type_ids.put(self.gpa, math_ty, {});
 
@@ -5149,6 +5158,7 @@ pub const Checker = struct {
             .{ .name = "stringify", .type_id = str_fn },
         };
         const json_ty = try h.objType(&json_props);
+        try self.global_value_types.put(self.gpa, "__JSON_struct", json_ty);
         try self.global_value_types.put(self.gpa, "JSON", json_ty);
         try self.natively_bound_type_ids.put(self.gpa, json_ty, {});
 
@@ -9421,6 +9431,18 @@ pub const Checker = struct {
         if (std.mem.eql(u8, t.name, "Promise")) {
             const inner = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
             return self.promisePrototypeProperty(name, inner);
+        }
+        if (std.mem.eql(u8, t.name, "Math")) {
+            if (self.global_value_types.get("__Math_struct")) |math_struct| {
+                if (self.propertyTypeOfTypeId(math_struct, name)) |prop_ty| return prop_ty;
+            }
+            return null;
+        }
+        if (std.mem.eql(u8, t.name, "JSON")) {
+            if (self.global_value_types.get("__JSON_struct")) |json_struct| {
+                if (self.propertyTypeOfTypeId(json_struct, name)) |prop_ty| return prop_ty;
+            }
+            return null;
         }
         return null;
     }
