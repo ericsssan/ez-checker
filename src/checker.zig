@@ -355,7 +355,11 @@ pub const Checker = struct {
 
             .equal, .not_equal, .strict_equal, .strict_not_equal,
             .less_than, .greater_than, .less_equal, .greater_equal,
-            .instanceof_expr, .in_expr => tymod.ID_BOOLEAN,
+            .instanceof_expr, .in_expr => blk: {
+                const data = self.ast_ref.nodeData(node);
+                if (data.lhs == .none or data.rhs == .none) break :blk tymod.ID_ANY;
+                break :blk tymod.ID_BOOLEAN;
+            },
 
             // Fold `!<boolean literal>` to the opposite literal so that
             // `!true` → `false` and `!!true` → `true`.
@@ -912,19 +916,26 @@ pub const Checker = struct {
                     if (self.ast_ref.nodeTag(data.lhs) != .identifier) continue;
                     const dn = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
                     if (!std.mem.eql(u8, dn, name)) continue;
+                    // Use annotation if present.
+                    const ann = self.ast_ref.nodeData(data.lhs).rhs;
+                    if (ann != .none and self.ast_ref.nodeTag(ann) == .ts_type_annotation) {
+                        return self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs);
+                    }
                     if (data.rhs == .none) {
-                        // Use annotation if present.
-                        const ann = self.ast_ref.nodeData(data.lhs).rhs;
-                        if (ann != .none and self.ast_ref.nodeTag(ann) == .ts_type_annotation) {
-                            return self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs);
-                        }
                         // Explicit declaration with no annotation and no initializer
                         // (e.g., `declare var x;` or `var x;` in a function) → any.
                         // This prevents falling through to global_value_types lookups
                         // for explicitly declared names that should resolve to any.
                         return tymod.ID_ANY;
                     }
-                    return self.typeOf(data.rhs);
+                    // Declarator with initializer: use the initializer's type, but
+                    // if the initializer is unresolvable (unknown/error), return any
+                    // since the variable itself is explicitly declared.
+                    const init_ty = self.typeOf(data.rhs);
+                    if (init_ty.eq(tymod.ID_UNKNOWN) or init_ty.eq(tymod.ID_ERROR)) {
+                        return tymod.ID_ANY;
+                    }
+                    return init_ty;
                 },
                 .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
                 .ts_declare_function => {
@@ -5766,9 +5777,18 @@ pub const Checker = struct {
         }
         const decl = self.type_decl_nodes.get(name) orelse {
             // Not declared locally — try cross-file import resolution.
-            const imported = self.resolveImportedType(name) orelse return null;
-            self.declared_type_cache.put(self.gpa, name, imported) catch {};
-            return imported;
+            if (self.resolveImportedType(name)) |imported| {
+                self.declared_type_cache.put(self.gpa, name, imported) catch {};
+                return imported;
+            }
+            // Name is imported but module resolution failed → type as any
+            // (the name exists in an external module, we just can't resolve it).
+            // This distinguishes "unresolvable import" from "truly undeclared".
+            if (self.import_map.get(name) != null) {
+                self.declared_type_cache.put(self.gpa, name, tymod.ID_ANY) catch {};
+                return tymod.ID_ANY;
+            }
+            return null;
         };
         // Insert sentinel to break cycles (e.g. `interface Node { children: Node[] }`).
         // On OOM, skip the sentinel rather than returning null — a missing sentinel
