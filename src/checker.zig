@@ -6703,7 +6703,7 @@ pub const Checker = struct {
 
     fn resolveUnion(self: *Checker, ty_node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(ty_node);
-        const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_ANY;
+        const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
         var buf: [16]TypeId = undefined;
         const n = @min(slice.len, buf.len);
         var i: usize = 0;
@@ -6711,7 +6711,7 @@ pub const Checker = struct {
             const m: NodeIndex = @enumFromInt(slice[i]);
             buf[i] = self.resolveTypeNode(m);
         }
-        return self.store.unionOf(buf[0..n]) catch tymod.ID_ANY;
+        return self.store.unionOf(buf[0..n]) catch tymod.ID_UNKNOWN;
     }
 
     fn resolveTupleType(self: *Checker, ty_node: NodeIndex) TypeId {
