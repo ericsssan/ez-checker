@@ -8681,9 +8681,17 @@ pub const Checker = struct {
         if (obj.kind == .number or obj.kind == .number_literal) {
             if (self.numberPrototypeProperty(prop_name)) |ty| return ty;
         }
-        // Fallback: if input was unknown/error, return `any` (unresolved → any);
-        // otherwise unknown (property not found on known type).
-        return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
+        // Fallback: for non-primitive types where the property wasn't found,
+        // return `any` to match TypeScript's permissive behavior on missing
+        // properties (e.g., class instance members not in the model).
+        // For primitives (string/number/boolean/etc.) whose prototype was fully
+        // checked above, a missing property stays unknown.
+        return switch (obj.kind) {
+            .string, .string_literal, .number, .number_literal,
+            .boolean, .boolean_literal, .null_t, .undefined_t,
+            .void_t, .never, .bigint, .bigint_literal, .symbol => tymod.ID_UNKNOWN,
+            else => tymod.ID_ANY,
+        };
     }
 
     /// Walk to the enclosing scope and find a `ts_type_parameter`
