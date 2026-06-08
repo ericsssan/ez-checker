@@ -428,7 +428,9 @@ pub const TypeStore = struct {
     }
 
     pub inline fn get(self: *const TypeStore, id: TypeId) *const Type {
-        return &self.types.items[id.toInt()];
+        const i = id.toInt();
+        if (i >= self.types.items.len) return &self.types.items[0]; // return 'any' on corrupt id
+        return &self.types.items[i];
     }
 
     pub fn add(self: *TypeStore, ty: Type) !TypeId {

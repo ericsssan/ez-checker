@@ -322,6 +322,10 @@ pub const Checker = struct {
             // A JSX element name (`<Foo .../>`) references a value — resolve it
             // like an identifier so the facade can read the component's props.
             .jsx_identifier => self.inferIdentifier(node),
+            // Property name in a member access (obj.prop): look up the property
+            // on the receiver type.  property_ident has no symbol reference, so
+            // skip straight to the parent-based dispatch.
+            .property_ident => self.inferPropertyIdent(node),
 
             .ts_as_expr, .ts_type_assertion => self.inferAsCast(node, t),
             .ts_satisfies_expr => self.inferSatisfies(node),
@@ -583,12 +587,14 @@ pub const Checker = struct {
         if (nidx >= parents.len) return false;
         const pidx = parents[nidx];
         if (pidx == @intFromEnum(NodeIndex.none)) return false;
+        if (pidx >= self.ast_ref.nodes.len) return false;
         const parent: NodeIndex = @enumFromInt(pidx);
         if (self.ast_ref.nodeTag(parent) != .property) return false;
         if (self.ast_ref.nodeData(parent).lhs != node) return false;
         if (pidx >= parents.len) return false;
         const gp_idx = parents[pidx];
         if (gp_idx == @intFromEnum(NodeIndex.none)) return false;
+        if (gp_idx >= self.ast_ref.nodes.len) return false;
         const grandparent: NodeIndex = @enumFromInt(gp_idx);
         return self.ast_ref.nodeTag(grandparent) == .object_literal;
     }
@@ -879,6 +885,7 @@ pub const Checker = struct {
         if (nidx >= parents.len) return null;
         const pidx = parents[nidx];
         if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        if (pidx >= self.ast_ref.nodes.len) return null;
         const parent: NodeIndex = @enumFromInt(pidx);
         if (self.ast_ref.nodeTag(parent) != .ts_property_signature) return null;
         const pdata = self.ast_ref.nodeData(parent);
@@ -890,6 +897,32 @@ pub const Checker = struct {
         // Use resolveSimpleTypeNode to avoid triggering deep conditional/recursive resolution.
         // Complex types (generics, conditionals) fall back to any to avoid panics.
         return self.resolveSimpleTypeNodeSafe(ty_node);
+    }
+
+    /// Type inference for `property_ident` nodes — the property name on the
+    /// right-hand side of a non-computed member expression (`obj.prop`).
+    fn inferPropertyIdent(self: *Checker, node: NodeIndex) TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return tymod.ID_ANY;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return tymod.ID_ANY;
+        if (pidx >= self.ast_ref.nodes.len) return tymod.ID_ANY;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        const ptag = self.ast_ref.nodeTag(parent);
+        const pdata = self.ast_ref.nodeData(parent);
+        switch (ptag) {
+            .member_expr, .optional_member_expr => {
+                if (pdata.rhs != node) return tymod.ID_ANY;
+                if (pdata.lhs == .none) return tymod.ID_ANY;
+                const obj_ty = self.typeOf(pdata.lhs);
+                const tok = self.ast_ref.nodeMainToken(node);
+                const prop_name = self.ast_ref.tokenText(tok);
+                if (prop_name.len == 0) return tymod.ID_ANY;
+                return self.memberOnApparentType(obj_ty, prop_name, pdata.lhs);
+            },
+            else => return tymod.ID_ANY,
+        }
     }
 
     /// Returns the declared type of an identifier that is the key of a `property_def`
@@ -1020,6 +1053,7 @@ pub const Checker = struct {
         if (node.toInt() >= parents.len) return false;
         const pidx = parents[node.toInt()];
         if (pidx == @intFromEnum(NodeIndex.none)) return false;
+        if (pidx >= self.ast_ref.nodes.len) return false;
         const parent: NodeIndex = @enumFromInt(pidx);
         switch (self.ast_ref.nodeTag(parent)) {
             .member_expr, .optional_member_expr,
@@ -1039,7 +1073,7 @@ pub const Checker = struct {
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         var p = parents[nidx];
         var guard: u8 = 0;
-        while (p != NONE and guard < 8) : (guard += 1) {
+        while (p != NONE and p < parents.len and p < self.ast_ref.nodes.len and guard < 8) : (guard += 1) {
             switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
                 // Parts of a qualified name (`FG.A`) — keep walking up.
                 .member_expr, .optional_member_expr, .identifier, .grouping_expr => {},
@@ -5664,7 +5698,7 @@ pub const Checker = struct {
         var anc_buf: [16]u32 = undefined;
         var nanc: usize = 0;
         var p = parents[tni];
-        while (p != NONE and nanc < anc_buf.len) : (p = parents[p]) {
+        while (p != NONE and p < parents.len and nanc < anc_buf.len) : (p = parents[p]) {
             anc_buf[nanc] = p;
             nanc += 1;
         }
@@ -8933,7 +8967,7 @@ pub const Checker = struct {
         var anc_buf: [16]u32 = undefined;
         var nanc: usize = 0;
         var p = parents[rni];
-        while (p != NONE and nanc < anc_buf.len) : (p = parents[p]) {
+        while (p != NONE and p < parents.len and nanc < anc_buf.len) : (p = parents[p]) {
             anc_buf[nanc] = p;
             nanc += 1;
         }
