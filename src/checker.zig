@@ -8490,9 +8490,13 @@ pub const Checker = struct {
                     const pd = self.ast_ref.nodeData(p);
                     const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
                     const val_ty = self.typeOf(pd.rhs);
-                    // Widen primitive literal types to their base types.
+                    // Widen primitive literal types to their base types, but
+                    // preserve the literal when an explicit type assertion pins
+                    // it (e.g. `0 as 0`, `"x" as "x"`, `0 as const`).
+                    const val_rhs_tag = self.ast_ref.nodeTag(pd.rhs);
+                    const has_type_assertion = val_rhs_tag == .ts_as_expr or val_rhs_tag == .ts_type_assertion;
                     const val_t = self.store.get(val_ty);
-                    const widened_ty = switch (val_t.kind) {
+                    const widened_ty = if (has_type_assertion) val_ty else switch (val_t.kind) {
                         .string_literal => tymod.ID_STRING,
                         .number_literal => tymod.ID_NUMBER,
                         .boolean_literal => tymod.ID_BOOLEAN,
