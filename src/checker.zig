@@ -2435,11 +2435,34 @@ pub const Checker = struct {
             // baseline format) instead of falling through to any.
             // NOTE: this also makes all identifier REFERENCES to class C return
             // type_ref("C") via the sym_types cache in declaredTypeForSymbol.
-            .class_decl, .ts_interface_decl, .ts_type_alias_decl => {
+            .class_decl, .ts_interface_decl => {
                 const tok = self.ast_ref.nodeMainToken(binding);
                 const name = self.ast_ref.tokenText(tok);
                 if (name.len > 0) return self.store.typeRef(name, &.{}) catch tymod.ID_ANY;
                 return tymod.ID_ANY;
+            },
+            // For generic type aliases like `type Tree<T> = ...`, the declared
+            // type of the alias NAME is `Tree<T>` (with type param placeholders),
+            // not bare `Tree`.
+            .ts_type_alias_decl => {
+                const tok = self.ast_ref.nodeMainToken(binding);
+                const name = self.ast_ref.tokenText(tok);
+                if (name.len == 0) return tymod.ID_ANY;
+                const dd = self.ast_ref.nodeData(parent);
+                if (dd.lhs == .none) return self.store.typeRef(name, &.{}) catch tymod.ID_ANY;
+                const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(dd.lhs));
+                if (ad.type_params >= ad.type_params_end) {
+                    return self.store.typeRef(name, &.{}) catch tymod.ID_ANY;
+                }
+                const n_params = ad.type_params_end - ad.type_params;
+                var args_buf: [8]TypeId = undefined;
+                const count = @min(n_params, @as(u32, args_buf.len));
+                for (0..count) |i| {
+                    const tp_node: NodeIndex = @enumFromInt(self.ast_ref.extra_data[ad.type_params + @as(u32, @intCast(i))]);
+                    const tp_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
+                    args_buf[i] = self.store.typeParam(tp_name, TypeId.none) catch return tymod.ID_ANY;
+                }
+                return self.store.typeRef(name, args_buf[0..count]) catch tymod.ID_ANY;
             },
             // Function/method/getter/setter parameter, class field, etc.
             // We don't resolve these structurally yet — return unknown
