@@ -340,9 +340,11 @@ pub const Checker = struct {
             .exp_assign, .and_assign, .or_assign, .xor_assign, .shl_assign,
             .shr_assign, .ushr_assign, .logical_and_assign, .logical_or_assign,
             .nullish_assign => blk: {
-                const lhs_ty = self.typeOf(self.ast_ref.nodeData(node).lhs);
+                const data = self.ast_ref.nodeData(node);
+                if (data.lhs == .none or data.rhs == .none) break :blk tymod.ID_ANY;
+                const lhs_ty = self.typeOf(data.lhs);
                 if (tymod.isAny(&self.store, lhs_ty)) break :blk tymod.ID_ANY;
-                const rhs_ty = self.typeOf(self.ast_ref.nodeData(node).rhs);
+                const rhs_ty = self.typeOf(data.rhs);
                 if (tymod.isAny(&self.store, rhs_ty)) break :blk tymod.ID_ANY;
                 break :blk lhs_ty;
             },
@@ -2556,7 +2558,16 @@ pub const Checker = struct {
         } else if (body_for_inference != .none) {
             const btag = self.ast_ref.nodeTag(body_for_inference);
             if (btag != .block_stmt) {
-                ret_ty = self.typeOf(body_for_inference);
+                const raw_ret = self.typeOf(body_for_inference);
+                // Widen primitive literal types in arrow expression bodies to their base types.
+                const ret_info = self.store.get(raw_ret);
+                ret_ty = switch (ret_info.kind) {
+                    .string_literal => tymod.ID_STRING,
+                    .number_literal => tymod.ID_NUMBER,
+                    .bigint_literal => tymod.ID_BIGINT,
+                    .boolean_literal => tymod.ID_BOOLEAN,
+                    else => raw_ret,
+                };
             } else {
                 ret_ty = self.inferBlockReturn(body_for_inference);
             }
@@ -2690,7 +2701,16 @@ pub const Checker = struct {
             if (!reached) continue;
             const arg = self.ast_ref.nodeData(ni).lhs;
             if (arg == .none) { has_bare_return = true; continue; }
-            const t = self.typeOf(arg);
+            const raw_t = self.typeOf(arg);
+            // Widen primitive literal types in return expressions to their base types.
+            const type_info = self.store.get(raw_t);
+            const t = switch (type_info.kind) {
+                .string_literal => tymod.ID_STRING,
+                .number_literal => tymod.ID_NUMBER,
+                .bigint_literal => tymod.ID_BIGINT,
+                .boolean_literal => tymod.ID_BOOLEAN,
+                else => raw_t,
+            };
             if (result.eq(TypeId.none)) {
                 result = t;
             } else if (!result.eq(t)) {
@@ -7659,7 +7679,19 @@ pub const Checker = struct {
                 return self.store.arrayOf(self.store.unionOf(buf[0..n]) catch tymod.ID_ANY) catch tymod.ID_ANY;
             return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
         }
-        const elem_t = self.store.unionOf(buf[0..n]) catch tymod.ID_ANY;
+        var widened_buf: [32]TypeId = undefined;
+        for (0..n) |j| {
+            const elem_t = self.store.get(buf[j]);
+            const widened = switch (elem_t.kind) {
+                .string_literal => tymod.ID_STRING,
+                .number_literal => tymod.ID_NUMBER,
+                .bigint_literal => tymod.ID_BIGINT,
+                .boolean_literal => tymod.ID_BOOLEAN,
+                else => buf[j],
+            };
+            widened_buf[j] = widened;
+        }
+        const elem_t = self.store.unionOf(widened_buf[0..n]) catch tymod.ID_ANY;
         return self.store.arrayOf(elem_t) catch tymod.ID_ANY;
     }
 
