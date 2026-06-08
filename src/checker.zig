@@ -5598,8 +5598,19 @@ pub const Checker = struct {
             // Unresolved type name → `any` to match TypeScript's permissive behavior.
             return tymod.ID_ANY;
         }
-        // User-declared interface or class → resolve to its structural
-        // shape (object_t with field/method ObjectProps).
+        // User-declared class or interface → named type_ref so the type
+        // renders as the class/interface name (matching tsc) rather than
+        // expanding to the structural object shape.  Member access resolves
+        // lazily via resolveDeclaredType inside memberOnApparentType.
+        if (self.type_decl_nodes.get(name)) |decl| {
+            const dtag = self.ast_ref.nodeTag(decl);
+            if (dtag == .class_decl or dtag == .ts_interface_decl) {
+                var args_buf: [8]TypeId = undefined;
+                const args = self.collectTypeArgs(ty_node, &args_buf);
+                return self.store.typeRef(name, args) catch tymod.ID_ANY;
+            }
+        }
+        // User-declared enum/namespace/type-alias → resolve structurally.
         if (self.resolveDeclaredType(name)) |resolved| {
             // Qualified type `A.B`: if `A` resolved to a namespace object_t,
             // look up the property `B` on it — `A.B` is the member type, not
