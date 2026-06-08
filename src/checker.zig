@@ -453,6 +453,7 @@ pub const Checker = struct {
                     md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator,
                 );
             },
+            .class_decl => tymod.ID_ANY,
             .class_expr => tymod.ID_UNKNOWN,
             else => tymod.ID_ANY,
         };
@@ -785,6 +786,36 @@ pub const Checker = struct {
         };
     }
 
+    /// If `node` is the name identifier of a class declaration, return the
+    /// TypeId for the class name type.  Non-generic: `C` → typeRef("C").
+    /// Generic: `class C<T, U>` → typeRef("C", [typeParam("T"), typeParam("U")])
+    /// so it renders as "C<T, U>" matching tsc's annotation on the name.
+    fn typeForClassDeclarationName(self: *Checker, node: NodeIndex, name: []const u8) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .class_decl) return null;
+        const cdata = self.ast_ref.nodeData(parent);
+        if (cdata.lhs == .none) return null;
+        const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
+        if (cd.name != node) return null;
+        if (cd.type_params >= cd.type_params_end) {
+            return self.store.typeRef(name, &.{}) catch null;
+        }
+        const n_params = cd.type_params_end - cd.type_params;
+        var args_buf: [8]TypeId = undefined;
+        const count = @min(n_params, @as(u32, args_buf.len));
+        for (0..count) |i| {
+            const tp_node: NodeIndex = @enumFromInt(self.ast_ref.extra_data[cd.type_params + @as(u32, @intCast(i))]);
+            const tp_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
+            args_buf[i] = self.store.typeParam(tp_name, TypeId.none) catch return null;
+        }
+        return self.store.typeRef(name, args_buf[0..count]) catch null;
+    }
+
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
         if (self.symbolForIdentRef(node)) |sym| {
             const base = self.declaredTypeForSymbol(sym);
@@ -847,6 +878,9 @@ pub const Checker = struct {
         // an outer variable with the same name.
         if (self.identifierAsObjectLiteralPropertyKey(node)) |ty| return ty;
         if (self.typeOfNameByAstSearch(name)) |t| return t;
+        // Class declaration name: `class C { }` or `class C<T>` — return the
+        // named type matching tsc's annotation (e.g. `>C : C` / `>C : C<T>`).
+        if (self.typeForClassDeclarationName(node, name)) |ty| return ty;
         // When an enum identifier appears, it should be typed as the union of its members
         // (the type-side), not the object type (which is for member access like `Foo.Bar`).
         if (self.enum_kinds.get(name) != null) {
