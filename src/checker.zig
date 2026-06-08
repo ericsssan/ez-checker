@@ -1139,7 +1139,26 @@ pub const Checker = struct {
         if (gp_pidx == @intFromEnum(NodeIndex.none)) return null;
         if (gp_pidx >= self.ast_ref.nodes.len) return null;
         if (self.ast_ref.nodeTag(@enumFromInt(gp_pidx)) != .object_literal) return null;
+        // Check if the object_literal is wrapped in `as const`. If so, preserve
+        // the literal type (TypeScript annotates keys with literal types in as-const context).
+        const is_as_const = blk: {
+            if (gp_pidx >= parents.len) break :blk false;
+            const ggp_pidx = parents[gp_pidx];
+            if (ggp_pidx == @intFromEnum(NodeIndex.none)) break :blk false;
+            if (ggp_pidx >= self.ast_ref.nodes.len) break :blk false;
+            if (self.ast_ref.nodeTag(@enumFromInt(ggp_pidx)) != .ts_as_expr) break :blk false;
+            const as_data = self.ast_ref.nodeData(@enumFromInt(ggp_pidx));
+            if (as_data.rhs == .none) break :blk false;
+            if (self.ast_ref.nodeTag(as_data.rhs) != .ts_type_reference) break :blk false;
+            const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(as_data.rhs));
+            break :blk std.mem.eql(u8, cname, "const");
+        };
         const val_ty = self.typeOf(pdata.rhs);
+        if (is_as_const) return val_ty;
+        // If the value is a type assertion (`0 as 0`, `"a" as "a"`), preserve the
+        // asserted literal type — TypeScript does not widen explicitly-asserted types.
+        const rhs_tag = self.ast_ref.nodeTag(pdata.rhs);
+        if (rhs_tag == .ts_as_expr or rhs_tag == .ts_type_assertion) return val_ty;
         const t = self.store.get(val_ty);
         // Widen primitive literal types to their base types, matching TypeScript's
         // widening behavior for object literal property types.
