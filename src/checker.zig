@@ -8654,6 +8654,22 @@ pub const Checker = struct {
     /// Element type for an empty array literal `[]`.  TS gives an empty array
     /// BOUND to a variable (`const x = []`) the evolving-array element `any`,
     /// but a bare `[]` expression (return/argument/template) stays `never`.
+    /// Returns true when `node` (an array literal) is the RHS initializer of a
+    /// variable declarator whose LHS is an array-destructuring pattern.
+    /// In this context TypeScript infers a fixed-length tuple rather than T[].
+    fn isArrayInDestructuringRhs(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        if (node.toInt() >= parents.len) return false;
+        const p = parents[node.toInt()];
+        if (p == @intFromEnum(NodeIndex.none)) return false;
+        const pn: NodeIndex = @enumFromInt(p);
+        if (self.ast_ref.nodeTag(pn) != .declarator) return false;
+        const pn_data = self.ast_ref.nodeData(pn);
+        if (pn_data.rhs != node) return false;
+        if (pn_data.lhs == .none) return false;
+        return self.ast_ref.nodeTag(pn_data.lhs) == .array_pattern;
+    }
+
     /// This matches both rules at once: `const arg = []` passes restrict-template-
     /// expressions' allowArray (any element), while `return []` stays safe for
     /// no-unsafe-return (never[] is not an any-array).
@@ -8740,7 +8756,9 @@ pub const Checker = struct {
             all_same_kind = false;
         }
         if (all_same_kind) {
-            // All elements same primitive literal kind → T[]
+            // All elements same primitive literal kind → T[] in most contexts.
+            // Exception: when the array literal is the RHS of an array-destructuring
+            // declarator, tsc infers a fixed-length tuple ([1, 2] → [number, number]).
             const elem_t: TypeId = switch (first_kind) {
                 .string_literal => tymod.ID_STRING,
                 .number_literal => tymod.ID_NUMBER,
@@ -8748,6 +8766,13 @@ pub const Checker = struct {
                 .boolean_literal => tymod.ID_BOOLEAN,
                 else => unreachable,
             };
+            if (self.isArrayInDestructuringRhs(node)) {
+                var tup_buf: [32]TypeId = undefined;
+                for (0..n_used) |j| tup_buf[j] = elem_t;
+                const list = self.store.appendTypeIds(tup_buf[0..n_used]) catch
+                    return self.store.arrayOf(elem_t) catch tymod.ID_ANY;
+                return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
+            }
             return self.store.arrayOf(elem_t) catch tymod.ID_ANY;
         }
         // Widen any literal elements to their base types, then check for
@@ -8776,7 +8801,14 @@ pub const Checker = struct {
                     break;
                 }
             }
-            if (all_same_id) return self.store.arrayOf(widened_elems_buf[0]) catch tymod.ID_ANY;
+            if (all_same_id) {
+                if (self.isArrayInDestructuringRhs(node)) {
+                    const list = self.store.appendTypeIds(widened_elems_buf[0..n_used]) catch
+                        return self.store.arrayOf(widened_elems_buf[0]) catch tymod.ID_ANY;
+                    return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
+                }
+                return self.store.arrayOf(widened_elems_buf[0]) catch tymod.ID_ANY;
+            }
         }
         if (any_widened and !has_spread) {
             const list = self.store.appendTypeIds(widened_elems_buf[0..n_used]) catch
