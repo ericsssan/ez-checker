@@ -9154,8 +9154,8 @@ pub const Checker = struct {
                     if (byte == 0x00) {
                         // TypeScript renders the null byte as \0
                         try buf.appendSlice(gpa, "\\0");
-                    } else if (byte < 0x20 or byte == 0x7F) {
-                        // Encode other control characters as \uXXXX
+                    } else if (byte < 0x20) {
+                        // Encode C0 control characters as \uXXXX (uppercase hex, matching tsc)
                         try buf.print(gpa, "\\u{X:0>4}", .{byte});
                     } else if (byte == '"') {
                         try buf.appendSlice(gpa, "\\\"");
