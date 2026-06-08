@@ -13,22 +13,35 @@
 //                         sweep and printing the same full report.
 //
 // Honesty is the point: nothing relevant is silently skipped, and the report is
-// verbose by default. Multi-section baselines are evaluated section-by-section
-// (each in its own language). Every primitive-typed baseline expression lands in
-// exactly one reported bucket — correct / wrong / coverage-gap / no-node — so the
-// denominator can't be shrunk to flatter the rate. The report then breaks the
-// failures down by *systematic pattern* (which kinds of types ez gets wrong /
-// can't model) with a concrete example each, and by source language — so you can
-// see at a glance WHERE ez diverges, not just how often.
+// verbose by default. Multi-section baselines are evaluated as a single program
+// (cross-file types resolve correctly). Every baseline expression lands in
+// exactly one reported bucket — correct / wrong / coverage-gap / no-node — so
+// the denominator can't be shrunk to flatter the rate. The breakdown tables
+// cover ALL expression types (not just primitives), grouped by tsc category →
+// ez category with a concrete example per row.
 //
 // Anchoring strategy (why this is robust):
 //   A `.types` section interleaves each source line with `>expr : type` entries
 //   for the expressions starting on that line. We collect the non-`>` lines as
 //   the "effective source" — *exactly* the text the baseline's expr fragments
-//   were sliced from — so parsing it lines AST node line-numbers and node
-//   source-text up with the baseline with zero realignment. Each entry's type
+//   were sliced from — so parsing it aligns AST node line-numbers and node
+//   source-text with the baseline with zero realignment. Each entry's type
 //   boundary is the decoration line's first `^` column (the only reliable
 //   expr/type split, since both exprs and types can contain " : ").
+//
+// Compiler options (fix #2):
+//   Each .types file's header encodes the source path. We read that file and
+//   parse its `// @option: value` directives (TypeScript's test-harness
+//   equivalent of tsconfig.json) to extract CompilerOpts.  Sections compiled
+//   with options ez-checker doesn't yet model are tagged `is_strict` and
+//   counted separately — they remain in the denominator (honest) but are
+//   broken out in the report.
+//
+// Cross-file evaluation (fix #3):
+//   When a .types file contains multiple sections (19% of the corpus), all
+//   compatible sections (ts + dts, or tsx-only, etc.) are concatenated into
+//   one source and evaluated with a single checker pass, so types defined in
+//   one section are in scope for subsequent sections.
 
 const std = @import("std");
 const ez = @import("ez_checker");
@@ -57,43 +70,107 @@ fn langIdx(l: Language) usize {
     };
 }
 
+// ── Compiler options (parsed from // @ directives in source file) ────────────
+
+const CompilerOpts = struct {
+    strict: bool = false,
+    strict_null_checks: bool = false,
+    no_implicit_any: bool = false,
+
+    // True when any option is set that ez-checker doesn't model yet — sections
+    // compiled under these options are still evaluated and counted in the
+    // denominator but reported separately.
+    fn needsUnimplementedOpts(self: CompilerOpts) bool {
+        return self.strict or self.strict_null_checks;
+    }
+};
+
+// Extract "tests/cases/compiler/foo.ts" from "//// [tests/cases/compiler/foo.ts] ////".
+fn extractSourcePath(line: []const u8) ?[]const u8 {
+    const pre = "//// [";
+    const suf = "] ////";
+    if (!std.mem.startsWith(u8, line, pre)) return null;
+    if (!std.mem.endsWith(u8, line, suf)) return null;
+    return line[pre.len .. line.len - suf.len];
+}
+
+// Derive the TypeScript submodule root from ref_dir.
+// ref_dir is typically "typescript/tests/baselines/reference".
+fn tsRoot(ref_dir: []const u8) ?[]const u8 {
+    const suf = "tests/baselines/reference";
+    if (!std.mem.endsWith(u8, ref_dir, suf)) return null;
+    return std.mem.trimEnd(u8, ref_dir[0 .. ref_dir.len - suf.len], "/");
+}
+
+fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8, source_rel_path: []const u8) CompilerOpts {
+    const full_path = std.fmt.allocPrint(arena, "{s}/{s}", .{ ts_root_dir, source_rel_path }) catch return .{};
+    const content = std.Io.Dir.cwd().readFileAlloc(io, full_path, arena, std.Io.Limit.limited(64 * 1024)) catch return .{};
+    var opts = CompilerOpts{};
+    var it = std.mem.splitScalar(u8, content, '\n');
+    while (it.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \r");
+        if (line.len == 0) continue;
+        if (!std.mem.startsWith(u8, line, "// @")) break; // stop at first non-directive
+        const rest = line["// @".len..];
+        const colon = std.mem.indexOfScalar(u8, rest, ':') orelse continue;
+        const key = std.mem.trim(u8, rest[0..colon], " ");
+        const val = std.mem.trim(u8, rest[colon + 1 ..], " ");
+        // Stop at filename splits — options after belong to individual files.
+        if (std.mem.eql(u8, key, "filename") or std.mem.eql(u8, key, "Filename")) break;
+        if (std.mem.eql(u8, key, "strict")) {
+            opts.strict = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "strictNullChecks")) {
+            opts.strict_null_checks = std.mem.eql(u8, val, "true");
+        } else if (std.mem.eql(u8, key, "noImplicitAny")) {
+            opts.no_implicit_any = std.mem.eql(u8, val, "true");
+        }
+    }
+    return opts;
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 //  Public surface
 // ════════════════════════════════════════════════════════════════════════════
 
 pub const Options = struct {
     ref_dir: []const u8 = REF_DIR,
-    filter: ?[]const u8 = null, // only files whose name contains this
-    skip: ?[]const u8 = null, // skip files whose name contains any (comma-sep)
-    limit: usize = std.math.maxInt(usize), // stop after N files
-    progress: bool = false, // print each file as processed (locating hangs)
+    filter: ?[]const u8 = null,
+    skip: ?[]const u8 = null,
+    limit: usize = std.math.maxInt(usize),
+    progress: bool = false,
 };
 
 pub const Stats = struct {
     files_seen: u64 = 0,
     sections_seen: u64 = 0,
     sections_eval: u64 = 0,
-    sections_noncode: u64 = 0, // .json / no extension
-    sections_large: u64 = 0, // reconstructed source over the cap
+    sections_noncode: u64 = 0,
+    sections_large: u64 = 0,
     sections_errored: u64 = 0,
+    sections_strict: u64 = 0, // sections compiled with options ez-checker doesn't model
 
-    seen: u64 = 0, // every baseline `>expr : type` entry
+    // ── All-types primary metric (fix #1) ─────────────────────────────────
+    // Every baseline expression is bucketed: match + wrong + gap + nonode.
+    // nonode = seen - comparable - ambiguous (derived).
+    seen: u64 = 0,       // every baseline `>expr : type` entry
     comparable: u64 = 0, // …that resolved to a single ez node
-    match: u64 = 0, // …and ez agreed with tsc (all types)
-    ambiguous: u64 = 0, // dropped: conflicting ez nodes at one anchor
+    ambiguous: u64 = 0,  // …excluded: conflicting concrete ez nodes at one anchor
+    match: u64 = 0,      // correct (all types)
+    wrong: u64 = 0,      // ez returned a different concrete type
+    gap: u64 = 0,        // ez returned error/unknown/any for a non-gap tsc type
 
-    prim_seen: u64 = 0, // primitive/literal subset (= match+wrong+gap+nonode)
+    // ── Primitive sub-metric (kept for historical comparison) ─────────────
+    prim_seen: u64 = 0,
     prim_match: u64 = 0,
     prim_wrong: u64 = 0,
     prim_gap: u64 = 0,
     prim_nonode: u64 = 0,
+    prim_ambiguous: u64 = 0, // primitive entries excluded as ambiguous
 
     prim_seen_lang: [LANG_N]u64 = [_]u64{ 0, 0, 0, 0, 0 },
     prim_match_lang: [LANG_N]u64 = [_]u64{ 0, 0, 0, 0, 0 },
 };
 
-/// One row of a failure breakdown: a category pattern, a count, and a concrete
-/// example so the divergence is actionable, not just a number.
 pub const Pattern = struct {
     label: []const u8,
     count: u64,
@@ -105,10 +182,10 @@ pub const Pattern = struct {
 
 pub const Result = struct {
     stats: Stats,
-    wrong: []Pattern, // wrong-concrete, grouped by `wantCategory → gotCategory`
-    gap: []Pattern, // coverage-gap, grouped by want category
-    nonode: []Pattern, // no-ez-node, grouped by want category
-    arena: *std.heap.ArenaAllocator, // owns the slices above
+    wrong: []Pattern,
+    gap: []Pattern,
+    nonode: []Pattern,
+    arena: *std.heap.ArenaAllocator,
 
     pub fn deinit(self: *Result) void {
         const child = self.arena.child_allocator;
@@ -147,9 +224,6 @@ const Collector = struct {
     }
 };
 
-/// Sweep the corpus and return aggregate stats + failure breakdowns. Per-section
-/// pipeline errors are counted, not propagated, so one bad section can't abort
-/// the sweep. Caller owns the Result and must `deinit()` it.
 pub fn run(opts: Options) !Result {
     const child = std.heap.page_allocator;
     const arena_ptr = try child.create(std.heap.ArenaAllocator);
@@ -171,6 +245,10 @@ pub fn run(opts: Options) !Result {
 
     var dir = try std.Io.Dir.cwd().openDir(io, opts.ref_dir, .{ .iterate = true });
     defer dir.close(io);
+
+    // Derive the TypeScript submodule root so we can read source files for
+    // compiler option parsing (fix #2).
+    const ts_root_dir = tsRoot(opts.ref_dir);
 
     var stats = Stats{};
     var it = dir.iterate();
@@ -201,39 +279,58 @@ pub fn run(opts: Options) !Result {
         const content = dir.readFileAlloc(io, entry.name, fa, std.Io.Limit.limited(MAX_FILE)) catch continue;
         if (opts.progress) std.debug.print("[{d}] {s}\n", .{ processed, entry.name });
 
+        // Parse compiler options from the corresponding source file (fix #2).
+        const comp_opts: CompilerOpts = blk: {
+            if (ts_root_dir) |root| {
+                const first_nl = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
+                const first_line = std.mem.trim(u8, content[0..first_nl], " \r");
+                if (extractSourcePath(first_line)) |rel| {
+                    break :blk parseSourceOpts(io, fa, root, rel);
+                }
+            }
+            break :blk CompilerOpts{};
+        };
+
         const sections = parseSections(fa, content) catch continue;
-        for (sections) |sec| {
-            stats.sections_seen += 1;
-            const lang = Language.fromExtension(sec.name) orelse {
-                stats.sections_noncode += 1;
-                continue;
-            };
-            if (sec.source.len > MAX_SECTION_SRC) {
-                stats.sections_large += 1;
+
+        // Evaluate sections — either as a combined program (cross-file fix #3)
+        // or independently when languages are incompatible.
+        const groups = groupSections(fa, sections) catch {
+            // fallback: evaluate independently
+            for (sections) |sec| {
+                stats.sections_seen += 1;
+                const lang = Language.fromExtension(sec.name) orelse {
+                    stats.sections_noncode += 1;
+                    continue;
+                };
+                if (sec.source.len > MAX_SECTION_SRC) {
+                    stats.sections_large += 1;
+                    continue;
+                }
+                const r = evalSection(fa, sec, lang, comp_opts, &coll);
+                accumulateResult(&stats, r, lang, comp_opts);
+            }
+            continue;
+        };
+
+        for (groups) |grp| {
+            // Count individual sections (for sections_seen / sections_noncode).
+            for (sections[grp.start..grp.end]) |sec| {
+                stats.sections_seen += 1;
+                if (Language.fromExtension(sec.name) == null) stats.sections_noncode += 1;
+            }
+
+            const lang = grp.lang;
+            const combined = grp.combined;
+            if (combined.source.len > MAX_SECTION_SRC) {
+                const count = grp.end - grp.start;
+                stats.sections_large += count;
                 continue;
             }
-            const r = evalSection(fa, sec, lang, &coll);
-            switch (r.status) {
-                .errored => {
-                    stats.sections_errored += 1;
-                    std.debug.print("  [{s} / {s}] pipeline error\n", .{ entry.name, sec.name });
-                },
-                .ok => {
-                    stats.sections_eval += 1;
-                    stats.seen += r.seen;
-                    stats.comparable += r.comparable;
-                    stats.match += r.match;
-                    stats.ambiguous += r.ambiguous;
-                    stats.prim_seen += r.prim_seen;
-                    stats.prim_match += r.prim_match;
-                    stats.prim_wrong += r.prim_wrong;
-                    stats.prim_gap += r.prim_gap;
-                    stats.prim_nonode += r.prim_nonode;
-                    const li = langIdx(lang);
-                    stats.prim_seen_lang[li] += r.prim_seen;
-                    stats.prim_match_lang[li] += r.prim_match;
-                },
-            }
+            const r = evalSection(fa, combined, lang, comp_opts, &coll);
+            // Count sections_eval once per section in the group.
+            const section_count = grp.end - grp.start;
+            accumulateResultN(&stats, r, lang, comp_opts, section_count);
         }
     }
 
@@ -244,6 +341,171 @@ pub fn run(opts: Options) !Result {
         .nonode = try topPatterns(ra, &nonode_map),
         .arena = arena_ptr,
     };
+}
+
+fn accumulateResult(stats: *Stats, r: SecResult, lang: Language, comp_opts: CompilerOpts) void {
+    accumulateResultN(stats, r, lang, comp_opts, 1);
+}
+
+fn accumulateResultN(stats: *Stats, r: SecResult, lang: Language, comp_opts: CompilerOpts, n: usize) void {
+    switch (r.status) {
+        .errored => {
+            stats.sections_errored += n;
+        },
+        .ok => {
+            stats.sections_eval += n;
+            if (comp_opts.needsUnimplementedOpts()) stats.sections_strict += n;
+            stats.seen += r.seen;
+            stats.comparable += r.comparable;
+            stats.ambiguous += r.ambiguous;
+            stats.match += r.match;
+            stats.wrong += r.wrong;
+            stats.gap += r.gap;
+            stats.prim_seen += r.prim_seen;
+            stats.prim_match += r.prim_match;
+            stats.prim_wrong += r.prim_wrong;
+            stats.prim_gap += r.prim_gap;
+            stats.prim_nonode += r.prim_nonode;
+            stats.prim_ambiguous += r.prim_ambiguous;
+            const li = langIdx(lang);
+            stats.prim_seen_lang[li] += r.prim_seen;
+            stats.prim_match_lang[li] += r.prim_match;
+        },
+    }
+}
+
+// ── Cross-file section grouping (fix #3) ─────────────────────────────────────
+
+const SectionGroup = struct {
+    start: usize,  // index into sections slice (inclusive)
+    end: usize,    // index into sections slice (exclusive)
+    lang: Language,
+    combined: Section,
+};
+
+// Classify language for grouping: .dts is compatible with .ts (ambient decls).
+fn groupLang(lang: Language) u8 {
+    return switch (lang) {
+        .ts, .dts => 0, // ts+dts go together
+        .tsx => 1,
+        .js, .jsx => 2,
+    };
+}
+
+fn combinedLangFor(sections: []const Section, start: usize, end: usize) ?Language {
+    var has_ts = false;
+    var has_tsx = false;
+    var has_js = false;
+    for (sections[start..end]) |sec| {
+        const lang = Language.fromExtension(sec.name) orelse continue;
+        switch (lang) {
+            .ts, .dts => has_ts = true,
+            .tsx => has_tsx = true,
+            .js, .jsx => has_js = true,
+        }
+    }
+    // Return the dominant language for parsing.
+    if (has_ts and !has_tsx and !has_js) return .ts;
+    if (has_tsx and !has_ts and !has_js) return .tsx;
+    if (has_js and !has_ts and !has_tsx) return .js;
+    if (has_ts and has_tsx and !has_js) return .tsx; // jsx parser handles ts subset
+    return null; // incompatible mix — can't combine
+}
+
+// Count newline characters + 1 = number of lines in s.
+fn countLines(s: []const u8) u32 {
+    var n: u32 = 1;
+    for (s) |c| if (c == '\n') { n += 1; };
+    return n;
+}
+
+fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]SectionGroup {
+    var groups = std.ArrayList(SectionGroup).empty;
+
+    var i: usize = 0;
+    while (i < sections.len) {
+        // Find a run of sections that share a compatible language group.
+        const start = i;
+        const first_lang = Language.fromExtension(sections[i].name);
+        if (first_lang == null) {
+            // Non-code section — skip as a group of one (caller handles noncode).
+            i += 1;
+            continue;
+        }
+        const grp_key = groupLang(first_lang.?);
+        var end = start + 1;
+        while (end < sections.len) : (end += 1) {
+            const l = Language.fromExtension(sections[end].name) orelse break;
+            if (groupLang(l) != grp_key) break;
+        }
+
+        const combined_lang = combinedLangFor(sections, start, end) orelse {
+            // Can't combine — emit one group per section.
+            for (sections[start..end], start..) |sec, si| {
+                const sl = Language.fromExtension(sec.name) orelse {
+                    i = si + 1;
+                    continue;
+                };
+                try groups.append(arena, .{
+                    .start = si,
+                    .end = si + 1,
+                    .lang = sl,
+                    .combined = sec,
+                });
+            }
+            i = end;
+            continue;
+        };
+
+        // Concatenate: .dts sections first (ambient declarations), then others.
+        var src_parts = std.ArrayList([]const u8).empty;
+        var all_entries = std.ArrayList(Entry).empty;
+        var line_offset: u32 = 0;
+
+        // Pass 1: dts sections first.
+        for (sections[start..end]) |sec| {
+            const sl = Language.fromExtension(sec.name) orelse continue;
+            if (sl != .dts) continue;
+            for (sec.entries) |e| {
+                try all_entries.append(arena, .{
+                    .line = e.line + line_offset,
+                    .expr = e.expr,
+                    .type_str = e.type_str,
+                });
+            }
+            try src_parts.append(arena, sec.source);
+            line_offset += countLines(sec.source);
+        }
+        // Pass 2: non-dts sections.
+        for (sections[start..end]) |sec| {
+            const sl = Language.fromExtension(sec.name) orelse continue;
+            if (sl == .dts) continue;
+            for (sec.entries) |e| {
+                try all_entries.append(arena, .{
+                    .line = e.line + line_offset,
+                    .expr = e.expr,
+                    .type_str = e.type_str,
+                });
+            }
+            try src_parts.append(arena, sec.source);
+            line_offset += countLines(sec.source);
+        }
+
+        const combined_src = try std.mem.join(arena, "\n", src_parts.items);
+        const combined = Section{
+            .name = sections[start].name,
+            .source = combined_src,
+            .entries = try all_entries.toOwnedSlice(arena),
+        };
+        try groups.append(arena, .{
+            .start = start,
+            .end = end,
+            .lang = combined_lang,
+            .combined = combined,
+        });
+        i = end;
+    }
+    return groups.toOwnedSlice(arena);
 }
 
 fn topPatterns(ra: std.mem.Allocator, map: *std.StringHashMap(*Pattern)) ![]Pattern {
@@ -274,9 +536,6 @@ fn isNumericLiteralStr(t: []const u8) bool {
     return saw_digit;
 }
 
-/// Collapse a concrete type string to a small, bounded category so failure
-/// breakdowns are meaningful (literals/objects don't explode into thousands of
-/// one-off rows).
 fn typeCategory(t: []const u8) []const u8 {
     const kws = [_][]const u8{
         "string", "number",  "boolean", "void",   "undefined",
@@ -422,22 +681,38 @@ fn isPrimitiveAtom(p: []const u8) bool {
     return isNumericLiteralStr(p);
 }
 
-fn normalizeType(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
-    const trimmed = std.mem.trim(u8, s, " \r");
-    if (std.mem.indexOf(u8, trimmed, " | ") == null) return trimmed;
-    for (trimmed) |c| switch (c) {
-        '{', '}', '(', ')', '<', '>', '[', ']', '=' => return trimmed,
+// Sort the members of a simple union or intersection (fix #5).
+// Skips sorting if the type contains structural characters that would make
+// naive splitting ambiguous (e.g. `{ x: A | B }` must not be split on " | ").
+fn sortMembers(arena: std.mem.Allocator, s: []const u8, sep: []const u8) !?[]const u8 {
+    for (s) |c| switch (c) {
+        '{', '}', '(', ')', '<', '>', '[', ']', '=' => return null,
         else => {},
     };
     var parts = std.ArrayList([]const u8).empty;
-    var it = std.mem.splitSequence(u8, trimmed, " | ");
+    var it = std.mem.splitSequence(u8, s, sep);
     while (it.next()) |p| try parts.append(arena, std.mem.trim(u8, p, " "));
+    if (parts.items.len <= 1) return null; // nothing to sort
     std.mem.sort([]const u8, parts.items, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
             return std.mem.order(u8, a, b) == .lt;
         }
     }.lt);
-    return std.mem.join(arena, " | ", parts.items);
+    return try std.mem.join(arena, sep, parts.items);
+}
+
+fn normalizeType(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
+    const trimmed = std.mem.trim(u8, s, " \r");
+
+    // Sort union members for order-independent comparison.
+    if (std.mem.indexOf(u8, trimmed, " | ") != null) {
+        if (try sortMembers(arena, trimmed, " | ")) |sorted| return sorted;
+    }
+    // Sort intersection members similarly.
+    if (std.mem.indexOf(u8, trimmed, " & ") != null) {
+        if (try sortMembers(arena, trimmed, " & ")) |sorted| return sorted;
+    }
+    return trimmed;
 }
 
 // ── exact node source span ──────────────────────────────────────────────────
@@ -497,15 +772,20 @@ const Status = enum { ok, errored };
 
 const SecResult = struct {
     status: Status = .ok,
+    // All-types (primary metric)
     seen: u32 = 0,
     comparable: u32 = 0,
-    match: u32 = 0,
     ambiguous: u32 = 0,
+    match: u32 = 0,
+    wrong: u32 = 0,
+    gap: u32 = 0,
+    // Primitive sub-metric
     prim_seen: u32 = 0,
     prim_match: u32 = 0,
     prim_wrong: u32 = 0,
     prim_gap: u32 = 0,
     prim_nonode: u32 = 0,
+    prim_ambiguous: u32 = 0,
 };
 
 fn isGapType(s: []const u8) bool {
@@ -535,7 +815,8 @@ fn lineOf(starts: []const u32, offset: u32) u32 {
     return @intCast(lo - 1);
 }
 
-fn evalSection(arena: std.mem.Allocator, sec: Section, lang: Language, coll: *Collector) SecResult {
+fn evalSection(arena: std.mem.Allocator, sec: Section, lang: Language, opts: CompilerOpts, coll: *Collector) SecResult {
+    _ = opts; // reserved for future checker option passing
     return evalSectionInner(arena, sec, lang, coll) catch SecResult{ .status = .errored };
 }
 
@@ -588,11 +869,6 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, coll
         }
         const old = gop.value_ptr.*;
         if (std.mem.eql(u8, old, tystr) or std.mem.eql(u8, old, AMBIG)) continue;
-        // Same (line, text) anchor, different ez types. tsc's entry is for one
-        // expression; an enclosing/structural node often shares the text but
-        // only knows `unknown`/`error`/`any`. Prefer the concrete answer; only
-        // call it ambiguous when two *different concrete* types genuinely
-        // conflict (e.g. a value narrowed differently twice on one line).
         const old_gap = isGapType(old);
         const new_gap = isGapType(tystr);
         if (old_gap and !new_gap) {
@@ -609,29 +885,39 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, coll
         const is_prim = isPrimitiveType(want);
         if (is_prim) res.prim_seen += 1;
 
-        const got = map.get(Key{ .line = e.line, .text = e.expr });
-        if (got == null or std.mem.eql(u8, got.?, AMBIG)) {
-            if (got != null) res.ambiguous += 1;
-            if (is_prim) {
+        const got_raw = map.get(Key{ .line = e.line, .text = e.expr });
+        const is_ambig = got_raw != null and std.mem.eql(u8, got_raw.?, AMBIG);
+        if (got_raw == null or is_ambig) {
+            // fix #4: track ambiguous anchors separately from no-node.
+            if (is_ambig) {
+                res.ambiguous += 1;
+                if (is_prim) res.prim_ambiguous += 1;
+            }
+            if (is_prim and !is_ambig) {
                 res.prim_nonode += 1;
-                coll.record(coll.nonode, typeCategory(want), sec.name, e.expr, want, if (got != null) "<ambiguous>" else "<no node>");
+                coll.record(coll.nonode, typeCategory(want), sec.name, e.expr, want, "<no node>");
+            } else if (is_prim and is_ambig) {
+                coll.record(coll.nonode, typeCategory(want), sec.name, e.expr, want, "<ambiguous>");
             }
             continue;
         }
         res.comparable += 1;
-        const got_norm = try normalizeType(arena, got.?);
+        const got_norm = try normalizeType(arena, got_raw.?);
         if (std.mem.eql(u8, got_norm, want)) {
+            // Correct.
             res.match += 1;
             if (is_prim) res.prim_match += 1;
-        } else if (is_prim) {
-            if (isGapType(got_norm)) {
-                res.prim_gap += 1;
-                coll.record(coll.gap, typeCategory(want), sec.name, e.expr, want, got_norm);
-            } else {
-                res.prim_wrong += 1;
-                const label = std.fmt.bufPrint(&keybuf, "{s} → {s}", .{ typeCategory(want), typeCategory(got_norm) }) catch typeCategory(want);
-                coll.record(coll.wrong, label, sec.name, e.expr, want, got_norm);
-            }
+        } else if (isGapType(got_norm)) {
+            // ez returned a gap type where tsc has a concrete type.
+            res.gap += 1;
+            if (is_prim) res.prim_gap += 1;
+            coll.record(coll.gap, typeCategory(want), sec.name, e.expr, want, got_norm);
+        } else {
+            // ez returned a different concrete type — a real divergence.
+            res.wrong += 1;
+            if (is_prim) res.prim_wrong += 1;
+            const label = std.fmt.bufPrint(&keybuf, "{s} → {s}", .{ typeCategory(want), typeCategory(got_norm) }) catch typeCategory(want);
+            coll.record(coll.wrong, label, sec.name, e.expr, want, got_norm);
         }
     }
     return res;
@@ -664,7 +950,8 @@ fn ellipsis(s: []const u8, max: usize) []const u8 {
 
 pub fn printReport(res: Result) void {
     const s = res.stats;
-    const nonode_all = s.seen - s.comparable;
+    const all_nonode = s.seen - s.comparable - s.ambiguous;
+    const all_denom = s.seen; // honest: includes no-node and ambiguous in denominator
     std.debug.print("\n", .{});
     std.debug.print("══════════════════════════════════════════════════════════════\n", .{});
     std.debug.print(" ez-checker × TypeScript corpus oracle\n", .{});
@@ -672,34 +959,40 @@ pub fn printReport(res: Result) void {
     std.debug.print(" files                : {d}\n", .{s.files_seen});
     std.debug.print(" sections             : {d} total\n", .{s.sections_seen});
     std.debug.print("   ├─ evaluated       : {d}\n", .{s.sections_eval});
+    std.debug.print("   ├─ strict opts     : {d}  (options ez-checker doesn't model yet)\n", .{s.sections_strict});
     std.debug.print("   ├─ non-code skip   : {d}  (.json / no extension)\n", .{s.sections_noncode});
     std.debug.print("   ├─ too-large skip  : {d}  (reconstructed source > 512 KiB)\n", .{s.sections_large});
     std.debug.print("   └─ pipeline errors : {d}\n", .{s.sections_errored});
     std.debug.print("──────────────────────────────────────────────────────────────\n", .{});
-    std.debug.print(" baseline expressions : {d}\n", .{s.seen});
-    std.debug.print("   comparable (ez node): {d}   ({d} had no comparable node; {d} ambiguous)\n", .{ s.comparable, nonode_all, s.ambiguous });
-    std.debug.print(" all-types match      : {d}/{d}  ({d:.1}% of comparable)\n", .{ s.match, s.comparable, pct(s.match, s.comparable) });
+    std.debug.print(" ALL-TYPES conformance (primary metric)\n", .{});
+    std.debug.print("   baseline expressions : {d}\n", .{s.seen});
+    std.debug.print("   ├─ correct          : {d:>7}  ({d:.1}%)  ← conformance\n", .{ s.match, pct(s.match, all_denom) });
+    std.debug.print("   ├─ wrong concrete   : {d:>7}  (ez disagrees — divergence / bug)\n", .{s.wrong});
+    std.debug.print("   ├─ coverage gap     : {d:>7}  (ez = error/unknown/any — unmodeled)\n", .{s.gap});
+    std.debug.print("   ├─ no ez node       : {d:>7}  (no comparable node — anchoring gap)\n", .{all_nonode});
+    std.debug.print("   └─ ambiguous anchor : {d:>7}  (conflicting ez nodes — excluded)\n", .{s.ambiguous});
     std.debug.print("──────────────────────────────────────────────────────────────\n", .{});
-    std.debug.print(" primitive subset     : {d} expressions (every one bucketed)\n", .{s.prim_seen});
-    std.debug.print("   ├─ correct         : {d:>7}  ({d:.1}%)  ← conformance\n", .{ s.prim_match, pct(s.prim_match, s.prim_seen) });
-    std.debug.print("   ├─ wrong concrete  : {d:>7}  (ez disagrees — divergence / bug)\n", .{s.prim_wrong});
-    std.debug.print("   ├─ coverage gap    : {d:>7}  (ez = error/unknown/any — unmodeled)\n", .{s.prim_gap});
-    std.debug.print("   └─ no ez node      : {d:>7}  (no comparable node — anchoring / coverage gap)\n", .{s.prim_nonode});
+    std.debug.print(" PRIMITIVE sub-metric  (string/number/boolean/literal/union-of-above)\n", .{});
+    std.debug.print("   ├─ correct         : {d:>7}/{d:<7}  ({d:.1}%)\n", .{ s.prim_match, s.prim_seen, pct(s.prim_match, s.prim_seen) });
+    std.debug.print("   ├─ wrong concrete  : {d:>7}\n", .{s.prim_wrong});
+    std.debug.print("   ├─ coverage gap    : {d:>7}\n", .{s.prim_gap});
+    std.debug.print("   ├─ no ez node      : {d:>7}\n", .{s.prim_nonode});
+    std.debug.print("   └─ ambiguous       : {d:>7}\n", .{s.prim_ambiguous});
 
-    // Per-language conformance.
+    // Per-language conformance (primitive sub-metric).
     std.debug.print("──────────────────────────────────────────────────────────────\n", .{});
-    std.debug.print(" conformance by language (primitive correct / seen):\n", .{});
+    std.debug.print(" primitive conformance by language:\n", .{});
     for (0..LANG_N) |li| {
         const seen = s.prim_seen_lang[li];
         if (seen == 0) continue;
         std.debug.print("   {s:<6}: {d:>7}/{d:<7}  ({d:.1}%)\n", .{ LANG_NAMES[li], s.prim_match_lang[li], seen, pct(s.prim_match_lang[li], seen) });
     }
 
-    // Failure breakdowns — the "verbose by default" detail: WHERE ez diverges.
+    // Failure breakdowns — cover ALL types now (fix #1).
     std.debug.print("──────────────────────────────────────────────────────────────\n", .{});
-    printPatterns("wrong concrete — tsc category → ez category:", res.wrong, s.prim_wrong);
-    printPatterns("coverage gap — tsc category ez returns error/unknown/any for:", res.gap, s.prim_gap);
-    printPatterns("no ez node — tsc category with no comparable ez node:", res.nonode, s.prim_nonode);
+    printPatterns("wrong concrete — tsc category → ez category:", res.wrong, s.wrong);
+    printPatterns("coverage gap — tsc category ez returns error/unknown/any for:", res.gap, s.gap);
+    printPatterns("no ez node — tsc category with no comparable ez node:", res.nonode, all_nonode);
     std.debug.print("══════════════════════════════════════════════════════════════\n", .{});
 }
 
@@ -748,38 +1041,39 @@ pub fn main(init: std.process.Init) !void {
     if (save_baseline) try writeBaseline(init.io, init.gpa, res.stats);
 }
 
-/// Overwrite oracle/baseline.lock with the current run's numbers. The ratchet
-/// baseline is tool-generated, never hand-edited — run `zig build save-baseline`
-/// (or `oracle --save-baseline`) to accept the current conformance as the new
-/// floor after a verified improvement.
 fn writeBaseline(io: std.Io, gpa: std.mem.Allocator, s: Stats) !void {
+    const all_nonode = s.seen - s.comparable - s.ambiguous;
     const content = try std.fmt.allocPrint(gpa,
         \\# ez-checker × TypeScript corpus conformance ratchet.
         \\#
         \\# Generated by `zig build save-baseline` — DO NOT hand-edit. Enforced by
         \\# `zig build test-oracle`; the test FAILS if conformance regresses:
-        \\#   * prim_match drops below prim_match_min        (fewer correct answers)
-        \\#   * prim_wrong rises above prim_wrong_max         (more wrong concrete answers)
-        \\#   * sections_eval drops below sections_eval_min   (sections stopped evaluating)
-        \\#   * any section raises a pipeline error           (sections_errored must be 0)
+        \\#   * match drops below match_min            (fewer correct answers — all types)
+        \\#   * wrong rises above wrong_max            (more wrong concrete answers — all types)
+        \\#   * prim_match drops below prim_match_min  (primitive sub-metric floor)
+        \\#   * sections_eval drops below sections_eval_min
+        \\#   * any section raises a pipeline error
         \\#
-        \\# Full corpus snapshot (every primitive expression bucketed):
+        \\# Full corpus snapshot:
+        \\#   all-types correct = {d}/{d} ({d:.1}%)   wrong = {d}   gap = {d}   no-node = {d}   ambig = {d}
         \\#   primitive correct = {d}/{d} ({d:.1}%)   wrong = {d}   gap = {d}   no-node = {d}
-        \\#   all-types match   = {d}/{d} ({d:.1}% of comparable)
         \\sections_eval_min {d}
+        \\match_min {d}
+        \\wrong_max {d}
         \\prim_match_min {d}
         \\prim_wrong_max {d}
         \\
     , .{
-        s.prim_match,   s.prim_seen,  pct(s.prim_match, s.prim_seen),
-        s.prim_wrong,   s.prim_gap,   s.prim_nonode,
-        s.match,        s.comparable, pct(s.match, s.comparable),
-        s.sections_eval, s.prim_match, s.prim_wrong,
+        s.match,      s.seen,      pct(s.match, s.seen),
+        s.wrong,      s.gap,       all_nonode, s.ambiguous,
+        s.prim_match, s.prim_seen, pct(s.prim_match, s.prim_seen),
+        s.prim_wrong, s.prim_gap,  s.prim_nonode,
+        s.sections_eval, s.match, s.wrong, s.prim_match, s.prim_wrong,
     });
     defer gpa.free(content);
 
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = "oracle/baseline.lock", .data = content });
-    std.debug.print("\nwrote oracle/baseline.lock  (sections_eval_min={d} prim_match_min={d} prim_wrong_max={d})\n", .{ s.sections_eval, s.prim_match, s.prim_wrong });
+    std.debug.print("\nwrote oracle/baseline.lock  (match_min={d} wrong_max={d} prim_match_min={d})\n", .{ s.match, s.wrong, s.prim_match });
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -808,12 +1102,14 @@ test "oracle: TypeScript corpus conformance (ratchet)" {
         return err;
     };
     defer res.deinit();
-    printReport(res); // verbose by default — the full breakdown prints every run
+    printReport(res);
     const s = res.stats;
 
     const sections_eval_min = try lockValue("sections_eval_min");
-    const prim_match_min = try lockValue("prim_match_min");
-    const prim_wrong_max = try lockValue("prim_wrong_max");
+    const match_min         = try lockValue("match_min");
+    const wrong_max         = try lockValue("wrong_max");
+    const prim_match_min    = try lockValue("prim_match_min");
+    const prim_wrong_max    = try lockValue("prim_wrong_max");
 
     var failed = false;
     if (s.sections_errored != 0) {
@@ -821,23 +1117,31 @@ test "oracle: TypeScript corpus conformance (ratchet)" {
         failed = true;
     }
     if (s.sections_eval < sections_eval_min) {
-        std.debug.print("REGRESSION: sections_eval {d} < baseline {d} (sections stopped evaluating)\n", .{ s.sections_eval, sections_eval_min });
+        std.debug.print("REGRESSION: sections_eval {d} < baseline {d}\n", .{ s.sections_eval, sections_eval_min });
+        failed = true;
+    }
+    if (s.match < match_min) {
+        std.debug.print("REGRESSION: match {d} < baseline {d} (fewer correct answers)\n", .{ s.match, match_min });
+        failed = true;
+    }
+    if (s.wrong > wrong_max) {
+        std.debug.print("REGRESSION: wrong {d} > baseline {d} (more wrong answers)\n", .{ s.wrong, wrong_max });
         failed = true;
     }
     if (s.prim_match < prim_match_min) {
-        std.debug.print("REGRESSION: prim_match {d} < baseline {d} (fewer correct answers)\n", .{ s.prim_match, prim_match_min });
+        std.debug.print("REGRESSION: prim_match {d} < baseline {d}\n", .{ s.prim_match, prim_match_min });
         failed = true;
     }
     if (s.prim_wrong > prim_wrong_max) {
-        std.debug.print("REGRESSION: prim_wrong {d} > baseline {d} (more wrong answers)\n", .{ s.prim_wrong, prim_wrong_max });
+        std.debug.print("REGRESSION: prim_wrong {d} > baseline {d}\n", .{ s.prim_wrong, prim_wrong_max });
         failed = true;
     }
     if (failed) return error.ConformanceRegressed;
 
-    if (s.prim_match > prim_match_min or s.prim_wrong < prim_wrong_max or s.sections_eval > sections_eval_min) {
+    if (s.match > match_min or s.wrong < wrong_max or s.sections_eval > sections_eval_min) {
         std.debug.print(
-            "IMPROVED — bump oracle/baseline.lock: sections_eval_min={d} prim_match_min={d} prim_wrong_max={d}\n",
-            .{ s.sections_eval, s.prim_match, s.prim_wrong },
+            "IMPROVED — bump oracle/baseline.lock: match_min={d} wrong_max={d} prim_match_min={d}\n",
+            .{ s.match, s.wrong, s.prim_match },
         );
     }
 }
