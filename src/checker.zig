@@ -734,7 +734,35 @@ pub const Checker = struct {
         // type/namespace reference, not a value, so don't read it as an unsafe
         // value (no-unsafe-member-access excludes heritage member expressions).
         if (self.identifierInTypePosition(node)) return tymod.ID_UNKNOWN;
+        // TypeScript keywords/reserved words that appear in invalid positions
+        // (e.g., `static public;` or used as a variable name) should be typed as
+        // `any` not `error`, since they're syntactically present keywords in
+        // a bad context. This fixes ~21.5k coverage-gap cases where "want any got error".
+        if (isKeywordOrReservedWord(name)) return tymod.ID_ANY;
         return tymod.ID_ERROR;
+    }
+
+    /// TypeScript keywords and reserved words. Used to distinguish a keyword
+    /// used in an invalid position (e.g., `static public;`) from a genuinely
+    /// undeclared identifier. Keywords in bad contexts should type as `any`,
+    /// not `error`, to match TypeScript's behavior.
+    fn isKeywordOrReservedWord(name: []const u8) bool {
+        const keywords = [_][]const u8{
+            "break",    "case",     "catch",    "class",    "const",    "continue",
+            "debugger", "default",  "delete",   "do",       "else",     "export",
+            "extends",  "false",    "finally",  "for",      "function", "if",
+            "import",   "in",       "instanceof", "let",    "new",      "null",
+            "return",   "super",    "switch",   "this",     "throw",    "true",
+            "try",      "typeof",   "var",      "void",     "while",    "with",      "yield",
+            "static",   "async",    "await",    "interface", "namespace",
+            "enum",     "abstract", "as",       "declare",  "from",     "get",
+            "of",       "set",      "type",     "module",   "implements", "private",
+            "protected", "public",  "readonly", "require",
+        };
+        inline for (keywords) |kw| {
+            if (std.mem.eql(u8, name, kw)) return true;
+        }
+        return false;
     }
 
     /// True when `node` is the object (receiver) of a member access —
