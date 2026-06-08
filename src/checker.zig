@@ -2939,7 +2939,10 @@ pub const Checker = struct {
         // expression body uses its body type directly; block-body
         // returns are inferred by walking direct `return <expr>;`
         // statements in the body (no nested function descent).
-        var ret_ty: TypeId = tymod.ID_UNKNOWN;
+        // `declare function f(...)` with no return annotation and no body:
+        // TypeScript infers `any` as the return type. Use `any` as the initial
+        // fallback; body inference or annotation will override it below.
+        var ret_ty: TypeId = if (body_for_inference == .none) tymod.ID_ANY else tymod.ID_UNKNOWN;
         var predicate_param_idx: u16 = 0xFFFF;
         var predicate_target: TypeId = TypeId.none;
         var is_assertion: bool = false;
