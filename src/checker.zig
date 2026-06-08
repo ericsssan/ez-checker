@@ -8750,7 +8750,27 @@ pub const Checker = struct {
             };
             return self.store.arrayOf(elem_t) catch tymod.ID_ANY;
         }
-        // Heterogeneous or non-literal: keep tuple for precise destructuring.
+        // Heterogeneous: widen any literal elements to their base types.
+        // TypeScript widens `[1, "a", true]` to `[number, string, boolean]`.
+        var widened_elems_buf: [32]TypeId = undefined;
+        var any_widened = false;
+        for (0..n_used) |j| {
+            const et = self.store.get(buf[j]);
+            const w: TypeId = switch (et.kind) {
+                .string_literal => blk: { any_widened = true; break :blk tymod.ID_STRING; },
+                .number_literal => blk: { any_widened = true; break :blk tymod.ID_NUMBER; },
+                .bigint_literal => blk: { any_widened = true; break :blk tymod.ID_BIGINT; },
+                .boolean_literal => blk: { any_widened = true; break :blk tymod.ID_BOOLEAN; },
+                else => buf[j],
+            };
+            widened_elems_buf[j] = w;
+        }
+        if (any_widened and !has_spread) {
+            const list = self.store.appendTypeIds(widened_elems_buf[0..n_used]) catch
+                return self.store.arrayOf(self.store.unionOf(widened_elems_buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
+            return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
+        }
+        // No literals to widen: keep tuple as-is for precise destructuring.
         if (!has_spread) {
             const list = self.store.appendTypeIds(buf[0..n_used]) catch
                 return self.store.arrayOf(self.store.unionOf(buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
