@@ -842,6 +842,10 @@ pub const Checker = struct {
         // an unrelated variable with the same name.
         if (self.identifierAsPropertySignatureKey(node)) |ty| return ty;
         if (self.identifierAsClassPropertyKey(node)) |ty| return ty;
+        // Object-literal property key: `{ x: 0 }` → x has the type of its value (widened).
+        // Check before typeOfNameByAstSearch so the property value type takes precedence over
+        // an outer variable with the same name.
+        if (self.identifierAsObjectLiteralPropertyKey(node)) |ty| return ty;
         if (self.typeOfNameByAstSearch(name)) |t| return t;
         // When an enum identifier appears, it should be typed as the union of its members
         // (the type-side), not the object type (which is for member access like `Foo.Bar`).
@@ -978,6 +982,45 @@ pub const Checker = struct {
             },
             else => return null,
         }
+    }
+
+    /// Returns the widened value type of an identifier used as a property key
+    /// in an object literal (e.g., `x` in `{ x: 0 }` → number, `y` in `{ y: "hi" }` → string).
+    /// Returns null if the identifier is not an object-literal property key.
+    /// Distinguished from object-pattern property keys by checking the grandparent node.
+    fn identifierAsObjectLiteralPropertyKey(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        if (pidx >= self.ast_ref.nodes.len) return null;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .property) return null;
+        const pdata = self.ast_ref.nodeData(parent);
+        // The identifier must be the key (lhs), not the value (rhs).
+        if (pdata.lhs != node) return null;
+        if (pdata.rhs == .none) return null;
+        // Distinguish object-literal `{ x: 0 }` (grandparent = object_literal) from
+        // object-pattern `{ x: y }` (grandparent = object_pattern). They both use
+        // the .property node tag, so we check the grandparent.
+        const par_idx = @intFromEnum(parent);
+        if (par_idx >= parents.len) return null;
+        const gp_pidx = parents[par_idx];
+        if (gp_pidx == @intFromEnum(NodeIndex.none)) return null;
+        if (gp_pidx >= self.ast_ref.nodes.len) return null;
+        if (self.ast_ref.nodeTag(@enumFromInt(gp_pidx)) != .object_literal) return null;
+        const val_ty = self.typeOf(pdata.rhs);
+        const t = self.store.get(val_ty);
+        // Widen primitive literal types to their base types, matching TypeScript's
+        // widening behavior for object literal property types.
+        return switch (t.kind) {
+            .string_literal => tymod.ID_STRING,
+            .number_literal => tymod.ID_NUMBER,
+            .boolean_literal => tymod.ID_BOOLEAN,
+            .bigint_literal => tymod.ID_BIGINT,
+            else => val_ty,
+        };
     }
 
     /// Resolve a type annotation node to a TypeId, but only for simple/primitive types.
@@ -2083,6 +2126,9 @@ pub const Checker = struct {
                     }
                     return raw;
                 }
+                // No annotation and no initializer: check if this is a for-in binding.
+                // `for (const x in obj)` — x is always string (a property key).
+                if (self.isForInLoopBinding(parent)) return tymod.ID_STRING;
                 return tymod.ID_UNKNOWN;
             },
             .assignment_pattern => {
@@ -2265,6 +2311,8 @@ pub const Checker = struct {
                 // `p.then(onF, e => …)` (arg 1) — `e` is the rejection reason,
                 // contextually `any` (lib.es5 onrejected is `(reason: any)`).
                 if (self.contextualPromiseRejectionParamType(binding)) |t| return t;
+                // For-in destructuring: `for (var [a, b] in obj)` — all bindings are string.
+                if (self.isForInLoopBinding(binding)) return tymod.ID_STRING;
                 return tymod.ID_ANY;
             },
         }
@@ -2364,6 +2412,32 @@ pub const Checker = struct {
         // Receiver must be a Promise.
         if (!tymod.isPromiseRef(&self.store, self.typeOf(md.lhs))) return null;
         return tymod.ID_ANY;
+    }
+
+    /// Returns true if `node` is a declaration binding inside a `for_in_stmt`.
+    /// Walks up through pattern/declarator/var-decl ancestors up to a small depth.
+    /// For-in bindings have no initializer and should be typed as `string` (property keys).
+    fn isForInLoopBinding(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var cur: u32 = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var depth: u32 = 0;
+        while (cur != NONE and depth < 8) : (depth += 1) {
+            const p: NodeIndex = @enumFromInt(cur);
+            switch (self.ast_ref.nodeTag(p)) {
+                .for_in_stmt => return true,
+                // Stop at other statement types that cannot contain a for_in_stmt binding.
+                .for_of_stmt, .for_await_of_stmt, .for_stmt,
+                .while_stmt, .do_while_stmt,
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                .arrow_fn, .async_arrow_fn,
+                .block_stmt => return false,
+                else => {},
+            }
+            cur = if (p.toInt() < parents.len) parents[p.toInt()] else NONE;
+        }
+        return false;
     }
 
     /// Walk up through pattern parents (array/object patterns) to find
@@ -9410,6 +9484,55 @@ pub const Checker = struct {
             }
         }
         return tymod.ID_ANY;
+    }
+
+    /// Infer the type of a `new.target` expression.
+    ///
+    /// TypeScript types `new.target` as the enclosing non-arrow function's
+    /// own type (a function_t).  Arrow functions are transparent — they
+    /// inherit `new.target` from their lexical enclosing non-arrow function.
+    /// Inside a constructor the result is approximately `() => any`
+    /// (the full `typeof ClassName` requires class-side type building which
+    /// we avoid here to keep the change minimal).  The key invariant is
+    /// that the result is always a function_t, never bare `any`.
+    fn inferNewTarget(self: *Checker, node: NodeIndex) TypeId {
+        // Build a reusable `() => any` sentinel for constructor and
+        // unknown-context fallbacks.
+        const any_fn = self.store.functionType(.{
+            .params_start = 0,
+            .params_end = 0,
+            .return_type = tymod.ID_ANY,
+        }) catch return tymod.ID_ANY;
+
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return any_fn;
+        var p = parents[nidx];
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            const tag = self.ast_ref.nodeTag(pn);
+            switch (tag) {
+                // Arrow functions are transparent for new.target — keep walking.
+                .arrow_fn, .async_arrow_fn => {},
+                // A constructor: we'd need the class type for the precise
+                // `typeof ClassName` result.  Return `() => any` as approximation.
+                .constructor_def => return any_fn,
+                // Regular function declarations and expressions: return the
+                // function's own type so `new.target` is at least a function_t.
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => {
+                    return self.functionTypeFromFnDecl(pn);
+                },
+                // Method / getter / setter / static method in a class body:
+                // new.target is `() => any` here (could be a subclass constructor).
+                .method_def, .computed_method_def,
+                .getter_def, .setter_def,
+                .computed_getter_def, .computed_setter_def => return any_fn,
+                else => {},
+            }
+        }
+        return any_fn;
     }
 
     fn inferAwait(self: *Checker, node: NodeIndex) TypeId {
