@@ -6941,6 +6941,28 @@ pub const Checker = struct {
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(data.rhs));
                 const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                 const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
+                // Getter: the property value IS the return type, not the function itself.
+                if (tag == .getter_def) {
+                    const fn_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator);
+                    const ft = self.store.get(fn_ty);
+                    if (ft.kind == .function_t) {
+                        const sigs = self.store.signaturesOf(ft.signatures);
+                        if (sigs.len > 0) {
+                            return .{ .name = name, .type_id = sigs[0].return_type };
+                        }
+                    }
+                    return .{ .name = name, .type_id = tymod.ID_ANY };
+                }
+                // Setter: the property value type comes from the first parameter.
+                if (tag == .setter_def) {
+                    const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+                    if (md.params_start < md.params_end and md.params_end <= ext_len) {
+                        const param: NodeIndex = @enumFromInt(self.ast_ref.extra_data[md.params_start]);
+                        const pty = self.paramDeclaredType(param);
+                        if (!pty.eq(tymod.ID_UNKNOWN)) return .{ .name = name, .type_id = pty };
+                    }
+                    return .{ .name = name, .type_id = tymod.ID_ANY };
+                }
                 const fn_ty = self.buildFunctionType(
                     md.params_start,
                     md.params_end,
@@ -6952,7 +6974,7 @@ pub const Checker = struct {
                 return .{
                     .name = name,
                     .type_id = fn_ty,
-                    .is_method = tag == .method_def,
+                    .is_method = true,
                 };
             },
             else => return null,
