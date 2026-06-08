@@ -898,8 +898,6 @@ pub const Checker = struct {
             return tymod.ID_ANY;
         }
         const ty_node = self.ast_ref.nodeData(pdata.rhs).lhs;
-        // Use resolveSimpleTypeNode to avoid triggering deep conditional/recursive resolution.
-        // Complex types (generics, conditionals) fall back to any to avoid panics.
         return self.resolveSimpleTypeNodeSafe(ty_node);
     }
 
@@ -6469,12 +6467,13 @@ pub const Checker = struct {
                 self.declared_type_cache.put(self.gpa, name, imported) catch {};
                 return imported;
             }
-            // Name is imported but module resolution failed → type as any
-            // (the name exists in an external module, we just can't resolve it).
-            // This distinguishes "unresolvable import" from "truly undeclared".
+            // Name is imported but module resolution failed → preserve as type_ref
+            // so annotations like `function f(): ImportedType {}` render as
+            // `() => ImportedType` rather than `() => any`.
             if (self.import_map.get(name) != null) {
-                self.declared_type_cache.put(self.gpa, name, tymod.ID_ANY) catch {};
-                return tymod.ID_ANY;
+                const tr = self.store.typeRef(name, &.{}) catch tymod.ID_ANY;
+                self.declared_type_cache.put(self.gpa, name, tr) catch {};
+                return tr;
             }
             return null;
         };
@@ -8952,6 +8951,13 @@ pub const Checker = struct {
                     if (!tymod.isUnknown(&self.store, t)) return t;
                 }
             }
+            // Polymorphic `this` type: resolve member access via the enclosing class.
+            if (std.mem.eql(u8, ref_name, "this")) {
+                if (self.thisEnclosingClassType(obj_node)) |class_ty| {
+                    const t = self.memberOnApparentType(class_ty, prop_name, obj_node);
+                    if (!tymod.isUnknown(&self.store, t)) return t;
+                }
+            }
             // Type parameter: chase constraint (apparent type).
             const constraint = self.typeParameterConstraintFromName(ref_name, obj_node);
             if (constraint) |c| {
@@ -9201,7 +9207,13 @@ pub const Checker = struct {
                     }
                     const new_ret = self.substituteTypeId(sig.return_type, keys, vals);
                     if (!new_ret.eq(sig.return_type)) changed = true;
-                    const old_names = self.store.signatureParamNamesOf(sig);
+                    // Snapshot names before appendSignatureParams — that call may grow
+                    // signature_param_name_pool, invalidating the slice we borrow from it.
+                    const old_names_slice = self.store.signatureParamNamesOf(sig);
+                    var old_names_buf: [8][]const u8 = undefined;
+                    if (old_names_slice.len > old_names_buf.len) return id;
+                    @memcpy(old_names_buf[0..old_names_slice.len], old_names_slice);
+                    const old_names = old_names_buf[0..old_names_slice.len];
                     const pr = self.store.appendSignatureParams(new_params_buf[0..old_params.len], old_names) catch return id;
                     // Preserve all other signature fields (is_construct, predicate,
                     // assertion) — only the param range and return type change.
@@ -9449,6 +9461,48 @@ pub const Checker = struct {
         return self.resolveTypeNode(self.ast_ref.nodeData(bd.rhs).lhs);
     }
 
+    /// Walk parents from `node` to find the enclosing class instance type.
+    /// Returns the structural (object_t) type for the class, or null if not
+    /// inside a class method.  Used by memberOnApparentType for `typeRef("this")`.
+    fn thisEnclosingClassType(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        if (parents.len == 0) return null;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        var p = parents[nidx];
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            const tag = self.ast_ref.nodeTag(pn);
+            switch (tag) {
+                .method_def, .computed_method_def, .getter_def, .setter_def,
+                .computed_getter_def, .computed_setter_def, .constructor_def => {
+                    var q = parents[p];
+                    while (q != NONE) : (q = parents[q]) {
+                        const qn: NodeIndex = @enumFromInt(q);
+                        const qtag = self.ast_ref.nodeTag(qn);
+                        if (qtag == .class_decl or qtag == .class_expr) {
+                            const cdata = self.ast_ref.nodeData(qn);
+                            if (cdata.lhs == .none) return null;
+                            const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
+                            if (cd.name == .none) return null;
+                            const qname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+                            if (qname.len == 0) return null;
+                            return self.resolveDeclaredType(qname);
+                        }
+                        if (qtag == .class_body) continue;
+                    }
+                    return null;
+                },
+                .fn_decl, .async_fn_decl, .generator_fn_decl,
+                .async_generator_fn_decl, .fn_expr, .async_fn_expr,
+                .generator_fn_expr, .async_generator_fn_expr => return null,
+                else => {},
+            }
+        }
+        return null;
+    }
+
     /// `this` inside a class method/getter/setter/constructor resolves
     /// to the enclosing class's instance type.  Walks parents to find
     /// the nearest method-or-class declaration.  A stand-alone function's
@@ -9475,9 +9529,7 @@ pub const Checker = struct {
                         const qn: NodeIndex = @enumFromInt(q);
                         const qtag = self.ast_ref.nodeTag(qn);
                         if (qtag == .class_decl or qtag == .class_expr) {
-                            const qcd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(self.ast_ref.nodeData(qn).lhs));
-                            const qname = if (qcd.name == .none) "" else self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qcd.name));
-                            return self.buildClassInstanceType(qn, qname);
+                            return self.store.typeRef("this", &.{}) catch tymod.ID_ANY;
                         }
                         // class_body sits between method_def and class_decl/expr;
                         // keep walking until we hit the decl/expr.
