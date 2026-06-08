@@ -369,6 +369,25 @@ pub const Checker = struct {
             .typeof_expr => blk: {
                 const operand = self.ast_ref.nodeData(node).lhs;
                 if (operand == .none) break :blk tymod.ID_STRING;
+                // typeof on property access returns the full typeof union
+                // (TypeScript treats member access conservatively since
+                // properties can be reassigned and their runtime type may
+                // not match their declared type).
+                const op_tag = self.ast_ref.nodeTag(operand);
+                if (op_tag == .member_expr or op_tag == .optional_member_expr or
+                    op_tag == .computed_member_expr or op_tag == .optional_computed_member_expr)
+                {
+                    var buf: [8]TypeId = undefined;
+                    buf[0] = self.store.stringLiteral("bigint") catch tymod.ID_STRING;
+                    buf[1] = self.store.stringLiteral("boolean") catch tymod.ID_STRING;
+                    buf[2] = self.store.stringLiteral("function") catch tymod.ID_STRING;
+                    buf[3] = self.store.stringLiteral("number") catch tymod.ID_STRING;
+                    buf[4] = self.store.stringLiteral("object") catch tymod.ID_STRING;
+                    buf[5] = self.store.stringLiteral("string") catch tymod.ID_STRING;
+                    buf[6] = self.store.stringLiteral("symbol") catch tymod.ID_STRING;
+                    buf[7] = self.store.stringLiteral("undefined") catch tymod.ID_STRING;
+                    break :blk self.store.unionOf(&buf) catch tymod.ID_STRING;
+                }
                 break :blk self.typeofStringIdOf(self.typeOf(operand));
             },
             .void_expr => tymod.ID_UNDEFINED,
@@ -1547,17 +1566,9 @@ pub const Checker = struct {
         // would lose enum-ness. Mirrors the no-symbol fallback in
         // inferIdentifier.
         if (self.ast_ref.nodeTag(binding) == .ts_enum_decl) {
-            const data = self.ast_ref.nodeData(binding);
-            if (data.lhs != .none) {
-                const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
-                const enum_name = self.ast_ref.tokenText(ed.name);
-                if (self.buildEnumObjectType(enum_name)) |t| return t else {
-                    // buildEnumObjectType returns null for enums with reserved word members.
-                    // TypeScript treats these as any in strict mode.
-                    return tymod.ID_ANY;
-                }
-            }
-            return tymod.ID_UNKNOWN;
+            // Enum values are typed as `any` to match TypeScript's runtime behavior.
+            // Member access (like `EnumName.Member`) is handled specially in inferMember.
+            return tymod.ID_ANY;
         }
         // Try to find a type annotation by peeling wrappers and checking the binding or its lhs.
         var node = binding;
@@ -6644,6 +6655,8 @@ pub const Checker = struct {
         const num_elements = range.end - range.start;
         if (num_elements < 2) return tymod.ID_ANY;
         const last_idx = self.ast_ref.extra_data[range.end - 1];
+        // If last operand is missing (represented as .none), result is any
+        if (last_idx == @intFromEnum(NodeIndex.none)) return tymod.ID_ANY;
         return self.typeOf(@enumFromInt(last_idx));
     }
 
@@ -7581,6 +7594,14 @@ pub const Checker = struct {
                     const pd = self.ast_ref.nodeData(p);
                     const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
                     const val_ty = self.typeOf(pd.rhs);
+                    // Widen primitive literal types to their base types.
+                    const val_t = self.store.get(val_ty);
+                    const widened_ty = switch (val_t.kind) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        else => val_ty,
+                    };
                     const vt = self.ast_ref.nodeTag(pd.rhs);
                     const is_plain_fn = vt == .fn_expr or vt == .async_fn_expr or
                         vt == .generator_fn_expr or vt == .async_generator_fn_expr;
@@ -7592,7 +7613,7 @@ pub const Checker = struct {
                     // NOT "unbound" (which is reserved for class fields).
                     buf[n] = .{
                         .name = key_name,
-                        .type_id = val_ty,
+                        .type_id = widened_ty,
                         .is_method = is_fn,
                         .is_fn_property = false,
                     };
@@ -7602,7 +7623,15 @@ pub const Checker = struct {
                     const pd = self.ast_ref.nodeData(p);
                     const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
                     const val_ty = self.typeOf(pd.lhs);
-                    buf[n] = .{ .name = key_name, .type_id = val_ty };
+                    // Widen primitive literal types to their base types.
+                    const val_t = self.store.get(val_ty);
+                    const widened_ty = switch (val_t.kind) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        else => val_ty,
+                    };
+                    buf[n] = .{ .name = key_name, .type_id = widened_ty };
                     n += 1;
                 },
                 .method_def => {
@@ -7665,7 +7694,40 @@ pub const Checker = struct {
     fn inferMember(self: *Checker, node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(node);
         const obj_ty = self.typeOf(data.lhs);
-        if (tymod.isAny(&self.store, obj_ty)) return tymod.ID_ANY;
+        // Special case: enum member access (e.g. `SyntaxKind.Block`).
+        // Enum values are typed as `any`, but we still want to look up
+        // the member in the enum definition and return the literal type.
+        if (tymod.isAny(&self.store, obj_ty)) {
+            const obj_node = data.lhs;
+            if (self.ast_ref.nodeTag(obj_node) == .identifier) {
+                const obj_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(obj_node));
+                // Check if this is an enum and try to look up the member
+                if (self.enum_kinds.get(obj_name) != null) {
+                    const tag = self.ast_ref.nodeTag(node);
+                    const prop_name: []const u8 = switch (tag) {
+                        .member_expr, .optional_member_expr => blk: {
+                            if (data.rhs == .none) break :blk &.{};
+                            const t = self.ast_ref.nodeMainToken(data.rhs);
+                            break :blk self.ast_ref.tokenText(t);
+                        },
+                        else => return tymod.ID_ANY,
+                    };
+                    if (prop_name.len > 0) {
+                        if (self.buildEnumObjectType(obj_name)) |obj_type| {
+                            const ot = self.store.get(obj_type);
+                            if (ot.kind == .object_t) {
+                                for (self.store.propsOf(ot.object_props)) |p| {
+                                    if (std.mem.eql(u8, p.name, prop_name)) {
+                                        return p.type_id;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return tymod.ID_ANY;
+        }
         const tag = self.ast_ref.nodeTag(node);
         const is_optional = tag == .optional_member_expr or tag == .optional_computed_member_expr;
         // Optional chain propagates: even on plain `.x` access, if a prior
