@@ -8799,7 +8799,7 @@ pub const Checker = struct {
         {
             return self.makeNullaryFn(tymod.ID_STRING);
         }
-        return tymod.ID_UNKNOWN;
+        return tymod.ID_ANY;
     }
 
     fn stringPrototypeProperty(self: *Checker, name: []const u8) ?TypeId {
