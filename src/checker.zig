@@ -7188,6 +7188,7 @@ pub const Checker = struct {
             self.calleeIsInOptionalChain(callee);
         const lookup_ty = if (in_optional_chain) self.stripNullishForLookup(callee_ty) else callee_ty;
         const t = self.store.get(lookup_ty);
+        const callee_unresolved = lookup_ty.eq(tymod.ID_UNKNOWN) or lookup_ty.eq(tymod.ID_ERROR);
         var result: TypeId = tymod.ID_UNKNOWN;
         if (t.kind == .function_t) {
             const sigs = self.store.signaturesOf(t.signatures);
@@ -7222,6 +7223,7 @@ pub const Checker = struct {
                 return self.store.unionOf(&.{ result, tymod.ID_UNDEFINED }) catch result;
             }
         }
+        if (callee_unresolved and result.eq(tymod.ID_UNKNOWN)) return tymod.ID_ANY;
         return result;
     }
 
