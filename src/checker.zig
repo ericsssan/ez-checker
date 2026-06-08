@@ -316,7 +316,8 @@ pub const Checker = struct {
                 break :blk tymod.ID_UNKNOWN;
             },
             .this_expr => self.inferThis(node),
-            .super_expr => tymod.ID_UNKNOWN,
+            // super's type depends on the base class — default to any when not modeled.
+            .super_expr => tymod.ID_ANY,
 
             .identifier => self.inferIdentifier(node),
             // A JSX element name (`<Foo .../>`) references a value — resolve it
@@ -433,7 +434,9 @@ pub const Checker = struct {
             .optional_member_expr, .optional_computed_member_expr => self.inferMember(node),
 
             .await_expr => self.inferAwait(node),
-            .yield_expr, .yield_delegate => tymod.ID_UNKNOWN,
+            // yield's type is TNext of the enclosing Generator — defaults to any
+            // when not explicitly typed.  Using any matches tsc's default behaviour.
+            .yield_expr, .yield_delegate => tymod.ID_ANY,
 
             // Function/arrow expressions build a function_t carrying
             // their signature (param types + return type).  Class
@@ -455,6 +458,16 @@ pub const Checker = struct {
             },
             .class_decl => tymod.ID_ANY,
             .class_expr => tymod.ID_UNKNOWN,
+            // Spread element `...expr` in call args/array literals:
+            // its type is the element type of the spread argument (with
+            // literals widened, matching tsc's spread behaviour).
+            .spread_element => blk: {
+                const se_data = self.ast_ref.nodeData(node);
+                if (se_data.lhs == .none) break :blk tymod.ID_ANY;
+                const se_ty = self.typeOf(se_data.lhs);
+                if (tymod.isAny(&self.store, se_ty)) break :blk tymod.ID_ANY;
+                break :blk self.arrayMethodElementTypeOf(se_ty) orelse tymod.ID_ANY;
+            },
             else => tymod.ID_ANY,
         };
     }
