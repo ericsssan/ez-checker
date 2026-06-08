@@ -10163,7 +10163,9 @@ pub const Checker = struct {
                 const ids = self.store.idsOf(t.list_data);
                 if (ids.len > 0) {
                     const elem = self.store.get(ids[0]);
-                    const needs_parens = elem.kind == .union_t or elem.kind == .intersection_t or elem.kind == .function_t;
+                    const needs_parens = elem.kind == .union_t or elem.kind == .intersection_t or
+                        elem.kind == .function_t or
+                        (elem.kind == .type_ref and std.mem.startsWith(u8, elem.name, "typeof "));
                     if (needs_parens) try buf.appendSlice(gpa, "(");
                     try self.typeToStringInner(ids[0], buf, depth + 1);
                     if (needs_parens) try buf.appendSlice(gpa, ")");
@@ -10177,7 +10179,9 @@ pub const Checker = struct {
                 const ids = self.store.idsOf(t.list_data);
                 if (ids.len > 0) {
                     const elem = self.store.get(ids[0]);
-                    const needs_parens = elem.kind == .union_t or elem.kind == .intersection_t or elem.kind == .function_t;
+                    const needs_parens = elem.kind == .union_t or elem.kind == .intersection_t or
+                        elem.kind == .function_t or
+                        (elem.kind == .type_ref and std.mem.startsWith(u8, elem.name, "typeof "));
                     if (needs_parens) try buf.appendSlice(gpa, "(");
                     try self.typeToStringInner(ids[0], buf, depth + 1);
                     if (needs_parens) try buf.appendSlice(gpa, ")");
