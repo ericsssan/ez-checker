@@ -412,10 +412,20 @@ pub const Checker = struct {
                 break :blk self.store.numberLiteral(-lit.literal_value.number) catch tymod.ID_NUMBER;
             },
 
-            .bitwise_not,
+            .bitwise_not => blk: {
+                const operand = self.ast_ref.nodeData(node).lhs;
+                break :blk if (operand == .none) tymod.ID_ANY else tymod.ID_NUMBER;
+            },
             .bitwise_and, .bitwise_or, .bitwise_xor,
-            .shift_left, .shift_right, .unsigned_shift_right,
-            .prefix_inc, .prefix_dec, .postfix_inc, .postfix_dec => tymod.ID_NUMBER,
+            .shift_left, .shift_right, .unsigned_shift_right => blk: {
+                const data = self.ast_ref.nodeData(node);
+                if (data.lhs == .none or data.rhs == .none) break :blk tymod.ID_ANY;
+                break :blk tymod.ID_NUMBER;
+            },
+            .prefix_inc, .prefix_dec, .postfix_inc, .postfix_dec => blk: {
+                const operand = self.ast_ref.nodeData(node).lhs;
+                break :blk if (operand == .none) tymod.ID_ANY else tymod.ID_NUMBER;
+            },
 
             .array_literal => self.inferArrayLiteral(node),
             .object_literal => self.inferObjectLiteral(node),
@@ -734,35 +744,7 @@ pub const Checker = struct {
         // type/namespace reference, not a value, so don't read it as an unsafe
         // value (no-unsafe-member-access excludes heritage member expressions).
         if (self.identifierInTypePosition(node)) return tymod.ID_UNKNOWN;
-        // TypeScript keywords/reserved words that appear in invalid positions
-        // (e.g., `static public;` or used as a variable name) should be typed as
-        // `any` not `error`, since they're syntactically present keywords in
-        // a bad context. This fixes ~21.5k coverage-gap cases where "want any got error".
-        if (isKeywordOrReservedWord(name)) return tymod.ID_ANY;
         return tymod.ID_ERROR;
-    }
-
-    /// TypeScript keywords and reserved words. Used to distinguish a keyword
-    /// used in an invalid position (e.g., `static public;`) from a genuinely
-    /// undeclared identifier. Keywords in bad contexts should type as `any`,
-    /// not `error`, to match TypeScript's behavior.
-    fn isKeywordOrReservedWord(name: []const u8) bool {
-        const keywords = [_][]const u8{
-            "break",    "case",     "catch",    "class",    "const",    "continue",
-            "debugger", "default",  "delete",   "do",       "else",     "export",
-            "extends",  "false",    "finally",  "for",      "function", "if",
-            "import",   "in",       "instanceof", "let",    "new",      "null",
-            "return",   "super",    "switch",   "this",     "throw",    "true",
-            "try",      "typeof",   "var",      "void",     "while",    "with",      "yield",
-            "static",   "async",    "await",    "interface", "namespace",
-            "enum",     "abstract", "as",       "declare",  "from",     "get",
-            "of",       "set",      "type",     "module",   "implements", "private",
-            "protected", "public",  "readonly", "require",
-        };
-        inline for (keywords) |kw| {
-            if (std.mem.eql(u8, name, kw)) return true;
-        }
-        return false;
     }
 
     /// True when `node` is the object (receiver) of a member access —
@@ -1316,6 +1298,13 @@ pub const Checker = struct {
         if (self.tryTypeofNarrow(data.rhs, data.lhs, sym, is_neq, negate)) |narrowed| {
             return self.intersectNarrow(ty, narrowed.kind, narrowed.keep_only);
         }
+        // typeof narrowing on property access: `typeof sym.prop === 'string'`
+        if (self.tryTypeofNarrowProp(data.lhs, data.rhs, sym, is_neq, negate)) |narrowed| {
+            return self.narrowTypeofProp(ty, narrowed.prop_name, narrowed.kind, narrowed.keep_only);
+        }
+        if (self.tryTypeofNarrowProp(data.rhs, data.lhs, sym, is_neq, negate)) |narrowed| {
+            return self.narrowTypeofProp(ty, narrowed.prop_name, narrowed.kind, narrowed.keep_only);
+        }
         // Try `<sym> op <literal>` and `<literal> op <sym>`.
         var sym_side: NodeIndex = .none;
         var lit_side: NodeIndex = .none;
@@ -1379,6 +1368,53 @@ pub const Checker = struct {
         if (std.mem.eql(u8, inner, "undefined")) return .undefined_t;
         if (std.mem.eql(u8, inner, "function")) return .function;
         return null;
+    }
+
+    const TypeofPropNarrowSpec = struct { prop_name: []const u8, kind: Narrowable, keep_only: bool };
+
+    /// Recognise `typeof <sym>.prop <op> <"kind">`.  Returns the narrow spec
+    /// when the typeof's operand resolves to a member access of `sym`.
+    fn tryTypeofNarrowProp(self: *Checker, typeof_side: NodeIndex, str_side: NodeIndex, sym: symbol_mod.SymbolId, is_neq: bool, negate: bool) ?TypeofPropNarrowSpec {
+        if (self.ast_ref.nodeTag(typeof_side) != .typeof_expr) return null;
+        const operand = self.ast_ref.nodeData(typeof_side).lhs;
+        const prop_name = self.isMemberAccessOfSym(operand, sym) orelse return null;
+        const str_kind = self.typeofStringValue(str_side) orelse return null;
+        const keep_only = (!is_neq) != negate;
+        return .{ .prop_name = prop_name, .kind = str_kind, .keep_only = keep_only };
+    }
+
+    /// Narrow a union type by typeof on a property: `typeof sym.prop === 'string'`.
+    /// For each union member, narrow its `prop` field by the typeof kind, then
+    /// reconstruct the union with only members that have compatible property types.
+    fn narrowTypeofProp(self: *Checker, ty: TypeId, prop_name: []const u8, kind: Narrowable, keep_only: bool) TypeId {
+        const t = self.store.get(ty);
+        if (t.kind != .union_t) {
+            // For non-union: try to narrow the property directly and see if it results
+            // in a valid type. If the property doesn't match the typeof, skip member.
+            const prop_ty = self.directPropOf(ty, prop_name);
+            if (prop_ty.eq(tymod.ID_UNKNOWN)) return ty;
+            const narrowed = self.narrowUnion(prop_ty, kind, keep_only);
+            const matches = !narrowed.eq(tymod.ID_NEVER);
+            return if (keep_only == matches) ty else tymod.ID_NEVER;
+        }
+        var buf: [16]TypeId = undefined;
+        var n: usize = 0;
+        for (self.store.idsOf(t.list_data)) |m| {
+            const prop_ty = self.directPropOf(m, prop_name);
+            const narrowed = if (prop_ty.eq(tymod.ID_UNKNOWN))
+                prop_ty // unknown prop: can't narrow, keep member
+            else
+                self.narrowUnion(prop_ty, kind, keep_only);
+            const matches = !narrowed.eq(tymod.ID_NEVER);
+            if (keep_only == matches) {
+                if (n >= buf.len) return ty;
+                buf[n] = m;
+                n += 1;
+            }
+        }
+        if (n == 0) return tymod.ID_NEVER;
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch ty;
     }
 
     /// Combine narrow spec with current type: for `typeof x === 'string'`
@@ -8210,10 +8246,6 @@ pub const Checker = struct {
     ///   - object_t: direct property lookup.
     fn memberOnApparentType(self: *Checker, obj_ty: TypeId, prop_name: []const u8, obj_node: NodeIndex) TypeId {
         const obj = self.store.get(obj_ty);
-        // Remember if input obj_ty is unknown/error so we return `any`
-        // instead of `unknown` at the end, following the "unknown source → any"
-        // assumption (fixes ~14k coverage-gap cases systematically).
-        const input_was_unknown = obj_ty.eq(tymod.ID_UNKNOWN) or obj_ty.eq(tymod.ID_ERROR);
         // Composite receivers: walk members.
         if (obj.kind == .union_t) {
             // Per TS: every union member must have the property.  We
@@ -8287,9 +8319,7 @@ pub const Checker = struct {
         if (obj.kind == .number or obj.kind == .number_literal) {
             if (self.numberPrototypeProperty(prop_name)) |ty| return ty;
         }
-        // Fallback: if input was unknown/error, return `any` (unresolved → any);
-        // otherwise unknown (property not found on known type).
-        return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
+        return tymod.ID_UNKNOWN;
     }
 
     /// Walk to the enclosing scope and find a `ts_type_parameter`

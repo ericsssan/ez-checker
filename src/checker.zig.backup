@@ -734,35 +734,7 @@ pub const Checker = struct {
         // type/namespace reference, not a value, so don't read it as an unsafe
         // value (no-unsafe-member-access excludes heritage member expressions).
         if (self.identifierInTypePosition(node)) return tymod.ID_UNKNOWN;
-        // TypeScript keywords/reserved words that appear in invalid positions
-        // (e.g., `static public;` or used as a variable name) should be typed as
-        // `any` not `error`, since they're syntactically present keywords in
-        // a bad context. This fixes ~21.5k coverage-gap cases where "want any got error".
-        if (isKeywordOrReservedWord(name)) return tymod.ID_ANY;
         return tymod.ID_ERROR;
-    }
-
-    /// TypeScript keywords and reserved words. Used to distinguish a keyword
-    /// used in an invalid position (e.g., `static public;`) from a genuinely
-    /// undeclared identifier. Keywords in bad contexts should type as `any`,
-    /// not `error`, to match TypeScript's behavior.
-    fn isKeywordOrReservedWord(name: []const u8) bool {
-        const keywords = [_][]const u8{
-            "break",    "case",     "catch",    "class",    "const",    "continue",
-            "debugger", "default",  "delete",   "do",       "else",     "export",
-            "extends",  "false",    "finally",  "for",      "function", "if",
-            "import",   "in",       "instanceof", "let",    "new",      "null",
-            "return",   "super",    "switch",   "this",     "throw",    "true",
-            "try",      "typeof",   "var",      "void",     "while",    "with",      "yield",
-            "static",   "async",    "await",    "interface", "namespace",
-            "enum",     "abstract", "as",       "declare",  "from",     "get",
-            "of",       "set",      "type",     "module",   "implements", "private",
-            "protected", "public",  "readonly", "require",
-        };
-        inline for (keywords) |kw| {
-            if (std.mem.eql(u8, name, kw)) return true;
-        }
-        return false;
     }
 
     /// True when `node` is the object (receiver) of a member access —
@@ -825,6 +797,29 @@ pub const Checker = struct {
         };
         inline for (names) |g| {
             if (std.mem.eql(u8, name, g)) return true;
+        }
+        return false;
+    }
+
+    /// TypeScript keywords and reserved words. Used to distinguish a keyword
+    /// used in an invalid position (e.g., `static public;`) from a genuinely
+    /// undeclared identifier. Keywords in bad contexts should type as `any`,
+    /// not `error`, to match TypeScript's behavior.
+    fn isKeywordOrReservedWord(name: []const u8) bool {
+        const keywords = [_][]const u8{
+            "break",    "case",     "catch",    "class",    "const",    "continue",
+            "debugger", "default",  "delete",   "do",       "else",     "export",
+            "extends",  "false",    "finally",  "for",      "function", "if",
+            "import",   "in",       "instanceof", "let",    "new",      "null",
+            "return",   "super",    "switch",   "this",     "throw",    "true",
+            "try",      "typeof",   "var",      "void",     "while",    "with",      "yield",
+            "static",   "async",    "await",    "interface", "namespace",
+            "enum",     "abstract", "as",       "declare",  "from",     "get",
+            "of",       "set",      "type",     "module",   "implements", "private",
+            "protected", "public",  "readonly", "require",
+        };
+        inline for (keywords) |kw| {
+            if (std.mem.eql(u8, name, kw)) return true;
         }
         return false;
     }
@@ -8210,10 +8205,6 @@ pub const Checker = struct {
     ///   - object_t: direct property lookup.
     fn memberOnApparentType(self: *Checker, obj_ty: TypeId, prop_name: []const u8, obj_node: NodeIndex) TypeId {
         const obj = self.store.get(obj_ty);
-        // Remember if input obj_ty is unknown/error so we return `any`
-        // instead of `unknown` at the end, following the "unknown source → any"
-        // assumption (fixes ~14k coverage-gap cases systematically).
-        const input_was_unknown = obj_ty.eq(tymod.ID_UNKNOWN) or obj_ty.eq(tymod.ID_ERROR);
         // Composite receivers: walk members.
         if (obj.kind == .union_t) {
             // Per TS: every union member must have the property.  We
@@ -8287,9 +8278,7 @@ pub const Checker = struct {
         if (obj.kind == .number or obj.kind == .number_literal) {
             if (self.numberPrototypeProperty(prop_name)) |ty| return ty;
         }
-        // Fallback: if input was unknown/error, return `any` (unresolved → any);
-        // otherwise unknown (property not found on known type).
-        return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
+        return tymod.ID_UNKNOWN;
     }
 
     /// Walk to the enclosing scope and find a `ts_type_parameter`
