@@ -430,11 +430,28 @@ pub const Checker = struct {
     }
 
     fn literalString(self: *Checker, node: NodeIndex) TypeId {
+        if (self.stringLiteralIsPropertyKey(node)) return tymod.ID_STRING;
         const tok = self.ast_ref.nodeMainToken(node);
         const raw = self.ast_ref.tokenText(tok);
         if (raw.len < 2) return tymod.ID_STRING;
         const value = raw[1 .. raw.len - 1];
         return self.store.stringLiteral(value) catch tymod.ID_STRING;
+    }
+
+    fn stringLiteralIsPropertyKey(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return false;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return false;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .property) return false;
+        if (self.ast_ref.nodeData(parent).lhs != node) return false;
+        if (pidx >= parents.len) return false;
+        const gp_idx = parents[pidx];
+        if (gp_idx == @intFromEnum(NodeIndex.none)) return false;
+        const grandparent: NodeIndex = @enumFromInt(gp_idx);
+        return self.ast_ref.nodeTag(grandparent) == .object_literal;
     }
 
     fn literalNumber(self: *Checker, node: NodeIndex) TypeId {
@@ -788,6 +805,7 @@ pub const Checker = struct {
             props_buf[n] = .{ .name = member_name, .type_id = member_ty };
             n += 1;
         }
+        if (n == 0) return null;
         const list = self.store.appendObjectProps(props_buf[0..n]) catch return null;
         return self.store.add(.{ .kind = .object_t, .object_props = list }) catch null;
     }
