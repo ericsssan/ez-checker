@@ -9156,7 +9156,7 @@ pub const Checker = struct {
                         try buf.appendSlice(gpa, "\\0");
                     } else if (byte < 0x20 or byte == 0x7F) {
                         // Encode other control characters as \uXXXX
-                        try buf.print(gpa, "\\u{x:0>4}", .{byte});
+                        try buf.print(gpa, "\\u{X:0>4}", .{byte});
                     } else if (byte == '"') {
                         try buf.appendSlice(gpa, "\\\"");
                     } else if (byte == '\\') {
