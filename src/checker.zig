@@ -10186,12 +10186,38 @@ pub const Checker = struct {
                 }
             },
             .intersection_t => {
+                // If tagged with a type-alias name, serialize as the alias
+                // (e.g. `type T = A & B` at use site shows as `T`, not `A & B`).
+                if (t.alias_name.len > 0) {
+                    try buf.appendSlice(gpa, t.alias_name);
+                    return;
+                }
                 for (self.store.idsOf(t.list_data), 0..) |m, i| {
                     if (i > 0) try buf.appendSlice(gpa, " & ");
                     try self.typeToStringInner(m, buf, depth + 1);
                 }
             },
             .union_t => {
+                // If tagged with a type-alias name AND the union contains at least
+                // one complex member (not a bare primitive/literal), serialize as
+                // the alias. TypeScript reports `All` for `type All = A | B` when
+                // A/B are object/named types, but expands simple scalar unions like
+                // `type MaybeStr = string | undefined` to `string | undefined`.
+                if (t.alias_name.len > 0) {
+                    const members = self.store.idsOf(t.list_data);
+                    const has_complex = for (members) |m| {
+                        const mk = self.store.get(m).kind;
+                        switch (mk) {
+                            .type_ref, .object_t, .function_t, .intersection_t,
+                            .array_t, .readonly_array_t, .tuple_t, .type_param => break true,
+                            else => {},
+                        }
+                    } else false;
+                    if (has_complex) {
+                        try buf.appendSlice(gpa, t.alias_name);
+                        return;
+                    }
+                }
                 const ids = self.store.idsOf(t.list_data);
                 // Collect member strings, sort for stability.
                 var strs: std.ArrayList([]u8) = .empty;
