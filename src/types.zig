@@ -614,6 +614,35 @@ pub const TypeStore = struct {
                 try addUnique(self.gpa, &buf, m);
             }
         }
+        // `true | false` → `boolean`: TypeScript collapses the full boolean
+        // literal union to the base type before any base-type absorption below.
+        {
+            var has_true = false;
+            var has_false = false;
+            for (buf.items) |m| {
+                const t = self.get(m);
+                if (t.kind == .boolean_literal) {
+                    if (t.literal_value.boolean) has_true = true else has_false = true;
+                }
+            }
+            if (has_true and has_false) {
+                var w: usize = 0;
+                var inserted = false;
+                for (buf.items) |m| {
+                    if (self.get(m).kind == .boolean_literal) {
+                        if (!inserted) {
+                            buf.items[w] = ID_BOOLEAN;
+                            w += 1;
+                            inserted = true;
+                        }
+                    } else {
+                        buf.items[w] = m;
+                        w += 1;
+                    }
+                }
+                buf.shrinkRetainingCapacity(w);
+            }
+        }
         // Literal absorption: a literal is subsumed by its broad primitive base
         // when both appear in the union — TS collapses `'a' | string` to `string`
         // (and `Str.A | string` to `string`). Required for no-unsafe-enum-
