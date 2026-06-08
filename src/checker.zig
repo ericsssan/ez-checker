@@ -831,6 +831,11 @@ pub const Checker = struct {
         const tok = self.ast_ref.nodeMainToken(node);
         const name = self.ast_ref.tokenText(tok);
         if (name.len == 0) return tymod.ID_UNKNOWN;
+        // If this identifier is the key of a ts_property_signature (e.g., `a`
+        // in `interface Foo { a: number }`), return its declared type from the
+        // annotation rather than falling through to AST search which may find
+        // an unrelated variable with the same name.
+        if (self.identifierAsPropertySignatureKey(node)) |ty| return ty;
         if (self.typeOfNameByAstSearch(name)) |t| return t;
         // When an enum identifier appears, it should be typed as the union of its members
         // (the type-side), not the object type (which is for member access like `Foo.Bar`).
@@ -861,7 +866,73 @@ pub const Checker = struct {
         return tymod.ID_ERROR;
     }
 
-    /// TypeScript keywords and reserved words. Used to distinguish a keyword
+    /// Returns the declared type of an identifier that is the key of a
+    /// `ts_property_signature` (e.g., `a` in `interface Foo { a: number }`).
+    /// Returns null if the identifier is not a property-signature key.
+    /// Uses the cached sym_types path to avoid triggering deep type resolution.
+    fn identifierAsPropertySignatureKey(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .ts_property_signature) return null;
+        const pdata = self.ast_ref.nodeData(parent);
+        if (pdata.lhs != node) return null;
+        if (pdata.rhs == .none or self.ast_ref.nodeTag(pdata.rhs) != .ts_type_annotation) {
+            return tymod.ID_ANY;
+        }
+        const ty_node = self.ast_ref.nodeData(pdata.rhs).lhs;
+        // Use resolveSimpleTypeNode to avoid triggering deep conditional/recursive resolution.
+        // Complex types (generics, conditionals) fall back to any to avoid panics.
+        return self.resolveSimpleTypeNodeSafe(ty_node);
+    }
+
+    /// Resolve a type annotation node to a TypeId, but only for simple/primitive types.
+    /// Returns null for complex types (generics, conditionals) to avoid recursion.
+    fn resolveSimpleTypeNodeSafe(self: *Checker, ty_node: NodeIndex) ?TypeId {
+        const tag = self.ast_ref.nodeTag(ty_node);
+        switch (tag) {
+            .ts_type_reference => {
+                const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ty_node));
+                if (std.mem.eql(u8, name, "number")) return tymod.ID_NUMBER;
+                if (std.mem.eql(u8, name, "string")) return tymod.ID_STRING;
+                if (std.mem.eql(u8, name, "boolean")) return tymod.ID_BOOLEAN;
+                if (std.mem.eql(u8, name, "any")) return tymod.ID_ANY;
+                if (std.mem.eql(u8, name, "unknown")) return tymod.ID_UNKNOWN;
+                if (std.mem.eql(u8, name, "never")) return tymod.ID_NEVER;
+                if (std.mem.eql(u8, name, "void")) return tymod.ID_VOID;
+                if (std.mem.eql(u8, name, "null")) return tymod.ID_NULL;
+                if (std.mem.eql(u8, name, "undefined")) return tymod.ID_UNDEFINED;
+                if (std.mem.eql(u8, name, "symbol")) return tymod.ID_SYMBOL;
+                if (std.mem.eql(u8, name, "bigint")) return tymod.ID_BIGINT;
+                // Complex named type → don't recurse
+                return null;
+            },
+            .string_literal => return self.literalString(ty_node),
+            .number_literal => return self.literalNumber(ty_node),
+            .ts_union_type => {
+                // Simple unions: only recurse one level.
+                const data = self.ast_ref.nodeData(ty_node);
+                const slice = self.directRange(data.lhs, data.rhs) orelse return null;
+                var buf: [8]TypeId = undefined;
+                if (slice.len > buf.len) return null;
+                var n: usize = 0;
+                for (slice) |raw| {
+                    const member = self.resolveSimpleTypeNodeSafe(@enumFromInt(raw)) orelse return null;
+                    buf[n] = member;
+                    n += 1;
+                }
+                if (n == 0) return null;
+                if (n == 1) return buf[0];
+                return self.store.unionOf(buf[0..n]) catch null;
+            },
+            else => return null,
+        }
+    }
+
+/// TypeScript keywords and reserved words. Used to distinguish a keyword
     /// used in an invalid position (e.g., `static public;`) from a genuinely
     /// undeclared identifier. Keywords in bad contexts should type as `any`,
     /// not `error`, to match TypeScript's behavior.
