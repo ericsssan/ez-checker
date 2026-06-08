@@ -454,20 +454,10 @@ pub const Checker = struct {
         };
     }
 
-    fn literalString(self: *Checker, node: NodeIndex) TypeId {
-        if (self.stringLiteralIsPropertyKey(node)) return tymod.ID_STRING;
-        const tok = self.ast_ref.nodeMainToken(node);
-        const raw = self.ast_ref.tokenText(tok);
-        if (raw.len < 2) return tymod.ID_STRING;
-        const inner = raw[1 .. raw.len - 1];
-        // If the string has no backslashes, use it directly (fast path).
-        if (std.mem.indexOfScalar(u8, inner, '\\') == null) {
-            return self.store.stringLiteral(inner) catch tymod.ID_STRING;
-        }
-        // Decode escape sequences so the stored value matches TypeScript's
-        // canonical string value (e.g. "\5" → U+0005, "\n" → newline).
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.gpa);
+    /// Decode JS/TS escape sequences in `inner` (raw string content without quotes)
+    /// and append the result to `buf`. Returns true on success, false if decoding
+    /// was incomplete (caller should fall back to the raw string).
+    fn decodeJsEscapes(self: *Checker, inner: []const u8, buf: *std.ArrayList(u8)) bool {
         var i: usize = 0;
         outer: while (i < inner.len) {
             if (inner[i] != '\\' or i + 1 >= inner.len) {
@@ -495,7 +485,6 @@ pub const Checker = struct {
                             j += 1;
                         }
                     }
-                    // Encode as UTF-8
                     var tbuf: [4]u8 = undefined;
                     const len2 = std.unicode.utf8Encode(@intCast(val), &tbuf) catch {
                         buf.append(self.gpa, '?') catch { i = inner.len; break :outer; };
@@ -522,7 +511,6 @@ pub const Checker = struct {
                 'u' => {
                     // \uNNNN or \u{NNNN}
                     if (i + 2 < inner.len and inner[i + 2] == '{') {
-                        // \u{NNNN}
                         const end_brace = std.mem.indexOfScalarPos(u8, inner, i + 3, '}') orelse {
                             buf.appendSlice(self.gpa, "\\u{") catch { i = inner.len; break :outer; };
                             i += 3;
@@ -543,7 +531,6 @@ pub const Checker = struct {
                         buf.appendSlice(self.gpa, tbuf[0..len2]) catch { i = inner.len; break :outer; };
                         i = end_brace + 1;
                     } else if (i + 5 < inner.len) {
-                        // \uNNNN (4 hex digits)
                         const hex_str = inner[i + 2 .. i + 6];
                         const code_point = std.fmt.parseInt(u21, hex_str, 16) catch {
                             buf.appendSlice(self.gpa, "\\u") catch { i = inner.len; break :outer; };
@@ -564,14 +551,26 @@ pub const Checker = struct {
                     }
                 },
                 else => {
-                    // Other escapes: \' \\ \" etc. — just use the escaped char
                     buf.append(self.gpa, esc) catch { i = inner.len; break :outer; };
                     i += 2;
                 },
             }
         }
-        // If we didn't process all characters (loop broke early), fall back to raw
-        if (i < inner.len) {
+        return i >= inner.len;
+    }
+
+    fn literalString(self: *Checker, node: NodeIndex) TypeId {
+        if (self.stringLiteralIsPropertyKey(node)) return tymod.ID_STRING;
+        const tok = self.ast_ref.nodeMainToken(node);
+        const raw = self.ast_ref.tokenText(tok);
+        if (raw.len < 2) return tymod.ID_STRING;
+        const inner = raw[1 .. raw.len - 1];
+        if (std.mem.indexOfScalar(u8, inner, '\\') == null) {
+            return self.store.stringLiteral(inner) catch tymod.ID_STRING;
+        }
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        if (!self.decodeJsEscapes(inner, &buf)) {
             return self.store.stringLiteral(inner) catch tymod.ID_STRING;
         }
         const decoded = self.gpa.dupe(u8, buf.items) catch return self.store.stringLiteral(inner) catch tymod.ID_STRING;
@@ -690,7 +689,12 @@ pub const Checker = struct {
                     span_end -= 1;
                 }
                 const quasi_text = src[span_start..span_end];
-                result.appendSlice(self.gpa, quasi_text) catch return tymod.ID_STRING;
+                // Decode escape sequences in template quasi text
+                if (std.mem.indexOfScalar(u8, quasi_text, '\\') != null) {
+                    if (!self.decodeJsEscapes(quasi_text, &result)) return tymod.ID_STRING;
+                } else {
+                    result.appendSlice(self.gpa, quasi_text) catch return tymod.ID_STRING;
+                }
                 continue;
             }
 
