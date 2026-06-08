@@ -851,7 +851,22 @@ pub const Checker = struct {
                     }
                     return tymod.ID_ANY;
                 }
-                // class_decl: base is typeRef("C"); return typeof-prefixed form
+                // class_decl: the class NAME in its own declaration has type "C" (not typeof C).
+                // A value-position REFERENCE to the class has type "typeof C".
+                const parents = self.semantic.parent_indices;
+                const nidx = node.toInt();
+                if (nidx < parents.len) {
+                    const pidx = parents[nidx];
+                    if (pidx != @intFromEnum(NodeIndex.none)) {
+                        const par_tag = self.ast_ref.nodeTag(@enumFromInt(pidx));
+                        if (par_tag == .class_decl or par_tag == .class_expr) {
+                            // We're at the class name in the declaration itself — return class type.
+                            const base_c2 = self.declaredTypeForSymbol(sym);
+                            return self.narrowAtUse(node, sym, base_c2);
+                        }
+                    }
+                }
+                // Value reference to the class → typeof C.
                 const base_c = self.declaredTypeForSymbol(sym);
                 const stored_c = self.store.get(base_c);
                 if (stored_c.kind == .type_ref) {
