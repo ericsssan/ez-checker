@@ -476,10 +476,49 @@ pub const Checker = struct {
     fn literalNumber(self: *Checker, node: NodeIndex) TypeId {
         const tok = self.ast_ref.nodeMainToken(node);
         const raw = self.ast_ref.tokenText(tok);
-        // Strip underscores and 0x/0o/0b prefixes for std.fmt.parseFloat.
-        // For our purposes the literal is usually a plain decimal /
-        // negative; rely on parseFloat's tolerance.
-        const v = std.fmt.parseFloat(f64, raw) catch return tymod.ID_NUMBER;
+
+        // Remove underscores from the literal
+        var cleaned: [256]u8 = undefined;
+        var cleaned_idx: usize = 0;
+        for (raw) |ch| {
+            if (ch != '_') {
+                if (cleaned_idx >= cleaned.len) return tymod.ID_NUMBER;
+                cleaned[cleaned_idx] = ch;
+                cleaned_idx += 1;
+            }
+        }
+        const cleaned_text = cleaned[0..cleaned_idx];
+
+        // Try to parse as hex (0x/0X prefix)
+        if (cleaned_text.len >= 2 and cleaned_text[0] == '0' and (cleaned_text[1] == 'x' or cleaned_text[1] == 'X')) {
+            if (std.fmt.parseInt(u64, cleaned_text[2..], 16)) |val| {
+                return self.store.numberLiteral(@as(f64, @floatFromInt(val))) catch tymod.ID_NUMBER;
+            } else |_| {}
+        }
+
+        // Try to parse as octal (0o/0O prefix or legacy 0-prefix)
+        if (cleaned_text.len >= 2 and cleaned_text[0] == '0') {
+            if (cleaned_text[1] == 'o' or cleaned_text[1] == 'O') {
+                if (std.fmt.parseInt(u64, cleaned_text[2..], 8)) |val| {
+                    return self.store.numberLiteral(@as(f64, @floatFromInt(val))) catch tymod.ID_NUMBER;
+                } else |_| {}
+            } else if (cleaned_text[1] >= '0' and cleaned_text[1] <= '7') {
+                // Legacy octal (0-prefix without 'o')
+                if (std.fmt.parseInt(u64, cleaned_text, 8)) |val| {
+                    return self.store.numberLiteral(@as(f64, @floatFromInt(val))) catch tymod.ID_NUMBER;
+                } else |_| {}
+            }
+        }
+
+        // Try to parse as binary (0b/0B prefix)
+        if (cleaned_text.len >= 2 and cleaned_text[0] == '0' and (cleaned_text[1] == 'b' or cleaned_text[1] == 'B')) {
+            if (std.fmt.parseInt(u64, cleaned_text[2..], 2)) |val| {
+                return self.store.numberLiteral(@as(f64, @floatFromInt(val))) catch tymod.ID_NUMBER;
+            } else |_| {}
+        }
+
+        // Fall back to parseFloat for decimal and floating-point
+        const v = std.fmt.parseFloat(f64, cleaned_text) catch return tymod.ID_NUMBER;
         return self.store.numberLiteral(v) catch tymod.ID_NUMBER;
     }
 
@@ -1637,10 +1676,24 @@ pub const Checker = struct {
                     // (only `as const` produces a readonly tuple literal type).
                     if (t.kind == .tuple_t) {
                         const elems = self.store.idsOf(t.list_data);
-                        const elem_t = if (elems.len == 0)
-                            tymod.ID_NEVER
-                        else
-                            self.store.unionOf(elems) catch elems[0];
+                        if (elems.len == 0) {
+                            return self.store.arrayOf(tymod.ID_NEVER) catch raw;
+                        }
+                        // Widen primitive literals in the tuple elements before unioning
+                        var widened_buf: [32]TypeId = undefined;
+                        const widen_count = @min(elems.len, widened_buf.len);
+                        for (0..widen_count) |j| {
+                            const elem_t = self.store.get(elems[j]);
+                            const widened = switch (elem_t.kind) {
+                                .string_literal => tymod.ID_STRING,
+                                .number_literal => tymod.ID_NUMBER,
+                                .bigint_literal => tymod.ID_BIGINT,
+                                .boolean_literal => tymod.ID_BOOLEAN,
+                                else => elems[j],
+                            };
+                            widened_buf[j] = widened;
+                        }
+                        const elem_t = self.store.unionOf(widened_buf[0..widen_count]) catch elems[0];
                         return self.store.arrayOf(elem_t) catch raw;
                     }
                     // Primitive literals are widened to their base type for
@@ -6706,7 +6759,75 @@ pub const Checker = struct {
         // not `false | Promise`); a statically-truthy LHS evaluates to `b`.
         if (self.alwaysFalsy(a)) return a;
         if (self.alwaysTruthy(a)) return b;
-        return self.store.unionOf(&.{ a, b }) catch tymod.ID_ANY;
+        // For `a && b`, narrow b by the condition a and return false | narrowed_b
+        const narrowed_b = self.tryNarrowExprByCondition(data.lhs, data.rhs, b) orelse b;
+        const false_literal = self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN;
+        return self.store.unionOf(&.{ false_literal, narrowed_b }) catch tymod.ID_ANY;
+    }
+
+    /// Try to narrow an expression's type based on a condition in a logical AND.
+    fn tryNarrowExprByCondition(self: *Checker, cond_node: NodeIndex, expr_node: NodeIndex, expr_type: TypeId) ?TypeId {
+        // Handle typeof checks: typeof x === "string" narrows x
+        if (self.ast_ref.nodeTag(cond_node) == .strict_equal or self.ast_ref.nodeTag(cond_node) == .equal) {
+            const cond_data = self.ast_ref.nodeData(cond_node);
+            // Check typeof lhs === string_literal rhs
+            if (self.ast_ref.nodeTag(cond_data.lhs) == .typeof_expr) {
+                const typeof_node = cond_data.lhs;
+                const typeof_operand = self.ast_ref.nodeData(typeof_node).lhs;
+                if (self.nodesSyntacticallyEqual(typeof_operand, expr_node)) {
+                    if (self.typeofStringValue(cond_data.rhs)) |narrowable| {
+                        return self.intersectNarrow(expr_type, narrowable, true);
+                    }
+                }
+            }
+            // Check string_literal lhs === typeof rhs
+            if (self.ast_ref.nodeTag(cond_data.rhs) == .typeof_expr) {
+                const typeof_node = cond_data.rhs;
+                const typeof_operand = self.ast_ref.nodeData(typeof_node).lhs;
+                if (self.nodesSyntacticallyEqual(typeof_operand, expr_node)) {
+                    if (self.typeofStringValue(cond_data.lhs)) |narrowable| {
+                        return self.intersectNarrow(expr_type, narrowable, true);
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Check if two AST nodes are syntactically equal.
+    fn nodesSyntacticallyEqual(self: *Checker, a: NodeIndex, b: NodeIndex) bool {
+        if (a == b) return true;
+        if (a == .none or b == .none) return false;
+        const tag_a = self.ast_ref.nodeTag(a);
+        const tag_b = self.ast_ref.nodeTag(b);
+        if (tag_a != tag_b) return false;
+        const data_a = self.ast_ref.nodeData(a);
+        const data_b = self.ast_ref.nodeData(b);
+        return switch (tag_a) {
+            .identifier => blk: {
+                const tok_a = self.ast_ref.nodeMainToken(a);
+                const tok_b = self.ast_ref.nodeMainToken(b);
+                const name_a = self.ast_ref.tokenText(tok_a);
+                const name_b = self.ast_ref.tokenText(tok_b);
+                break :blk std.mem.eql(u8, name_a, name_b);
+            },
+            .this_expr => true,
+            .member_expr, .optional_member_expr => blk: {
+                const lhs_eq = self.nodesSyntacticallyEqual(data_a.lhs, data_b.lhs);
+                if (!lhs_eq) break :blk false;
+                const tok_a = self.ast_ref.nodeMainToken(data_a.rhs);
+                const tok_b = self.ast_ref.nodeMainToken(data_b.rhs);
+                const prop_a = self.ast_ref.tokenText(tok_a);
+                const prop_b = self.ast_ref.tokenText(tok_b);
+                break :blk std.mem.eql(u8, prop_a, prop_b);
+            },
+            .computed_member_expr, .optional_computed_member_expr => blk: {
+                const lhs_eq = self.nodesSyntacticallyEqual(data_a.lhs, data_b.lhs);
+                if (!lhs_eq) break :blk false;
+                break :blk self.nodesSyntacticallyEqual(data_a.rhs, data_b.rhs);
+            },
+            else => false,
+        };
     }
 
     /// A bigint literal whose textual value is zero (`0n` / `-0n`).
@@ -7406,6 +7527,8 @@ pub const Checker = struct {
         // Only `+` can return string.  Others coerce to number/bigint;
         // we approximate as number unless either operand is bigint.
         const data = self.ast_ref.nodeData(node);
+        // If either operand is missing (unresolvable), return any
+        if (data.lhs == .none or data.rhs == .none) return tymod.ID_ANY;
         const a = self.typeOf(data.lhs);
         const b = self.typeOf(data.rhs);
         if (tag == .add) {
