@@ -10,6 +10,7 @@
 
 pub const types = @import("types.zig");
 pub const Checker = @import("checker.zig").Checker;
+pub const CheckerOpts = @import("checker.zig").CheckerOpts;
 pub const ModuleResolver = @import("checker.zig").ModuleResolver;
 pub const EnumKind = @import("checker.zig").EnumKind;
 pub const ImportEntry = @import("checker.zig").ImportEntry;

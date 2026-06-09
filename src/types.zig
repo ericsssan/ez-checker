@@ -162,6 +162,12 @@ pub const Type = struct {
     /// for no-unsafe-enum-comparison. Part of interning identity so an enum
     /// member's `0` stays distinct from a plain literal `0`.
     enum_name: []const u8 = "",
+    /// True for function_t types created from overload declaration sets.
+    /// Forces object-form rendering `{ (x): T; }` even for single signatures,
+    /// matching tsc's output for `function f(x: T): U; function f(x: any) {}`.
+    /// Part of interning identity so overload types stay distinct from
+    /// structurally-identical regular function types.
+    is_overload_set: bool = false,
 };
 
 pub const LiteralValue = union(enum) {
@@ -286,6 +292,8 @@ pub const InternContext = struct {
         h.update(t.name);
         h.update(t.alias_name);
         h.update(t.enum_name);
+        const ovl: u8 = @intFromBool(t.is_overload_set);
+        h.update(std.mem.asBytes(&ovl));
         for (self.store.idsOf(t.list_data)) |c| {
             const v = c.toInt();
             h.update(std.mem.asBytes(&v));
@@ -328,6 +336,7 @@ pub const InternContext = struct {
         if (!std.mem.eql(u8, ta.name, tb.name)) return false;
         if (!std.mem.eql(u8, ta.alias_name, tb.alias_name)) return false;
         if (!std.mem.eql(u8, ta.enum_name, tb.enum_name)) return false;
+        if (ta.is_overload_set != tb.is_overload_set) return false;
         const la = self.store.idsOf(ta.list_data);
         const lb = self.store.idsOf(tb.list_data);
         if (la.len != lb.len) return false;
@@ -445,6 +454,36 @@ pub const TypeStore = struct {
         const gop = try self.intern.getOrPutContext(self.gpa, id, .{ .store = self });
         if (gop.found_existing) {
             self.types.items.len -= 1;
+            // If the kept type is a function with unnamed params, enrich it with
+            // names from the new type before reclaiming the new type's sig ranges.
+            // This way `(number) => void` from lib defs gains the name `v` when
+            // user code defines `function foo(v: number): void`.
+            if (ty.kind == .function_t) {
+                const kept_id = gop.key_ptr.*;
+                const kept_t = &self.types.items[kept_id.toInt()];
+                const kept_sigs = self.signaturesOf(kept_t.signatures);
+                const new_sigs = self.signaturesOf(ty.signatures);
+                if (kept_sigs.len == new_sigs.len) {
+                    for (kept_sigs, new_sigs) |ks, ns| {
+                        const param_count = ks.params_end - ks.params_start;
+                        if (param_count == ns.params_end - ns.params_start and
+                            ks.params_end <= self.signature_param_name_pool.items.len and
+                            ns.params_end <= self.signature_param_name_pool.items.len)
+                        {
+                            for (0..param_count) |pi| {
+                                const ki = ks.params_start + pi;
+                                const ni = ns.params_start + pi;
+                                if (self.signature_param_name_pool.items[ki].len == 0 and
+                                    self.signature_param_name_pool.items[ni].len > 0)
+                                {
+                                    self.signature_param_name_pool.items[ki] =
+                                        self.signature_param_name_pool.items[ni];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // Reclaim ONLY genuinely-fresh tail ranges: the range must be the pool
             // tail AND start at/after the committed watermark. A range starting
             // before its watermark is shared with a kept type (tagAliasName copies

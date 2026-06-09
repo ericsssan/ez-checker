@@ -78,7 +78,7 @@ pub fn checkBytes(gpa: std.mem.Allocator, src: []const u8) !void {
     });
     defer sem.deinit(gpa);
 
-    var checker = try Checker.init(gpa, &ast_result, &sem);
+    var checker = try Checker.init(gpa, &ast_result, &sem, .{});
     defer checker.deinit();
 
     // Drive type inference over every node so all code paths are exercised.

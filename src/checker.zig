@@ -26,6 +26,36 @@ const TypeId = tymod.TypeId;
 const Type = tymod.Type;
 pub const EnumKind = enum(u8) { number, string, mixed };
 
+/// TypeScript compiler options that affect type inference and display.
+/// Passed to Checker.init; defaults represent a vanilla tsconfig.json with
+/// no explicit settings (non-strict, ES5 target, no special module mode).
+pub const CheckerOpts = struct {
+    strict_null_checks: bool = false,
+    no_implicit_any: bool = false,
+    use_define_for_class_fields: bool = false,
+    target: Target = .es5,
+    /// Module resolution strategy.  Affects import resolution rules —
+    /// notably, node16/nodenext require explicit .js/.mjs/.cjs extensions
+    /// on relative imports; without them the import is unresolvable → `any`.
+    module: Module = .none,
+
+    pub const Target = enum {
+        es5, es2015, es2016, es2017, es2018, es2019,
+        es2020, es2021, es2022, es2023, esnext,
+    };
+    pub const Module = enum {
+        commonjs, amd, system, umd,
+        es2015, es2020, es2022, esnext,
+        node16, node18, node20, nodenext,
+        none,
+    };
+
+    pub fn isNode16Style(self: CheckerOpts) bool {
+        return self.module == .node16 or self.module == .node18 or
+            self.module == .node20 or self.module == .nodenext;
+    }
+};
+
 /// Opaque interface for cross-file module resolution.
 /// The concrete implementation (ModuleCache) lives outside this library.
 pub const ModuleResolver = struct {
@@ -58,6 +88,19 @@ pub const ImportEntry = struct {
     /// The name exported from the source module (may differ when `import { A as B }`).
     exported_name: []const u8,
 };
+
+/// Returns true when a module specifier is a relative path that lacks an explicit
+/// node-resolution extension (.js/.mjs/.cjs/.ts/.tsx/.mts/.cts).
+/// In node16/nodenext mode tsc requires the extension; omitting it means the
+/// module is unresolvable, so tsc types the namespace binding as `any`.
+fn node16UnresolvableSpec(spec: []const u8) bool {
+    if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return false;
+    const exts = [_][]const u8{ ".js", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts" };
+    for (exts) |ext| {
+        if (std.mem.endsWith(u8, spec, ext)) return false;
+    }
+    return true;
+}
 
 pub const Checker = struct {
     gpa: std.mem.Allocator,
@@ -176,6 +219,28 @@ pub const Checker = struct {
     /// Same pattern as merged_iface_extra but for namespace blocks.
     merged_ns_extra: std.ArrayListUnmanaged(struct { name: []const u8, node: NodeIndex }) = .empty,
 
+    /// Maps generic function TypeId → rendered type-parameter prefix string
+    /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
+    /// method type is built; looked up by typeToStringInner to emit the correct
+    /// `<T>(…) => …` form that tsc produces.  First writer wins for interned types.
+    fn_type_params: std.AutoHashMapUnmanaged(TypeId, []const u8) = .empty,
+
+    /// Function types that were built from explicit overload declarations (no-body
+    /// signatures).  These render as `{ (p): T; }` object form even when they have
+    /// only one signature, matching TypeScript's display for overloaded functions.
+    overload_fn_types: std.AutoHashMapUnmanaged(TypeId, void) = .empty,
+
+    /// Per-signature type params prefix (e.g. `"<T>"`) keyed by signature pool
+    /// index.  Used for multi-signature function types where each overload can
+    /// have its own type parameters.  Looked up by typeToStringInner when
+    /// rendering `{ <T>(…): R; <U>(…): R; }` overload sets.
+    sig_type_params: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
+
+    /// Temporary type-param rename table used during multi-sig overload rendering.
+    /// Maps original param name → display name (e.g. "T" → "T_1").
+    /// Set/cleared per-sig inside typeToStringInner; read by .type_param rendering.
+    tp_renames: std.StringHashMapUnmanaged([]const u8) = .empty,
+
     /// Recursion counter for resolveConditionalTypeWithSubst / distributeConditional.
     /// Prevents stack overflow on deeply nested generic conditional types.
     subst_depth: u8 = 0,
@@ -194,11 +259,19 @@ pub const Checker = struct {
     /// total depth and bails to `unknown` (a safe leaf) before the native stack
     /// overflows.  The cap is far above any real annotation's nesting.
     resolve_depth: u16 = 0,
+    /// When > 0, resolveTypeRef returns type_param TypeIds for in-scope type parameters
+    /// instead of resolving to their constraints.  Set during resolveFunctionType so
+    /// ts_function_type params and return types display as `T` rather than `any`.
+    type_pos_depth: u8 = 0,
+
+    /// Compiler options that affect type inference.
+    checker_opts: CheckerOpts = .{},
 
     pub fn init(
         gpa: std.mem.Allocator,
         ast_ref: *const Ast,
         semantic: *const SemanticResult,
+        opts: CheckerOpts,
     ) !Checker {
         const node_count = ast_ref.nodes.len;
         const node_types = try gpa.alloc(TypeId, node_count);
@@ -237,6 +310,7 @@ pub const Checker = struct {
             .enum_kinds = .empty,
             .global_value_types = .empty,
             .natively_bound_type_ids = .empty,
+            .checker_opts = opts,
         };
         try self.buildKnownTypeNames();
         try self.buildGlobalValueTypes();
@@ -264,6 +338,18 @@ pub const Checker = struct {
         self.namespace_import_map.deinit(self.gpa);
         self.merged_iface_extra.deinit(self.gpa);
         self.merged_ns_extra.deinit(self.gpa);
+        {
+            var it = self.fn_type_params.valueIterator();
+            while (it.next()) |v| self.gpa.free(v.*);
+            self.fn_type_params.deinit(self.gpa);
+        }
+        {
+            var it = self.sig_type_params.valueIterator();
+            while (it.next()) |v| self.gpa.free(v.*);
+            self.sig_type_params.deinit(self.gpa);
+        }
+        self.tp_renames.deinit(self.gpa);
+        self.overload_fn_types.deinit(self.gpa);
     }
 
     // ── Public queries (LintContext-facing) ───────────────
@@ -452,9 +538,12 @@ pub const Checker = struct {
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(d.rhs));
                 const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                 const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
-                break :blk self.buildFunctionType(
+                const mresult = self.buildFunctionType(
                     md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator,
                 );
+                if (md.type_params < md.type_params_end)
+                    self.registerFnTypeParams(mresult, md.type_params, md.type_params_end);
+                break :blk mresult;
             },
             .class_decl => tymod.ID_ANY,
             .class_expr => tymod.ID_UNKNOWN,
@@ -852,10 +941,26 @@ pub const Checker = struct {
             // Namespace or class identifier in value position → `typeof Name`.
             // Guard: skip type-annotation positions (where tsc says `any`).
             const bkind = self.semantic.symbols.getBindingKind(sym);
-            if ((bkind == .namespace_decl or bkind == .class_decl) and
+            // Namespace star import (`import * as NS`) in value position → `typeof NS`.
+            // Exception: node16/nodenext mode requires explicit .js/.mjs/.cjs extensions on
+            // relative imports; without one the module is unresolvable and tsc types it `any`.
+            if (bkind == .import_binding and !self.identifierInTypePosition(node)) {
+                const tok = self.ast_ref.nodeMainToken(node);
+                const ns_name = self.ast_ref.tokenText(tok);
+                if (self.namespace_import_map.get(ns_name)) |mod_spec| {
+                    if (self.checker_opts.isNode16Style() and
+                        node16UnresolvableSpec(mod_spec))
+                    {
+                        return tymod.ID_ANY;
+                    }
+                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
+                    return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                }
+            }
+            if ((bkind == .namespace_decl or bkind == .class_decl or bkind == .enum_decl) and
                 !self.identifierInTypePosition(node))
             {
-                if (bkind == .namespace_decl) {
+                if (bkind == .namespace_decl or bkind == .enum_decl) {
                     const tok = self.ast_ref.nodeMainToken(node);
                     const ns_name = self.ast_ref.tokenText(tok);
                     if (ns_name.len > 0) {
@@ -944,6 +1049,7 @@ pub const Checker = struct {
         // an unrelated variable with the same name.
         if (self.identifierAsPropertySignatureKey(node)) |ty| return ty;
         if (self.identifierAsClassPropertyKey(node)) |ty| return ty;
+        if (self.identifierAsEnumMemberKey(node)) |ty| return ty;
         // Object-literal property key: `{ x: 0 }` → x has the type of its value (widened).
         // Check before typeOfNameByAstSearch so the property value type takes precedence over
         // an outer variable with the same name.
@@ -977,10 +1083,8 @@ pub const Checker = struct {
         // When an enum identifier appears, it should be typed as the union of its members
         // (the type-side), not the object type (which is for member access like `Foo.Bar`).
         if (self.enum_kinds.get(name) != null) {
-            if (self.buildEnumUnionType(name)) |t| return t;
-            // buildEnumUnionType returns null for enums with reserved word members or no members,
-            // which should be typed as any to match TypeScript's strict mode behavior.
-            return tymod.ID_ANY;
+            const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return tymod.ID_ANY;
+            return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
         }
         // Built-in global values (`console`, `Math`, `JSON`, ...) — fall
         // back to the curated lib shapes so member access / calls type
@@ -1017,6 +1121,11 @@ pub const Checker = struct {
         // `any` not `error`, since they're syntactically present keywords in
         // a bad context.
         if (isKeywordOrReservedWord(name)) return tymod.ID_ANY;
+        // `arguments` pseudo-variable: implicitly available in non-arrow functions.
+        // Only reached when no explicit symbol or declaration was found for `arguments`.
+        if (std.mem.eql(u8, name, "arguments") and self.enclosingNonArrowFunction(node) != .none) {
+            return self.store.typeRef("IArguments", &.{}) catch tymod.ID_ANY;
+        }
         // Unresolved identifier: return `any` to match TypeScript's permissive
         // behavior for undeclared names. Both `error` and `any` are "gap" in the
         // oracle, but `any` matches when tsc also says `any` (e.g., unresolved imports).
@@ -1043,6 +1152,46 @@ pub const Checker = struct {
         }
         const ty_node = self.ast_ref.nodeData(pdata.rhs).lhs;
         return self.resolveSimpleTypeNodeSafe(ty_node);
+    }
+
+    /// Return the enum-member type `E.MemberName` when `node` is the key
+    /// identifier of a `ts_enum_member` declaration (e.g. `A` in `enum E { A = 1 }`).
+    fn identifierAsEnumMemberKey(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .ts_enum_member) return null;
+        const pdata = self.ast_ref.nodeData(parent);
+        if (pdata.lhs != node) return null; // node is the initializer, not the key
+        const member_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+        // Walk up to the enum declaration to get the enum name.
+        const gidx = if (parent.toInt() < parents.len) parents[parent.toInt()] else @intFromEnum(NodeIndex.none);
+        if (gidx == @intFromEnum(NodeIndex.none)) return null;
+        const grandparent: NodeIndex = @enumFromInt(gidx);
+        if (self.ast_ref.nodeTag(grandparent) != .ts_enum_decl) return null;
+        const gdata = self.ast_ref.nodeData(grandparent);
+        if (gdata.lhs == .none) return null;
+        const ged = self.ast_ref.extraData(ast.EnumData, @intFromEnum(gdata.lhs));
+        const enum_name = self.ast_ref.tokenText(ged.name);
+        if (self.buildEnumObjectType(enum_name)) |obj_type| {
+            const ot = self.store.get(obj_type);
+            if (ot.kind == .object_t) {
+                for (self.store.propsOf(ot.object_props)) |p| {
+                    if (std.mem.eql(u8, p.name, member_name)) {
+                        // Only return if the type is properly enum-tagged (E.Member).
+                        // Non-literal members (computed initializers) get untagged types
+                        // that would conflict with tsc's E.Member rendering — skip those.
+                        const pt = self.store.get(p.type_id);
+                        if (pt.enum_name.len > 0) return p.type_id;
+                        return null;
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     /// Type inference for `property_ident` nodes — the property name on the
@@ -1117,10 +1266,21 @@ pub const Checker = struct {
                 return tymod.ID_ANY;
             },
             .method_def, .computed_method_def => {
+                // Attempt to build the merged multi-sig type for overloaded methods.
+                const ktag = self.ast_ref.nodeTag(pdata.lhs);
+                if (ktag == .identifier or ktag == .property_ident) {
+                    const mname2 = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pdata.lhs));
+                    if (mname2.len > 0) {
+                        if (self.classMethodTypeAtDecl(parent, mname2)) |merged2| return merged2;
+                    }
+                }
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
                 const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                 const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
-                return self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator);
+                const mres = self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator);
+                if (md.type_params < md.type_params_end)
+                    self.registerFnTypeParams(mres, md.type_params, md.type_params_end);
+                return mres;
             },
             else => return null,
         }
@@ -1593,20 +1753,6 @@ pub const Checker = struct {
                     ty = self.applyNarrowing(sd.lhs, sym, ty, true);
                 } else if (statementIsEarlyExit(self, ifd.alternate) and !statementIsEarlyExit(self, ifd.consequent)) {
                     ty = self.applyNarrowing(sd.lhs, sym, ty, false);
-                }
-            } else if (stmt_tag == .expression_stmt) {
-                // Assignment narrowing: `x = expr;` updates sym's known type.
-                const sd = self.ast_ref.nodeData(stmt);
-                if (sd.lhs != .none) {
-                    var expr = sd.lhs;
-                    while (self.ast_ref.nodeTag(expr) == .grouping_expr)
-                        expr = self.ast_ref.nodeData(expr).lhs;
-                    if (self.ast_ref.nodeTag(expr) == .assign) {
-                        const ad = self.ast_ref.nodeData(expr);
-                        if (self.identifierBindsToSym(ad.lhs, sym)) {
-                            ty = self.typeOf(ad.rhs);
-                        }
-                    }
                 }
             }
         }
@@ -2148,7 +2294,10 @@ pub const Checker = struct {
                 const data = self.ast_ref.nodeData(node);
                 if (data.rhs != .none and self.ast_ref.nodeTag(data.rhs) == .ts_type_annotation) {
                     const ty_node = self.ast_ref.nodeData(data.rhs).lhs;
-                    return self.resolveTypeNode(ty_node);
+                    self.type_pos_depth += 1;
+                    const ty = self.resolveTypeNode(ty_node);
+                    self.type_pos_depth -= 1;
+                    return ty;
                 }
                 // If no annotation, peel to lhs
                 node = data.lhs;
@@ -2165,10 +2314,12 @@ pub const Checker = struct {
             const bd = self.ast_ref.nodeData(node);
             if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
                 const ty_node = self.ast_ref.nodeData(bd.rhs).lhs;
+                self.type_pos_depth += 1;
                 var ty = self.resolveTypeNode(ty_node);
+                self.type_pos_depth -= 1;
                 // Optional parameter (`x?: T`) — parser marks the identifier
-                // by setting lhs to `.root`.  Union the annotation type
-                // with `undefined` to match TS's behavior.
+                // by setting lhs to `.root`.  TypeScript always types optional
+                // params as `T | undefined` regardless of strictNullChecks.
                 if (bd.lhs == .root) {
                     const ids = [_]TypeId{ ty, tymod.ID_UNDEFINED };
                     ty = self.store.unionOf(&ids) catch ty;
@@ -2184,6 +2335,34 @@ pub const Checker = struct {
         const parent: NodeIndex = @enumFromInt(pidx);
         const ptag = self.ast_ref.nodeTag(parent);
         switch (ptag) {
+            // When the decl_node is ts_enum_member (binding is the enum member node),
+            // the parent is ts_enum_decl. Return the member's E.Name type.
+            .ts_enum_decl => {
+                if (self.ast_ref.nodeTag(binding) == .ts_enum_member) {
+                    const mdata = self.ast_ref.nodeData(binding);
+                    if (mdata.lhs != .none) {
+                        const member_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+                        const pdata = self.ast_ref.nodeData(parent);
+                        if (pdata.lhs != .none) {
+                            const ged = self.ast_ref.extraData(ast.EnumData, @intFromEnum(pdata.lhs));
+                            const enum_name = self.ast_ref.tokenText(ged.name);
+                            if (self.buildEnumObjectType(enum_name)) |obj_type| {
+                                const ot = self.store.get(obj_type);
+                                if (ot.kind == .object_t) {
+                                    for (self.store.propsOf(ot.object_props)) |p| {
+                                        if (std.mem.eql(u8, p.name, member_name)) {
+                                            const pt = self.store.get(p.type_id);
+                                            if (pt.enum_name.len > 0) return p.type_id;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                return tymod.ID_ANY;
+            },
             .declarator => {
                 const data = self.ast_ref.nodeData(parent);
                 // Check if the identifier has a type annotation first.
@@ -2390,10 +2569,22 @@ pub const Checker = struct {
             .method_def, .computed_method_def => {
                 const pdata = self.ast_ref.nodeData(parent);
                 if (pdata.lhs != binding) return tymod.ID_ANY;
+                // For overloaded methods, return the merged multi-sig type so
+                // every declaration shows the full overload set, matching tsc.
+                const key_tag2 = self.ast_ref.nodeTag(pdata.lhs);
+                if (key_tag2 == .identifier or key_tag2 == .property_ident) {
+                    const mname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pdata.lhs));
+                    if (mname.len > 0) {
+                        if (self.classMethodTypeAtDecl(parent, mname)) |merged| return merged;
+                    }
+                }
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
                 const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                 const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
-                return self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator);
+                const mres2 = self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator);
+                if (md.type_params < md.type_params_end)
+                    self.registerFnTypeParams(mres2, md.type_params, md.type_params_end);
+                return mres2;
             },
             .getter_def => {
                 const pdata = self.ast_ref.nodeData(parent);
@@ -2476,6 +2667,30 @@ pub const Checker = struct {
                     args_buf[i] = self.store.typeParam(tp_name, TypeId.none) catch return tymod.ID_ANY;
                 }
                 return self.store.typeRef(name, args_buf[0..count]) catch tymod.ID_ANY;
+            },
+            // Enum member key: `A` in `enum E1 { A = 1 }` has type `E1.A`.
+            .ts_enum_member => {
+                const pdata = self.ast_ref.nodeData(parent);
+                if (pdata.lhs != binding) return tymod.ID_ANY; // binding is the initializer
+                const member_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(binding));
+                // Grandparent must be ts_enum_decl.
+                const gidx = if (parent.toInt() < parents.len) parents[parent.toInt()] else @intFromEnum(NodeIndex.none);
+                if (gidx == @intFromEnum(NodeIndex.none)) return tymod.ID_ANY;
+                const grandparent: NodeIndex = @enumFromInt(gidx);
+                if (self.ast_ref.nodeTag(grandparent) != .ts_enum_decl) return tymod.ID_ANY;
+                const gdata = self.ast_ref.nodeData(grandparent);
+                if (gdata.lhs == .none) return tymod.ID_ANY;
+                const ged = self.ast_ref.extraData(ast.EnumData, @intFromEnum(gdata.lhs));
+                const enum_name = self.ast_ref.tokenText(ged.name);
+                if (self.buildEnumObjectType(enum_name)) |obj_type| {
+                    const ot = self.store.get(obj_type);
+                    if (ot.kind == .object_t) {
+                        for (self.store.propsOf(ot.object_props)) |p| {
+                            if (std.mem.eql(u8, p.name, member_name)) return p.type_id;
+                        }
+                    }
+                }
+                return tymod.ID_ANY;
             },
             // Function/method/getter/setter parameter, class field, etc.
             // We don't resolve these structurally yet — return unknown
@@ -3264,6 +3479,178 @@ pub const Checker = struct {
         return false;
     }
 
+    /// Build a `<T extends X, U>` prefix string from the AST type-params range.
+    /// Returns an owned slice or null if no type params / allocation failed.
+    fn buildTypeParamsPrefix(self: *Checker, tp_start: u32, tp_end: u32) ?[]const u8 {
+        if (tp_start >= tp_end) return null;
+        const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+        if (tp_end > ext_len) return null;
+        const tp_nodes = self.ast_ref.extra_data[tp_start..tp_end];
+        var buf: std.ArrayList(u8) = .empty;
+        buf.append(self.gpa, '<') catch { buf.deinit(self.gpa); return null; };
+        var count: usize = 0;
+        for (tp_nodes) |raw| {
+            const tp: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) continue;
+            if (count > 0) buf.appendSlice(self.gpa, ", ") catch { buf.deinit(self.gpa); return null; };
+            const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+            buf.appendSlice(self.gpa, name) catch { buf.deinit(self.gpa); return null; };
+            const constraint = self.ast_ref.nodeData(tp).lhs;
+            if (constraint != .none) {
+                const constraint_ty = self.resolveTypeNode(constraint);
+                if (self.typeToString(constraint_ty)) |cs| {
+                    buf.appendSlice(self.gpa, " extends ") catch { self.gpa.free(cs); buf.deinit(self.gpa); return null; };
+                    buf.appendSlice(self.gpa, cs) catch { self.gpa.free(cs); buf.deinit(self.gpa); return null; };
+                    self.gpa.free(cs);
+                } else |_| {}
+            }
+            count += 1;
+        }
+        if (count == 0) { buf.deinit(self.gpa); return null; }
+        buf.append(self.gpa, '>') catch { buf.deinit(self.gpa); return null; };
+        return buf.toOwnedSlice(self.gpa) catch { buf.deinit(self.gpa); return null; };
+    }
+
+    /// Record the generic type-parameter prefix for a function TypeId so that
+    /// typeToStringInner can emit the correct `<T>(…) => …` form.
+    /// Reads type parameter names from the AST extra_data range [tp_start, tp_end).
+    /// First-writer wins for interned types (identical structural signatures share one TypeId).
+    fn registerFnTypeParams(self: *Checker, fn_type: TypeId, tp_start: u32, tp_end: u32) void {
+        if (self.fn_type_params.contains(fn_type)) return;
+        const s = self.buildTypeParamsPrefix(tp_start, tp_end) orelse return;
+        self.fn_type_params.put(self.gpa, fn_type, s) catch self.gpa.free(s);
+    }
+
+    /// Record the generic type-parameter prefix for a specific signature slot
+    /// (keyed by signature pool index) for multi-sig overload rendering.
+    fn registerSigTypeParams(self: *Checker, sig_pool_idx: u32, tp_start: u32, tp_end: u32) void {
+        if (self.sig_type_params.contains(sig_pool_idx)) return;
+        const s = self.buildTypeParamsPrefix(tp_start, tp_end) orelse return;
+        self.sig_type_params.put(self.gpa, sig_pool_idx, s) catch self.gpa.free(s);
+    }
+
+    /// Extract type parameter names from a prefix like `"<T>"`, `"<T extends X, U>"`.
+    /// Returns the count of names found; names are stored in `out[0..count]`.
+    /// Handles nested `<>` correctly so commas inside constraints are ignored.
+    fn extractTpNames(prefix: []const u8, out: [][]const u8) usize {
+        if (prefix.len < 2 or prefix[0] != '<') return 0;
+        const inner = prefix[1 .. prefix.len - 1];
+        var count: usize = 0;
+        var depth: usize = 0;
+        var seg_start: usize = 0;
+        var i: usize = 0;
+        while (i <= inner.len) : (i += 1) {
+            const c: u8 = if (i < inner.len) inner[i] else ',';
+            if (c == '<') { depth += 1; continue; }
+            if (c == '>') { if (depth > 0) depth -= 1; continue; }
+            if (c == ',' and depth == 0) {
+                const seg = std.mem.trim(u8, inner[seg_start..i], " ");
+                const name_end = std.mem.indexOfScalar(u8, seg, ' ') orelse seg.len;
+                if (name_end > 0 and count < out.len) {
+                    out[count] = seg[0..name_end];
+                    count += 1;
+                }
+                seg_start = i + 1;
+            }
+        }
+        return count;
+    }
+
+    /// Build a renamed type-params prefix string for a multi-sig overload.
+    /// For each name in `original_prefix` that already appears in `seen[0..seen_len]`,
+    /// generates a fresh name (e.g. T → T_1, T_1 → T_2) and:
+    ///   - Writes the rename into `self.tp_renames` so typeToStringInner can use it.
+    ///   - Adds original and renamed names to `seen_buf[seen_len..]`, updating `seen_len.*`.
+    /// Returns an owned renamed prefix or null if no renames were needed (caller emits original).
+    /// Caller must call `self.tp_renames.clearRetainingCapacity()` before each call.
+    /// `name_pool` is caller-provided stack storage for fresh name bytes (non-owning slices).
+    fn applyTpRenames(
+        self: *Checker,
+        original_prefix: []const u8,
+        seen_buf: [][]const u8,
+        seen_len: *usize,
+        name_pool: []u8,
+        name_pool_pos: *usize,
+    ) ?[]const u8 {
+        var names_buf: [16][]const u8 = undefined;
+        const n = extractTpNames(original_prefix, &names_buf);
+        if (n == 0) return null;
+
+        var any_rename = false;
+        for (names_buf[0..n]) |name| {
+            var conflict = false;
+            for (seen_buf[0..seen_len.*]) |s| {
+                if (std.mem.eql(u8, s, name)) { conflict = true; break; }
+            }
+            if (!conflict) {
+                if (seen_len.* < seen_buf.len) { seen_buf[seen_len.*] = name; seen_len.* += 1; }
+                continue;
+            }
+            // Generate a fresh name: name_1, name_2, ...
+            any_rename = true;
+            var suffix: u32 = 1;
+            var fresh_slice: []const u8 = name;
+            var fbuf: [64]u8 = undefined;
+            while (suffix < 100) : (suffix += 1) {
+                const candidate = std.fmt.bufPrint(&fbuf, "{s}_{d}", .{ name, suffix }) catch break;
+                var taken = false;
+                for (seen_buf[0..seen_len.*]) |s| {
+                    if (std.mem.eql(u8, s, candidate)) { taken = true; break; }
+                }
+                if (!taken) {
+                    // Copy into caller-provided name_pool (stack storage, no heap alloc)
+                    if (name_pool_pos.* + candidate.len <= name_pool.len) {
+                        @memcpy(name_pool[name_pool_pos.*..][0..candidate.len], candidate);
+                        fresh_slice = name_pool[name_pool_pos.*..][0..candidate.len];
+                        name_pool_pos.* += candidate.len;
+                    }
+                    break;
+                }
+            }
+            self.tp_renames.put(self.gpa, name, fresh_slice) catch {};
+            if (seen_len.* < seen_buf.len) { seen_buf[seen_len.*] = fresh_slice; seen_len.* += 1; }
+            if (seen_len.* < seen_buf.len) { seen_buf[seen_len.*] = name; seen_len.* += 1; }
+        }
+
+        if (!any_rename) return null;
+
+        // Build the renamed prefix string from the original, substituting names.
+        var out: std.ArrayList(u8) = .empty;
+        out.append(self.gpa, '<') catch { out.deinit(self.gpa); return null; };
+        for (names_buf[0..n], 0..) |name, ni| {
+            if (ni > 0) out.appendSlice(self.gpa, ", ") catch { out.deinit(self.gpa); return null; };
+            const display = self.tp_renames.get(name) orelse name;
+            out.appendSlice(self.gpa, display) catch { out.deinit(self.gpa); return null; };
+            // Find the constraint part (everything after "name" in original_prefix segment).
+            // Re-parse original_prefix to find this segment and append the constraint.
+            const inner = original_prefix[1 .. original_prefix.len - 1];
+            var depth2: usize = 0;
+            var seg_s: usize = 0;
+            var seg_idx: usize = 0;
+            var ii: usize = 0;
+            while (ii <= inner.len) : (ii += 1) {
+                const c2: u8 = if (ii < inner.len) inner[ii] else ',';
+                if (c2 == '<') { depth2 += 1; continue; }
+                if (c2 == '>') { if (depth2 > 0) depth2 -= 1; continue; }
+                if (c2 == ',' and depth2 == 0) {
+                    if (seg_idx == ni) {
+                        // Append constraint part of this segment
+                        const seg = std.mem.trim(u8, inner[seg_s..ii], " ");
+                        const name_end2 = std.mem.indexOfScalar(u8, seg, ' ') orelse seg.len;
+                        if (name_end2 < seg.len) {
+                            out.appendSlice(self.gpa, seg[name_end2..]) catch { out.deinit(self.gpa); return null; };
+                        }
+                        break;
+                    }
+                    seg_s = ii + 1;
+                    seg_idx += 1;
+                }
+            }
+        }
+        out.append(self.gpa, '>') catch { out.deinit(self.gpa); return null; };
+        return out.toOwnedSlice(self.gpa) catch { out.deinit(self.gpa); return null; };
+    }
+
     /// Build a function_t from an fn_decl / async_fn_decl / etc. node.
     /// Params come from the FnData params SubRange; each param's
     /// declared annotation (if any) becomes its TypeId, defaulting to
@@ -3284,7 +3671,10 @@ pub const Checker = struct {
             .async_generator_fn_decl, .async_generator_fn_expr => true,
             else => false,
         };
-        return self.buildFunctionType(fd.params, fd.params_end, fd.return_type, fd.body, is_async, is_generator);
+        const result = self.buildFunctionType(fd.params, fd.params_end, fd.return_type, fd.body, is_async, is_generator);
+        if (fd.type_params < fd.type_params_end)
+            self.registerFnTypeParams(result, fd.type_params, fd.type_params_end);
+        return result;
     }
 
     /// Build a function_t from an arrow_fn / async_arrow_fn node.
@@ -3321,6 +3711,10 @@ pub const Checker = struct {
         is_generator: bool,
     ) ?tymod.Signature {
         // Resolve each param's type from its annotation.
+        // Use type-position mode so type-parameter references like `T` in
+        // `<T>(x: T) => T` render as the named param, not as the constraint.
+        self.type_pos_depth += 1;
+        defer self.type_pos_depth -= 1;
         var param_buf: [16]tymod.TypeId = undefined;
         var name_buf: [16][]const u8 = undefined;
         var opt_buf: [16]bool = undefined;
@@ -3467,7 +3861,9 @@ pub const Checker = struct {
     /// Returns null when no call-visible overloads are found.
     fn functionTypeFromAllOverloads(self: *Checker, fn_name: []const u8) ?TypeId {
         var sig_buf: [16]tymod.Signature = undefined;
+        var tp_buf: [16]struct { start: u32, end: u32 } = undefined;
         var sig_count: usize = 0;
+        var has_impl: bool = false; // true if any declaration has a body
         const list = self.value_decl_by_name.get(fn_name) orelse return null;
         for (list.items) |ni| {
             if (sig_count >= sig_buf.len) break;
@@ -3482,7 +3878,7 @@ pub const Checker = struct {
                     const dn = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(fd.name));
                     if (!std.mem.eql(u8, dn, fn_name)) continue;
                     // Implementation signatures (with body) are not call-visible.
-                    if (fd.body != .none) continue;
+                    if (fd.body != .none) { has_impl = true; continue; }
                     const is_async = switch (t) {
                         .async_fn_decl, .async_generator_fn_decl => true,
                         else => false,
@@ -3493,6 +3889,7 @@ pub const Checker = struct {
                     };
                     const sig = self.buildSignatureRaw(fd.params, fd.params_end, fd.return_type, .none, is_async, is_generator) orelse continue;
                     sig_buf[sig_count] = sig;
+                    tp_buf[sig_count] = .{ .start = fd.type_params, .end = fd.type_params_end };
                     sig_count += 1;
                 },
                 else => {},
@@ -3500,7 +3897,101 @@ pub const Checker = struct {
         }
         if (sig_count == 0) return null;
         const sig_list = self.store.appendSignatures(sig_buf[0..sig_count]) catch return null;
-        return self.store.add(.{ .kind = .function_t, .signatures = sig_list }) catch null;
+        for (tp_buf[0..sig_count], 0..) |tp, i| {
+            if (tp.start < tp.end) {
+                const pool_idx: u32 = sig_list.start + @as(u32, @intCast(i));
+                self.registerSigTypeParams(pool_idx, tp.start, tp.end);
+            }
+        }
+        // Mark as overload-set (renders as `{ ... }` object form) only when there are
+        // multiple exposed sigs; single-sig functions keep arrow form to avoid false
+        // positives from value_decl_by_name mixing nested-scope declarations.
+        const fn_ty = self.store.add(.{ .kind = .function_t, .signatures = sig_list, .is_overload_set = sig_count > 1 }) catch return null;
+        return fn_ty;
+    }
+
+    /// Build the merged function type from all no-body overload declarations of a
+    /// class method (or static method when want_static=true) with the given name.
+    /// Works like functionTypeFromAllOverloads but scoped to a single class body.
+    /// Returns null when no call-visible overloads are found (single body-only method).
+    fn buildClassMethodMergedType(
+        self: *Checker,
+        class_node: NodeIndex,
+        method_name: []const u8,
+        want_static: bool,
+    ) ?TypeId {
+        const cdata = self.ast_ref.nodeData(class_node);
+        if (cdata.lhs == .none) return null;
+        const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
+        if (cd.body == .none) return null;
+        const body_data = self.ast_ref.nodeData(cd.body);
+        const slice = self.directRange(body_data.lhs, body_data.rhs) orelse return null;
+
+        var sig_buf: [8]tymod.Signature = undefined;
+        var tp_buf: [8]struct { start: u32, end: u32 } = undefined;
+        var sig_count: usize = 0;
+        var has_impl_method: bool = false; // any method_def with a body?
+
+        for (slice) |raw| {
+            if (sig_count >= sig_buf.len) break;
+            const m: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(m) != .method_def) continue;
+            if (self.classMemberIsStatic(m) != want_static) continue;
+            const mdata = self.ast_ref.nodeData(m);
+            if (mdata.lhs == .none or mdata.rhs == .none) continue;
+            const ktag = self.ast_ref.nodeTag(mdata.lhs);
+            if (ktag != .identifier and ktag != .property_ident) continue;
+            const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+            if (!std.mem.eql(u8, key, method_name)) continue;
+            const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(mdata.rhs));
+            if (md.body != .none) { has_impl_method = true; continue; }
+            const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
+            const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
+            const sig = self.buildSignatureRaw(md.params_start, md.params_end, md.return_type, .none, is_async, is_generator) orelse continue;
+            sig_buf[sig_count] = sig;
+            tp_buf[sig_count] = .{ .start = md.type_params, .end = md.type_params_end };
+            sig_count += 1;
+        }
+        if (sig_count == 0) return null;
+        const sig_list = self.store.appendSignatures(sig_buf[0..sig_count]) catch return null;
+        // Register per-signature type params so rendering uses <T> prefixes correctly.
+        for (tp_buf[0..sig_count], 0..) |tp, i| {
+            if (tp.start < tp.end) {
+                const pool_idx: u32 = sig_list.start + @as(u32, @intCast(i));
+                self.registerSigTypeParams(pool_idx, tp.start, tp.end);
+            }
+        }
+        const fn_ty = self.store.add(.{ .kind = .function_t, .signatures = sig_list, .is_overload_set = sig_count > 1 }) catch return null;
+        // For single-sig, also register fn_type_params for type-param prefix rendering.
+        if (sig_count == 1 and tp_buf[0].start < tp_buf[0].end) {
+            self.registerFnTypeParams(fn_ty, tp_buf[0].start, tp_buf[0].end);
+        }
+        return fn_ty;
+    }
+
+    /// For a method_def key at a class method declaration, walk up to the containing
+    /// class and return the merged overload type.  Returns null when not in a class
+    /// context or when there are no no-body overload signatures.
+    fn classMethodTypeAtDecl(self: *Checker, method_def_node: NodeIndex, method_name: []const u8) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const midx = method_def_node.toInt();
+        if (midx >= parents.len) return null;
+        var p_idx = parents[midx];
+        if (p_idx == NONE) return null;
+        // Skip class_body node if present between method_def and class_decl/expr.
+        if (p_idx < parents.len) {
+            const possible_body: NodeIndex = @enumFromInt(p_idx);
+            if (self.ast_ref.nodeTag(possible_body) == .class_body) {
+                p_idx = parents[p_idx];
+                if (p_idx == NONE) return null;
+            }
+        }
+        const class_node: NodeIndex = @enumFromInt(p_idx);
+        const ctag = self.ast_ref.nodeTag(class_node);
+        if (ctag != .class_decl and ctag != .class_expr) return null;
+        const is_static = self.classMemberIsStatic(method_def_node);
+        return self.buildClassMethodMergedType(class_node, method_name, is_static);
     }
 
     /// Return the identifier name of a function parameter binding.
@@ -3631,6 +4122,31 @@ pub const Checker = struct {
     }
 
 
+    /// Like paramDeclaredType but uses resolveTypeNodeParamAware so that bare
+    /// type-parameter references (e.g. `T` in `<T>(x: T) => T`) resolve to a
+    /// genuine type_param TypeId rather than `any`.  Only for type-position function
+    /// types (ts_function_type) where the type params are in scope.
+    fn paramDeclaredTypeParamAware(self: *Checker, param: NodeIndex) TypeId {
+        var node = param;
+        if (self.ast_ref.nodeTag(node) == .assignment_pattern) node = self.ast_ref.nodeData(node).lhs;
+        if (self.ast_ref.nodeTag(node) == .ts_parameter_property) node = self.ast_ref.nodeData(node).lhs;
+        if (self.ast_ref.nodeTag(node) == .rest_element) {
+            const rdata = self.ast_ref.nodeData(node);
+            if (rdata.rhs != .none and self.ast_ref.nodeTag(rdata.rhs) == .ts_type_annotation) {
+                const ty = self.ast_ref.nodeData(rdata.rhs).lhs;
+                return self.resolveTypeNodeParamAware(ty);
+            }
+            return tymod.ID_ANY;
+        }
+        if (self.ast_ref.nodeTag(node) != .identifier) return tymod.ID_UNKNOWN;
+        const bd = self.ast_ref.nodeData(node);
+        if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
+            const ty = self.ast_ref.nodeData(bd.rhs).lhs;
+            return self.resolveTypeNodeParamAware(ty);
+        }
+        return tymod.ID_ANY;
+    }
+
     fn paramDeclaredType(self: *Checker, param: NodeIndex) TypeId {
         var node = param;
         // Peel assignment_pattern (default value) — the binding side
@@ -3757,44 +4273,45 @@ pub const Checker = struct {
     fn resolveFunctionType(self: *Checker, ty_node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(ty_node);
         const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(data.lhs));
-        // Resolve params from FnData.params..params_end.
-        var param_buf: [16]TypeId = undefined;
+        // ts_function_type: return type lives in fd.body (parser reuses the field for type position).
+        // Enable type-position mode so type-param references resolve to type_param TypeIds.
+        self.type_pos_depth += 1;
+        defer self.type_pos_depth -= 1;
+        // Walk params manually to capture optional/rest markers (like buildSignatureRaw does).
+        var param_buf: [16]tymod.TypeId = undefined;
         var name_buf: [16][]const u8 = undefined;
+        var opt_buf: [16]bool = undefined;
         var count: usize = 0;
+        var rest_idx: u16 = 0xFFFF;
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
         if (fd.params <= fd.params_end and fd.params_end <= ext_len) {
             const params = self.ast_ref.extra_data[fd.params..fd.params_end];
             for (params) |raw| {
                 if (count >= param_buf.len) break;
                 const param: NodeIndex = @enumFromInt(raw);
-                param_buf[count] = self.paramDeclaredType(param);
+                var pn = param;
+                const is_default = self.ast_ref.nodeTag(pn) == .assignment_pattern;
+                if (is_default) pn = self.ast_ref.nodeData(pn).lhs;
+                if (self.ast_ref.nodeTag(pn) == .ts_parameter_property) pn = self.ast_ref.nodeData(pn).lhs;
+                if (self.ast_ref.nodeTag(pn) == .rest_element) rest_idx = @intCast(count);
+                param_buf[count] = self.paramDeclaredTypeParamAware(param);
                 name_buf[count] = self.paramName(param);
+                opt_buf[count] = is_default or self.paramHasOptionalMarker(pn);
                 count += 1;
             }
         }
-        // Return type is in body for ts_function_type.
-        var ret_ty = if (fd.body != .none)
-            self.resolveTypeNode(fd.body)
-        else
-            tymod.ID_UNKNOWN;
-        // From the outside-of-the-function view, a return type that is
-        // a bare type-parameter ref (`<T ...>() => T`) gets folded to
-        // T's constraint — but only when the constraint is a literal
-        // type that uniquely determines a value (`extends true`, etc.).
-        // For broad constraints (`extends boolean`/`string`), leave as
-        // type_ref so callers don't treat T as a concrete value.
-        if (fd.body != .none and self.store.get(ret_ty).kind == .type_ref) {
-            ret_ty = self.foldTypeParamLiteralConstraint(fd.body, ret_ty);
-        }
-        const param_range = self.store.appendSignatureParams(param_buf[0..count], name_buf[0..count]) catch {
-            return tymod.ID_UNKNOWN;
-        };
+        const ret_ty = if (fd.body != .none) self.resolveTypeNodeParamAware(fd.body) else tymod.ID_UNKNOWN;
+        const param_range = self.store.appendSignatureParamsFull(param_buf[0..count], name_buf[0..count], opt_buf[0..count]) catch return tymod.ID_UNKNOWN;
         const sig: tymod.Signature = .{
             .params_start = param_range.start,
             .params_end = param_range.end,
             .return_type = ret_ty,
+            .rest_param_index = rest_idx,
         };
-        return self.store.functionType(sig) catch tymod.ID_UNKNOWN;
+        const fn_ty = self.store.functionType(sig) catch return tymod.ID_UNKNOWN;
+        if (fd.type_params < fd.type_params_end)
+            self.registerFnTypeParams(fn_ty, fd.type_params, fd.type_params_end);
+        return fn_ty;
     }
 
     /// Walk a `{ k1: T1; k2: T2; ... }` type literal and build an
@@ -3824,6 +4341,9 @@ pub const Checker = struct {
         const member_node_indices = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
         var props_buf: [32]tymod.ObjectProp = undefined;
         var prop_count: usize = 0;
+        var sig_buf: [8]tymod.Signature = undefined;
+        var sig_tp_buf: [8]struct { start: u32, end: u32 } = undefined;
+        var sig_count: usize = 0;
         for (member_node_indices) |raw| {
             if (prop_count >= props_buf.len) break;
             const member: NodeIndex = @enumFromInt(raw);
@@ -3849,6 +4369,22 @@ pub const Checker = struct {
                 if (!std.mem.eql(u8, sentinel, "[]") and prop_count < props_buf.len) {
                     props_buf[prop_count] = .{ .name = "[]", .type_id = value_ty };
                     prop_count += 1;
+                }
+                continue;
+            }
+            if (m_tag == .ts_call_signature or m_tag == .ts_construct_signature) {
+                if (sig_count < sig_buf.len) {
+                    const mdata = self.ast_ref.nodeData(member);
+                    if (mdata.lhs != .none) {
+                        const sd = self.ast_ref.extraData(ast.InterfaceSigData, @intFromEnum(mdata.lhs));
+                        if (self.buildSignatureRaw(sd.params_start, sd.params_end, sd.return_type, .none, false, false)) |raw_sig| {
+                            var sig = raw_sig;
+                            sig.is_construct = (m_tag == .ts_construct_signature);
+                            sig_buf[sig_count] = sig;
+                            sig_tp_buf[sig_count] = .{ .start = sd.type_params, .end = sd.type_params_end };
+                            sig_count += 1;
+                        }
+                    }
                 }
                 continue;
             }
@@ -3907,12 +4443,22 @@ pub const Checker = struct {
                     false,
                     false,
                 );
+                if (sig_data.type_params < sig_data.type_params_end)
+                    self.registerFnTypeParams(fn_ty, sig_data.type_params, sig_data.type_params_end);
                 props_buf[prop_count] = .{ .name = name, .type_id = fn_ty };
                 prop_count += 1;
             }
         }
         const list = self.store.appendObjectProps(props_buf[0..prop_count]) catch return tymod.ID_UNKNOWN;
-        return self.store.add(.{ .kind = .object_t, .object_props = list }) catch tymod.ID_UNKNOWN;
+        const sig_list = if (sig_count == 0) tymod.SignatureList.empty else blk: {
+            const sl = self.store.appendSignatures(sig_buf[0..sig_count]) catch break :blk tymod.SignatureList.empty;
+            for (sig_tp_buf[0..sig_count], 0..) |tp, i| {
+                if (tp.start < tp.end)
+                    self.registerSigTypeParams(sl.start + @as(u32, @intCast(i)), tp.start, tp.end);
+            }
+            break :blk sl;
+        };
+        return self.store.add(.{ .kind = .object_t, .object_props = list, .signatures = sig_list }) catch tymod.ID_UNKNOWN;
     }
 
     /// Evaluate a `ts_mapped_type` AST node into an `object_t` whose
@@ -5901,6 +6447,11 @@ pub const Checker = struct {
         // Built-in lib types with structural shapes (Promise, Set, Map,
         // etc.).  Generic args get substituted into the method signatures.
         if (self.resolveLibType(ty_node, name)) |resolved| return resolved;
+        // In type-position mode (inside ts_function_type), always return a genuine
+        // type_param TypeId for in-scope type params so the function type displays
+        // as `<T extends X>(x: T) => T` rather than `(x: X) => X`.
+        if (self.type_pos_depth > 0 and self.argIsInScopeTypeParam(ty_node))
+            return self.buildTypeParam(ty_node, name);
         // Type parameter with matching name in scope?  Resolve to its
         // constraint type (an over-approximation that lets `t: T` where
         // `T extends Foo` behave as `t: Foo`).
@@ -6757,9 +7308,22 @@ pub const Checker = struct {
         // risks deeper recursion on recursive types but won't silently drop results
         // for non-recursive types under memory pressure.
         self.declared_type_cache.put(self.gpa, name, tymod.ID_UNKNOWN) catch {};
+        // Build interface/class structural types with type_pos_depth > 0 so that
+        // unconstrained type parameters (e.g. `T` in `interface Pair<T>`) resolve to
+        // `type_param("T")` rather than `any`.  This makes the cached structural type
+        // substitutable: when accessed as `Pair<number>`, applyDeclTypeArgs substitutes
+        // T=number throughout, converting `type_param("T")` → `number`.
         const result = switch (self.ast_ref.nodeTag(decl)) {
-            .ts_interface_decl => self.buildInterfaceType(decl),
-            .class_decl => self.buildClassInstanceType(decl, name),
+            .ts_interface_decl => blk: {
+                self.type_pos_depth += 1;
+                defer self.type_pos_depth -= 1;
+                break :blk self.buildInterfaceType(decl);
+            },
+            .class_decl => blk: {
+                self.type_pos_depth += 1;
+                defer self.type_pos_depth -= 1;
+                break :blk self.buildClassInstanceType(decl, name);
+            },
             // A value typed `: Fruit` has the union of the enum's member literals
             // (the enum's type-side). unionOf collapses a single-member enum to
             // its one literal and absorbs members into `string`/`number` in a
@@ -6912,7 +7476,17 @@ pub const Checker = struct {
         seen_n.* += 1;
 
         const parent_ty = self.resolveDeclaredType(parent_name) orelse return;
-        const pt = self.store.get(parent_ty);
+        // If the parent resolved to a type_ref (e.g. `type Pair<T> = AB<T, T>`
+        // resolves to type_ref("AB", [T, T])), follow it one level to reach the
+        // structural object type with type args applied.
+        var structural = parent_ty;
+        if (self.store.get(structural).kind == .type_ref) {
+            const tr_name = self.store.get(structural).name;
+            if (self.resolveDeclaredType(tr_name)) |inner| {
+                structural = self.applyDeclTypeArgs(structural, tr_name, inner);
+            }
+        }
+        const pt = self.store.get(structural);
         if (pt.kind != .object_t) return;
         for (self.store.propsOf(pt.object_props)) |p| {
             props.append(self.gpa, p) catch {};
@@ -7031,7 +7605,22 @@ pub const Checker = struct {
                     continue;
                 }
                 if (self.interfaceMemberToProp(member)) |p| {
-                    props.append(self.gpa, p) catch {};
+                    // Merge same-named method signatures into a multi-sig function_t
+                    // instead of creating duplicate props (tsc renders overloads as
+                    // `{ sig1; sig2; }` — an object type, not a function type).
+                    var merged = false;
+                    if (self.store.get(p.type_id).kind == .function_t) {
+                        for (props.items) |*existing| {
+                            if (std.mem.eql(u8, existing.name, p.name) and
+                                self.store.get(existing.type_id).kind == .function_t)
+                            {
+                                existing.type_id = self.mergeFunctionTypes(existing.type_id, p.type_id);
+                                merged = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!merged) props.append(self.gpa, p) catch {};
                 }
             }
         }
@@ -7064,7 +7653,19 @@ pub const Checker = struct {
                         continue;
                     }
                     if (self.interfaceMemberToProp(member)) |p| {
-                        props.append(self.gpa, p) catch {};
+                        var merged = false;
+                        if (self.store.get(p.type_id).kind == .function_t) {
+                            for (props.items) |*existing| {
+                                if (std.mem.eql(u8, existing.name, p.name) and
+                                    self.store.get(existing.type_id).kind == .function_t)
+                                {
+                                    existing.type_id = self.mergeFunctionTypes(existing.type_id, p.type_id);
+                                    merged = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!merged) props.append(self.gpa, p) catch {};
                     }
                 }
             }
@@ -7229,7 +7830,9 @@ pub const Checker = struct {
                     false,
                     false,
                 );
-                return .{ .name = name, .type_id = fn_ty };
+                if (sig_data.type_params < sig_data.type_params_end)
+                    self.registerFnTypeParams(fn_ty, sig_data.type_params, sig_data.type_params_end);
+                return .{ .name = name, .type_id = fn_ty, .is_method = true };
             },
             .ts_index_signature => {
                 if (data.rhs == .none) return null;
@@ -7243,6 +7846,31 @@ pub const Checker = struct {
             },
             else => return null,
         }
+    }
+
+    /// Merge two function_t types into one multi-sig function_t by appending
+    /// the signatures of `new_ty` after those of `existing_ty`.
+    fn mergeFunctionTypes(self: *Checker, existing_ty: TypeId, new_ty: TypeId) TypeId {
+        const et = self.store.get(existing_ty);
+        const nt = self.store.get(new_ty);
+        if (et.kind != .function_t or nt.kind != .function_t) return new_ty;
+        const existing_sigs = self.store.signaturesOf(et.signatures);
+        const new_sigs = self.store.signaturesOf(nt.signatures);
+        var sig_buf: [8]tymod.Signature = undefined;
+        var n: usize = 0;
+        for (existing_sigs) |s| {
+            if (n >= sig_buf.len) break;
+            sig_buf[n] = s;
+            n += 1;
+        }
+        for (new_sigs) |s| {
+            if (n >= sig_buf.len) break;
+            sig_buf[n] = s;
+            n += 1;
+        }
+        if (n == 0) return new_ty;
+        const merged_sigs = self.store.appendSignatures(sig_buf[0..n]) catch return new_ty;
+        return self.store.add(.{ .kind = .function_t, .signatures = merged_sigs }) catch new_ty;
     }
 
     /// Build the INSTANCE type of a class — a record of fields and methods.
@@ -7311,8 +7939,68 @@ pub const Checker = struct {
             const list = self.store.appendObjectProps(props.items) catch return tymod.ID_UNKNOWN;
             return self.store.add(.{ .kind = .object_t, .object_props = list, .name = name, .list_data = base_list }) catch tymod.ID_UNKNOWN;
         };
+        // Pre-scan: find instance method names that have overload sigs (no body).
+        // They will be merged into multi-sig types; their implementations are skipped.
+        var overload_names_buf: [16][]const u8 = undefined;
+        var overload_count: usize = 0;
+        for (slice) |raw| {
+            const m: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(m) != .method_def) continue;
+            if (self.classMemberIsStatic(m)) continue;
+            const mdata = self.ast_ref.nodeData(m);
+            if (mdata.lhs == .none or mdata.rhs == .none) continue;
+            const ktag = self.ast_ref.nodeTag(mdata.lhs);
+            if (ktag != .identifier and ktag != .property_ident) continue;
+            const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(mdata.rhs));
+            if (md.body != .none) continue;
+            const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+            var already = false;
+            for (overload_names_buf[0..overload_count]) |n| {
+                if (std.mem.eql(u8, n, key)) { already = true; break; }
+            }
+            if (!already and overload_count < overload_names_buf.len) {
+                overload_names_buf[overload_count] = key;
+                overload_count += 1;
+            }
+        }
         for (slice) |raw| {
             const member: NodeIndex = @enumFromInt(raw);
+            const mtag = self.ast_ref.nodeTag(member);
+            // For method_def with overloads: merge no-body sigs, skip implementation.
+            if (mtag == .method_def and !self.classMemberIsStatic(member)) {
+                const mdata = self.ast_ref.nodeData(member);
+                if (mdata.lhs != .none and mdata.rhs != .none) {
+                    const ktag = self.ast_ref.nodeTag(mdata.lhs);
+                    if (ktag == .identifier or ktag == .property_ident) {
+                        const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+                        const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(mdata.rhs));
+                        var has_overloads = false;
+                        for (overload_names_buf[0..overload_count]) |n| {
+                            if (std.mem.eql(u8, n, key)) { has_overloads = true; break; }
+                        }
+                        if (has_overloads) {
+                            if (md.body != .none) continue; // implementation hidden by overloads
+                            const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
+                            const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
+                            const new_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, .none, is_async, is_generator);
+                            if (md.type_params < md.type_params_end)
+                                self.registerFnTypeParams(new_ty, md.type_params, md.type_params_end);
+                            var found_existing = false;
+                            for (props.items) |*existing| {
+                                if (std.mem.eql(u8, existing.name, key)) {
+                                    existing.type_id = self.mergeFunctionTypes(existing.type_id, new_ty);
+                                    found_existing = true;
+                                    break;
+                                }
+                            }
+                            if (!found_existing) {
+                                props.append(self.gpa, .{ .name = key, .type_id = new_ty, .is_method = true }) catch {};
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             if (self.classMemberToProp(member, false)) |p| {
                 // Inherited prop with the same name is overridden by the
                 // subclass definition — remove the prior entry.
@@ -7449,8 +8137,66 @@ pub const Checker = struct {
         const slice = self.directRange(body_data.lhs, body_data.rhs) orelse return tymod.ID_UNKNOWN;
         var props: std.ArrayList(tymod.ObjectProp) = .empty;
         defer props.deinit(self.gpa);
+        // Pre-scan: find static method names that have overload sigs (no body).
+        var st_overload_names_buf: [16][]const u8 = undefined;
+        var st_overload_count: usize = 0;
+        for (slice) |raw| {
+            const m: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(m) != .method_def) continue;
+            if (!self.classMemberIsStatic(m)) continue;
+            const mdata = self.ast_ref.nodeData(m);
+            if (mdata.lhs == .none or mdata.rhs == .none) continue;
+            const ktag = self.ast_ref.nodeTag(mdata.lhs);
+            if (ktag != .identifier and ktag != .property_ident) continue;
+            const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(mdata.rhs));
+            if (md.body != .none) continue;
+            const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+            var already = false;
+            for (st_overload_names_buf[0..st_overload_count]) |n| {
+                if (std.mem.eql(u8, n, key)) { already = true; break; }
+            }
+            if (!already and st_overload_count < st_overload_names_buf.len) {
+                st_overload_names_buf[st_overload_count] = key;
+                st_overload_count += 1;
+            }
+        }
         for (slice) |raw| {
             const member: NodeIndex = @enumFromInt(raw);
+            const mtag = self.ast_ref.nodeTag(member);
+            if (mtag == .method_def and self.classMemberIsStatic(member)) {
+                const mdata = self.ast_ref.nodeData(member);
+                if (mdata.lhs != .none and mdata.rhs != .none) {
+                    const ktag = self.ast_ref.nodeTag(mdata.lhs);
+                    if (ktag == .identifier or ktag == .property_ident) {
+                        const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+                        const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(mdata.rhs));
+                        var has_overloads = false;
+                        for (st_overload_names_buf[0..st_overload_count]) |n| {
+                            if (std.mem.eql(u8, n, key)) { has_overloads = true; break; }
+                        }
+                        if (has_overloads) {
+                            if (md.body != .none) continue;
+                            const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
+                            const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
+                            const new_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, .none, is_async, is_generator);
+                            if (md.type_params < md.type_params_end)
+                                self.registerFnTypeParams(new_ty, md.type_params, md.type_params_end);
+                            var found_existing = false;
+                            for (props.items) |*existing| {
+                                if (std.mem.eql(u8, existing.name, key)) {
+                                    existing.type_id = self.mergeFunctionTypes(existing.type_id, new_ty);
+                                    found_existing = true;
+                                    break;
+                                }
+                            }
+                            if (!found_existing) {
+                                props.append(self.gpa, .{ .name = key, .type_id = new_ty, .is_method = true, .is_static = true }) catch {};
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
             if (self.classMemberToProp(member, true)) |p| {
                 var sp = p;
                 sp.is_static = true;
@@ -7554,6 +8300,8 @@ pub const Checker = struct {
                     is_async,
                     is_generator,
                 );
+                if (md.type_params < md.type_params_end)
+                    self.registerFnTypeParams(fn_ty, md.type_params, md.type_params_end);
                 return .{
                     .name = name,
                     .type_id = fn_ty,
@@ -8893,6 +9641,9 @@ pub const Checker = struct {
             };
             widened_buf[j] = widened;
         }
+        // Sort union members by TypeScript's canonical TypeFlags priority so
+        // inferred unions like (string | number)[] match tsc's output order.
+        sortUnionByTypePriority(&self.store, widened_buf[0..n_used]);
         const elem_t = self.store.unionOf(widened_buf[0..n_used]) catch tymod.ID_ANY;
         return self.store.arrayOf(elem_t) catch tymod.ID_ANY;
     }
@@ -9015,6 +9766,8 @@ pub const Checker = struct {
                         is_async,
                         is_generator,
                     );
+                    if (md.type_params < md.type_params_end)
+                        self.registerFnTypeParams(fn_ty, md.type_params, md.type_params_end);
                     // `m(this: void, …)` is explicitly not a this-bound
                     // method — unbound-method should ignore it.
                     const this_void = self.methodFirstParamIsThisVoid(md.params_start, md.params_end);
@@ -9427,7 +10180,10 @@ pub const Checker = struct {
             // User-declared types — resolve via the declared cache.
             if (self.resolveDeclaredType(ref_name)) |resolved| {
                 if (!resolved.eq(obj_ty)) {
-                    const t = self.memberOnApparentType(resolved, prop_name, obj_node);
+                    // Apply generic type arg substitution: e.g. TaggedPair<number> →
+                    // substitute T=number throughout the resolved structural type before lookup.
+                    const subst = self.applyDeclTypeArgs(obj_ty, ref_name, resolved);
+                    const t = self.memberOnApparentType(subst, prop_name, obj_node);
                     if (!tymod.isUnknown(&self.store, t)) return t;
                 }
             }
@@ -9443,6 +10199,24 @@ pub const Checker = struct {
             if (constraint) |c| {
                 if (!c.eq(obj_ty)) {
                     return self.memberOnApparentType(c, prop_name, obj_node);
+                }
+            }
+            // `typeof X` where X is an enum or namespace star import — look up member
+            // in the enum object or the imported module respectively.
+            if (std.mem.startsWith(u8, ref_name, "typeof ")) {
+                const inner_name = ref_name["typeof ".len..];
+                if (self.enum_kinds.get(inner_name) != null) {
+                    if (self.buildEnumObjectType(inner_name)) |obj_type| {
+                        const ot2 = self.store.get(obj_type);
+                        if (ot2.kind == .object_t) {
+                            for (self.store.propsOf(ot2.object_props)) |p| {
+                                if (std.mem.eql(u8, p.name, prop_name)) return p.type_id;
+                            }
+                        }
+                    }
+                }
+                if (self.namespace_import_map.get(inner_name)) |mod_spec| {
+                    if (self.inferMemberOnNamespace(mod_spec, prop_name)) |resolved| return resolved;
                 }
             }
             return tymod.ID_ANY;
@@ -9609,6 +10383,57 @@ pub const Checker = struct {
         return self.substituteTypeId(alias_body, keys_buf[0..nsub], vals_buf[0..nsub]);
     }
 
+    /// For a `type_ref` with args (e.g. `TaggedPair<number>`), apply the type
+    /// args to the resolved structural body (`body`).  Extracts type param names
+    /// from the user-declared interface/class AST node, then calls substituteTypeId
+    /// to substitute each arg.  Returns `body` unchanged when there are no args or
+    /// no matching type params.
+    fn applyDeclTypeArgs(self: *Checker, ref_id: TypeId, name: []const u8, body: TypeId) TypeId {
+        const tr = self.store.get(ref_id);
+        const args_slice = self.store.idsOf(tr.list_data);
+        if (args_slice.len == 0) return body;
+
+        const decl = self.type_decl_nodes.get(name) orelse return body;
+        var tp_start: u32 = 0;
+        var tp_end: u32 = 0;
+        switch (self.ast_ref.nodeTag(decl)) {
+            .ts_interface_decl => {
+                const d = self.ast_ref.nodeData(decl);
+                const id = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(d.lhs));
+                tp_start = id.type_params;
+                tp_end = id.type_params_end;
+            },
+            .class_decl => {
+                const d = self.ast_ref.nodeData(decl);
+                const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(d.lhs));
+                tp_start = cd.type_params;
+                tp_end = cd.type_params_end;
+            },
+            else => return body,
+        }
+        if (tp_end <= tp_start) return body;
+
+        // Snapshot args before substituteTypeId may realloc the type_id_pool.
+        var args_buf: [8]TypeId = undefined;
+        const arg_count = @min(args_slice.len, args_buf.len);
+        @memcpy(args_buf[0..arg_count], args_slice[0..arg_count]);
+
+        var keys_buf: [8][]const u8 = undefined;
+        var vals_buf: [8]TypeId = undefined;
+        var nsub: usize = 0;
+        const n = @min(@min(tp_end - tp_start, @as(u32, @intCast(arg_count))), @as(u32, keys_buf.len));
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const tp: NodeIndex = @enumFromInt(self.ast_ref.extra_data[tp_start + i]);
+            if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) continue;
+            keys_buf[nsub] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+            vals_buf[nsub] = args_buf[i];
+            nsub += 1;
+        }
+        if (nsub == 0) return body;
+        return self.substituteTypeId(body, keys_buf[0..nsub], vals_buf[0..nsub]);
+    }
+
     /// Walk a TypeId and replace any `type_ref` whose name matches a
     /// substitution key.  Recurses through composites (union, intersection,
     /// array, tuple, object props).  Returns the original id when no
@@ -9634,11 +10459,15 @@ pub const Checker = struct {
                 return id;
             },
             .type_ref => {
+                // Snapshot name and list_data NOW — recursive substituteTypeId calls
+                // below can realloc types.items, invalidating the `t` pointer.
+                const ref_name = t.name;
+                const ref_list = t.list_data;
                 for (keys, vals) |k, v| {
-                    if (std.mem.eql(u8, k, t.name)) return v;
+                    if (std.mem.eql(u8, k, ref_name)) return v;
                 }
                 // Substitute through type args (e.g. `Promise<T>`).
-                const args_slice = self.store.idsOf(t.list_data);
+                const args_slice = self.store.idsOf(ref_list);
                 if (args_slice.len == 0) return id;
                 var args_buf: [8]TypeId = undefined;
                 if (args_slice.len > args_buf.len) return id;
@@ -9653,7 +10482,7 @@ pub const Checker = struct {
                     if (!new_args_buf[i].eq(a)) changed = true;
                 }
                 if (!changed) return id;
-                return self.store.typeRef(t.name, new_args_buf[0..args.len]) catch id;
+                return self.store.typeRef(ref_name, new_args_buf[0..args.len]) catch id;
             },
             .union_t => return self.substituteList(id, t, keys, vals, .union_t),
             .intersection_t => return self.substituteList(id, t, keys, vals, .intersection_t),
@@ -10116,6 +10945,28 @@ pub const Checker = struct {
         return any_fn;
     }
 
+    /// Returns the nearest enclosing non-arrow function node, or .none.
+    /// Arrow functions are transparent for `arguments` (they inherit from outer scope).
+    fn enclosingNonArrowFunction(self: *Checker, node: NodeIndex) NodeIndex {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return .none;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = parents[nidx];
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .arrow_fn, .async_arrow_fn => {},
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                .method_def, .computed_method_def, .getter_def, .setter_def,
+                .computed_getter_def, .computed_setter_def, .constructor_def => return pn,
+                else => {},
+            }
+        }
+        return .none;
+    }
+
     fn inferAwait(self: *Checker, node: NodeIndex) TypeId {
         // await unwraps Promise<T> → T, recursing through unions (await of
         // `Promise<A> | Promise<B>` → `A | B`) and nested promises — so a
@@ -10341,11 +11192,13 @@ pub const Checker = struct {
                 const sigs = self.store.signaturesOf(t.signatures);
                 if (sigs.len == 0) {
                     try buf.appendSlice(gpa, "() => unknown");
-                } else if (sigs.len == 1) {
+                } else if (sigs.len == 1 and !t.is_overload_set) {
                     const sig = sigs[0];
                     const params = self.store.signatureParamsOf(sig);
                     const names = self.store.signatureParamNamesOf(sig);
                     const opts = self.store.signatureParamOptionalsOf(sig);
+                    if (self.fn_type_params.get(id)) |tp_prefix|
+                        try buf.appendSlice(gpa, tp_prefix);
                     try buf.append(gpa, '(');
                     for (params, 0..) |param_ty, pi| {
                         if (pi > 0) try buf.appendSlice(gpa, ", ");
@@ -10361,7 +11214,27 @@ pub const Checker = struct {
                         try self.typeToStringInner(param_ty, buf, depth + 1);
                     }
                     try buf.appendSlice(gpa, ") => ");
-                    try self.typeToStringInner(sig.return_type, buf, depth + 1);
+                    if (sig.predicate_param_index != 0xFFFF and sig.predicate_target != .none) {
+                        const pred_name = if (sig.predicate_param_index < names.len) names[sig.predicate_param_index] else "";
+                        if (pred_name.len > 0) {
+                            if (sig.is_assertion) try buf.appendSlice(gpa, "asserts ");
+                            try buf.appendSlice(gpa, pred_name);
+                            try buf.appendSlice(gpa, " is ");
+                            try self.typeToStringInner(sig.predicate_target, buf, depth + 1);
+                        } else {
+                            try self.typeToStringInner(sig.return_type, buf, depth + 1);
+                        }
+                    } else if (sig.is_assertion and sig.predicate_param_index != 0xFFFF) {
+                        const pred_name = if (sig.predicate_param_index < names.len) names[sig.predicate_param_index] else "";
+                        if (pred_name.len > 0) {
+                            try buf.appendSlice(gpa, "asserts ");
+                            try buf.appendSlice(gpa, pred_name);
+                        } else {
+                            try self.typeToStringInner(sig.return_type, buf, depth + 1);
+                        }
+                    } else {
+                        try self.typeToStringInner(sig.return_type, buf, depth + 1);
+                    }
                 } else {
                     // Multi-signature (overloads) — tsc renders as { (p): T; (p): T; }
                     try buf.appendSlice(gpa, "{ ");
@@ -10370,6 +11243,10 @@ pub const Checker = struct {
                         const params = self.store.signatureParamsOf(sig);
                         const names = self.store.signatureParamNamesOf(sig);
                         const opts = self.store.signatureParamOptionalsOf(sig);
+                        const sig_pool_idx: u32 = t.signatures.start + @as(u32, @intCast(si));
+                        if (self.sig_type_params.get(sig_pool_idx)) |tp_prefix| {
+                            try buf.appendSlice(gpa, tp_prefix);
+                        }
                         try buf.append(gpa, '(');
                         for (params, 0..) |param_ty, pi| {
                             if (pi > 0) try buf.appendSlice(gpa, ", ");
@@ -10392,16 +11269,61 @@ pub const Checker = struct {
             },
             .object_t => {
                 const props = self.store.propsOf(t.object_props);
-                // Count renderable properties (skip index-signature sentinels).
+                const call_sigs = self.store.signaturesOf(t.signatures);
+                // Count renderable regular properties (skip index-signature sentinels).
                 var real_count: usize = 0;
                 for (props) |p| {
                     if (!std.mem.startsWith(u8, p.name, "[]")) real_count += 1;
                 }
-                if (real_count == 0) {
+                // Single call/construct signature with no props: render as arrow form.
+                if (real_count == 0 and call_sigs.len == 1) {
+                    const sig = call_sigs[0];
+                    const sparams = self.store.signatureParamsOf(sig);
+                    const snames = self.store.signatureParamNamesOf(sig);
+                    if (sig.is_construct) try buf.appendSlice(gpa, "new ");
+                    if (self.sig_type_params.get(t.signatures.start)) |tp_prefix|
+                        try buf.appendSlice(gpa, tp_prefix);
+                    try buf.append(gpa, '(');
+                    for (sparams, 0..) |sp, si| {
+                        if (si > 0) try buf.appendSlice(gpa, ", ");
+                        const sn = if (si < snames.len) snames[si] else "";
+                        if (sn.len > 0) {
+                            try buf.appendSlice(gpa, sn);
+                            try buf.appendSlice(gpa, ": ");
+                        }
+                        try self.typeToStringInner(sp, buf, depth + 1);
+                    }
+                    try buf.appendSlice(gpa, ") => ");
+                    try self.typeToStringInner(sig.return_type, buf, depth + 1);
+                } else if (real_count == 0 and call_sigs.len == 0) {
                     try buf.appendSlice(gpa, "{}");
                 } else {
                     try buf.appendSlice(gpa, "{ ");
                     var first = true;
+                    // Render call/construct signatures in object form.
+                    for (call_sigs, 0..) |sig, csi| {
+                        if (!first) try buf.appendSlice(gpa, "; ");
+                        first = false;
+                        const sparams = self.store.signatureParamsOf(sig);
+                        const snames = self.store.signatureParamNamesOf(sig);
+                        if (sig.is_construct) try buf.appendSlice(gpa, "new ");
+                        const pool_idx: u32 = t.signatures.start + @as(u32, @intCast(csi));
+                        if (self.sig_type_params.get(pool_idx)) |tp_prefix| {
+                            try buf.appendSlice(gpa, tp_prefix);
+                        }
+                        try buf.append(gpa, '(');
+                        for (sparams, 0..) |sp, si| {
+                            if (si > 0) try buf.appendSlice(gpa, ", ");
+                            const sn = if (si < snames.len) snames[si] else "";
+                            if (sn.len > 0) {
+                                try buf.appendSlice(gpa, sn);
+                                try buf.appendSlice(gpa, ": ");
+                            }
+                            try self.typeToStringInner(sp, buf, depth + 1);
+                        }
+                        try buf.appendSlice(gpa, "): ");
+                        try self.typeToStringInner(sig.return_type, buf, depth + 1);
+                    }
                     for (props) |p| {
                         if (std.mem.startsWith(u8, p.name, "[]")) continue;
                         if (!first) try buf.appendSlice(gpa, "; ");
@@ -10417,12 +11339,19 @@ pub const Checker = struct {
                                 const msig = msigs[0];
                                 const mparams = self.store.signatureParamsOf(msig);
                                 const mnames = self.store.signatureParamNamesOf(msig);
+                                if (self.fn_type_params.get(p.type_id)) |tp_prefix|
+                                    try buf.appendSlice(gpa, tp_prefix);
                                 try buf.append(gpa, '(');
+                                const mopts = self.store.signatureParamOptionalsOf(msig);
                                 for (mparams, 0..) |mp, mi| {
                                     if (mi > 0) try buf.appendSlice(gpa, ", ");
+                                    const mis_rest = msig.rest_param_index != 0xFFFF and mi == msig.rest_param_index;
+                                    if (mis_rest) try buf.appendSlice(gpa, "...");
                                     const mn = if (mi < mnames.len) mnames[mi] else "";
+                                    const mis_opt = !mis_rest and mi < mopts.len and mopts[mi];
                                     if (mn.len > 0) {
                                         try buf.appendSlice(gpa, mn);
+                                        if (mis_opt) try buf.append(gpa, '?');
                                         try buf.appendSlice(gpa, ": ");
                                     }
                                     try self.typeToStringInner(mp, buf, depth + 1);
@@ -10430,7 +11359,37 @@ pub const Checker = struct {
                                 try buf.appendSlice(gpa, "): ");
                                 try self.typeToStringInner(msig.return_type, buf, depth + 1);
                             } else {
-                                try buf.appendSlice(gpa, "(): unknown");
+                                // Multi-sig overloaded method: render each sig separately.
+                                // The name + optional '?' for the first sig were already written.
+                                for (msigs, 0..) |msig, msi| {
+                                    if (msi > 0) {
+                                        try buf.appendSlice(gpa, "; ");
+                                        if (p.readonly) try buf.appendSlice(gpa, "readonly ");
+                                        try buf.appendSlice(gpa, p.name);
+                                    }
+                                    const sig_pool_idx_m: u32 = pv.signatures.start + @as(u32, @intCast(msi));
+                                    if (self.sig_type_params.get(sig_pool_idx_m)) |tp_prefix|
+                                        try buf.appendSlice(gpa, tp_prefix);
+                                    try buf.append(gpa, '(');
+                                    const mparams = self.store.signatureParamsOf(msig);
+                                    const mnames = self.store.signatureParamNamesOf(msig);
+                                    const mopts = self.store.signatureParamOptionalsOf(msig);
+                                    for (mparams, 0..) |mp, mi| {
+                                        if (mi > 0) try buf.appendSlice(gpa, ", ");
+                                        const mis_rest = msig.rest_param_index != 0xFFFF and mi == msig.rest_param_index;
+                                        if (mis_rest) try buf.appendSlice(gpa, "...");
+                                        const mn = if (mi < mnames.len) mnames[mi] else "";
+                                        const mis_opt = !mis_rest and mi < mopts.len and mopts[mi];
+                                        if (mn.len > 0) {
+                                            try buf.appendSlice(gpa, mn);
+                                            if (mis_opt) try buf.append(gpa, '?');
+                                            try buf.appendSlice(gpa, ": ");
+                                        }
+                                        try self.typeToStringInner(mp, buf, depth + 1);
+                                    }
+                                    try buf.appendSlice(gpa, "): ");
+                                    try self.typeToStringInner(msig.return_type, buf, depth + 1);
+                                }
                             }
                         } else {
                             if (p.optional) try buf.append(gpa, '?');
@@ -10475,30 +11434,49 @@ pub const Checker = struct {
                     }
                 }
                 const ids = self.store.idsOf(t.list_data);
-                // Collect member strings, sort for stability.
-                var strs: std.ArrayList([]u8) = .empty;
-                defer {
-                    for (strs.items) |s| self.gpa.free(s);
-                    strs.deinit(self.gpa);
-                }
-                for (ids) |m| {
-                    var member_buf: std.ArrayList(u8) = .empty;
-                    try self.typeToStringInner(m, &member_buf, depth + 1);
-                    try strs.append(self.gpa, try member_buf.toOwnedSlice(self.gpa));
-                }
-                std.mem.sort([]u8, strs.items, {}, struct {
-                    fn lt(_: void, a: []u8, b: []u8) bool {
-                        return std.mem.order(u8, a, b) == .lt;
-                    }
-                }.lt);
-                for (strs.items, 0..) |s, i| {
+                // Output union members in insertion order (matches tsc's declaration order).
+                for (ids, 0..) |m, i| {
                     if (i > 0) try buf.appendSlice(gpa, " | ");
-                    try buf.appendSlice(gpa, s);
+                    try self.typeToStringInner(m, buf, depth + 1);
                 }
             },
         }
     }
 };
+
+/// TypeScript canonical TypeFlags priority for union member ordering in inferred
+/// array element unions. Matches TS's output: string < number < bigint < boolean
+/// < symbol < undefined < null < void < never < any < other.
+fn typePriorityForSort(store: *const tymod.TypeStore, id: tymod.TypeId) u8 {
+    const t = store.get(id);
+    return switch (t.kind) {
+        .string, .string_literal => 0,
+        .number, .number_literal => 1,
+        .bigint, .bigint_literal => 2,
+        .boolean, .boolean_literal => 3,
+        .symbol => 4,
+        .undefined_t => 5,
+        .null_t => 6,
+        .void_t => 7,
+        .never => 8,
+        else => 10,
+    };
+}
+
+fn sortUnionByTypePriority(store: *const tymod.TypeStore, members: []tymod.TypeId) void {
+    if (members.len <= 1) return;
+    // Insertion sort (members are few, typically 2–4).
+    var i: usize = 1;
+    while (i < members.len) : (i += 1) {
+        const key = members[i];
+        const kp = typePriorityForSort(store, key);
+        var j: usize = i;
+        while (j > 0 and typePriorityForSort(store, members[j - 1]) > kp) : (j -= 1) {
+            members[j] = members[j - 1];
+        }
+        members[j] = key;
+    }
+}
 
 fn firstNodeOfTag(ast_result: *const Ast, tag: ast.Node.Tag) ?NodeIndex {
     const total: u32 = @intCast(ast_result.nodes.len);
@@ -10520,7 +11498,7 @@ test "Checker: number literal type" {
     var sem = try parser.semantic.SemanticAnalyzer.analyze(allocator, &ast_result);
     defer sem.deinit(allocator);
 
-    var checker = try Checker.init(allocator, &ast_result, &sem);
+    var checker = try Checker.init(allocator, &ast_result, &sem, .{});
     defer checker.deinit();
 
     const expr = firstNodeOfTag(&ast_result, .number_literal) orelse return error.NoLiteral;
@@ -10544,7 +11522,7 @@ test "Checker: identifier bound to number annotation" {
     });
     defer sem.deinit(allocator);
 
-    var checker = try Checker.init(allocator, &ast_result, &sem);
+    var checker = try Checker.init(allocator, &ast_result, &sem, .{});
     defer checker.deinit();
 
     // Find the LAST identifier (the `x` reference) — the binding `x` is also an identifier.
@@ -10574,7 +11552,7 @@ test "Checker: array of any flagged via containsAny" {
     });
     defer sem.deinit(allocator);
 
-    var checker = try Checker.init(allocator, &ast_result, &sem);
+    var checker = try Checker.init(allocator, &ast_result, &sem, .{});
     defer checker.deinit();
 
     const total: u32 = @intCast(ast_result.nodes.len);

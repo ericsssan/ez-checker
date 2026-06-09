@@ -22,7 +22,7 @@ test "debug getName" {
         .build_parents = true,
     });
     defer sem.deinit(gpa);
-    var checker = try Checker.init(gpa, &ast, &sem);
+    var checker = try Checker.init(gpa, &ast, &sem, .{});
     defer checker.deinit();
 
     var n: u32 = 1;

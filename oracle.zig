@@ -76,12 +76,64 @@ const CompilerOpts = struct {
     strict: bool = false,
     strict_null_checks: bool = false,
     no_implicit_any: bool = false,
+    target: Target = .es5,
+    module: Module = .none,
+    jsx: Jsx = .none,
+    check_js: bool = false,
+    allow_js: bool = false,
+    use_define_for_class_fields: bool = false,
+    experimental_decorators: bool = false,
+    isolate_modules: bool = false,
+
+    pub const Target = enum { es5, es2015, es2016, es2017, es2018, es2019, es2020, es2021, es2022, es2023, esnext, none };
+    pub const Module = enum { commonjs, amd, system, umd, es2015, es2020, es2022, esnext, node16, node18, node20, nodenext, none };
+    pub const Jsx = enum { react, react_jsx, react_jsxdev, preserve, react_native, none };
 
     // True when any option is set that ez-checker doesn't model yet — sections
     // compiled under these options are still evaluated and counted in the
     // denominator but reported separately.
     fn needsUnimplementedOpts(self: CompilerOpts) bool {
-        return self.strict or self.strict_null_checks;
+        return self.jsx != .none
+            or self.experimental_decorators
+            or self.isolate_modules;
+    }
+
+    // Convert to CheckerOpts for passing to the type checker.
+    fn toCheckerOpts(self: CompilerOpts) ez.CheckerOpts {
+        return .{
+            .strict_null_checks = self.strict or self.strict_null_checks,
+            .no_implicit_any = self.strict or self.no_implicit_any,
+            .use_define_for_class_fields = self.use_define_for_class_fields,
+            .target = switch (self.target) {
+                .es5    => .es5,
+                .es2015 => .es2015,
+                .es2016 => .es2016,
+                .es2017 => .es2017,
+                .es2018 => .es2018,
+                .es2019 => .es2019,
+                .es2020 => .es2020,
+                .es2021 => .es2021,
+                .es2022 => .es2022,
+                .es2023 => .es2023,
+                .esnext => .esnext,
+                .none   => .es5,
+            },
+            .module = switch (self.module) {
+                .commonjs => .commonjs,
+                .amd      => .amd,
+                .system   => .system,
+                .umd      => .umd,
+                .es2015   => .es2015,
+                .es2020   => .es2020,
+                .es2022   => .es2022,
+                .esnext   => .esnext,
+                .node16   => .node16,
+                .node18   => .node18,
+                .node20   => .node20,
+                .nodenext => .nodenext,
+                .none     => .none,
+            },
+        };
     }
 };
 
@@ -102,6 +154,78 @@ fn tsRoot(ref_dir: []const u8) ?[]const u8 {
     return std.mem.trimEnd(u8, ref_dir[0 .. ref_dir.len - suf.len], "/");
 }
 
+fn isTrue(val: []const u8) bool {
+    return std.mem.eql(u8, val, "true");
+}
+
+/// Overrides fields in `opts` from `(key=value)` pairs embedded in the
+/// baseline filename (e.g. `nodeModules1(module=node16).types`).
+/// This is necessary when the source directive has a comma-separated list of
+/// values (e.g. `// @module: node16,node18,node20,nodenext`), which means
+/// tsc generated separate baseline files for each variant.
+fn applyVariantOverrides(opts: *CompilerOpts, filename: []const u8) void {
+    var rest = filename;
+    while (std.mem.indexOfScalar(u8, rest, '(')) |open| {
+        rest = rest[open + 1 ..];
+        const close = std.mem.indexOfScalar(u8, rest, ')') orelse break;
+        const pair = rest[0..close];
+        rest = rest[close + 1 ..];
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = std.mem.trim(u8, pair[0..eq], " ");
+        const val = std.mem.trim(u8, pair[eq + 1 ..], " ");
+        if (std.mem.eql(u8, key, "module")) opts.module = parseModule(val)
+        else if (std.mem.eql(u8, key, "target")) opts.target = parseTarget(val)
+        else if (std.mem.eql(u8, key, "strict")) opts.strict = isTrue(val)
+        else if (std.mem.eql(u8, key, "strictNullChecks")) opts.strict_null_checks = isTrue(val)
+        else if (std.mem.eql(u8, key, "noImplicitAny")) opts.no_implicit_any = isTrue(val)
+        else if (std.mem.eql(u8, key, "jsx")) opts.jsx = parseJsx(val)
+        else if (std.mem.eql(u8, key, "useDefineForClassFields")) opts.use_define_for_class_fields = isTrue(val)
+        else if (std.mem.eql(u8, key, "experimentalDecorators")) opts.experimental_decorators = isTrue(val)
+        else if (std.mem.eql(u8, key, "isolatedModules")) opts.isolate_modules = isTrue(val);
+    }
+}
+
+fn parseTarget(val: []const u8) CompilerOpts.Target {
+    const lower = val;
+    if (std.ascii.eqlIgnoreCase(lower, "es5"))    return .es5;
+    if (std.ascii.eqlIgnoreCase(lower, "es6") or std.ascii.eqlIgnoreCase(lower, "es2015")) return .es2015;
+    if (std.ascii.eqlIgnoreCase(lower, "es2016")) return .es2016;
+    if (std.ascii.eqlIgnoreCase(lower, "es2017")) return .es2017;
+    if (std.ascii.eqlIgnoreCase(lower, "es2018")) return .es2018;
+    if (std.ascii.eqlIgnoreCase(lower, "es2019")) return .es2019;
+    if (std.ascii.eqlIgnoreCase(lower, "es2020")) return .es2020;
+    if (std.ascii.eqlIgnoreCase(lower, "es2021")) return .es2021;
+    if (std.ascii.eqlIgnoreCase(lower, "es2022")) return .es2022;
+    if (std.ascii.eqlIgnoreCase(lower, "es2023")) return .es2023;
+    if (std.ascii.eqlIgnoreCase(lower, "esnext")) return .esnext;
+    return .none;
+}
+
+fn parseModule(val: []const u8) CompilerOpts.Module {
+    if (std.ascii.eqlIgnoreCase(val, "commonjs") or std.ascii.eqlIgnoreCase(val, "node")) return .commonjs;
+    if (std.ascii.eqlIgnoreCase(val, "amd"))      return .amd;
+    if (std.ascii.eqlIgnoreCase(val, "system"))   return .system;
+    if (std.ascii.eqlIgnoreCase(val, "umd"))      return .umd;
+    if (std.ascii.eqlIgnoreCase(val, "es6") or std.ascii.eqlIgnoreCase(val, "es2015")) return .es2015;
+    if (std.ascii.eqlIgnoreCase(val, "es2020"))   return .es2020;
+    if (std.ascii.eqlIgnoreCase(val, "es2022"))   return .es2022;
+    if (std.ascii.eqlIgnoreCase(val, "esnext"))   return .esnext;
+    if (std.ascii.eqlIgnoreCase(val, "node16"))   return .node16;
+    if (std.ascii.eqlIgnoreCase(val, "node18"))   return .node18;
+    if (std.ascii.eqlIgnoreCase(val, "node20"))   return .node20;
+    if (std.ascii.eqlIgnoreCase(val, "nodenext")) return .nodenext;
+    return .none;
+}
+
+fn parseJsx(val: []const u8) CompilerOpts.Jsx {
+    if (std.ascii.eqlIgnoreCase(val, "react"))        return .react;
+    if (std.ascii.eqlIgnoreCase(val, "react-jsx"))    return .react_jsx;
+    if (std.ascii.eqlIgnoreCase(val, "react-jsxdev")) return .react_jsxdev;
+    if (std.ascii.eqlIgnoreCase(val, "preserve"))     return .preserve;
+    if (std.ascii.eqlIgnoreCase(val, "react-native")) return .react_native;
+    return .none;
+}
+
 fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8, source_rel_path: []const u8) CompilerOpts {
     const full_path = std.fmt.allocPrint(arena, "{s}/{s}", .{ ts_root_dir, source_rel_path }) catch return .{};
     const content = std.Io.Dir.cwd().readFileAlloc(io, full_path, arena, std.Io.Limit.limited(64 * 1024)) catch return .{};
@@ -118,11 +242,27 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
         // Stop at filename splits — options after belong to individual files.
         if (std.mem.eql(u8, key, "filename") or std.mem.eql(u8, key, "Filename")) break;
         if (std.mem.eql(u8, key, "strict")) {
-            opts.strict = std.mem.eql(u8, val, "true");
+            opts.strict = isTrue(val);
         } else if (std.mem.eql(u8, key, "strictNullChecks")) {
-            opts.strict_null_checks = std.mem.eql(u8, val, "true");
+            opts.strict_null_checks = isTrue(val);
         } else if (std.mem.eql(u8, key, "noImplicitAny")) {
-            opts.no_implicit_any = std.mem.eql(u8, val, "true");
+            opts.no_implicit_any = isTrue(val);
+        } else if (std.mem.eql(u8, key, "target")) {
+            opts.target = parseTarget(val);
+        } else if (std.mem.eql(u8, key, "module")) {
+            opts.module = parseModule(val);
+        } else if (std.mem.eql(u8, key, "jsx")) {
+            opts.jsx = parseJsx(val);
+        } else if (std.mem.eql(u8, key, "checkJs")) {
+            opts.check_js = isTrue(val);
+        } else if (std.mem.eql(u8, key, "allowJs")) {
+            opts.allow_js = isTrue(val);
+        } else if (std.mem.eql(u8, key, "useDefineForClassFields")) {
+            opts.use_define_for_class_fields = isTrue(val);
+        } else if (std.mem.eql(u8, key, "experimentalDecorators")) {
+            opts.experimental_decorators = isTrue(val);
+        } else if (std.mem.eql(u8, key, "isolatedModules")) {
+            opts.isolate_modules = isTrue(val);
         }
     }
     return opts;
@@ -138,6 +278,7 @@ pub const Options = struct {
     skip: ?[]const u8 = null,
     limit: usize = std.math.maxInt(usize),
     progress: bool = false,
+    snap_writer: ?*SnapWriter = null,
 };
 
 pub const Stats = struct {
@@ -194,6 +335,29 @@ pub const Result = struct {
     }
 };
 
+// ── Per-expression snapshot / dump ──────────────────────────────────────────
+
+pub const SnapWriter = struct {
+    gpa: std.mem.Allocator,
+    buf: std.ArrayList(u8) = std.ArrayList(u8).empty,
+
+    pub fn init(gpa: std.mem.Allocator) SnapWriter {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(sw: *SnapWriter) void {
+        sw.buf.deinit(sw.gpa);
+    }
+
+    pub fn writeHeader(sw: *SnapWriter) void {
+        sw.buf.appendSlice(sw.gpa, "file\tsection\tline\texpr\twant\tgot\toutcome\n") catch {};
+    }
+
+    pub fn writeRow(sw: *SnapWriter, file: []const u8, sec_name: []const u8, line: u32, expr: []const u8, want: []const u8, got: []const u8, outcome: []const u8) void {
+        sw.buf.print(sw.gpa, "{s}\t{s}\t{d}\t{s}\t{s}\t{s}\t{s}\n", .{ file, sec_name, line, expr, want, got, outcome }) catch {};
+    }
+};
+
 // ════════════════════════════════════════════════════════════════════════════
 //  Sweep
 // ════════════════════════════════════════════════════════════════════════════
@@ -203,6 +367,8 @@ const Collector = struct {
     wrong: *std.StringHashMap(*Pattern),
     gap: *std.StringHashMap(*Pattern),
     nonode: *std.StringHashMap(*Pattern),
+    snap: ?*SnapWriter = null,
+    current_file: []const u8 = "",
 
     fn record(self: *Collector, map: *std.StringHashMap(*Pattern), key: []const u8, file: []const u8, expr: []const u8, want: []const u8, got: []const u8) void {
         const gop = map.getOrPut(key) catch return;
@@ -237,7 +403,7 @@ pub fn run(opts: Options) !Result {
     var wrong_map = std.StringHashMap(*Pattern).init(ra);
     var gap_map = std.StringHashMap(*Pattern).init(ra);
     var nonode_map = std.StringHashMap(*Pattern).init(ra);
-    var coll = Collector{ .ra = ra, .wrong = &wrong_map, .gap = &gap_map, .nonode = &nonode_map };
+    var coll = Collector{ .ra = ra, .wrong = &wrong_map, .gap = &gap_map, .nonode = &nonode_map, .snap = opts.snap_writer };
 
     var threaded = std.Io.Threaded.init(child, .{});
     defer threaded.deinit();
@@ -271,6 +437,7 @@ pub fn run(opts: Options) !Result {
         if (processed >= opts.limit) break;
         processed += 1;
         stats.files_seen += 1;
+        coll.current_file = entry.name;
 
         var file_arena = std.heap.ArenaAllocator.init(child);
         defer file_arena.deinit();
@@ -280,15 +447,20 @@ pub fn run(opts: Options) !Result {
         if (opts.progress) std.debug.print("[{d}] {s}\n", .{ processed, entry.name });
 
         // Parse compiler options from the corresponding source file (fix #2).
+        // Then apply (key=value) overrides from the baseline filename — needed for
+        // tests that produce multiple baseline variants from a single comma-separated
+        // directive (e.g. `// @module: node16,node18,node20,nodenext`).
         const comp_opts: CompilerOpts = blk: {
-            if (ts_root_dir) |root| {
+            var base: CompilerOpts = if (ts_root_dir) |root| inner: {
                 const first_nl = std.mem.indexOfScalar(u8, content, '\n') orelse content.len;
                 const first_line = std.mem.trim(u8, content[0..first_nl], " \r");
                 if (extractSourcePath(first_line)) |rel| {
-                    break :blk parseSourceOpts(io, fa, root, rel);
+                    break :inner parseSourceOpts(io, fa, root, rel);
                 }
-            }
-            break :blk CompilerOpts{};
+                break :inner CompilerOpts{};
+            } else CompilerOpts{};
+            applyVariantOverrides(&base, entry.name);
+            break :blk base;
         };
 
         const sections = parseSections(fa, content) catch continue;
@@ -372,6 +544,360 @@ fn accumulateResultN(stats: *Stats, r: SecResult, lang: Language, comp_opts: Com
             stats.prim_match_lang[li] += r.prim_match;
         },
     }
+}
+
+// ── Offline diff between two snapshots ───────────────────────────────────────
+
+fn parseTsvFields(line: []const u8, out: [][]const u8) bool {
+    var i: usize = 0;
+    var it = std.mem.splitScalar(u8, line, '\t');
+    while (it.next()) |f| {
+        if (i >= out.len) return false;
+        out[i] = f;
+        i += 1;
+    }
+    return i == out.len;
+}
+
+fn runDiff(io: std.Io, gpa: std.mem.Allocator, before_path: []const u8, after_path: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const before_bytes = try std.Io.Dir.cwd().readFileAlloc(io, before_path, aa, std.Io.Limit.unlimited);
+    const after_bytes  = try std.Io.Dir.cwd().readFileAlloc(io, after_path,  aa, std.Io.Limit.unlimited);
+
+    const BeforeRow = struct { got: []const u8, outcome: []const u8 };
+    var before_map = std.StringHashMap(BeforeRow).init(aa);
+
+    {
+        var it = std.mem.splitScalar(u8, before_bytes, '\n');
+        _ = it.next(); // skip header
+        while (it.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (line.len == 0) continue;
+            var f: [7][]const u8 = undefined;
+            if (!parseTsvFields(line, &f)) continue;
+            const key = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}\t{s}", .{ f[0], f[1], f[2], f[3] });
+            try before_map.put(key, .{ .got = f[5], .outcome = f[6] });
+        }
+    }
+
+    const TransKey = struct { before: []const u8, after: []const u8 };
+    const TransKeyCtx = struct {
+        pub fn hash(_: @This(), k: TransKey) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(k.before);
+            h.update("|");
+            h.update(k.after);
+            return h.final();
+        }
+        pub fn eql(_: @This(), a: TransKey, b: TransKey) bool {
+            return std.mem.eql(u8, a.before, b.before) and std.mem.eql(u8, a.after, b.after);
+        }
+    };
+    const Example = struct { file: []const u8, expr: []const u8, want: []const u8, before_got: []const u8, after_got: []const u8 };
+    const TransVal = struct { count: u64 = 0, ex: ?Example = null };
+    var trans_map = std.HashMap(TransKey, TransVal, TransKeyCtx, 80).init(aa);
+
+    var new_count: u64 = 0;
+    var matched_count: u64 = 0;
+    var after_count: u64 = 0;
+
+    {
+        var it = std.mem.splitScalar(u8, after_bytes, '\n');
+        _ = it.next(); // skip header
+        while (it.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (line.len == 0) continue;
+            var f: [7][]const u8 = undefined;
+            if (!parseTsvFields(line, &f)) continue;
+            after_count += 1;
+            const key = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}\t{s}", .{ f[0], f[1], f[2], f[3] });
+            if (before_map.get(key)) |br| {
+                matched_count += 1;
+                const tk = TransKey{ .before = br.outcome, .after = f[6] };
+                const gop = try trans_map.getOrPut(tk);
+                if (!gop.found_existing) {
+                    gop.key_ptr.* = .{ .before = try aa.dupe(u8, br.outcome), .after = try aa.dupe(u8, f[6]) };
+                    gop.value_ptr.* = .{};
+                }
+                gop.value_ptr.count += 1;
+                if (gop.value_ptr.ex == null) {
+                    gop.value_ptr.ex = .{ .file = f[0], .expr = f[3], .want = f[4], .before_got = br.got, .after_got = f[5] };
+                }
+            } else {
+                new_count += 1;
+            }
+        }
+    }
+
+    const before_count = before_map.count();
+    const removed_count = if (before_count > matched_count) before_count - matched_count else 0;
+
+    const TransEntry = struct { before: []const u8, after: []const u8, count: u64, ex: ?Example };
+    var list = std.ArrayList(TransEntry).empty;
+    var tit = trans_map.iterator();
+    while (tit.next()) |entry| {
+        try list.append(aa, .{ .before = entry.key_ptr.before, .after = entry.key_ptr.after, .count = entry.value_ptr.count, .ex = entry.value_ptr.ex });
+    }
+    std.mem.sort(TransEntry, list.items, {}, struct {
+        fn lt(_: void, a: TransEntry, b: TransEntry) bool {
+            const a_same = std.mem.eql(u8, a.before, a.after);
+            const b_same = std.mem.eql(u8, b.before, b.after);
+            if (a_same != b_same) return !a_same; // changed transitions first
+            return a.count > b.count;
+        }
+    }.lt);
+
+    std.debug.print("\n════ Oracle Diff ════\n", .{});
+    std.debug.print("  before: {s}\n  after:  {s}\n\n", .{ before_path, after_path });
+    std.debug.print("  before expressions  : {d}\n", .{before_map.count()});
+    std.debug.print("  after expressions   : {d}\n", .{after_count});
+    if (new_count > 0)     std.debug.print("  new  (only in after): {d}\n", .{new_count});
+    if (removed_count > 0) std.debug.print("  gone (only in before): {d}\n", .{removed_count});
+    std.debug.print("\n  Transitions (before → after):\n\n", .{});
+
+    var correct_gain: i64 = 0;
+    var correct_loss: i64 = 0;
+    for (list.items) |t| {
+        const same = std.mem.eql(u8, t.before, t.after);
+        const to_ok = !same and std.mem.eql(u8, t.after, "correct");
+        const from_ok = !same and std.mem.eql(u8, t.before, "correct");
+        const marker: []const u8 = if (to_ok) "  ++ gain" else if (from_ok) "  -- REGRESSION" else "";
+        std.debug.print("    {s:>10} → {s:<12}  {d:>8}{s}\n", .{ t.before, t.after, t.count, marker });
+        if (to_ok) correct_gain += @intCast(t.count);
+        if (from_ok) correct_loss += @intCast(t.count);
+    }
+
+    const net: i64 = correct_gain - correct_loss;
+    std.debug.print("\n  Net correct: {s}{d}  (gain={d} loss={d})\n", .{
+        if (net >= 0) @as([]const u8, "+") else "", net, correct_gain, correct_loss,
+    });
+
+    for (list.items) |t| {
+        if (std.mem.eql(u8, t.before, t.after)) continue;
+        const interesting = std.mem.eql(u8, t.after, "correct") or std.mem.eql(u8, t.before, "correct");
+        if (!interesting) continue;
+        const ex = t.ex orelse continue;
+        std.debug.print("\n  e.g. {s}→{s}  file={s}  `{s}`\n    want:   {s}\n    before: {s}\n    after:  {s}\n", .{
+            t.before, t.after, ex.file,
+            ellipsis(ex.expr, 60), ellipsis(ex.want, 60),
+            ellipsis(ex.before_got, 60), ellipsis(ex.after_got, 60),
+        });
+    }
+    std.debug.print("\n════════════════════\n", .{});
+}
+
+// ── Diff drilldown: filter by transition category and/or got value ─────────────
+
+const DiffCatOpts = struct {
+    cat_before: ?[]const u8 = null,
+    cat_after:  ?[]const u8 = null,
+    got_filter: ?[]const u8 = null,
+    max_per_file: usize = 8,
+};
+
+fn runDiffCat(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    before_path: []const u8,
+    after_path: []const u8,
+    dopts: DiffCatOpts,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    const before_bytes = try std.Io.Dir.cwd().readFileAlloc(io, before_path, aa, std.Io.Limit.unlimited);
+    const after_bytes  = try std.Io.Dir.cwd().readFileAlloc(io, after_path,  aa, std.Io.Limit.unlimited);
+
+    const BeforeRow = struct { got: []const u8, outcome: []const u8 };
+    var before_map = std.StringHashMap(BeforeRow).init(aa);
+    {
+        var it = std.mem.splitScalar(u8, before_bytes, '\n');
+        _ = it.next();
+        while (it.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (line.len == 0) continue;
+            var f: [7][]const u8 = undefined;
+            if (!parseTsvFields(line, &f)) continue;
+            const key = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}\t{s}", .{ f[0], f[1], f[2], f[3] });
+            try before_map.put(key, .{ .got = f[5], .outcome = f[6] });
+        }
+    }
+
+    const Hit = struct { expr: []const u8, want: []const u8, got_after: []const u8 };
+    var file_hits = std.StringHashMap(std.ArrayList(Hit)).init(aa);
+    var total: u64 = 0;
+
+    {
+        var it = std.mem.splitScalar(u8, after_bytes, '\n');
+        _ = it.next();
+        while (it.next()) |raw| {
+            const line = std.mem.trimEnd(u8, raw, "\r");
+            if (line.len == 0) continue;
+            var f: [7][]const u8 = undefined;
+            if (!parseTsvFields(line, &f)) continue;
+            const key = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}\t{s}", .{ f[0], f[1], f[2], f[3] });
+            const br = before_map.get(key) orelse continue;
+            // Skip unchanged transitions unless category filter is set
+            if (dopts.cat_before == null and dopts.cat_after == null) {
+                if (std.mem.eql(u8, br.outcome, f[6])) continue;
+            }
+            if (dopts.cat_before) |cb| if (!std.mem.eql(u8, br.outcome, cb)) continue;
+            if (dopts.cat_after)  |ca| if (!std.mem.eql(u8, f[6],      ca)) continue;
+            if (dopts.got_filter) |gf| if (std.mem.indexOf(u8, f[5], gf) == null) continue;
+            total += 1;
+            const fk = try aa.dupe(u8, f[0]);
+            const gop = try file_hits.getOrPut(fk);
+            if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(Hit).empty;
+            try gop.value_ptr.append(aa, .{
+                .expr     = try aa.dupe(u8, f[3]),
+                .want     = try aa.dupe(u8, f[4]),
+                .got_after = try aa.dupe(u8, f[5]),
+            });
+        }
+    }
+
+    std.debug.print("\n════ Diff Drilldown ════\n", .{});
+    std.debug.print("  before: {s}\n  after:  {s}\n", .{ before_path, after_path });
+    if (dopts.cat_before != null or dopts.cat_after != null)
+        std.debug.print("  transition: {s} → {s}\n", .{ dopts.cat_before orelse "*", dopts.cat_after orelse "*" });
+    if (dopts.got_filter) |gf|
+        std.debug.print("  got-contains: \"{s}\"\n", .{gf});
+    std.debug.print("  matches: {d}  files: {d}\n\n", .{ total, file_hits.count() });
+
+    const FileEntry = struct { name: []const u8, hits: []Hit };
+    var flist = std.ArrayList(FileEntry).empty;
+    var fit = file_hits.iterator();
+    while (fit.next()) |e|
+        try flist.append(aa, .{ .name = e.key_ptr.*, .hits = e.value_ptr.items });
+    std.mem.sort(FileEntry, flist.items, {}, struct {
+        fn lt(_: void, a: FileEntry, b: FileEntry) bool { return a.hits.len > b.hits.len; }
+    }.lt);
+
+    for (flist.items) |fe| {
+        std.debug.print("  [{d:>4}]  {s}\n", .{ fe.hits.len, fe.name });
+        const show = @min(fe.hits.len, dopts.max_per_file);
+        for (fe.hits[0..show]) |h| {
+            std.debug.print("         {s:<45}  want={s:<25}  got={s}\n", .{
+                ellipsis(h.expr, 45), ellipsis(h.want, 25), ellipsis(h.got_after, 40),
+            });
+        }
+        if (fe.hits.len > dopts.max_per_file)
+            std.debug.print("         ... +{d} more\n", .{ fe.hits.len - dopts.max_per_file });
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("════════════════════\n", .{});
+}
+
+// ── Inference trace: show all sibling expressions on the same source lines ─────
+//
+// Usage:  zig build oracle-trace -- "expr_text"
+//     or: zig build oracle-trace -- "expr_text" --filter file_pattern
+//
+// For each source line where expr_text appears, prints every expression on
+// that line together with its want/got types, so you can see what the
+// surrounding context inferred and why a particular expression went wrong.
+
+fn runTrace(gpa: std.mem.Allocator, snap: *const SnapWriter, expr_pat: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    // Pass 1: collect group keys (file+section+line) that contain a matching expr.
+    var matching_groups = std.StringHashMap(void).init(aa);
+    var total_matches: u32 = 0;
+    {
+        var it = std.mem.splitScalar(u8, snap.buf.items, '\n');
+        _ = it.next();
+        while (it.next()) |raw| {
+            const row = std.mem.trimEnd(u8, raw, "\r");
+            if (row.len == 0) continue;
+            var f: [7][]const u8 = undefined;
+            if (!parseTsvFields(row, &f)) continue;
+            if (std.mem.indexOf(u8, f[3], expr_pat) == null) continue;
+            total_matches += 1;
+            const gk = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}", .{ f[0], f[1], f[2] });
+            try matching_groups.put(gk, {});
+        }
+    }
+
+    if (total_matches == 0) {
+        std.debug.print("\nNo expressions matching '{s}' found.\n", .{expr_pat});
+        return;
+    }
+
+    std.debug.print("\n════ Trace: '{s}' ════\n", .{expr_pat});
+    std.debug.print("Matching rows: {d}  unique source lines: {d}\n\n", .{
+        total_matches, matching_groups.count(),
+    });
+
+    // Pass 2: print each matching group (all expressions on the same source line).
+    var prev_gk: []const u8 = "";
+    var group_n: u32 = 0;
+    {
+        var it = std.mem.splitScalar(u8, snap.buf.items, '\n');
+        _ = it.next();
+        while (it.next()) |raw| {
+            const row = std.mem.trimEnd(u8, raw, "\r");
+            if (row.len == 0) continue;
+            var f: [7][]const u8 = undefined;
+            if (!parseTsvFields(row, &f)) continue;
+            const gk = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}", .{ f[0], f[1], f[2] });
+            if (!matching_groups.contains(gk)) {
+                aa.free(gk);
+                continue;
+            }
+            if (!std.mem.eql(u8, gk, prev_gk)) {
+                group_n += 1;
+                std.debug.print("[{d}] {s}  §{s}  line {s}\n", .{ group_n, f[0], f[1], f[2] });
+                prev_gk = gk; // arena-owned, stable
+            } else {
+                aa.free(gk);
+            }
+            const is_match = std.mem.indexOf(u8, f[3], expr_pat) != null;
+            const pfx: []const u8 = if (is_match) " >" else "  ";
+            const ok: []const u8 = if (std.mem.eql(u8, f[6], "correct")) "OK"
+                else if (std.mem.eql(u8, f[6], "wrong")) "WRONG"
+                else f[6];
+            std.debug.print("{s} {s:<50}  want={s:<25}  got={s:<30}  {s}\n", .{
+                pfx,
+                ellipsis(f[3], 50), ellipsis(f[4], 25), ellipsis(f[5], 30),
+                ok,
+            });
+        }
+    }
+    std.debug.print("\n════════════════════\n", .{});
+}
+
+// ── Single-file / filtered dump ───────────────────────────────────────────────
+
+fn printDump(snap: *SnapWriter) void {
+    std.debug.print("\n════ Expression Dump ════\n", .{});
+    std.debug.print("{s:<60}  {s:<40}  {s:<40}  {s}\n", .{ "expr", "want (tsc)", "got (ez)", "outcome" });
+    std.debug.print("{s}\n", .{"─────────────────────────────────────────────────────────── ──────────────────────────────────────── ──────────────────────────────────────── ────────"});
+    var it = std.mem.splitScalar(u8, snap.buf.items, '\n');
+    _ = it.next(); // skip header
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        if (line.len == 0) continue;
+        var f: [7][]const u8 = undefined;
+        if (!parseTsvFields(line, &f)) continue;
+        const marker: []const u8 = switch (f[6][0]) {
+            'c' => "  OK",
+            'w' => "  WRONG",
+            'g' => "  gap",
+            'n' => "  no-node",
+            'a' => "  ambig",
+            else => "",
+        };
+        std.debug.print("{s:<60}  {s:<40}  {s:<40}  {s}{s}\n", .{
+            ellipsis(f[3], 60), ellipsis(f[4], 40), ellipsis(f[5], 40), f[6], marker,
+        });
+    }
+    std.debug.print("════════════════════════\n", .{});
 }
 
 // ── Cross-file section grouping (fix #3) ─────────────────────────────────────
@@ -816,11 +1342,10 @@ fn lineOf(starts: []const u32, offset: u32) u32 {
 }
 
 fn evalSection(arena: std.mem.Allocator, sec: Section, lang: Language, opts: CompilerOpts, coll: *Collector) SecResult {
-    _ = opts; // reserved for future checker option passing
-    return evalSectionInner(arena, sec, lang, coll) catch SecResult{ .status = .errored };
+    return evalSectionInner(arena, sec, lang, opts.toCheckerOpts(), coll) catch SecResult{ .status = .errored };
 }
 
-fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, coll: *Collector) !SecResult {
+fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, checker_opts: ez.CheckerOpts, coll: *Collector) !SecResult {
     var res = SecResult{ .status = .ok };
     if (sec.entries.len == 0) return res;
     const source = sec.source;
@@ -832,7 +1357,7 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, coll
         &ast_result,
         .{ .is_module = true, .build_parents = true },
     );
-    var checker = try Checker.init(arena, &ast_result, &sem);
+    var checker = try Checker.init(arena, &ast_result, &sem, checker_opts);
 
     const starts = try lineStarts(arena, source);
 
@@ -899,6 +1424,11 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, coll
             } else if (is_prim and is_ambig) {
                 coll.record(coll.nonode, typeCategory(want), sec.name, e.expr, want, "<ambiguous>");
             }
+            if (coll.snap) |sw| {
+                const got_s: []const u8 = if (is_ambig) "<ambiguous>" else "<no-node>";
+                const out_s: []const u8 = if (is_ambig) "ambiguous" else "no-node";
+                sw.writeRow(coll.current_file, sec.name, e.line, e.expr, want, got_s, out_s);
+            }
             continue;
         }
         res.comparable += 1;
@@ -907,17 +1437,20 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, coll
             // Correct.
             res.match += 1;
             if (is_prim) res.prim_match += 1;
+            if (coll.snap) |sw| sw.writeRow(coll.current_file, sec.name, e.line, e.expr, want, got_norm, "correct");
         } else if (isGapType(got_norm)) {
             // ez returned a gap type where tsc has a concrete type.
             res.gap += 1;
             if (is_prim) res.prim_gap += 1;
             coll.record(coll.gap, typeCategory(want), sec.name, e.expr, want, got_norm);
+            if (coll.snap) |sw| sw.writeRow(coll.current_file, sec.name, e.line, e.expr, want, got_norm, "gap");
         } else {
             // ez returned a different concrete type — a real divergence.
             res.wrong += 1;
             if (is_prim) res.prim_wrong += 1;
             const label = std.fmt.bufPrint(&keybuf, "{s} → {s}", .{ typeCategory(want), typeCategory(got_norm) }) catch typeCategory(want);
             coll.record(coll.wrong, label, sec.name, e.expr, want, got_norm);
+            if (coll.snap) |sw| sw.writeRow(coll.current_file, sec.name, e.line, e.expr, want, got_norm, "wrong");
         }
     }
     return res;
@@ -1012,14 +1545,105 @@ fn getEnv(name: []const u8) ?[]const u8 {
 }
 
 pub fn main(init: std.process.Init) !void {
-    var save_baseline = false;
-    for (init.minimal.args.vector) |a| {
-        if (std.mem.eql(u8, std.mem.span(a), "--save-baseline")) save_baseline = true;
+    var save_baseline  = false;
+    var snapshot_path: ?[]const u8 = null;
+    var diff_before:   ?[]const u8 = null;
+    var diff_after:    ?[]const u8 = null;
+    var dump_filter:   ?[]const u8 = null;
+    // New flags
+    var filter_override: ?[]const u8 = null; // --filter pattern (overrides ORACLE_FILTER)
+    var trace_expr:      ?[]const u8 = null; // --trace expr_text
+    var diff_cat_before: ?[]const u8 = null; // --cat before after
+    var diff_cat_after:  ?[]const u8 = null;
+    var diff_got_filter: ?[]const u8 = null; // --got-contains str
+    var do_diff_cat      = false;
+    var do_trace         = false;
+
+    var positionals = std.ArrayList([]const u8).empty;
+
+    const args = init.minimal.args.vector;
+    var ai: usize = 0;
+    while (ai < args.len) : (ai += 1) {
+        const a = std.mem.span(args[ai]);
+        if (std.mem.eql(u8, a, "--save-baseline")) {
+            save_baseline = true;
+        } else if (std.mem.eql(u8, a, "--snapshot")) {
+            // --snapshot [path]: path is optional; skip if next arg is a flag.
+            if (ai + 1 < args.len) {
+                const nxt = std.mem.span(args[ai + 1]);
+                if (!std.mem.startsWith(u8, nxt, "--")) {
+                    ai += 1;
+                    snapshot_path = nxt;
+                }
+            }
+        } else if (std.mem.eql(u8, a, "--filter-snap")) {
+            // --filter-snap pattern path — filtered snapshot in one step
+            ai += 1; if (ai < args.len) filter_override = std.mem.span(args[ai]);
+            ai += 1; if (ai < args.len) snapshot_path   = std.mem.span(args[ai]);
+        } else if (std.mem.eql(u8, a, "--diff")) {
+            ai += 1; if (ai < args.len) diff_before = std.mem.span(args[ai]);
+            ai += 1; if (ai < args.len) diff_after  = std.mem.span(args[ai]);
+        } else if (std.mem.eql(u8, a, "--diff-cat")) {
+            // --diff-cat before after [--cat b a] [--got str]
+            do_diff_cat = true;
+            ai += 1; if (ai < args.len) diff_before = std.mem.span(args[ai]);
+            ai += 1; if (ai < args.len) diff_after  = std.mem.span(args[ai]);
+        } else if (std.mem.eql(u8, a, "--cat")) {
+            ai += 1; if (ai < args.len) diff_cat_before = std.mem.span(args[ai]);
+            ai += 1; if (ai < args.len) diff_cat_after  = std.mem.span(args[ai]);
+        } else if (std.mem.eql(u8, a, "--got-contains")) {
+            ai += 1; if (ai < args.len) diff_got_filter = std.mem.span(args[ai]);
+        } else if (std.mem.eql(u8, a, "--dump")) {
+            ai += 1; if (ai < args.len) dump_filter = std.mem.span(args[ai]);
+        } else if (std.mem.eql(u8, a, "--filter")) {
+            ai += 1; if (ai < args.len) filter_override = std.mem.span(args[ai]);
+        } else if (std.mem.eql(u8, a, "--trace")) {
+            do_trace = true;
+            // Optionally consume next non-flag arg as expr pattern
+            if (ai + 1 < args.len) {
+                const nxt = std.mem.span(args[ai + 1]);
+                if (!std.mem.startsWith(u8, nxt, "--")) {
+                    ai += 1;
+                    trace_expr = nxt;
+                }
+            }
+        } else if (!std.mem.startsWith(u8, a, "--")) {
+            // Collect positional args for commands that need them
+            if (do_trace and trace_expr == null) {
+                trace_expr = a;
+            } else {
+                positionals.append(init.gpa, a) catch {};
+            }
+        }
+    }
+    defer positionals.deinit(init.gpa);
+
+    // --diff-cat mode: drilldown on a specific transition category.
+    if (do_diff_cat and diff_before != null and diff_after != null) {
+        return runDiffCat(init.io, init.gpa, diff_before.?, diff_after.?, .{
+            .cat_before = diff_cat_before,
+            .cat_after  = diff_cat_after,
+            .got_filter = diff_got_filter,
+        });
+    }
+
+    // --diff mode: offline analysis of two snapshots, no sweep needed.
+    if (diff_before != null and diff_after != null) {
+        return runDiff(init.io, init.gpa, diff_before.?, diff_after.?);
+    }
+
+    var snap: ?SnapWriter = null;
+    defer if (snap) |*sw| sw.deinit();
+
+    // Trace and dump modes need a snap; snapshot mode optionally writes to disk.
+    if (snapshot_path != null or dump_filter != null or do_trace) {
+        snap = SnapWriter.init(init.gpa);
+        snap.?.writeHeader();
     }
 
     const opts = Options{
         .ref_dir = getEnv("ORACLE_DIR") orelse REF_DIR,
-        .filter = getEnv("ORACLE_FILTER"),
+        .filter = filter_override orelse dump_filter orelse getEnv("ORACLE_FILTER"),
         .skip = getEnv("ORACLE_SKIP"),
         .limit = blk: {
             if (getEnv("ORACLE_LIMIT")) |lv| {
@@ -1028,6 +1652,7 @@ pub fn main(init: std.process.Init) !void {
             break :blk std.math.maxInt(usize);
         },
         .progress = getEnv("ORACLE_PROGRESS") != null,
+        .snap_writer = if (snap != null) &snap.? else null,
     };
 
     var res = run(opts) catch |err| {
@@ -1036,7 +1661,23 @@ pub fn main(init: std.process.Init) !void {
         return err;
     };
     defer res.deinit();
-    printReport(res);
+
+    if (do_trace) {
+        if (trace_expr) |te| {
+            try runTrace(init.gpa, &snap.?, te);
+        } else {
+            std.debug.print("usage: zig build oracle-trace -- \"expr_text\" [--filter file_pattern]\n", .{});
+        }
+    } else if (dump_filter != null) {
+        printDump(&snap.?);
+    } else {
+        printReport(res);
+    }
+
+    if (snapshot_path) |sp| {
+        try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = sp, .data = snap.?.buf.items });
+        std.debug.print("wrote {s}  ({d} rows)\n", .{ sp, std.mem.count(u8, snap.?.buf.items, "\n") - 1 });
+    }
 
     if (save_baseline) try writeBaseline(init.io, init.gpa, res.stats);
 }
