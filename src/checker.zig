@@ -1222,9 +1222,10 @@ pub const Checker = struct {
             // at setup) to avoid seeding the intern map early and exposing latent
             // bugs in substituteTypeId's intern-rehash path.
             const named_form: ?[]const u8 = if (std.mem.eql(u8, name, "Math") or
-                std.mem.eql(u8, name, "JSON") or
-                std.mem.eql(u8, name, "console"))
+                std.mem.eql(u8, name, "JSON"))
                 name
+            else if (std.mem.eql(u8, name, "console"))
+                "Console"
             else if (std.mem.eql(u8, name, "Array"))
                 "ArrayConstructor"
             else if (std.mem.eql(u8, name, "Object"))
