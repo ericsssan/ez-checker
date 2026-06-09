@@ -5214,8 +5214,9 @@ pub const Checker = struct {
                     sig_data.rhs;
                 const value_ty = self.resolveTypeNode(value_node);
                 const sentinel = self.indexSigSentinel(member);
+                const display = self.indexSigDisplayInfo(member);
                 if (prop_count < props_buf.len) {
-                    props_buf[prop_count] = .{ .name = sentinel, .type_id = value_ty };
+                    props_buf[prop_count] = .{ .name = sentinel, .type_id = value_ty, .index_key_name = display.key_name, .index_key_is_number = display.is_number };
                     prop_count += 1;
                 }
                 // Emit generic "[]" for backward compat when key was specific.
@@ -8651,6 +8652,35 @@ pub const Checker = struct {
     }
 
     /// Return the index-signature sentinel for an interface/type-literal member.
+    /// Extract key_name and key_is_number from a ts_index_signature node for
+    /// display purposes.  Returns .{ key_name, is_number } where key_name is
+    /// a slice into the source text (valid for the checker's lifetime) and
+    /// is_number is true when the key type resolves to `number`.
+    fn indexSigDisplayInfo(self: *Checker, member: NodeIndex) struct { key_name: []const u8, is_number: bool } {
+        const d = self.ast_ref.nodeData(member);
+        const key_param = d.lhs;
+        var key_name: []const u8 = "key";
+        if (key_param != .none and self.ast_ref.nodeTag(key_param) == .identifier) {
+            key_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(key_param));
+        }
+        var is_number = false;
+        if (key_param != .none) {
+            const key_ann = self.ast_ref.nodeData(key_param).rhs;
+            if (key_ann != .none) {
+                const key_ty_node = if (self.ast_ref.nodeTag(key_ann) == .ts_type_annotation)
+                    self.ast_ref.nodeData(key_ann).lhs
+                else
+                    key_ann;
+                if (key_ty_node != .none and self.ast_ref.nodeTag(key_ty_node) == .ts_type_reference) {
+                    const kt_tok = self.ast_ref.nodeMainToken(key_ty_node);
+                    const kt_name = self.ast_ref.tokenText(kt_tok);
+                    is_number = std.mem.eql(u8, kt_name, "number");
+                }
+            }
+        }
+        return .{ .key_name = key_name, .is_number = is_number };
+    }
+
     /// "[]"  = generic key (string/number/symbol)
     /// "[]L" = Lowercase<string> key — only matches all-lowercase accessor names
     /// "[]U" = Uppercase<string> key — only matches all-uppercase accessor names
@@ -8723,7 +8753,8 @@ pub const Checker = struct {
                     data.rhs;
                 const value_ty = self.resolveTypeNode(value_node);
                 const sentinel = self.indexSigSentinel(member);
-                return .{ .name = sentinel, .type_id = value_ty };
+                const display = self.indexSigDisplayInfo(member);
+                return .{ .name = sentinel, .type_id = value_ty, .index_key_name = display.key_name, .index_key_is_number = display.is_number };
             },
             else => return null,
         }
@@ -12190,11 +12221,16 @@ pub const Checker = struct {
                 const call_sigs = self.store.signaturesOf(t.signatures);
                 // Count renderable regular properties (skip index-signature sentinels).
                 var real_count: usize = 0;
+                var idx_sig_count: usize = 0;
                 for (props) |p| {
-                    if (!std.mem.startsWith(u8, p.name, "[]")) real_count += 1;
+                    if (std.mem.startsWith(u8, p.name, "[]")) {
+                        if (p.index_key_name.len > 0) idx_sig_count += 1;
+                    } else {
+                        real_count += 1;
+                    }
                 }
                 // Single call/construct signature with no props: render as arrow form.
-                if (real_count == 0 and call_sigs.len == 1) {
+                if (real_count == 0 and call_sigs.len == 1 and idx_sig_count == 0) {
                     const sig = call_sigs[0];
                     const sparams = self.store.signatureParamsOf(sig);
                     const snames = self.store.signatureParamNamesOf(sig);
@@ -12213,7 +12249,7 @@ pub const Checker = struct {
                     }
                     try buf.appendSlice(gpa, ") => ");
                     try self.typeToStringInner(sig.return_type, buf, depth + 1);
-                } else if (real_count == 0 and call_sigs.len == 0) {
+                } else if (real_count == 0 and call_sigs.len == 0 and idx_sig_count == 0) {
                     try buf.appendSlice(gpa, "{}");
                 } else {
                     try buf.appendSlice(gpa, "{ ");
@@ -12241,6 +12277,27 @@ pub const Checker = struct {
                         }
                         try buf.appendSlice(gpa, "): ");
                         try self.typeToStringInner(sig.return_type, buf, depth + 1);
+                    }
+                    // Render index signatures (e.g. `[key: string]: T`).
+                    for (props) |p| {
+                        if (!std.mem.startsWith(u8, p.name, "[]")) continue;
+                        if (p.index_key_name.len == 0) continue; // skip synthetic/backward-compat entries
+                        if (!first) try buf.appendSlice(gpa, "; ");
+                        first = false;
+                        try buf.append(gpa, '[');
+                        try buf.appendSlice(gpa, p.index_key_name);
+                        try buf.appendSlice(gpa, ": ");
+                        if (std.mem.eql(u8, p.name, "[]L")) {
+                            try buf.appendSlice(gpa, "Lowercase<string>");
+                        } else if (std.mem.eql(u8, p.name, "[]U")) {
+                            try buf.appendSlice(gpa, "Uppercase<string>");
+                        } else if (p.index_key_is_number) {
+                            try buf.appendSlice(gpa, "number");
+                        } else {
+                            try buf.appendSlice(gpa, "string");
+                        }
+                        try buf.appendSlice(gpa, "]: ");
+                        try self.typeToStringInner(p.type_id, buf, depth + 1);
                     }
                     for (props) |p| {
                         if (std.mem.startsWith(u8, p.name, "[]")) continue;

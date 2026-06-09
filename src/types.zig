@@ -109,6 +109,13 @@ pub const ObjectProp = struct {
     /// constructor / static side).  Lets `unbound-method`'s `ignoreStatic`
     /// option see the modifier via the facade's synthesized declaration.
     is_static: bool = false,
+    /// For index signature props (name == "[]" / "[]L" / "[]U"): the key
+    /// parameter name from the declaration (e.g. "key" in `[key: string]`).
+    /// Empty string for synthetic/backward-compat "[]" entries — those are
+    /// skipped during type rendering so only the declared form is displayed.
+    index_key_name: []const u8 = "",
+    /// True when the index signature key type is `number` (vs string/symbol).
+    index_key_is_number: bool = false,
 };
 
 pub const Signature = struct {
@@ -306,8 +313,10 @@ pub const InternContext = struct {
                 @intFromBool(p.optional), @intFromBool(p.readonly),
                 @intFromBool(p.is_method), @intFromBool(p.is_fn_property),
                 @intFromBool(p.is_static),
+                @intFromBool(p.index_key_is_number),
             };
             h.update(&flags);
+            h.update(p.index_key_name);
         }
         for (self.store.signaturesOf(t.signatures)) |s| {
             for (self.store.signatureParamsOf(s)) |pp| {
@@ -354,6 +363,8 @@ pub const InternContext = struct {
             if (x.optional != y.optional or x.readonly != y.readonly or
                 x.is_method != y.is_method or x.is_fn_property != y.is_fn_property or
                 x.is_static != y.is_static) return false;
+            if (!std.mem.eql(u8, x.index_key_name, y.index_key_name)) return false;
+            if (x.index_key_is_number != y.index_key_is_number) return false;
         }
         const sa = self.store.signaturesOf(ta.signatures);
         const sb = self.store.signaturesOf(tb.signatures);
