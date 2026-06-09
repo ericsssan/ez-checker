@@ -228,6 +228,23 @@ pub const Checker = struct {
     seg_reach_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
     seg_worklist: std.ArrayListUnmanaged(u32) = .empty,
 
+    /// Evolving-array support (`let x = []` / `let x; x = []`).  TypeScript's
+    /// auto-array type: the element type grows from `x.push(v)` and `x[i] = v`
+    /// contributions.  Symbols flagged here are evolving arrays; the element
+    /// contributions reaching a pure read give its `(union)[]` type, while a
+    /// push-receiver / element-assign-target reads as `any[]`.
+    evolving_array_syms: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Symbols disqualified from evolving-array (assigned a non-empty array
+    /// literal) — order-independent guard during index building.
+    evolving_array_disq: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Symbols whose declarator initializer is `[]` (auto-array from the
+    /// declaration onward, so every use is an array).
+    evolving_array_init: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// The `x = []` reset writes (seg/pos) that establish the auto-array; a use
+    /// is only an array if one reaches it.
+    evolving_array_resets: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(EvolvingWrite)) = .empty,
+    evolving_array_contribs: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(EvolvingWrite)) = .empty,
+
     /// Absolute path of the file being checked.  Empty string means
     /// cross-file resolution is disabled.
     file_path: []const u8 = "",
@@ -372,6 +389,19 @@ pub const Checker = struct {
         if (self.node_seg.len > 0) self.gpa.free(self.node_seg);
         self.seg_reach_set.deinit(self.gpa);
         self.seg_worklist.deinit(self.gpa);
+        self.evolving_array_syms.deinit(self.gpa);
+        self.evolving_array_disq.deinit(self.gpa);
+        self.evolving_array_init.deinit(self.gpa);
+        {
+            var rit = self.evolving_array_resets.valueIterator();
+            while (rit.next()) |list| list.deinit(self.gpa);
+            self.evolving_array_resets.deinit(self.gpa);
+        }
+        {
+            var ait = self.evolving_array_contribs.valueIterator();
+            while (ait.next()) |list| list.deinit(self.gpa);
+            self.evolving_array_contribs.deinit(self.gpa);
+        }
         self.merged_iface_extra.deinit(self.gpa);
         self.merged_ns_extra.deinit(self.gpa);
         {
@@ -1071,6 +1101,18 @@ pub const Checker = struct {
                 return self.narrowAtUse(node, sym, base_c);
             }
             const base = self.declaredTypeForSymbol(sym);
+            // Evolving array (`let x = []`): the binding's declared type is the
+            // auto-array (rendered `any`); refine it to the element-union array
+            // built from `push`/element-assign contributions.  Only when the
+            // declared type is the unrefined `any`/`unknown`/empty-array form,
+            // so a real annotation (`let x: number[] = []`) is untouched.
+            if (self.checker_opts.no_implicit_any and (bkind == .@"var" or bkind == .let) and
+                (base.eq(tymod.ID_ANY) or base.eq(tymod.ID_UNKNOWN) or self.isEmptyArrayType(base)))
+            {
+                if (self.inferEvolvingArrayType(sym, node)) |arr| {
+                    return self.narrowAtUse(node, sym, arr);
+                }
+            }
             if (!base.eq(tymod.ID_UNKNOWN)) return self.narrowAtUse(node, sym, base);
             // Symbol resolves but has no declared type — distinguish between
             // explicit declarations (return any) and implicit globals (try lib).
@@ -2530,6 +2572,163 @@ pub const Checker = struct {
                 .pos = self.ast_ref.nodeSpan(@as(NodeIndex, @enumFromInt(ni))).start,
             }) catch {};
         }
+
+        // ── Evolving arrays ──────────────────────────────────────────────
+        // Pass A: a var/let assigned an empty array literal `[]` is an
+        // evolving (auto-)array.
+        ri = 0;
+        while (ri < total) : (ri += 1) {
+            const sid = sym_col[ri];
+            if (@intFromEnum(sid) == @intFromEnum(symbol_mod.SymbolId.none)) continue;
+            const bkind = self.semantic.symbols.getBindingKind(sid);
+            if (bkind != .@"var" and bkind != .let) continue;
+            const node: NodeIndex = node_col[ri];
+            const valn = self.assignedValueOf(node) orelse continue;
+            // A *non-empty* array-literal write (`x = [5, "hello"]`, `x = [true]`)
+            // makes the binding a fixed (non-evolving) array; disqualify it even
+            // if `x = []` also appears (TS's evolving inference fails → `any`).
+            if (self.ast_ref.nodeTag(valn) == .array_literal and !self.isEmptyArrayLiteral(valn)) {
+                _ = self.evolving_array_syms.remove(sid.toInt());
+                self.evolving_array_disq.put(self.gpa, sid.toInt(), {}) catch {};
+                continue;
+            }
+            if (!self.isEmptyArrayLiteral(valn)) continue;
+            if (self.evolving_array_disq.contains(sid.toInt())) continue;
+            // A binding whose *initializer* is something other than `[]` has a
+            // declared type from it (`let foo = map.get(k)` is `T[] | undefined`)
+            // and is not an evolving array, even if `foo = []` appears later.
+            const decl_init = self.bindingDeclInit(sid);
+            if (decl_init != .none and !self.isEmptyArrayLiteral(decl_init)) continue;
+            self.evolving_array_syms.put(self.gpa, sid.toInt(), {}) catch {};
+            const symid2 = sid.toInt();
+            if (decl_init != .none) {
+                // Initializer is `[]` → auto-array from the declaration onward.
+                self.evolving_array_init.put(self.gpa, symid2, {}) catch {};
+            } else {
+                // `x = []` reset write — records where the auto-array begins.
+                const rgop = self.evolving_array_resets.getOrPut(self.gpa, symid2) catch continue;
+                if (!rgop.found_existing) rgop.value_ptr.* = .empty;
+                rgop.value_ptr.append(self.gpa, .{
+                    .rhs = valn,
+                    .assign = .none,
+                    .op = .assign,
+                    .seg = seg_col[ri],
+                    .pos = self.ast_ref.nodeSpan(node).start,
+                }) catch {};
+            }
+        }
+        // Pass B: collect element contributions (`x.push(v)`, `x[i] = v`).
+        if (self.evolving_array_syms.count() != 0) {
+            ri = 0;
+            while (ri < total) : (ri += 1) {
+                const sid = sym_col[ri];
+                if (@intFromEnum(sid) == @intFromEnum(symbol_mod.SymbolId.none)) continue;
+                if (!self.evolving_array_syms.contains(sid.toInt())) continue;
+                self.collectArrayContribs(sid.toInt(), node_col[ri], seg_col[ri]);
+            }
+        }
+    }
+
+    /// True for `never[]` / `any[]` — the unrefined empty-array element forms.
+    fn isEmptyArrayType(self: *Checker, ty: TypeId) bool {
+        const t = self.store.get(ty);
+        if (t.kind != .array_t and t.kind != .readonly_array_t) return false;
+        const elems = self.store.idsOf(t.list_data);
+        if (elems.len != 1) return false;
+        return elems[0].eq(tymod.ID_NEVER) or elems[0].eq(tymod.ID_ANY);
+    }
+
+    /// The initializer node of a var/let binding's declarator, or `.none`.
+    fn bindingDeclInit(self: *Checker, sym: symbol_mod.SymbolId) NodeIndex {
+        const decl = self.semantic.symbols.getDeclNode(sym);
+        if (decl == .none) return .none;
+        var n = decl;
+        if (self.ast_ref.nodeTag(n) != .declarator) {
+            const ni = n.toInt();
+            if (ni >= self.semantic.parent_indices.len) return .none;
+            const p = self.semantic.parent_indices[ni];
+            if (p == @intFromEnum(NodeIndex.none)) return .none;
+            n = @enumFromInt(p);
+            if (self.ast_ref.nodeTag(n) != .declarator) return .none;
+        }
+        return self.ast_ref.nodeData(n).rhs;
+    }
+
+    /// Peel grouping and report whether `node` is an empty array literal `[]`.
+    fn isEmptyArrayLiteral(self: *Checker, node: NodeIndex) bool {
+        var n = node;
+        while (self.ast_ref.nodeTag(n) == .grouping_expr) n = self.ast_ref.nodeData(n).lhs;
+        if (self.ast_ref.nodeTag(n) != .array_literal) return false;
+        const d = self.ast_ref.nodeData(n);
+        const r = self.directRange(d.lhs, d.rhs);
+        return r == null or r.?.len == 0;
+    }
+
+    /// The value assigned to `node` when it is an `=` target or a declarator
+    /// binding identifier, else null.
+    fn assignedValueOf(self: *Checker, node: NodeIndex) ?NodeIndex {
+        const ni = node.toInt();
+        if (ni >= self.semantic.parent_indices.len) return null;
+        const pidx = self.semantic.parent_indices[ni];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        const ptag = self.ast_ref.nodeTag(parent);
+        if (ptag != .assign and ptag != .declarator) return null;
+        const pd = self.ast_ref.nodeData(parent);
+        if (@intFromEnum(pd.lhs) != ni or pd.rhs == .none) return null;
+        return pd.rhs;
+    }
+
+    fn addArrayContrib(self: *Checker, symid: u32, value: NodeIndex, seg: u32, pos: u32) void {
+        const gop = self.evolving_array_contribs.getOrPut(self.gpa, symid) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.append(self.gpa, .{ .rhs = value, .assign = NodeIndex.none, .op = .assign, .seg = seg, .pos = pos }) catch {};
+    }
+
+    /// When `xnode` (a reference to an evolving-array symbol) is the receiver of
+    /// `x.push(...)`/`x.unshift(...)` or the object of `x[i] = v`, record the
+    /// contributed element value(s).
+    fn collectArrayContribs(self: *Checker, symid: u32, xnode: NodeIndex, seg: u32) void {
+        const parents = self.semantic.parent_indices;
+        const ni = xnode.toInt();
+        if (ni >= parents.len) return;
+        const pidx = parents[ni];
+        if (pidx == @intFromEnum(NodeIndex.none)) return;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        const ptag = self.ast_ref.nodeTag(parent);
+        const md = self.ast_ref.nodeData(parent);
+        if (@intFromEnum(md.lhs) != ni) return; // x must be the object/receiver
+        if (ptag == .member_expr) {
+            if (md.rhs == .none) return;
+            const method = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
+            if (!std.mem.eql(u8, method, "push") and !std.mem.eql(u8, method, "unshift")) return;
+            const pi = parent.toInt();
+            if (pi >= parents.len) return;
+            const gpi = parents[pi];
+            if (gpi == @intFromEnum(NodeIndex.none)) return;
+            const gp: NodeIndex = @enumFromInt(gpi);
+            if (self.ast_ref.nodeTag(gp) != .call_expr) return;
+            const cd = self.ast_ref.nodeData(gp);
+            if (@intFromEnum(cd.lhs) != pi) return; // member is the callee
+            const args = self.safeSubRange(cd.rhs) orelse return;
+            const extra = self.ast_ref.extra_data;
+            if (args.start > extra.len or args.end > extra.len) return;
+            const cpos = self.ast_ref.nodeSpan(gp).start;
+            var k = args.start;
+            while (k < args.end) : (k += 1) {
+                self.addArrayContrib(symid, @enumFromInt(extra[k]), seg, cpos);
+            }
+        } else if (ptag == .computed_member_expr) {
+            const pi = parent.toInt();
+            if (pi >= parents.len) return;
+            const gpi = parents[pi];
+            if (gpi == @intFromEnum(NodeIndex.none)) return;
+            const gp: NodeIndex = @enumFromInt(gpi);
+            if (self.ast_ref.nodeTag(gp) != .assign) return;
+            const ad = self.ast_ref.nodeData(gp);
+            if (@intFromEnum(ad.lhs) != pi or ad.rhs == .none) return;
+            self.addArrayContrib(symid, ad.rhs, seg, self.ast_ref.nodeSpan(gp).start);
+        }
     }
 
     /// True when `node` is `ancestor` or lies within its subtree (walking up
@@ -2760,6 +2959,139 @@ pub const Checker = struct {
         const u = self.store.unionOf(buf[0..n]) catch return null;
         if (tymod.isAny(&self.store, u)) return null;
         return u;
+    }
+
+    /// True when `node` is the receiver of an evolving-array mutation
+    /// (`x.push(...)`/`x.unshift(...)`) or the object of an element assignment
+    /// (`x[i] = v`).  At such a position TypeScript reports the auto-array type
+    /// (`any[]`), not the finalized element-union type.
+    fn isEvolvingArrayOpTarget(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        // Peel enclosing parentheses: `((x))[3] = …` / `(x).push(…)`.
+        var ni = node.toInt();
+        while (ni < parents.len) {
+            const up = parents[ni];
+            if (up == @intFromEnum(NodeIndex.none)) break;
+            if (self.ast_ref.nodeTag(@as(NodeIndex, @enumFromInt(up))) != .grouping_expr) break;
+            ni = up;
+        }
+        if (ni >= parents.len) return false;
+        const pidx = parents[ni];
+        if (pidx == @intFromEnum(NodeIndex.none)) return false;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        const ptag = self.ast_ref.nodeTag(parent);
+        const md = self.ast_ref.nodeData(parent);
+        if (@intFromEnum(md.lhs) != ni) return false; // node is the object
+        if (ptag == .member_expr) {
+            if (md.rhs == .none) return false;
+            const method = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
+            if (!std.mem.eql(u8, method, "push") and !std.mem.eql(u8, method, "unshift")) return false;
+            const pi = parent.toInt();
+            if (pi >= parents.len) return false;
+            const gpi = parents[pi];
+            if (gpi == @intFromEnum(NodeIndex.none)) return false;
+            const gp: NodeIndex = @enumFromInt(gpi);
+            return self.ast_ref.nodeTag(gp) == .call_expr and
+                @intFromEnum(self.ast_ref.nodeData(gp).lhs) == pi;
+        } else if (ptag == .computed_member_expr) {
+            const pi = parent.toInt();
+            if (pi >= parents.len) return false;
+            const gpi = parents[pi];
+            if (gpi == @intFromEnum(NodeIndex.none)) return false;
+            const gp: NodeIndex = @enumFromInt(gpi);
+            return self.ast_ref.nodeTag(gp) == .assign and
+                @intFromEnum(self.ast_ref.nodeData(gp).lhs) == pi;
+        }
+        return false;
+    }
+
+    /// Fill `seg_reach_set` with every segment that can reach `target`
+    /// (backward closure over prev + looped-prev edges).
+    fn computeBackwardClosure(self: *Checker, cpr: anytype, target: u32) void {
+        self.seg_reach_set.clearRetainingCapacity();
+        self.seg_worklist.clearRetainingCapacity();
+        if (target >= cpr.seg_count) return;
+        self.seg_reach_set.put(self.gpa, target, {}) catch return;
+        _ = self.pushPrevSegs(cpr, target);
+        while (self.seg_worklist.pop()) |seg| {
+            if (seg >= cpr.seg_count) continue;
+            _ = self.pushPrevSegs(cpr, seg);
+        }
+    }
+
+    /// Evolving-array: type a use of an auto-array `let x = []` binding.  A
+    /// push-receiver / element-assign target reads as `any[]`; a pure read is
+    /// `(union of element contributions reaching it)[]`, or `any[]` when none.
+    /// A write at (`w_seg`,`w_pos`) reaches the use: earlier in the same
+    /// segment, or in a CFG predecessor segment (closure precomputed in
+    /// `seg_reach_set`).  Falls back to source order without CFG.
+    fn writeReachesUse(self: *Checker, w_seg: u32, w_pos: u32, use_seg: u32, use_pos: u32, has_cfg: bool) bool {
+        if (use_seg == NONE_SEG or w_seg == NONE_SEG or !has_cfg) return w_pos < use_pos;
+        if (w_seg == use_seg) return w_pos < use_pos;
+        return self.seg_reach_set.contains(w_seg);
+    }
+
+    fn inferEvolvingArrayType(self: *Checker, sym: symbol_mod.SymbolId, use_node: NodeIndex) ?TypeId {
+        if (!self.evolving_index_built) self.buildEvolvingIndex();
+        const symid = sym.toInt();
+        if (!self.evolving_array_syms.contains(symid)) return null;
+        // No element contributions anywhere → the array never evolves; leave
+        // the declared empty-array type (`never[]`) untouched rather than
+        // forcing `any[]`.
+        const list = self.evolving_array_contribs.get(symid) orelse return null;
+        if (list.items.len == 0) return null;
+
+        const use_ni = use_node.toInt();
+        const use_seg: u32 = if (use_ni < self.node_seg.len) self.node_seg[use_ni] else NONE_SEG;
+        const use_pos = self.ast_ref.nodeSpan(use_node).start;
+        const cpr_opt = self.semantic.code_path_result;
+        if (cpr_opt) |*cpr| {
+            if (use_seg != NONE_SEG) self.computeBackwardClosure(cpr, use_seg);
+        }
+        const has_cfg = cpr_opt != null;
+
+        // The binding is an array at this use only if its initializer is `[]`
+        // or a `x = []` reset reaches the use.  Before that (`let x;`
+        // declaration, uses preceding the reset) it is the plain auto `any`.
+        if (!self.evolving_array_init.contains(symid)) {
+            const resets = self.evolving_array_resets.get(symid) orelse return null;
+            var reached = false;
+            for (resets.items) |r| {
+                if (self.writeReachesUse(r.seg, r.pos, use_seg, use_pos, has_cfg)) {
+                    reached = true;
+                    break;
+                }
+            }
+            if (!reached) return null;
+        }
+
+        const any_arr = self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_ANY;
+        if (self.isEvolvingArrayOpTarget(use_node)) return any_arr;
+        if (self.evolving_in_progress.contains(symid)) return any_arr;
+
+        self.evolving_in_progress.put(self.gpa, symid, {}) catch return any_arr;
+        defer _ = self.evolving_in_progress.remove(symid);
+        var buf: [32]TypeId = undefined;
+        var n: usize = 0;
+        for (list.items) |c| {
+            const reaches = self.writeReachesUse(c.seg, c.pos, use_seg, use_pos, has_cfg);
+            if (!reaches) continue;
+            const raw = self.typeOf(c.rhs);
+            const widened = switch (self.store.get(raw).kind) {
+                .string_literal => tymod.ID_STRING,
+                .number_literal => tymod.ID_NUMBER,
+                .bigint_literal => tymod.ID_BIGINT,
+                .boolean_literal => tymod.ID_BOOLEAN,
+                else => raw,
+            };
+            if (n < buf.len) {
+                buf[n] = widened;
+                n += 1;
+            }
+        }
+        if (n == 0) return any_arr;
+        const elem = self.store.unionOf(buf[0..n]) catch return any_arr;
+        return self.store.arrayOf(elem) catch any_arr;
     }
 
     fn declaredTypeForSymbol(self: *Checker, sym: symbol_mod.SymbolId) TypeId {
@@ -11203,9 +11535,12 @@ pub const Checker = struct {
         {
             return self.makeNullaryFn(tymod.ID_BOOLEAN);
         }
+        // push/unshift: `(...items: T[]) => number`.
+        if (std.mem.eql(u8, name, "push") or std.mem.eql(u8, name, "unshift")) {
+            return self.makeArrayMutatorFn(elem);
+        }
         // number returners.
-        if (std.mem.eql(u8, name, "push") or std.mem.eql(u8, name, "unshift") or
-            std.mem.eql(u8, name, "indexOf") or std.mem.eql(u8, name, "lastIndexOf") or
+        if (std.mem.eql(u8, name, "indexOf") or std.mem.eql(u8, name, "lastIndexOf") or
             std.mem.eql(u8, name, "findIndex") or std.mem.eql(u8, name, "findLastIndex"))
         {
             return self.makeNullaryFn(tymod.ID_NUMBER);
@@ -11282,6 +11617,23 @@ pub const Checker = struct {
             .return_type = ret,
         };
         return self.store.functionType(sig) catch tymod.ID_UNKNOWN;
+    }
+
+    /// `(...items: <elem>[]) => number` — the signature of Array.push/unshift.
+    fn makeArrayMutatorFn(self: *Checker, elem: TypeId) TypeId {
+        const items_ty = self.store.arrayOf(elem) catch return self.makeNullaryFn(tymod.ID_NUMBER);
+        var pbuf = [_]TypeId{items_ty};
+        var nbuf = [_][]const u8{"items"};
+        var obuf = [_]bool{false};
+        const pr = self.store.appendSignatureParamsFull(&pbuf, &nbuf, &obuf) catch
+            return self.makeNullaryFn(tymod.ID_NUMBER);
+        const sig: tymod.Signature = .{
+            .params_start = pr.start,
+            .params_end = pr.end,
+            .return_type = tymod.ID_NUMBER,
+            .rest_param_index = 0,
+        };
+        return self.store.functionType(sig) catch self.makeNullaryFn(tymod.ID_NUMBER);
     }
 
     /// A function's explicit `this: T` parameter type, or null when absent.
