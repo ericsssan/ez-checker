@@ -26,6 +26,16 @@ const TypeId = tymod.TypeId;
 const Type = tymod.Type;
 pub const EnumKind = enum(u8) { number, string, mixed };
 
+/// CFG sentinel for "no segment" (mirrors code_path.NONE_SEG).
+const NONE_SEG: u32 = std.math.maxInt(u32);
+
+/// A write to an evolving-any binding: the assigned RHS expression, the
+/// enclosing assignment node, the assignment operator (`.assign` for `=`, or a
+/// compound `*_assign`), the CFG segment it occurs in, and the source offset of
+/// the assignment target.  A write does not reach a read that lies inside its
+/// own assignment subtree (the read is evaluating this write's value).
+const EvolvingWrite = struct { rhs: NodeIndex, assign: NodeIndex, op: ast.Node.Tag, seg: u32, pos: u32 };
+
 /// TypeScript compiler options that affect type inference and display.
 /// Passed to Checker.init; defaults represent a vanilla tsconfig.json with
 /// no explicit settings (non-strict, ES5 target, no special module mode).
@@ -201,6 +211,23 @@ pub const Checker = struct {
     /// through the module's exported types.
     namespace_import_map: std.StringHashMapUnmanaged([]const u8) = .empty,
 
+    /// Evolving-any support.  An untyped `var`/`let` (no annotation, no
+    /// initializer) is typed at each *use* as the union of the assigned
+    /// values that reach that use in the control-flow graph — reaching
+    /// definitions over the CFG segment graph the parser already builds
+    /// (`code_path_result`), with each write's segment recovered from the
+    /// reference table's `seg_id` column.
+    evolving_assign_index: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(EvolvingWrite)) = .empty,
+    evolving_index_built: bool = false,
+    /// Symbols whose evolving type is mid-computation — guards self-reference
+    /// (`a = a + 1`).
+    evolving_in_progress: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// node → CFG segment id (NONE_SEG = none), built once with the index.
+    node_seg: []u32 = &.{},
+    /// Reusable scratch for the per-use backward reachability walk.
+    seg_reach_set: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    seg_worklist: std.ArrayListUnmanaged(u32) = .empty,
+
     /// Absolute path of the file being checked.  Empty string means
     /// cross-file resolution is disabled.
     file_path: []const u8 = "",
@@ -336,6 +363,15 @@ pub const Checker = struct {
         self.natively_bound_type_ids.deinit(self.gpa);
         self.import_map.deinit(self.gpa);
         self.namespace_import_map.deinit(self.gpa);
+        {
+            var eit = self.evolving_assign_index.valueIterator();
+            while (eit.next()) |list| list.deinit(self.gpa);
+            self.evolving_assign_index.deinit(self.gpa);
+        }
+        self.evolving_in_progress.deinit(self.gpa);
+        if (self.node_seg.len > 0) self.gpa.free(self.node_seg);
+        self.seg_reach_set.deinit(self.gpa);
+        self.seg_worklist.deinit(self.gpa);
         self.merged_iface_extra.deinit(self.gpa);
         self.merged_ns_extra.deinit(self.gpa);
         {
@@ -365,7 +401,19 @@ pub const Checker = struct {
         // back-edge instead of recursing until the stack overflows.
         self.node_types[idx] = tymod.ID_UNKNOWN;
         const computed = self.inferExpr(node);
-        self.node_types[idx] = computed;
+        // Don't persist results produced while an evolving-any inference is in
+        // progress: same-variable reads inside a reaching write's RHS get
+        // short-circuited to `any` by the recursion guard, which would poison
+        // the cache for their real (later) query.  Leave them uncached so they
+        // recompute correctly once the guard clears.  (Order-independence:
+        // otherwise a node's type would depend on whether it was first touched
+        // during an evolving computation — e.g. the oracle's parent-first
+        // full-tree sweep vs a lazy query.)
+        if (self.evolving_in_progress.count() == 0) {
+            self.node_types[idx] = computed;
+        } else {
+            self.node_types[idx] = TypeId.none;
+        }
         return computed;
     }
 
@@ -1028,6 +1076,15 @@ pub const Checker = struct {
             // explicit declarations (return any) and implicit globals (try lib).
             const decl_node = self.semantic.symbols.getDeclNode(sym);
             if (decl_node != .none) {
+                // Untyped `var`/`let` with no initializer: TypeScript evolves
+                // its type from the values assigned to it that reach this use —
+                // but only under `noImplicitAny`.  With it off, the binding is
+                // a plain `any` everywhere (no evolution).
+                if (self.checker_opts.no_implicit_any and (bkind == .@"var" or bkind == .let)) {
+                    if (self.inferEvolvingType(sym, node)) |evolved| {
+                        return self.narrowAtUse(node, sym, evolved);
+                    }
+                }
                 // Explicitly declared in the file with no type annotation → any
                 return tymod.ID_ANY;
             }
@@ -2421,6 +2478,288 @@ pub const Checker = struct {
         const v = self.node_to_sym[ni];
         if (v == 0xFFFFFFFF) return null;
         return symbol_mod.SymbolId.fromInt(v);
+    }
+
+    /// Build, once: node → CFG segment id, and the reverse index from a
+    /// symbol to the `x = expr` writes targeting it.  The resolver leaves
+    /// write_expr_id `.none`, so the assigned expression is recovered from the
+    /// AST (a write reference's node is the `=` target; its parent `assign`
+    /// node's rhs is the value).  Each write's effect position is the END of
+    /// the RHS so a write does not kill reads inside its own RHS.
+    fn buildEvolvingIndex(self: *Checker) void {
+        self.evolving_index_built = true;
+        const refs = &self.semantic.references;
+        const total = refs.count();
+        if (total == 0) return;
+        const node_count = self.node_types.len;
+        self.node_seg = self.gpa.alloc(u32, node_count) catch &.{};
+        if (self.node_seg.len == node_count) @memset(self.node_seg, NONE_SEG);
+        const parents = self.semantic.parent_indices;
+        const seg_col = refs.list.items(.seg_id);
+        const node_col = refs.list.items(.node_id);
+        const kind_col = refs.list.items(.kind);
+        const sym_col = refs.list.items(.symbol_id);
+        var ri: usize = 0;
+        while (ri < total) : (ri += 1) {
+            const ni = @intFromEnum(node_col[ri]);
+            if (ni < self.node_seg.len) self.node_seg[ni] = seg_col[ri];
+            if (@intFromEnum(sym_col[ri]) == @intFromEnum(symbol_mod.SymbolId.none)) continue;
+            // Index both plain `=` (`.write`) and compound `+=`/`<<=`/…
+            // (`.read_write`).  They are used asymmetrically downstream: a
+            // READ reference sees only plain writes (tsc keeps the prior
+            // narrowed type across a compound op), while a WRITE-TARGET
+            // reference also sees compound writes (its reported type reflects
+            // the value the compound op just produced).
+            if (kind_col[ri] != .write and kind_col[ri] != .read_write) continue;
+            if (ni >= parents.len) continue;
+            const pidx = parents[ni];
+            if (pidx == @intFromEnum(NodeIndex.none)) continue;
+            const parent: NodeIndex = @enumFromInt(pidx);
+            const ptag = self.ast_ref.nodeTag(parent);
+            if (!isAssignTag(ptag)) continue;
+            const pd = self.ast_ref.nodeData(parent);
+            if (@intFromEnum(pd.lhs) != ni or pd.rhs == .none) continue;
+            const symid = sym_col[ri].toInt();
+            const gop = self.evolving_assign_index.getOrPut(self.gpa, symid) catch continue;
+            if (!gop.found_existing) gop.value_ptr.* = .empty;
+            gop.value_ptr.append(self.gpa, .{
+                .rhs = pd.rhs,
+                .assign = parent,
+                .op = ptag,
+                .seg = seg_col[ri],
+                .pos = self.ast_ref.nodeSpan(@as(NodeIndex, @enumFromInt(ni))).start,
+            }) catch {};
+        }
+    }
+
+    /// True when `node` is `ancestor` or lies within its subtree (walking up
+    /// parent links).  Used to tell whether a read lies inside a write's own
+    /// assignment (so that write doesn't reach it).
+    fn nodeWithin(self: *Checker, node: NodeIndex, ancestor: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        var cur = node.toInt();
+        const target = ancestor.toInt();
+        var guard: u32 = 0;
+        while (guard < 4096) : (guard += 1) {
+            if (cur == target) return true;
+            if (cur >= parents.len) return false;
+            const p = parents[cur];
+            if (p == @intFromEnum(NodeIndex.none)) return false;
+            cur = p;
+        }
+        return false;
+    }
+
+    /// Index (into `writes`) of the nearest *plain* `=` write in segment `seg`
+    /// that reaches the read `use_node` (at `bound`): position before the read
+    /// and not the assignment the read itself belongs to.  Compound writes
+    /// (`+=` …) are skipped — tsc keeps the prior narrowed type across them.
+    fn bestWriteInSeg(self: *Checker, writes: []const EvolvingWrite, seg: u32, bound: u32, use_node: NodeIndex) ?usize {
+        var best: ?usize = null;
+        var best_pos: u32 = 0;
+        for (writes, 0..) |w, i| {
+            if (w.seg != seg or w.pos >= bound or w.op != .assign) continue;
+            if (self.nodeWithin(use_node, w.assign)) continue; // read is in this write's RHS
+            if (best == null or w.pos > best_pos) {
+                best = i;
+                best_pos = w.pos;
+            }
+        }
+        return best;
+    }
+
+    /// Push every not-yet-visited predecessor of `seg` (normal + looped) onto
+    /// the worklist.  Returns true when `seg` has NO predecessors — a CFG
+    /// entry, i.e. the walk reached the code-path start along this path.
+    fn pushPrevSegs(self: *Checker, cpr: anytype, seg: u32) bool {
+        if (seg >= cpr.seg_count) return false;
+        var has_prev = false;
+        inline for (.{
+            .{ cpr.seg_all_prev_start, cpr.seg_all_prev_end, cpr.all_prev_targets },
+            .{ cpr.seg_looped_prev_start, cpr.seg_looped_prev_end, cpr.looped_targets },
+        }) |edge| {
+            var k = edge[0][seg];
+            const end = edge[1][seg];
+            const pool = edge[2];
+            while (k < end) : (k += 1) {
+                has_prev = true;
+                const prev = pool[k];
+                const gop = self.seg_reach_set.getOrPut(self.gpa, prev) catch continue;
+                if (!gop.found_existing) self.seg_worklist.append(self.gpa, prev) catch {};
+            }
+        }
+        return !has_prev;
+    }
+
+    /// Kill-aware reaching definitions: marks `reaches[i]` for each write that
+    /// reaches the use along some path with no intervening write (a segment
+    /// carrying a write is a sink).  Returns true when a *write-free* path
+    /// reaches the use — the binding is still its un-narrowed auto (`any`)
+    /// type there, so tsc reports `any` and we must not evolve it.
+    fn computeReachingWrites(
+        self: *Checker,
+        cpr: anytype,
+        writes: []const EvolvingWrite,
+        reaches: []bool,
+        use_seg: u32,
+        use_pos: u32,
+        use_node: NodeIndex,
+    ) bool {
+        self.seg_reach_set.clearRetainingCapacity();
+        self.seg_worklist.clearRetainingCapacity();
+        if (self.bestWriteInSeg(writes, use_seg, use_pos, use_node)) |bi| {
+            reaches[bi] = true;
+            return false;
+        }
+        self.seg_reach_set.put(self.gpa, use_seg, {}) catch return true;
+        var unwritten = self.pushPrevSegs(cpr, use_seg);
+        while (self.seg_worklist.pop()) |seg| {
+            if (seg >= cpr.seg_count) continue;
+            if (self.bestWriteInSeg(writes, seg, std.math.maxInt(u32), use_node)) |bi| {
+                reaches[bi] = true; // reaching def on this path; do not expand
+                continue;
+            }
+            if (self.pushPrevSegs(cpr, seg)) unwritten = true;
+        }
+        return unwritten;
+    }
+
+    /// Evolving-any: type a use of an untyped `var`/`let` as the union of the
+    /// assigned values that reach it.  Returns null (→ caller yields `any`)
+    /// when a write-free path reaches the use, when no write reaches it, or
+    /// when a reaching write is itself `any`/`unknown`.
+    fn isAssignTag(tag: ast.Node.Tag) bool {
+        return switch (tag) {
+            .assign,
+            .add_assign, .sub_assign, .mul_assign, .div_assign, .mod_assign,
+            .exp_assign, .and_assign, .or_assign, .xor_assign, .shl_assign,
+            .shr_assign, .ushr_assign, .logical_and_assign, .logical_or_assign,
+            .nullish_assign => true,
+            else => false,
+        };
+    }
+
+    /// True when `node` is the target of a *plain* `=` assignment (a pure
+    /// write).  TypeScript reports the binding's declared (evolved) type at
+    /// such a target, not the flow type — whereas a compound-assignment target
+    /// (`node += …`) is a read-modify-write and gets the flow type like a read.
+    fn isPlainAssignTarget(self: *Checker, node: NodeIndex) bool {
+        const ni = node.toInt();
+        if (ni >= self.semantic.parent_indices.len) return false;
+        const pidx = self.semantic.parent_indices[ni];
+        if (pidx == @intFromEnum(NodeIndex.none)) return false;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .assign) return false;
+        return @intFromEnum(self.ast_ref.nodeData(parent).lhs) == ni;
+    }
+
+    /// The value type established by an evolving write.  For `=` it is the RHS
+    /// type; for a compound assignment it is the result of the operator
+    /// (`a += x` ≈ `a + x`): `+=` yields string/bigint/number/any by operand,
+    /// the arithmetic/bitwise/shift forms yield number (or bigint), and the
+    /// logical forms (`||=`/`&&=`/`??=`) are treated conservatively as `any`.
+    fn evolvingWriteType(self: *Checker, w: EvolvingWrite) TypeId {
+        if (w.op == .assign) return self.typeOf(w.rhs);
+        const r = self.typeOf(w.rhs);
+        return switch (w.op) {
+            .add_assign => if (tymod.isAny(&self.store, r))
+                tymod.ID_ANY
+            else if (isStringish(&self.store, r))
+                tymod.ID_STRING
+            else if (isBigintish(&self.store, r))
+                tymod.ID_BIGINT
+            else
+                tymod.ID_NUMBER,
+            .logical_and_assign, .logical_or_assign, .nullish_assign => tymod.ID_ANY,
+            else => if (isBigintish(&self.store, r)) tymod.ID_BIGINT else tymod.ID_NUMBER,
+        };
+    }
+
+    /// Whether the var/let binding for `sym` has an initializer.  Evolving-any
+    /// applies only to bindings declared *without* one (`var x;`); a binding
+    /// with an initializer takes that initializer's type even when we can't
+    /// resolve it (`var x = Array()` is `any[]`, not an evolving auto var).
+    fn bindingHasInitializer(self: *Checker, sym: symbol_mod.SymbolId) bool {
+        const decl = self.semantic.symbols.getDeclNode(sym);
+        if (decl == .none) return false;
+        var node = decl;
+        if (self.ast_ref.nodeTag(node) != .declarator) {
+            const ni = node.toInt();
+            if (ni >= self.semantic.parent_indices.len) return false;
+            const p = self.semantic.parent_indices[ni];
+            if (p == @intFromEnum(NodeIndex.none)) return false;
+            node = @enumFromInt(p);
+            if (self.ast_ref.nodeTag(node) != .declarator) return false;
+        }
+        return self.ast_ref.nodeData(node).rhs != .none;
+    }
+
+    fn inferEvolvingType(self: *Checker, sym: symbol_mod.SymbolId, use_node: NodeIndex) ?TypeId {
+        if (!self.evolving_index_built) self.buildEvolvingIndex();
+        const symid = sym.toInt();
+        if (self.bindingHasInitializer(sym)) return null;
+        const list = self.evolving_assign_index.get(symid) orelse return null;
+        if (list.items.len == 0) return null;
+        if (self.evolving_in_progress.contains(symid)) return null;
+        // Pure `=` write target → the binding's *declared* type, which for an
+        // evolving auto variable renders as `any` regardless of what it evolves
+        // to (`bc = b & c` reports `bc : any` even though every write is
+        // number).  Compound `+=` targets are read-modify-writes and fall
+        // through to the flow path below.
+        if (self.isPlainAssignTarget(use_node)) return null;
+
+        var reaches: [64]bool = undefined;
+        @memset(&reaches, false);
+        const m = @min(list.items.len, reaches.len);
+        const writes = list.items[0..m];
+
+        {
+            // Read (or compound-assignment target) → reaching-definitions flow
+            // type over PLAIN writes only; tsc keeps the prior narrowed type
+            // across a compound op.
+            const use_ni = use_node.toInt();
+            const use_seg: u32 = if (use_ni < self.node_seg.len) self.node_seg[use_ni] else NONE_SEG;
+            const use_pos = self.ast_ref.nodeSpan(use_node).start;
+            if (use_seg != NONE_SEG) {
+                if (self.semantic.code_path_result) |*cpr| {
+                    if (self.computeReachingWrites(cpr, writes, reaches[0..m], use_seg, use_pos, use_node)) return null;
+                } else {
+                    for (writes, 0..) |w, i| reaches[i] = w.pos < use_pos and w.op == .assign;
+                }
+            } else {
+                for (writes, 0..) |w, i| reaches[i] = w.pos < use_pos and w.op == .assign;
+            }
+        }
+
+        self.evolving_in_progress.put(self.gpa, symid, {}) catch return null;
+        defer _ = self.evolving_in_progress.remove(symid);
+        var buf: [32]TypeId = undefined;
+        var n: usize = 0;
+        for (writes, 0..) |w, i| {
+            if (!reaches[i]) continue;
+            const raw = self.evolvingWriteType(w);
+            if (tymod.isAny(&self.store, raw) or raw.eq(tymod.ID_UNKNOWN)) return null;
+            // Restrict evolution to primitive write types (literals widened to
+            // their base).  Non-primitive writes — arrays/tuples (TS's separate
+            // evolving-array mechanism), objects, unions and named/aliased types
+            // — engage structural/contextual/alias machinery we render
+            // differently, so fall back to `any` for those.
+            const widened = switch (self.store.get(raw).kind) {
+                .string, .string_literal => tymod.ID_STRING,
+                .number, .number_literal => tymod.ID_NUMBER,
+                .bigint, .bigint_literal => tymod.ID_BIGINT,
+                .boolean, .boolean_literal => tymod.ID_BOOLEAN,
+                else => return null,
+            };
+            if (n < buf.len) {
+                buf[n] = widened;
+                n += 1;
+            }
+        }
+        if (n == 0) return null;
+        const u = self.store.unionOf(buf[0..n]) catch return null;
+        if (tymod.isAny(&self.store, u)) return null;
+        return u;
     }
 
     fn declaredTypeForSymbol(self: *Checker, sym: symbol_mod.SymbolId) TypeId {

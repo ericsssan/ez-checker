@@ -155,7 +155,7 @@ fn tsRoot(ref_dir: []const u8) ?[]const u8 {
 }
 
 fn isTrue(val: []const u8) bool {
-    return std.mem.eql(u8, val, "true");
+    return std.ascii.eqlIgnoreCase(val, "true");
 }
 
 /// Overrides fields in `opts` from `(key=value)` pairs embedded in the
@@ -240,28 +240,31 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
         const key = std.mem.trim(u8, rest[0..colon], " ");
         const val = std.mem.trim(u8, rest[colon + 1 ..], " ");
         // Stop at filename splits — options after belong to individual files.
-        if (std.mem.eql(u8, key, "filename") or std.mem.eql(u8, key, "Filename")) break;
-        if (std.mem.eql(u8, key, "strict")) {
+        // TypeScript test directive keys are case-insensitive (`@noImplicitAny`
+        // and `@noimplicitany` are equivalent).
+        const ci = std.ascii.eqlIgnoreCase;
+        if (ci(key, "filename")) break;
+        if (ci(key, "strict")) {
             opts.strict = isTrue(val);
-        } else if (std.mem.eql(u8, key, "strictNullChecks")) {
+        } else if (ci(key, "strictNullChecks")) {
             opts.strict_null_checks = isTrue(val);
-        } else if (std.mem.eql(u8, key, "noImplicitAny")) {
+        } else if (ci(key, "noImplicitAny")) {
             opts.no_implicit_any = isTrue(val);
-        } else if (std.mem.eql(u8, key, "target")) {
+        } else if (ci(key, "target")) {
             opts.target = parseTarget(val);
-        } else if (std.mem.eql(u8, key, "module")) {
+        } else if (ci(key, "module")) {
             opts.module = parseModule(val);
-        } else if (std.mem.eql(u8, key, "jsx")) {
+        } else if (ci(key, "jsx")) {
             opts.jsx = parseJsx(val);
-        } else if (std.mem.eql(u8, key, "checkJs")) {
+        } else if (ci(key, "checkJs")) {
             opts.check_js = isTrue(val);
-        } else if (std.mem.eql(u8, key, "allowJs")) {
+        } else if (ci(key, "allowJs")) {
             opts.allow_js = isTrue(val);
-        } else if (std.mem.eql(u8, key, "useDefineForClassFields")) {
+        } else if (ci(key, "useDefineForClassFields")) {
             opts.use_define_for_class_fields = isTrue(val);
-        } else if (std.mem.eql(u8, key, "experimentalDecorators")) {
+        } else if (ci(key, "experimentalDecorators")) {
             opts.experimental_decorators = isTrue(val);
-        } else if (std.mem.eql(u8, key, "isolatedModules")) {
+        } else if (ci(key, "isolatedModules")) {
             opts.isolate_modules = isTrue(val);
         }
     }
