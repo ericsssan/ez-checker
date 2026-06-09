@@ -10616,11 +10616,16 @@ pub const Checker = struct {
                 return self.store.arrayOf(self.store.unionOf(widened_elems_buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
             return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
         }
-        // No literals to widen: keep tuple as-is for precise destructuring.
+        // No literals to widen: heterogeneous non-literal elements.
+        // In destructuring (`const [a, b] = [d1, d2]`) keep per-position types as a tuple.
+        // Otherwise TypeScript infers a union array: [d1, d2] → (Derived1 | Derived2)[].
         if (!has_spread) {
-            const list = self.store.appendTypeIds(buf[0..n_used]) catch
-                return self.store.arrayOf(self.store.unionOf(buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
-            return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
+            if (self.isArrayInDestructuringRhs(node)) {
+                const list = self.store.appendTypeIds(buf[0..n_used]) catch
+                    return self.store.arrayOf(self.store.unionOf(buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
+                return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
+            }
+            return self.store.arrayOf(self.store.unionOf(buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
         }
         var widened_buf: [32]TypeId = undefined;
         for (0..n_used) |j| {
