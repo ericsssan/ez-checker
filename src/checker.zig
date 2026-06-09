@@ -4749,6 +4749,8 @@ pub const Checker = struct {
         // multiple exposed sigs; single-sig functions keep arrow form to avoid false
         // positives from value_decl_by_name mixing nested-scope declarations.
         const fn_ty = self.store.add(.{ .kind = .function_t, .signatures = sig_list, .is_overload_set = sig_count > 1 }) catch return null;
+        if (sig_count == 1 and tp_buf[0].start < tp_buf[0].end)
+            self.registerFnTypeParams(fn_ty, tp_buf[0].start, tp_buf[0].end);
         return fn_ty;
     }
 
