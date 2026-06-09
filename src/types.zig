@@ -638,6 +638,18 @@ pub const TypeStore = struct {
         });
     }
 
+    /// Whether a union member participates in subtype reduction.  Limited to
+    /// array/tuple types — the common `number[] | never[]` → `number[]` case —
+    /// while leaving primitives, literals, objects and named refs untouched
+    /// (TS displays many of those unreduced and broad absorption risks
+    /// surprising collapses).
+    fn subtypeReducible(self: *const TypeStore, id: TypeId) bool {
+        return switch (self.get(id).kind) {
+            .array_t, .readonly_array_t, .tuple_t => true,
+            else => false,
+        };
+    }
+
     pub fn unionOf(self: *TypeStore, members: []const TypeId) !TypeId {
         // Flatten + dedup (cheap: most unions are small).
         var buf = std.ArrayList(TypeId).empty;
@@ -720,6 +732,32 @@ pub const TypeStore = struct {
         if (buf.items.len == 1) return buf.items[0];
         // any-in-union collapses to any (TS semantics).
         for (buf.items) |m| if (m.eq(ID_ANY)) return ID_ANY;
+        // Subtype reduction: drop any member that is a strict subtype of a
+        // distinct member (TS keeps the widest type — e.g. `number[] | never[]`
+        // → `number[]`).  Primitives/literals are already handled above and are
+        // skipped here to avoid surprising collapses of nominal-ish types.
+        if (buf.items.len > 1 and buf.items.len <= 32) {
+            var w: usize = 0;
+            outer: for (buf.items, 0..) |m, i| {
+                if (subtypeReducible(self, m)) {
+                    for (buf.items, 0..) |other, j| {
+                        if (i == j or !subtypeReducible(self, other)) continue;
+                        if (!isAssignableTo(self, m, other)) continue;
+                        // `m <: other`.  If also `other <: m` they are
+                        // equivalent — keep only the earlier index.
+                        if (isAssignableTo(self, other, m)) {
+                            if (j < i) continue :outer;
+                        } else {
+                            continue :outer; // strict subtype → drop m
+                        }
+                    }
+                }
+                buf.items[w] = m;
+                w += 1;
+            }
+            buf.shrinkRetainingCapacity(w);
+            if (buf.items.len == 1) return buf.items[0];
+        }
         const list = try self.appendTypeIds(buf.items);
         return try self.add(.{ .kind = .union_t, .list_data = list });
     }
