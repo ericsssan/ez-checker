@@ -287,6 +287,10 @@ pub const Checker = struct {
 
     /// Recursion counter for resolveConditionalTypeWithSubst / distributeConditional.
     /// Prevents stack overflow on deeply nested generic conditional types.
+    /// Pool of dynamically-allocated strings (e.g. qualified type names like
+    /// "lavali.xanthognathus").  Freed all at once in deinit.
+    string_pool: std.ArrayListUnmanaged([]u8) = .empty,
+
     subst_depth: u8 = 0,
 
     /// Recursion guard for buildTypeParam → resolveTypeNodeParamAware → buildTypeParam
@@ -362,6 +366,8 @@ pub const Checker = struct {
     }
 
     pub fn deinit(self: *Checker) void {
+        for (self.string_pool.items) |s| self.gpa.free(s);
+        self.string_pool.deinit(self.gpa);
         self.store.deinit();
         self.gpa.free(self.node_types);
         self.gpa.free(self.sym_types);
@@ -7243,10 +7249,23 @@ pub const Checker = struct {
                     if (member_data.rhs != .none) {
                         const member_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(member_data.rhs));
                         for (self.store.propsOf(rt.object_props)) |p| {
-                            if (std.mem.eql(u8, p.name, member_name)) return p.type_id;
+                            if (!std.mem.eql(u8, p.name, member_name)) continue;
+                            // For class members (object_t stored in namespace) preserve the
+                            // qualified name — e.g. render as "lavali.xanthognathus" not structural.
+                            const prop_kind = self.store.get(p.type_id).kind;
+                            if (prop_kind == .object_t) {
+                                const qual_name = self.qualifiedTypeName(ty_node, member_data.rhs);
+                                if (qual_name.len > 0) {
+                                    var args_buf2: [8]TypeId = undefined;
+                                    const args2 = self.collectTypeArgs(ty_node, &args_buf2);
+                                    return self.store.typeRef(qual_name, args2) catch p.type_id;
+                                }
+                            }
+                            return p.type_id;
                         }
-                        // Member not found in namespace type — fall through to the
-                        // qualified-name heuristic which checks `known_type_names`.
+                        // Member not found in namespace type — return the bare last
+                        // component so `Harness.Compiler.WriterAggregator` resolves
+                        // to `WriterAggregator`, matching tsc's unqualified display.
                         if (self.known_type_names.contains(member_name)) {
                             var args_buf: [8]TypeId = undefined;
                             const args = self.collectTypeArgs(ty_node, &args_buf);
@@ -8652,6 +8671,22 @@ pub const Checker = struct {
     }
 
     /// Return the index-signature sentinel for an interface/type-literal member.
+    /// Build the fully-qualified type name from the source text for a qualified
+    /// ts_type_reference like `lavali.xanthognathus` or `Harness.Compiler.C`.
+    /// Returns a slice into the source (zero-allocation, valid for checker lifetime).
+    /// Returns "" if the span cannot be computed.
+    fn qualifiedTypeName(self: *Checker, ty_node: NodeIndex, member_rhs: NodeIndex) []const u8 {
+        const name_tok = self.ast_ref.nodeMainToken(ty_node);
+        const rhs_tok = self.ast_ref.nodeMainToken(member_rhs);
+        const start = self.ast_ref.tokenStart(name_tok);
+        const rhs_start = self.ast_ref.tokenStart(rhs_tok);
+        const rhs_len = self.ast_ref.tokens.items(.len)[rhs_tok];
+        const end = rhs_start + rhs_len;
+        const src = self.ast_ref.source;
+        if (start >= end or end > src.len) return "";
+        return src[start..end];
+    }
+
     /// Extract key_name and key_is_number from a ts_index_signature node for
     /// display purposes.  Returns .{ key_name, is_number } where key_name is
     /// a slice into the source text (valid for the checker's lifetime) and
