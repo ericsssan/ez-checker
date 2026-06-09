@@ -1716,6 +1716,149 @@ pub const Checker = struct {
         return ty;
     }
 
+    /// Structural equality of two access paths (`foo.a.b` ≡ `foo.a.b`).
+    /// Leaf identifiers compare by resolved symbol; intermediate property
+    /// names compare by string.  Used for member-access flow narrowing.
+    fn accessPathsEqual(self: *Checker, a: NodeIndex, b: NodeIndex) bool {
+        var na = a;
+        var nb = b;
+        while (self.ast_ref.nodeTag(na) == .grouping_expr) na = self.ast_ref.nodeData(na).lhs;
+        while (self.ast_ref.nodeTag(nb) == .grouping_expr) nb = self.ast_ref.nodeData(nb).lhs;
+        const ta = self.ast_ref.nodeTag(na);
+        const tb = self.ast_ref.nodeTag(nb);
+        if (ta == .identifier and tb == .identifier) {
+            const sa = self.symbolForIdentRef(na) orelse return false;
+            const sb = self.symbolForIdentRef(nb) orelse return false;
+            return sa.toInt() == sb.toInt();
+        }
+        if (ta == .this_expr and tb == .this_expr) return true;
+        const a_mem = ta == .member_expr or ta == .optional_member_expr;
+        const b_mem = tb == .member_expr or tb == .optional_member_expr;
+        if (a_mem and b_mem) {
+            const da = self.ast_ref.nodeData(na);
+            const db = self.ast_ref.nodeData(nb);
+            if (da.rhs == .none or db.rhs == .none) return false;
+            const pa = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(da.rhs));
+            const pb = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(db.rhs));
+            if (pa.len == 0 or !std.mem.eql(u8, pa, pb)) return false;
+            return self.accessPathsEqual(da.lhs, db.lhs);
+        }
+        return false;
+    }
+
+    /// Flow-narrow a member-access use (`foo.a`) by walking enclosing
+    /// guards (`if (foo.a)`, `foo.a && …`, `foo.a !== undefined`) and
+    /// matching the guarded path structurally.  Mirrors `narrowAtUse` but
+    /// keyed on an access path rather than a single symbol.
+    fn narrowMemberAtUse(self: *Checker, node: NodeIndex, base: TypeId) TypeId {
+        if (self.semantic.parent_indices.len == 0) return base;
+        // Only paths whose type can carry nullish are worth narrowing.
+        if (self.store.get(base).kind != .union_t) return base;
+        var ty = base;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var prev = node.toInt();
+        if (prev >= self.semantic.parent_indices.len) return base;
+        var p = self.semantic.parent_indices[prev];
+        while (p != NONE) {
+            const pn: NodeIndex = @enumFromInt(p);
+            const tag = self.ast_ref.nodeTag(pn);
+            switch (tag) {
+                .if_stmt => {
+                    const data = self.ast_ref.nodeData(pn);
+                    if (@intFromEnum(data.rhs) == prev or self.descendsFrom(node, data.rhs)) {
+                        ty = self.applyMemberNarrowing(data.lhs, node, ty, false);
+                    }
+                },
+                .if_else_stmt => {
+                    const data = self.ast_ref.nodeData(pn);
+                    const ifd = self.ast_ref.extraData(ast.IfData, @intFromEnum(data.rhs));
+                    if (self.descendsFrom(node, ifd.consequent)) {
+                        ty = self.applyMemberNarrowing(data.lhs, node, ty, false);
+                    } else if (self.descendsFrom(node, ifd.alternate)) {
+                        ty = self.applyMemberNarrowing(data.lhs, node, ty, true);
+                    }
+                },
+                .conditional => {
+                    const data = self.ast_ref.nodeData(pn);
+                    const cd = self.ast_ref.extraData(ast.Conditional, @intFromEnum(data.rhs));
+                    if (self.descendsFrom(node, cd.consequent)) {
+                        ty = self.applyMemberNarrowing(data.lhs, node, ty, false);
+                    } else if (self.descendsFrom(node, cd.alternate)) {
+                        ty = self.applyMemberNarrowing(data.lhs, node, ty, true);
+                    }
+                },
+                .logical_and => {
+                    const data = self.ast_ref.nodeData(pn);
+                    if (self.descendsFrom(node, data.rhs)) {
+                        ty = self.applyMemberNarrowing(data.lhs, node, ty, false);
+                    }
+                },
+                .logical_or => {
+                    const data = self.ast_ref.nodeData(pn);
+                    if (self.descendsFrom(node, data.rhs)) {
+                        ty = self.applyMemberNarrowing(data.lhs, node, ty, true);
+                    }
+                },
+                else => {},
+            }
+            prev = p;
+            p = self.semantic.parent_indices[p];
+        }
+        return ty;
+    }
+
+    /// Apply narrowing implied by `test` to the access path `target`.
+    fn applyMemberNarrowing(self: *Checker, test_node: NodeIndex, target: NodeIndex, ty: TypeId, negate: bool) TypeId {
+        var t = test_node;
+        var neg = negate;
+        while (self.ast_ref.nodeTag(t) == .logical_not) {
+            t = self.ast_ref.nodeData(t).lhs;
+            neg = !neg;
+        }
+        while (self.ast_ref.nodeTag(t) == .grouping_expr) t = self.ast_ref.nodeData(t).lhs;
+        const tag = self.ast_ref.nodeTag(t);
+        switch (tag) {
+            .member_expr, .optional_member_expr => {
+                if (self.accessPathsEqual(t, target)) return self.narrowTruthy(ty, neg);
+                return ty;
+            },
+            .logical_and => {
+                const data = self.ast_ref.nodeData(t);
+                const lty = self.applyMemberNarrowing(data.lhs, target, ty, neg);
+                return self.applyMemberNarrowing(data.rhs, target, lty, neg);
+            },
+            .logical_or => {
+                if (neg) {
+                    const data = self.ast_ref.nodeData(t);
+                    const lty = self.applyMemberNarrowing(data.lhs, target, ty, neg);
+                    return self.applyMemberNarrowing(data.rhs, target, lty, neg);
+                }
+                return ty;
+            },
+            .strict_not_equal, .not_equal, .strict_equal, .equal => {
+                const data = self.ast_ref.nodeData(t);
+                var lit_node: NodeIndex = .none;
+                if (self.accessPathsEqual(data.lhs, target)) {
+                    lit_node = data.rhs;
+                } else if (self.accessPathsEqual(data.rhs, target)) {
+                    lit_node = data.lhs;
+                } else return ty;
+                const removed = self.narrowKindFromLiteral(lit_node);
+                if (removed != .null_t and removed != .undefined_t) return ty;
+                const is_neq = tag == .strict_not_equal or tag == .not_equal;
+                // Loose `== null` / `!= null` covers both null and undefined.
+                if (tag == .equal or tag == .not_equal) {
+                    const remove_nullish = (!is_neq) == neg;
+                    return self.narrowNullish(ty, remove_nullish);
+                }
+                // Strict: remove exactly the tested nullish kind.
+                const remove = is_neq != neg;
+                return self.narrowUnion(ty, removed, !remove);
+            },
+            else => return ty,
+        }
+    }
+
     /// Within `block`, walk the children that appear *before* `child`
     /// and apply the inverse-condition narrowing from any
     /// `if (cond) <early-exit>;` so subsequent uses of `sym` see the
@@ -9885,7 +10028,8 @@ pub const Checker = struct {
             }
         }
         const inner = self.memberOnApparentType(lookup_ty, prop_name, data.lhs);
-        return self.maybeAddOptionalUndefined(inner, obj_ty, in_chain);
+        const result = self.maybeAddOptionalUndefined(inner, obj_ty, in_chain);
+        return self.narrowMemberAtUse(node, result);
     }
 
     fn inferMemberOnNamespace(self: *Checker, module_spec: []const u8, member_name: []const u8) ?TypeId {
