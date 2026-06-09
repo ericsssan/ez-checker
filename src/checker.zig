@@ -5297,7 +5297,8 @@ pub const Checker = struct {
                 );
                 if (sig_data.type_params < sig_data.type_params_end)
                     self.registerFnTypeParams(fn_ty, sig_data.type_params, sig_data.type_params_end);
-                props_buf[prop_count] = .{ .name = name, .type_id = fn_ty };
+                const m_optional = propertyHasOptionalMarker(self, sig_data.key);
+                props_buf[prop_count] = .{ .name = name, .type_id = fn_ty, .is_method = true, .optional = m_optional };
                 prop_count += 1;
             }
         }
