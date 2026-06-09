@@ -6585,6 +6585,19 @@ pub const Checker = struct {
                 };
                 return try h.checker.store.functionType(sig);
             }
+            // (...data: any[]) => ret  — a single rest param named "data"
+            fn fnTypeRestAnyArray(h: @This(), ret: TypeId) !TypeId {
+                const any_arr = try h.checker.store.arrayOf(tymod.ID_ANY);
+                const name: []const u8 = "data";
+                const pr = try h.checker.store.appendSignatureParams(&.{any_arr}, &.{name});
+                const sig = tymod.Signature{
+                    .params_start = pr.start,
+                    .params_end = pr.end,
+                    .rest_param_index = 0,
+                    .return_type = ret,
+                };
+                return try h.checker.store.functionType(sig);
+            }
             fn objType(h: @This(), props: []const tymod.ObjectProp) !TypeId {
                 const list = try h.checker.store.appendObjectProps(props);
                 return try h.checker.store.add(.{ .kind = .object_t, .object_props = list });
@@ -6599,18 +6612,26 @@ pub const Checker = struct {
         // surfaces getSymbol().getName() === "PromiseConstructor".
         try self.global_value_types.put(self.gpa, "Promise", try self.store.typeRef("PromiseConstructor", &.{}));
 
-        // Console — every method returns void.
+        // Console — methods with ...data: any[] rest param return void; others () => void.
         const void_fn = try h.fnType(tymod.ID_VOID);
-        const console_methods = [_][]const u8{
+        const rest_void_fn = try h.fnTypeRestAnyArray(tymod.ID_VOID);
+        const console_methods_rest = [_][]const u8{
             "log", "error", "warn", "info", "debug", "trace",
-            "dir", "dirxml", "table", "group", "groupEnd",
-            "groupCollapsed", "time", "timeEnd", "timeLog",
+            "dir", "dirxml", "table",
+        };
+        const console_methods_void = [_][]const u8{
+            "group", "groupEnd", "groupCollapsed",
+            "time", "timeEnd", "timeLog",
             "count", "countReset", "clear", "assert", "profile",
             "profileEnd", "timeStamp",
         };
-        var console_props: [console_methods.len]tymod.ObjectProp = undefined;
-        for (console_methods, 0..) |name, i| {
-            console_props[i] = .{ .name = name, .type_id = void_fn };
+        const console_method_count = console_methods_rest.len + console_methods_void.len;
+        var console_props: [console_method_count]tymod.ObjectProp = undefined;
+        for (console_methods_rest, 0..) |name, i| {
+            console_props[i] = .{ .name = name, .type_id = rest_void_fn };
+        }
+        for (console_methods_void, 0..) |name, i| {
+            console_props[console_methods_rest.len + i] = .{ .name = name, .type_id = void_fn };
         }
         const console_ty = try h.objType(&console_props);
         try self.global_value_types.put(self.gpa, "__console_struct", console_ty);
