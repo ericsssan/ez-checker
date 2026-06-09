@@ -4337,13 +4337,21 @@ pub const Checker = struct {
             if (count > 0) buf.appendSlice(self.gpa, ", ") catch { buf.deinit(self.gpa); return null; };
             const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
             buf.appendSlice(self.gpa, name) catch { buf.deinit(self.gpa); return null; };
-            const constraint = self.ast_ref.nodeData(tp).lhs;
-            if (constraint != .none) {
-                const constraint_ty = self.resolveTypeNode(constraint);
+            const tp_data = self.ast_ref.nodeData(tp);
+            if (tp_data.lhs != .none) {
+                const constraint_ty = self.resolveTypeNode(tp_data.lhs);
                 if (self.typeToString(constraint_ty)) |cs| {
                     buf.appendSlice(self.gpa, " extends ") catch { self.gpa.free(cs); buf.deinit(self.gpa); return null; };
                     buf.appendSlice(self.gpa, cs) catch { self.gpa.free(cs); buf.deinit(self.gpa); return null; };
                     self.gpa.free(cs);
+                } else |_| {}
+            }
+            if (tp_data.rhs != .none) {
+                const default_ty = self.resolveTypeNode(tp_data.rhs);
+                if (self.typeToString(default_ty)) |ds| {
+                    buf.appendSlice(self.gpa, " = ") catch { self.gpa.free(ds); buf.deinit(self.gpa); return null; };
+                    buf.appendSlice(self.gpa, ds) catch { self.gpa.free(ds); buf.deinit(self.gpa); return null; };
+                    self.gpa.free(ds);
                 } else |_| {}
             }
             count += 1;
