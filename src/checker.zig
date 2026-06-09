@@ -5180,6 +5180,18 @@ pub const Checker = struct {
     /// in our Type model).  Index signatures cause the property lookup
     /// to fall back to "we don't know" — equivalent to unknown.
     /// Source-scan helper: is there a `?` between the end of `name_node`
+    /// Does the `ts_property_signature` member carry a `readonly` modifier?
+    /// Scans the token immediately before the name token — for `readonly a: T`
+    /// the layout is [..., kw_readonly, identifier(a), ...].
+    fn propertyHasReadonlyModifier(self: *Checker, name_node: NodeIndex) bool {
+        const name_tok = self.ast_ref.nodeMainToken(name_node);
+        if (name_tok == 0) return false;
+        const prev_tok: u32 = name_tok - 1;
+        const token_tags = self.ast_ref.tokens.items(.tag);
+        if (prev_tok >= token_tags.len) return false;
+        return token_tags[prev_tok] == .kw_readonly;
+    }
+
     /// and the next colon/lparen/lbrace?  Property signatures lose the
     /// optional marker during parse, so we recover it here.
     fn propertyHasOptionalMarker(self: *Checker, name_node: NodeIndex) bool {
@@ -5266,7 +5278,8 @@ pub const Checker = struct {
                     prop_ty = self.resolveTypeNode(ty_inner);
                 }
                 const optional = propertyHasOptionalMarker(self, name_node);
-                props_buf[prop_count] = .{ .name = name, .type_id = prop_ty, .optional = optional };
+                const is_readonly = propertyHasReadonlyModifier(self, name_node);
+                props_buf[prop_count] = .{ .name = name, .type_id = prop_ty, .optional = optional, .readonly = is_readonly };
                 prop_count += 1;
             } else {
                 // ts_method_signature: name is in InterfaceSigData.key.
@@ -9475,23 +9488,56 @@ pub const Checker = struct {
         return self.resolveTypeNode(ty_node);
     }
 
-    /// `as const` lowering: for an array_literal source, build a tuple_t
-    /// with each element's specific type.  Otherwise return the source's
-    /// inferred type unchanged.
+    /// `as const` lowering: build the narrowest readonly type for the source.
+    /// - array_literal  → readonly tuple with per-element literal types
+    /// - object_literal → object with all properties readonly and literal-typed
+    /// - anything else  → typeOf(src) unchanged
     fn inferAsConst(self: *Checker, src: NodeIndex) TypeId {
         if (src == .none) return tymod.ID_UNKNOWN;
-        if (self.ast_ref.nodeTag(src) != .array_literal) return self.typeOf(src);
-        const data = self.ast_ref.nodeData(src);
-        const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
-        var buf: [32]TypeId = undefined;
-        const n = @min(slice.len, buf.len);
-        var i: usize = 0;
-        while (i < n) : (i += 1) {
-            const elem: NodeIndex = @enumFromInt(slice[i]);
-            buf[i] = if (elem == .none) tymod.ID_UNDEFINED else self.typeOf(elem);
+        const src_tag = self.ast_ref.nodeTag(src);
+        if (src_tag == .array_literal) {
+            const data = self.ast_ref.nodeData(src);
+            const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
+            var buf: [32]TypeId = undefined;
+            const n = @min(slice.len, buf.len);
+            var i: usize = 0;
+            while (i < n) : (i += 1) {
+                const elem: NodeIndex = @enumFromInt(slice[i]);
+                buf[i] = if (elem == .none) tymod.ID_UNDEFINED else self.inferAsConst(elem);
+            }
+            const list = self.store.appendTypeIds(buf[0..n]) catch return tymod.ID_UNKNOWN;
+            return self.store.add(.{ .kind = .tuple_t, .list_data = list, .name = "readonly" }) catch tymod.ID_UNKNOWN;
         }
-        const list = self.store.appendTypeIds(buf[0..n]) catch return tymod.ID_UNKNOWN;
-        return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_UNKNOWN;
+        if (src_tag == .object_literal) {
+            const data = self.ast_ref.nodeData(src);
+            const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
+            var props_buf: [16]tymod.ObjectProp = undefined;
+            var n: usize = 0;
+            for (slice) |raw| {
+                if (n >= props_buf.len) break;
+                const p: NodeIndex = @enumFromInt(raw);
+                const pt = self.ast_ref.nodeTag(p);
+                switch (pt) {
+                    .property => {
+                        const pd = self.ast_ref.nodeData(p);
+                        const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
+                        const val_ty = self.inferAsConst(pd.rhs);
+                        props_buf[n] = .{ .name = key_name, .type_id = val_ty, .readonly = true };
+                        n += 1;
+                    },
+                    .shorthand_property => {
+                        const pd = self.ast_ref.nodeData(p);
+                        const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
+                        const val_ty = self.typeOf(pd.lhs);
+                        props_buf[n] = .{ .name = key_name, .type_id = val_ty, .readonly = true };
+                        n += 1;
+                    },
+                    else => return tymod.ID_UNKNOWN,
+                }
+            }
+            return self.store.objectOf(props_buf[0..n]) catch tymod.ID_UNKNOWN;
+        }
+        return self.typeOf(src);
     }
 
     fn inferSatisfies(self: *Checker, node: NodeIndex) TypeId {
@@ -12148,6 +12194,7 @@ pub const Checker = struct {
                 try buf.appendSlice(gpa, "[]");
             },
             .tuple_t => {
+                if (t.name.len > 0) try buf.appendSlice(gpa, "readonly ");
                 try buf.appendSlice(gpa, "[");
                 for (self.store.idsOf(t.list_data), 0..) |m, i| {
                     if (i > 0) try buf.appendSlice(gpa, ", ");
