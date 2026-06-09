@@ -429,8 +429,10 @@ pub const Checker = struct {
             // unsafe-* rules).
             .add_assign, .sub_assign, .mul_assign, .div_assign, .mod_assign,
             .exp_assign, .and_assign, .or_assign, .xor_assign, .shl_assign,
-            .shr_assign, .ushr_assign, .logical_and_assign, .logical_or_assign,
-            .nullish_assign => blk: {
+            .shr_assign, .ushr_assign, .logical_and_assign => blk: {
+                // `a &&= b` ≡ `a && (a = b)` evaluates to falsy(a) ∪ b.  In the
+                // common case where b's type matches truthy(a), that collapses
+                // back to a, so the declared LHS type is the safe approximation.
                 const data = self.ast_ref.nodeData(node);
                 if (data.lhs == .none or data.rhs == .none) break :blk tymod.ID_ANY;
                 const lhs_ty = self.typeOf(data.lhs);
@@ -438,6 +440,27 @@ pub const Checker = struct {
                 const rhs_ty = self.typeOf(data.rhs);
                 if (tymod.isAny(&self.store, rhs_ty)) break :blk tymod.ID_ANY;
                 break :blk lhs_ty;
+            },
+
+            // Logical compound assignments evaluate to the assigned value:
+            //   `a ||= b`  ≡  `a || (a = b)`  → truthy-part-of-a  ∪ typeof b
+            //   `a ??= b`  ≡  `a ?? (a = b)`  → non-nullish-of-a  ∪ typeof b
+            .logical_or_assign, .nullish_assign => blk: {
+                const data = self.ast_ref.nodeData(node);
+                if (data.lhs == .none or data.rhs == .none) break :blk tymod.ID_ANY;
+                const lhs_ty = self.typeOf(data.lhs);
+                if (tymod.isAny(&self.store, lhs_ty)) break :blk tymod.ID_ANY;
+                const rhs_ty = self.typeOf(data.rhs);
+                if (tymod.isAny(&self.store, rhs_ty)) break :blk tymod.ID_ANY;
+                const kept = switch (t) {
+                    .logical_or_assign => self.narrowTruthy(lhs_ty, false),
+                    .nullish_assign => self.narrowNullish(lhs_ty, true),
+                    else => unreachable,
+                };
+                if (kept.eq(tymod.ID_NEVER)) break :blk rhs_ty;
+                if (kept.eq(rhs_ty)) break :blk kept;
+                const ids = [_]TypeId{ kept, rhs_ty };
+                break :blk self.store.unionOf(&ids) catch lhs_ty;
             },
 
             .logical_and, .logical_or, .nullish_coalesce => self.inferLogical(node),
