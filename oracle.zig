@@ -1372,7 +1372,15 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
             return a.line == b.line and std.mem.eql(u8, a.text, b.text);
         }
     };
-    var map = std.HashMap(Key, []const u8, Ctx, 80).init(arena);
+    // Occurrence-aware anchoring.  An identifier can appear several times on a
+    // line with *different* types (e.g. evolving-any: `a = (a << 3)` has the
+    // write-target `a : any` and read `a : number`).  Collapsing all
+    // occurrences of a `(line, text)` to one value mis-scores these — the
+    // non-gap read type would override the gap-typed target, so the target
+    // entry (`any`) would mismatch.  Instead we record every ez occurrence in
+    // source order and pair the k-th baseline entry with the k-th ez node.
+    const Occ = struct { pos: u32, ty: []const u8 };
+    var map = std.HashMap(Key, std.ArrayListUnmanaged(Occ), Ctx, 80).init(arena);
 
     const total_nodes: u32 = @intCast(ast_result.nodes.len);
     var n: u32 = 0;
@@ -1388,20 +1396,31 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
         const tystr = checker.typeToString(ty) catch continue;
         const key = Key{ .line = line, .text = text };
         const gop = try map.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = tystr;
-            continue;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        // Dedup exact (pos, type) repeats (the same node can be visited via
+        // multiple AST slots); keep distinct positions.
+        var dup = false;
+        for (gop.value_ptr.items) |o| {
+            if (o.pos == span.start) {
+                dup = true;
+                break;
+            }
         }
-        const old = gop.value_ptr.*;
-        if (std.mem.eql(u8, old, tystr) or std.mem.eql(u8, old, AMBIG)) continue;
-        const old_gap = isGapType(old);
-        const new_gap = isGapType(tystr);
-        if (old_gap and !new_gap) {
-            gop.value_ptr.* = tystr;
-        } else if (!old_gap and !new_gap) {
-            gop.value_ptr.* = AMBIG;
+        if (!dup) try gop.value_ptr.append(arena, .{ .pos = span.start, .ty = tystr });
+    }
+    // Sort each occurrence list by source position.
+    {
+        var vit = map.valueIterator();
+        while (vit.next()) |list| {
+            std.sort.pdq(Occ, list.items, {}, struct {
+                fn lt(_: void, x: Occ, y: Occ) bool {
+                    return x.pos < y.pos;
+                }
+            }.lt);
         }
     }
+    // Per-(line,text) consumption index: the i-th entry pairs with the i-th occ.
+    var consumed = std.HashMap(Key, usize, Ctx, 80).init(arena);
 
     var keybuf: [128]u8 = undefined;
     for (sec.entries) |e| {
@@ -1410,7 +1429,17 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
         const is_prim = isPrimitiveType(want);
         if (is_prim) res.prim_seen += 1;
 
-        const got_raw = map.get(Key{ .line = e.line, .text = e.expr });
+        const ekey = Key{ .line = e.line, .text = e.expr };
+        const ci = consumed.get(ekey) orelse 0;
+        try consumed.put(ekey, ci + 1);
+        const got_raw: ?[]const u8 = blk: {
+            const list = map.get(ekey) orelse break :blk null;
+            if (ci < list.items.len) break :blk list.items[ci].ty;
+            // More baseline entries than ez occurrences: fall back to the last
+            // occurrence's type (handles ez under-emitting duplicate nodes).
+            if (list.items.len > 0) break :blk list.items[list.items.len - 1].ty;
+            break :blk null;
+        };
         const is_ambig = got_raw != null and std.mem.eql(u8, got_raw.?, AMBIG);
         if (got_raw == null or is_ambig) {
             // fix #4: track ambiguous anchors separately from no-node.
