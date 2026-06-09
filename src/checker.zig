@@ -7326,6 +7326,51 @@ pub const Checker = struct {
                 props.append(self.gpa, p) catch {};
             }
         }
+        // Constructor parameter properties: `constructor(readonly x: T)` makes `x` a
+        // class property.  Add them before the interface-merge pass so the property
+        // is visible when later code resolves `this.x`.
+        // Note: a constructor WITH a body is emitted as method_def (key = "constructor"),
+        // not constructor_def (which is for declare/overload-only constructors).
+        for (slice) |raw| {
+            const member: NodeIndex = @enumFromInt(raw);
+            const mtag = self.ast_ref.nodeTag(member);
+            if (mtag != .method_def and mtag != .constructor_def) continue;
+            const ctor_data = self.ast_ref.nodeData(member);
+            // method_def / constructor_def: lhs = key, rhs = extra index to MethodData
+            // For constructor_def the key may be .none; for method_def check the key name.
+            if (mtag == .method_def) {
+                if (ctor_data.lhs == .none) continue;
+                const key_tag = self.ast_ref.nodeTag(ctor_data.lhs);
+                if (key_tag != .identifier and key_tag != .property_ident) continue;
+                const key_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ctor_data.lhs));
+                if (!std.mem.eql(u8, key_name, "constructor")) continue;
+            }
+            if (ctor_data.rhs == .none) continue;
+            const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(ctor_data.rhs));
+            if (md.params_start >= md.params_end) continue;
+            const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+            if (md.params_end > ext_len) continue;
+            for (self.ast_ref.extra_data[md.params_start..md.params_end]) |param_raw| {
+                const param: NodeIndex = @enumFromInt(param_raw);
+                if (self.ast_ref.nodeTag(param) != .ts_parameter_property) continue;
+                var binding = self.ast_ref.nodeData(param).lhs;
+                if (binding == .none) continue;
+                if (self.ast_ref.nodeTag(binding) == .assignment_pattern) {
+                    binding = self.ast_ref.nodeData(binding).lhs;
+                }
+                if (self.ast_ref.nodeTag(binding) != .identifier) continue;
+                const prop_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(binding));
+                if (prop_name.len == 0) continue;
+                const prop_ty = self.paramDeclaredType(param);
+                // Only add if not already present (explicit property_def takes precedence).
+                var already = false;
+                for (props.items) |existing| {
+                    if (std.mem.eql(u8, existing.name, prop_name)) { already = true; break; }
+                }
+                if (!already) props.append(self.gpa, .{ .name = prop_name, .type_id = prop_ty }) catch {};
+            }
+            break; // only one constructor
+        }
         // Declaration merging: merge members from any same-named interface declarations.
         for (self.merged_iface_extra.items) |entry| {
             if (!std.mem.eql(u8, entry.name, name)) continue;
@@ -8612,7 +8657,9 @@ pub const Checker = struct {
             if (isBigintish(&self.store, a) or isBigintish(&self.store, b)) return tymod.ID_BIGINT;
             return tymod.ID_NUMBER;
         }
-        if (tymod.isAny(&self.store, a) or tymod.isAny(&self.store, b)) return tymod.ID_ANY;
+        // `*`, `/`, `%`, `-`, `**` always coerce to number at runtime.
+        // TypeScript types these as `number` even when operands are `any`,
+        // so we do NOT short-circuit to `any` here.
         if (isBigintish(&self.store, a) or isBigintish(&self.store, b)) return tymod.ID_BIGINT;
         return tymod.ID_NUMBER;
     }
@@ -9974,7 +10021,8 @@ pub const Checker = struct {
             // arrow_fn but stop at non-arrow function definitions.
             switch (tag) {
                 .method_def, .computed_method_def, .getter_def, .setter_def,
-                .computed_getter_def, .computed_setter_def, .constructor_def => {
+                .computed_getter_def, .computed_setter_def, .constructor_def,
+                .property_def => {
                     // Walk up to the class_decl / class_expr.
                     var q = parents[p];
                     while (q != NONE) : (q = parents[q]) {
@@ -9983,7 +10031,7 @@ pub const Checker = struct {
                         if (qtag == .class_decl or qtag == .class_expr) {
                             return self.store.typeRef("this", &.{}) catch tymod.ID_ANY;
                         }
-                        // class_body sits between method_def and class_decl/expr;
+                        // class_body sits between member and class_decl/expr;
                         // keep walking until we hit the decl/expr.
                         if (qtag == .class_body) continue;
                         // Other intermediate nodes (computed key wrappers?) — keep walking.
@@ -10035,18 +10083,31 @@ pub const Checker = struct {
             switch (tag) {
                 // Arrow functions are transparent for new.target — keep walking.
                 .arrow_fn, .async_arrow_fn => {},
-                // A constructor: we'd need the class type for the precise
-                // `typeof ClassName` result.  Return `() => any` as approximation.
-                .constructor_def => return any_fn,
+                // A no-body constructor_def: tsc returns `typeof ClassName`
+                // which requires class-side type building we avoid here.
+                // Return ID_ANY (coverage gap) rather than a wrong function type.
+                .constructor_def => return tymod.ID_ANY,
                 // Regular function declarations and expressions: return the
                 // function's own type so `new.target` is at least a function_t.
                 .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
                 .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => {
                     return self.functionTypeFromFnDecl(pn);
                 },
-                // Method / getter / setter / static method in a class body:
-                // new.target is `() => any` here (could be a subclass constructor).
-                .method_def, .computed_method_def,
+                // Method / getter / setter in a class body.
+                // For a regular method, new.target is `() => any`.
+                // For a constructor method (key = "constructor"), tsc returns
+                // `typeof ClassName` — leave as ID_ANY to avoid a wrong type.
+                .method_def, .computed_method_def => {
+                    const md = self.ast_ref.nodeData(pn);
+                    if (md.lhs != .none) {
+                        const kt = self.ast_ref.nodeTag(md.lhs);
+                        if (kt == .identifier or kt == .property_ident) {
+                            const kname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.lhs));
+                            if (std.mem.eql(u8, kname, "constructor")) return tymod.ID_ANY;
+                        }
+                    }
+                    return any_fn;
+                },
                 .getter_def, .setter_def,
                 .computed_getter_def, .computed_setter_def => return any_fn,
                 else => {},
