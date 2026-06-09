@@ -314,6 +314,10 @@ pub const InternContext = struct {
                 const v = pp.toInt();
                 h.update(std.mem.asBytes(&v));
             }
+            for (self.store.signatureParamOptionalsOf(s)) |opt| {
+                const v: u8 = @intFromBool(opt);
+                h.update(std.mem.asBytes(&v));
+            }
             const rv = s.return_type.toInt();
             h.update(std.mem.asBytes(&rv));
             const flags = [_]u8{
@@ -365,6 +369,10 @@ pub const InternContext = struct {
             const ypa = self.store.signatureParamsOf(y);
             if (xpa.len != ypa.len) return false;
             for (xpa, ypa) |m, nn| if (!m.eq(nn)) return false;
+            const xoa = self.store.signatureParamOptionalsOf(x);
+            const yoa = self.store.signatureParamOptionalsOf(y);
+            if (xoa.len != yoa.len) return false;
+            for (xoa, yoa) |m, nn| if (m != nn) return false;
         }
         return true;
     }

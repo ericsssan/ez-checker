@@ -28,6 +28,18 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    const debug_mod = b.createModule(.{
+        .root_source_file = b.path("src/debug_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    debug_mod.addImport("es_parser", es_parser_mod);
+    debug_mod.addImport("ez_checker", mod);
+    const debug_tests = b.addTest(.{ .root_module = debug_mod });
+    const run_debug = b.addRunArtifact(debug_tests);
+    const debug_step = b.step("test-debug", "Run debug test");
+    debug_step.dependOn(&run_debug.step);
+
     // Oracle: ez-checker's conformance test suite against the TypeScript corpus.
     // One file (oracle.zig, at the project root so @embedFile can reach oracle/)
     // is the root of BOTH a test and an executable:

@@ -7874,6 +7874,12 @@ pub const Checker = struct {
     fn appendTypeIdsToSigPool(self: *Checker, ids: []const TypeId) !u32 {
         const start: u32 = @intCast(self.store.signature_param_pool.items.len);
         try self.store.signature_param_pool.appendSlice(self.gpa, ids);
+        // Keep name/optional pools in sync so signatureParamOptionalsOf returns
+        // consistent data (required for correct intern hash stability).
+        for (ids) |_| {
+            try self.store.signature_param_name_pool.append(self.gpa, "");
+            try self.store.signature_param_optional_pool.append(self.gpa, false);
+        }
         return start;
     }
 
@@ -11598,15 +11604,31 @@ pub const Checker = struct {
     }
 
     fn numberPrototypeProperty(self: *Checker, name: []const u8) ?TypeId {
-        // number methods return string
+        // toString/toFixed/toExponential/toPrecision: (radix?: number) => string
         if (std.mem.eql(u8, name, "toString") or std.mem.eql(u8, name, "toFixed") or
-            std.mem.eql(u8, name, "toExponential") or std.mem.eql(u8, name, "toPrecision") or
-            std.mem.eql(u8, name, "toLocaleString"))
+            std.mem.eql(u8, name, "toExponential") or std.mem.eql(u8, name, "toPrecision"))
         {
-            return self.makeNullaryFn(tymod.ID_STRING);
+            const pname: []const u8 = if (std.mem.eql(u8, name, "toString")) "radix" else "fractionDigits";
+            return self.makeNamedOptionalFn(tymod.ID_NUMBER, pname, tymod.ID_STRING);
         }
+        if (std.mem.eql(u8, name, "toLocaleString")) return self.makeNullaryFn(tymod.ID_STRING);
         if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(tymod.ID_NUMBER);
         return null;
+    }
+
+    /// `(pname?: T) => R` — single named optional parameter.
+    fn makeNamedOptionalFn(self: *Checker, param: TypeId, pname: []const u8, ret: TypeId) TypeId {
+        var pbuf = [_]tymod.TypeId{param};
+        var nbuf = [_][]const u8{pname};
+        var obuf = [_]bool{true};
+        const pr = self.store.appendSignatureParamsFull(&pbuf, &nbuf, &obuf) catch
+            return self.makeNullaryFn(ret);
+        const sig: tymod.Signature = .{
+            .params_start = pr.start,
+            .params_end = pr.end,
+            .return_type = ret,
+        };
+        return self.store.functionType(sig) catch self.makeNullaryFn(ret);
     }
 
     fn makeNullaryFn(self: *Checker, ret: TypeId) TypeId {
