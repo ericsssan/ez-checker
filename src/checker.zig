@@ -8299,6 +8299,35 @@ pub const Checker = struct {
                 return self.store.typeRef(name, args) catch tymod.ID_ANY;
             }
         }
+        // Qualified type `A.B` whose last component `B` is NOT a declared
+        // type anywhere (e.g. `TypeScript.AST` where AST lives in another file
+        // referenced via ///<reference>) → preserve the verbatim qualified name
+        // without resolving `A` structurally.  Doing this BEFORE the recursive
+        // resolveDeclaredType(A) avoids cache-poisoning when `A` is a namespace
+        // mid-build (its own member's annotation references `A.B`).
+        // Only for a namespace/module first component — enum members
+        // (`AnimalType.cat`) and class/interface qualifications resolve through
+        // their own paths below.
+        if (self.type_decl_nodes.get(name)) |ndecl0| {
+            const ntag0 = self.ast_ref.nodeTag(ndecl0);
+            if (ntag0 == .ts_namespace_decl or ntag0 == .ts_module_decl) {
+                const ty_data0 = self.ast_ref.nodeData(ty_node);
+                if (ty_data0.lhs != .none and self.ast_ref.nodeTag(ty_data0.lhs) == .member_expr) {
+                    const md0 = self.ast_ref.nodeData(ty_data0.lhs);
+                    if (md0.rhs != .none) {
+                        const last = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md0.rhs));
+                        if (last.len > 0 and !self.known_type_names.contains(last)) {
+                            const qual = self.qualifiedTypeName(ty_node, md0.rhs);
+                            if (qual.len > 0) {
+                                var args_buf0: [8]TypeId = undefined;
+                                const args0 = self.collectTypeArgs(ty_node, &args_buf0);
+                                return self.store.typeRef(qual, args0) catch tymod.ID_ANY;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // User-declared enum/namespace/type-alias → resolve structurally.
         if (self.resolveDeclaredType(name)) |resolved| {
             // Qualified type `A.B`: if `A` resolved to a namespace object_t,
@@ -8371,19 +8400,26 @@ pub const Checker = struct {
                             }
                             return p.type_id;
                         }
-                        // Member not found in namespace type — resolve to the
-                        // scope-relative qualified display: bare inside the
-                        // namespace (`WriterAggregator`), qualified outside
-                        // (`N.T7`).
+                        // Member not found in the namespace's props.
+                        const qual_name = self.qualifiedTypeName(ty_node, member_data.rhs);
+                        var args_buf: [8]TypeId = undefined;
+                        const args = self.collectTypeArgs(ty_node, &args_buf);
                         if (self.known_type_names.contains(member_name)) {
-                            const qual_name = self.qualifiedTypeName(ty_node, member_data.rhs);
+                            // A type declared elsewhere → scope-relative display:
+                            // bare inside the namespace (`WriterAggregator`),
+                            // qualified outside (`N.T7`).
                             const display = if (qual_name.len > 0)
                                 self.displayQualifiedName(ty_node, qual_name)
                             else
                                 member_name;
-                            var args_buf: [8]TypeId = undefined;
-                            const args = self.collectTypeArgs(ty_node, &args_buf);
                             return self.store.typeRef(display, args) catch tymod.ID_ANY;
+                        }
+                        // Unresolvable member (`TS.AST` where AST is declared in
+                        // another file via ///<reference>) — tsc preserves the
+                        // verbatim qualified name rather than expanding `TS` to
+                        // its namespace shape.
+                        if (qual_name.len > 0) {
+                            return self.store.typeRef(qual_name, args) catch tymod.ID_ANY;
                         }
                     }
                 }
