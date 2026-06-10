@@ -13165,12 +13165,17 @@ pub const Checker = struct {
             switch (pt) {
                 .property => {
                     const pd = self.ast_ref.nodeData(p);
-                    const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
+                    const key_name = self.objectMemberKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
                     // A property clashing with an earlier accessor is a
-                    // duplicate-member error tsc renders specially — bail.
+                    // duplicate-member error tsc renders specially — bail.  A
+                    // clash with a plain property keeps the last value (tsc
+                    // dedups; numeric keys like `0` and `0x0` collide).
+                    var dup_idx: ?usize = null;
                     for (buf[0..n], 0..) |bp, bi| {
-                        if (acc_kind[bi] != 0 and std.mem.eql(u8, bp.name, key_name))
-                            return tymod.ID_UNKNOWN;
+                        if (!std.mem.eql(u8, bp.name, key_name)) continue;
+                        if (acc_kind[bi] != 0) return tymod.ID_UNKNOWN;
+                        dup_idx = bi;
+                        break;
                     }
                     const val_ty = self.typeOf(pd.rhs);
                     // Widen primitive literal types to their base types, but
@@ -13197,13 +13202,17 @@ pub const Checker = struct {
                     // TypeScript displays `{ k: function(){} }` as property
                     // style `{ k: () => T }`, not method shorthand `{ k(): T }`.
                     _ = is_fn;
-                    buf[n] = .{
-                        .name = key_name,
-                        .type_id = widened_ty,
-                        .is_method = false,
-                        .is_fn_property = false,
-                    };
-                    n += 1;
+                    if (dup_idx) |di| {
+                        buf[di].type_id = widened_ty; // last value wins
+                    } else {
+                        buf[n] = .{
+                            .name = key_name,
+                            .type_id = widened_ty,
+                            .is_method = false,
+                            .is_fn_property = false,
+                        };
+                        n += 1;
+                    }
                 },
                 .shorthand_property => {
                     const pd = self.ast_ref.nodeData(p);
@@ -13257,7 +13266,7 @@ pub const Checker = struct {
                     // renders specially — bail.
                     const pd = self.ast_ref.nodeData(p);
                     if (pd.lhs == .none or pd.rhs == .none) return tymod.ID_UNKNOWN;
-                    const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
+                    const key_name = self.objectMemberKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
                     // Private accessor (`get #x`) isn't part of the structural
                     // type; an `any`/`unknown` accessor type usually means the
                     // body depends on an unresolved `this` — bail rather than
@@ -13303,7 +13312,7 @@ pub const Checker = struct {
                     // getter of the same key; bail on a non-accessor clash.
                     const pd = self.ast_ref.nodeData(p);
                     if (pd.lhs == .none or pd.rhs == .none) return tymod.ID_UNKNOWN;
-                    const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
+                    const key_name = self.objectMemberKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
                     if (key_name.len > 0 and key_name[0] == '#') return tymod.ID_UNKNOWN;
                     const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pd.rhs));
                     // Only the parameter type matters — skip body inference (it can
@@ -13347,6 +13356,32 @@ pub const Checker = struct {
             }
         }
         return self.store.objectOf(buf[0..n]) catch tymod.ID_UNKNOWN;
+    }
+
+    /// Property-key string for an object-literal member, including numeric
+    /// literal keys (`0x20` → "32") that `staticPropertyKey` doesn't cover.
+    fn objectMemberKey(self: *Checker, key: NodeIndex) ?[]const u8 {
+        return self.staticPropertyKey(key) orelse self.numericKeyString(key);
+    }
+
+    /// The canonical property-key string for a numeric literal key, matching
+    /// tsc's normalization (`0x20` → "32", `1.0` → "1", `1e2` → "100").
+    /// Allocates via gpa (leaked, like other synthesized display strings).
+    fn numericKeyString(self: *Checker, key: NodeIndex) ?[]const u8 {
+        if (self.ast_ref.nodeTag(key) != .number_literal) return null;
+        const num_ty = self.literalNumber(key);
+        const nt = self.store.get(num_ty);
+        if (nt.kind != .number_literal) return null;
+        const n = nt.literal_value.number;
+        if (std.math.isPositiveInf(n)) return "Infinity";
+        if (std.math.isNegativeInf(n)) return "-Infinity";
+        if (std.math.isNan(n)) return "NaN";
+        const i64_min: f64 = -9223372036854775808.0;
+        const i64_max: f64 = 9223372036854775808.0;
+        if (n == @trunc(n) and n >= i64_min and n < i64_max) {
+            return std.fmt.allocPrint(self.gpa, "{d}", .{@as(i64, @intFromFloat(@trunc(n)))}) catch null;
+        }
+        return std.fmt.allocPrint(self.gpa, "{d}", .{n}) catch null;
     }
 
     fn staticPropertyKey(self: *Checker, key: NodeIndex) ?[]const u8 {
