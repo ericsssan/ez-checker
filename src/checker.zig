@@ -189,6 +189,13 @@ pub const Checker = struct {
     /// `foo.x` member access can resolve lazily to the widened value type.
     expando_fns: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(ExpandoProp)) = .empty,
 
+    /// Lazily-built map: destructuring pattern node → its `ts_type_annotation`
+    /// node.  Patterns store their `: T` annotation as a child node parented to
+    /// the pattern (not in the pattern's lhs/rhs range), so this reverse index
+    /// lets `({ a }: T)` parameter bindings find their declared type.
+    pattern_annotations: std.AutoHashMapUnmanaged(u32, NodeIndex) = .empty,
+    pattern_annotations_built: bool = false,
+
     /// Cache: type name → resolved TypeId for declared structural types.
     /// Populated lazily by `resolveDeclaredType`.  Recursion-safe via a
     /// sentinel (ID_UNKNOWN inserted before recursion, replaced after).
@@ -398,6 +405,7 @@ pub const Checker = struct {
             while (eit.next()) |lst| lst.deinit(self.gpa);
         }
         self.expando_fns.deinit(self.gpa);
+        self.pattern_annotations.deinit(self.gpa);
         self.type_decl_nodes.deinit(self.gpa);
         self.declared_type_cache.deinit(self.gpa);
         self.global_value_types.deinit(self.gpa);
@@ -1377,6 +1385,15 @@ pub const Checker = struct {
                     if (pt2 == .rest_element or pt2 == .assignment_pattern) {
                         const ty = self.declaredTypeAtBinding(node);
                         if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
+                    }
+                    // Destructured parameter binding (`{ a: x }: T`) at its
+                    // declaration site has no reference-table symbol.
+                    if (pt2 == .property or pt2 == .shorthand_property or
+                        pt2 == .object_pattern or pt2 == .array_pattern)
+                    {
+                        if (self.destructuredParamBindingType(node)) |ty| {
+                            if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
+                        }
                     }
                 }
             }
@@ -4109,6 +4126,9 @@ pub const Checker = struct {
                 // parent chain is pattern → pattern → declarator, but we need to
                 // infer from the declarator's RHS.
                 if (self.inferTypeFromDestructuringPattern(binding)) |t| return t;
+                // Annotated destructured parameter: `function f({ a: x }: T)` —
+                // x's type comes from T navigated by the pattern path.
+                if (self.destructuredParamBindingType(binding)) |t| return t;
 
                 // Contextual typing: an un-annotated arrow/fn-expr parameter
                 // that's the predicate of an array method gets the array's
@@ -4323,6 +4343,140 @@ pub const Checker = struct {
     /// a declarator with an RHS, then infer the binding's type from the RHS.
     /// This handles destructuring patterns like `[x, y] = [1, 2]` where `y`'s
     /// parent is inside a pattern, not directly the declarator.
+    /// Build the pattern→annotation reverse index (lazy, once).  A pattern's
+    /// `: T` annotation is a `ts_type_annotation` child node whose parent is the
+    /// pattern but which isn't reachable from the pattern's prop/element range.
+    fn buildPatternAnnotations(self: *Checker) void {
+        self.pattern_annotations_built = true;
+        const parents = self.semantic.parent_indices;
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .ts_type_annotation) continue;
+            if (i >= parents.len) continue;
+            const pidx = parents[i];
+            if (pidx == @intFromEnum(NodeIndex.none)) continue;
+            const ptag = self.ast_ref.nodeTag(@enumFromInt(pidx));
+            if (ptag == .object_pattern or ptag == .array_pattern) {
+                self.pattern_annotations.put(self.gpa, pidx, ni) catch {};
+            }
+        }
+    }
+
+    /// A destructured *parameter* binding (`function f({ a: x }: T)`) takes its
+    /// type from the parameter's type annotation, navigated by the pattern path
+    /// from the binding up to the annotated pattern.  Returns null when the
+    /// binding isn't a parameter destructuring or its type can't be resolved.
+    fn destructuredParamBindingType(self: *Checker, binding: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const PathStep = union(enum) { key: []const u8, index: usize, rest_obj, rest_arr };
+        var path: [16]PathStep = undefined;
+        var npath: usize = 0;
+
+        var node = binding;
+        while (true) {
+            const nidx = node.toInt();
+            if (nidx >= parents.len) return null;
+            const pidx = parents[nidx];
+            if (pidx == NONE) return null;
+            const parent: NodeIndex = @enumFromInt(pidx);
+            switch (self.ast_ref.nodeTag(parent)) {
+                .property => {
+                    const pd = self.ast_ref.nodeData(parent);
+                    // Only the value side (rhs) is a binding; the key (lhs) is a
+                    // property reference that tsc types `any`.  `node` may be the
+                    // rhs directly or an assignment_pattern wrapping it.
+                    const is_value = pd.rhs == node or
+                        (pd.rhs != .none and self.ast_ref.nodeTag(pd.rhs) == .assignment_pattern and
+                            self.ast_ref.nodeData(pd.rhs).lhs == node);
+                    if (!is_value) return null;
+                    if (npath >= path.len) return null;
+                    path[npath] = .{ .key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs)) };
+                    npath += 1;
+                    node = parent;
+                },
+                .shorthand_property => {
+                    const pd = self.ast_ref.nodeData(parent);
+                    var keyn = pd.lhs;
+                    if (keyn != .none and self.ast_ref.nodeTag(keyn) == .assignment_pattern)
+                        keyn = self.ast_ref.nodeData(keyn).lhs;
+                    if (npath >= path.len) return null;
+                    path[npath] = .{ .key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(keyn)) };
+                    npath += 1;
+                    node = parent;
+                },
+                .assignment_pattern => {
+                    // Default value wrapper inside a pattern — skip.
+                    node = parent;
+                },
+                .array_pattern => {
+                    // Find `node`'s element index within the array pattern.
+                    const d = self.ast_ref.nodeData(parent);
+                    const slice = self.directRange(d.lhs, d.rhs) orelse return null;
+                    var idx: usize = 0;
+                    var found = false;
+                    for (slice) |raw| {
+                        const el: NodeIndex = @enumFromInt(raw);
+                        if (el == node) { found = true; break; }
+                        idx += 1;
+                    }
+                    if (!found) return null;
+                    if (npath >= path.len) return null;
+                    path[npath] = .{ .index = idx };
+                    npath += 1;
+                    node = parent;
+                },
+                .object_pattern => {
+                    node = parent; // descend handled via the property step
+                },
+                else => {
+                    // `parent` is the enclosing declaration; `node` is the
+                    // top-level pattern.  Only proceed for function parameters.
+                    if (!self.isFunctionParamNode(node)) return null;
+                    const ptag = self.ast_ref.nodeTag(node);
+                    if (ptag != .object_pattern and ptag != .array_pattern) return null;
+                    if (!self.pattern_annotations_built) self.buildPatternAnnotations();
+                    const ann = self.pattern_annotations.get(node.toInt()) orelse return null;
+                    const ann_ty_node = self.ast_ref.nodeData(ann).lhs;
+                    if (ann_ty_node == .none) return null;
+                    var ty = self.resolveTypeNode(ann_ty_node);
+                    // Navigate the path from outermost (last pushed) to innermost.
+                    var k: usize = npath;
+                    while (k > 0) {
+                        k -= 1;
+                        ty = switch (path[k]) {
+                            .key => |key| self.memberOnApparentType(ty, key, node),
+                            .index => |idx| self.tupleOrArrayElement(ty, idx) orelse return null,
+                            .rest_obj, .rest_arr => return null,
+                        };
+                        if (ty.eq(tymod.ID_UNKNOWN) or ty.eq(tymod.ID_ANY)) return ty;
+                    }
+                    return ty;
+                },
+            }
+        }
+    }
+
+    /// Element type of a tuple at `idx`, or an array's element type.
+    fn tupleOrArrayElement(self: *Checker, id: TypeId, idx: usize) ?TypeId {
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .tuple_t => {
+                const elems = self.store.idsOf(t.list_data);
+                if (idx < elems.len) return self.peelRestElem(elems[idx]);
+                return null;
+            },
+            .array_t, .readonly_array_t => {
+                const elems = self.store.idsOf(t.list_data);
+                if (elems.len > 0) return elems[0];
+                return null;
+            },
+            else => return null,
+        }
+    }
+
     fn inferTypeFromDestructuringPattern(self: *Checker, binding: NodeIndex) ?TypeId {
         const parents = self.semantic.parent_indices;
         const bidx = binding.toInt();
