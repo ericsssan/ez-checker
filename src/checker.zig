@@ -229,6 +229,7 @@ pub const Checker = struct {
     jsdoc_returns: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     jsdoc_vars: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     jsdoc_built: bool = false,
+    jsdoc_type_depth: u8 = 0,
 
     /// Cache: type name → resolved TypeId for declared structural types.
     /// Populated lazily by `resolveDeclaredType`.  Recursion-safe via a
@@ -1004,6 +1005,14 @@ pub const Checker = struct {
     /// Recursively evaluate a numeric literal expression to an f64 value.
     /// Handles number literals, unary +/-, and binary arithmetic on literal operands.
     /// Returns null when the expression is not a numeric constant.
+    /// ECMAScript ToInt32: NaN/Inf → 0, otherwise truncate and wrap mod 2^32.
+    fn jsToInt32(v: f64) i32 {
+        if (std.math.isNan(v) or std.math.isInf(v)) return 0;
+        const wrapped = @mod(@trunc(v), 4294967296.0);
+        const u: u32 = @intFromFloat(@min(@max(wrapped, 0.0), 4294967295.0));
+        return @bitCast(u);
+    }
+
     fn evalLiteralNumericExpr(self: *Checker, node: NodeIndex) ?f64 {
         const tag = self.ast_ref.nodeTag(node);
         const data = self.ast_ref.nodeData(node);
@@ -1053,8 +1062,8 @@ pub const Checker = struct {
                 if (data.lhs == .none or data.rhs == .none) return null;
                 const av = self.evalLiteralNumericExpr(data.lhs) orelse return null;
                 const bv = self.evalLiteralNumericExpr(data.rhs) orelse return null;
-                const ai: i32 = @intFromFloat(av);
-                const bi: i32 = @intFromFloat(bv);
+                const ai: i32 = jsToInt32(av);
+                const bi: i32 = jsToInt32(bv);
                 const ri: i32 = switch (tag) {
                     .bitwise_and => ai & bi,
                     .bitwise_or => ai | bi,
@@ -1069,7 +1078,7 @@ pub const Checker = struct {
             .bitwise_not => {
                 if (data.lhs == .none) return null;
                 const v = self.evalLiteralNumericExpr(data.lhs) orelse return null;
-                const i: i32 = @intFromFloat(v);
+                const i: i32 = jsToInt32(v);
                 return @floatFromInt(~i);
             },
             else => return null,
@@ -4727,7 +4736,14 @@ pub const Checker = struct {
     /// Parse a JSDoc type string into a TypeId.  Handles primitives, `*`/`?`,
     /// arrays (`T[]` / `Array<T>`), unions (`A | B`), object literals
     /// (`{a: T, b: U}`), nullable (`?T`), and named references.
+    fn is_safe_to_recurse(self: *Checker) bool {
+        return self.jsdoc_type_depth < 32;
+    }
+
     fn parseJsdocType(self: *Checker, ty_str: []const u8) TypeId {
+        if (!self.is_safe_to_recurse()) return tymod.ID_ANY;
+        self.jsdoc_type_depth += 1;
+        defer self.jsdoc_type_depth -= 1;
         const s = std.mem.trim(u8, ty_str, " \t\r\n");
         if (s.len == 0) return tymod.ID_ANY;
         // Top-level union split (respecting brackets/braces/parens).
