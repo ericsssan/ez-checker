@@ -52,6 +52,9 @@ pub const CheckerOpts = struct {
     /// JSX element expression has type `JSX.Element`; under `preserve` / unset
     /// it stays `any`.
     jsx_react_mode: bool = false,
+    /// True for `.js`/`.jsx` source files, where JSDoc `@param`/`@type`/
+    /// `@returns` annotations supply types (in `.ts` they're ignored).
+    is_js_file: bool = false,
     target: Target = .es5,
     /// Module resolution strategy.  Affects import resolution rules —
     /// notably, node16/nodenext require explicit .js/.mjs/.cjs extensions
@@ -122,6 +125,7 @@ fn node16UnresolvableSpec(spec: []const u8) bool {
 }
 
 const ExpandoProp = struct { name: []const u8, value: NodeIndex };
+const JsdocParam = struct { name: []const u8, type_str: []const u8 };
 
 pub const Checker = struct {
     gpa: std.mem.Allocator,
@@ -200,6 +204,17 @@ pub const Checker = struct {
     /// lets `({ a }: T)` parameter bindings find their declared type.
     pattern_annotations: std.AutoHashMapUnmanaged(u32, NodeIndex) = .empty,
     pattern_annotations_built: bool = false,
+
+    /// JSDoc type annotations harvested from `/** … */` comment blocks (JS
+    /// files use these in place of TS type syntax).  Lazily built from the
+    /// source text.  `jsdoc_params` maps a function node to its ordered
+    /// `@param` type strings; `jsdoc_returns` its `@returns` type; `jsdoc_vars`
+    /// maps a declarator node to its `@type`.  Type strings are slices into the
+    /// source (no allocation).
+    jsdoc_params: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(JsdocParam)) = .empty,
+    jsdoc_returns: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
+    jsdoc_vars: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
+    jsdoc_built: bool = false,
 
     /// Cache: type name → resolved TypeId for declared structural types.
     /// Populated lazily by `resolveDeclaredType`.  Recursion-safe via a
@@ -411,6 +426,13 @@ pub const Checker = struct {
         }
         self.expando_fns.deinit(self.gpa);
         self.pattern_annotations.deinit(self.gpa);
+        {
+            var jit = self.jsdoc_params.valueIterator();
+            while (jit.next()) |lst| lst.deinit(self.gpa);
+        }
+        self.jsdoc_params.deinit(self.gpa);
+        self.jsdoc_returns.deinit(self.gpa);
+        self.jsdoc_vars.deinit(self.gpa);
         self.type_decl_nodes.deinit(self.gpa);
         self.declared_type_cache.deinit(self.gpa);
         self.global_value_types.deinit(self.gpa);
@@ -1413,6 +1435,21 @@ pub const Checker = struct {
                         if (self.destructuredParamBindingType(node)) |ty| {
                             if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
                         }
+                        if (self.jsdocParamBindingType(node)) |ty| {
+                            if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
+                        }
+                    }
+                    // Simple JS parameter at its declaration site with a JSDoc
+                    // `@param` type.
+                    switch (pt2) {
+                        .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                        .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                        .arrow_fn, .async_arrow_fn, .ts_declare_function => {
+                            if (self.jsdocParamBindingType(node)) |ty| {
+                                if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
+                            }
+                        },
+                        else => {},
                     }
                 }
             }
@@ -3737,6 +3774,22 @@ pub const Checker = struct {
                         return self.resolveTypeNode(ty_node);
                     }
                 }
+                // JSDoc `/** @type {T} */ var x = …` — the tag supplies the
+                // declared type (JS only).  Keyed by the enclosing var-decl.
+                if (self.checker_opts.is_js_file) {
+                    if (!self.jsdoc_built) self.buildJsdoc();
+                    if (self.jsdoc_vars.count() > 0) {
+                        const di = parent.toInt();
+                        if (di < self.semantic.parent_indices.len) {
+                            const vd = self.semantic.parent_indices[di];
+                            if (vd != @intFromEnum(NodeIndex.none)) {
+                                if (self.jsdoc_vars.get(vd)) |ts| {
+                                    return self.parseJsdocType(ts);
+                                }
+                            }
+                        }
+                    }
+                }
                 if (data.rhs != .none) {
                     const raw = self.typeOf(data.rhs);
                     const t = self.store.get(raw);
@@ -3974,6 +4027,8 @@ pub const Checker = struct {
                         for (params) |raw| {
                             if (raw == binding.toInt()) {
                                 // The binding is a parameter of this function.
+                                // A JSDoc `@param {T}` tag supplies the type in JS.
+                                if (self.jsdocParamBindingType(binding)) |jt| return jt;
                                 // Unannotated parameters should be any, not the function type.
                                 // But if the binding is a parameter wrapper (assignment_pattern, rest_element, etc.),
                                 // those cases should have been handled by their respective switch arms.
@@ -4154,6 +4209,8 @@ pub const Checker = struct {
                 // Annotated destructured parameter: `function f({ a: x }: T)` —
                 // x's type comes from T navigated by the pattern path.
                 if (self.destructuredParamBindingType(binding)) |t| return t;
+                // JSDoc-annotated (possibly destructured) parameter.
+                if (self.jsdocParamBindingType(binding)) |t| return t;
 
                 // Contextual typing: an un-annotated arrow/fn-expr parameter
                 // that's the predicate of an array method gets the array's
@@ -4368,6 +4425,473 @@ pub const Checker = struct {
     /// a declarator with an RHS, then infer the binding's type from the RHS.
     /// This handles destructuring patterns like `[x, y] = [1, 2]` where `y`'s
     /// parent is inside a pattern, not directly the declarator.
+    // ── JSDoc type annotations (JS files) ───────────────────────────────────
+
+    /// Scan the source for `/** … */` JSDoc blocks and associate each with the
+    /// declaration that immediately follows it, harvesting `@param`/`@returns`/
+    /// `@type` type strings.  Lazy, once.
+    fn buildJsdoc(self: *Checker) void {
+        self.jsdoc_built = true;
+        // JSDoc type tags only supply types in JS files; `.ts` ignores them.
+        if (!self.checker_opts.is_js_file) return;
+        const src = self.ast_ref.source;
+        if (src.len < 4) return;
+        var i: usize = 0;
+        while (i + 2 < src.len) {
+            // Find a JSDoc opener `/**`.
+            if (src[i] == '/' and src[i + 1] == '*' and src[i + 2] == '*') {
+                const block_start = i;
+                var j = i + 3;
+                while (j + 1 < src.len and !(src[j] == '*' and src[j + 1] == '/')) : (j += 1) {}
+                const block_end = @min(j + 2, src.len);
+                const block = src[block_start..block_end];
+                // The declaration this block documents starts at the next token
+                // after the block (skipping trivia).
+                const decl_node = self.declAfterPos(block_end) orelse {
+                    i = block_end;
+                    continue;
+                };
+                self.attachJsdoc(block, decl_node);
+                i = block_end;
+            } else i += 1;
+        }
+    }
+
+    /// First declaration-like node whose span starts at/after `pos` (and is the
+    /// closest such).  Used to bind a JSDoc block to what it documents.
+    fn declAfterPos(self: *Checker, pos: usize) ?NodeIndex {
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var best: NodeIndex = .none;
+        var best_start: usize = std.math.maxInt(usize);
+        var n: u32 = 1;
+        while (n < total) : (n += 1) {
+            const ni: NodeIndex = @enumFromInt(n);
+            switch (self.ast_ref.nodeTag(ni)) {
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .var_decl, .let_decl, .const_decl, .class_decl,
+                .ts_declare_function, .expression_stmt => {},
+                else => continue,
+            }
+            const span = self.ast_ref.nodeSpan(ni);
+            if (span.start < pos) continue;
+            if (span.start < best_start) {
+                best_start = span.start;
+                best = ni;
+            }
+        }
+        return if (best == .none) null else best;
+    }
+
+    /// Parse the `@param`/`@returns`/`@type` tags out of a JSDoc block and
+    /// attach the type strings to `decl`.
+    fn attachJsdoc(self: *Checker, block: []const u8, decl: NodeIndex) void {
+        // Resolve the function node (a var-decl `const f = function(){}` /
+        // arrow documents the inner function for @param/@returns).
+        const fn_node = self.jsdocFunctionOf(decl);
+        var it = std.mem.splitScalar(u8, block, '\n');
+        while (it.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r*");
+            if (!std.mem.startsWith(u8, line, "@")) continue;
+            if (std.mem.startsWith(u8, line, "@param") or std.mem.startsWith(u8, line, "@arg") or
+                std.mem.startsWith(u8, line, "@argument"))
+            {
+                const after_kw = line[std.mem.indexOfScalar(u8, line, ' ') orelse line.len ..];
+                const ty = jsdocTagType(after_kw) orelse continue;
+                const pname = jsdocParamName(after_kw);
+                // Nested tags (`@param {T} obj.prop`) document a property, not
+                // the parameter itself — skip so they don't consume a slot.
+                if (std.mem.indexOfScalar(u8, pname, '.') != null) continue;
+                if (fn_node) |fnn| {
+                    const gop = self.jsdoc_params.getOrPut(self.gpa, fnn.toInt()) catch continue;
+                    if (!gop.found_existing) gop.value_ptr.* = .empty;
+                    gop.value_ptr.append(self.gpa, .{ .name = pname, .type_str = ty }) catch {};
+                }
+            } else if (std.mem.startsWith(u8, line, "@returns") or std.mem.startsWith(u8, line, "@return")) {
+                const after = if (std.mem.startsWith(u8, line, "@returns")) line["@returns".len..] else line["@return".len..];
+                const ty = jsdocTagType(after) orelse continue;
+                if (fn_node) |fnn| self.jsdoc_returns.put(self.gpa, fnn.toInt(), ty) catch {};
+            } else if (std.mem.startsWith(u8, line, "@type")) {
+                const ty = jsdocTagType(line["@type".len..]) orelse continue;
+                self.jsdoc_vars.put(self.gpa, decl.toInt(), ty) catch {};
+            }
+        }
+    }
+
+    /// The function node documented by a declaration: a `function` decl is
+    /// itself; a `const f = () => …` / `= function(){}` declarator/expr-stmt
+    /// unwraps to the inner function expression.
+    fn jsdocFunctionOf(self: *Checker, decl: NodeIndex) ?NodeIndex {
+        switch (self.ast_ref.nodeTag(decl)) {
+            .fn_decl, .async_fn_decl, .generator_fn_decl,
+            .async_generator_fn_decl, .ts_declare_function => return decl,
+            .var_decl, .let_decl, .const_decl => {
+                // First declarator's initializer, if a function/arrow.
+                const d = self.ast_ref.nodeData(decl);
+                const slice = self.directRange(d.lhs, d.rhs) orelse return null;
+                if (slice.len == 0) return null;
+                const declr: NodeIndex = @enumFromInt(slice[0]);
+                if (self.ast_ref.nodeTag(declr) != .declarator) return null;
+                const init_node = self.ast_ref.nodeData(declr).rhs;
+                return self.jsdocFunctionOfExpr(init_node);
+            },
+            .expression_stmt => return self.jsdocFunctionOfExpr(self.ast_ref.nodeData(decl).lhs),
+            else => return null,
+        }
+    }
+
+    fn jsdocFunctionOfExpr(self: *Checker, expr: NodeIndex) ?NodeIndex {
+        if (expr == .none) return null;
+        return switch (self.ast_ref.nodeTag(expr)) {
+            .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+            .arrow_fn, .async_arrow_fn => expr,
+            // `foo.x = function(){}` — peel the assignment.
+            .assign => self.jsdocFunctionOfExpr(self.ast_ref.nodeData(expr).rhs),
+            else => null,
+        };
+    }
+
+    /// Extract the `{TYPE}` payload immediately after a JSDoc tag keyword,
+    /// returning the inner type string (trimmed).  `@param {number} x` → "number".
+    fn jsdocTagType(after_tag: []const u8) ?[]const u8 {
+        var s = after_tag;
+        // Skip whitespace.
+        while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) s = s[1..];
+        if (s.len == 0 or s[0] != '{') return null;
+        // Balanced-brace scan (object types nest braces).
+        var depth: usize = 0;
+        var k: usize = 0;
+        while (k < s.len) : (k += 1) {
+            if (s[k] == '{') depth += 1
+            else if (s[k] == '}') {
+                depth -= 1;
+                if (depth == 0) return std.mem.trim(u8, s[1..k], " \t");
+            }
+        }
+        return null;
+    }
+
+    /// Extract the parameter name following the `{TYPE}` of a JSDoc param tag.
+    /// `{number} x` → "x"; `{number} [x=1]` → "x"; `{number} obj.p` → "obj.p".
+    fn jsdocParamName(after_tag: []const u8) []const u8 {
+        var s = after_tag;
+        while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) s = s[1..];
+        // Skip the `{TYPE}` payload (balanced braces).
+        if (s.len > 0 and s[0] == '{') {
+            var depth: usize = 0;
+            var k: usize = 0;
+            while (k < s.len) : (k += 1) {
+                if (s[k] == '{') depth += 1
+                else if (s[k] == '}') {
+                    depth -= 1;
+                    if (depth == 0) { s = s[k + 1 ..]; break; }
+                }
+            }
+        }
+        while (s.len > 0 and (s[0] == ' ' or s[0] == '\t')) s = s[1..];
+        // Optional `[name=default]` wrapper.
+        if (s.len > 0 and s[0] == '[') s = s[1..];
+        var end: usize = 0;
+        while (end < s.len and ((s[end] >= 'A' and s[end] <= 'Z') or (s[end] >= 'a' and s[end] <= 'z') or
+            (s[end] >= '0' and s[end] <= '9') or s[end] == '_' or s[end] == '$' or s[end] == '.')) : (end += 1)
+        {}
+        return s[0..end];
+    }
+
+    /// Parse a JSDoc type string into a TypeId.  Handles primitives, `*`/`?`,
+    /// arrays (`T[]` / `Array<T>`), unions (`A | B`), object literals
+    /// (`{a: T, b: U}`), nullable (`?T`), and named references.
+    fn parseJsdocType(self: *Checker, ty_str: []const u8) TypeId {
+        const s = std.mem.trim(u8, ty_str, " \t\r\n");
+        if (s.len == 0) return tymod.ID_ANY;
+        // Top-level union split (respecting brackets/braces/parens).
+        if (self.jsdocSplitUnion(s)) |parts| {
+            defer self.gpa.free(parts);
+            var buf: [16]TypeId = undefined;
+            var n: usize = 0;
+            for (parts) |p| {
+                if (n >= buf.len) break;
+                buf[n] = self.parseJsdocType(p);
+                n += 1;
+            }
+            if (n == 0) return tymod.ID_ANY;
+            if (n == 1) return buf[0];
+            return self.store.unionOf(buf[0..n]) catch tymod.ID_ANY;
+        }
+        // Nullable/optional prefixes.
+        if (s[0] == '?' or s[0] == '!') return self.parseJsdocType(s[1..]);
+        if (s[0] == '*') return tymod.ID_ANY;
+        // Optional suffix `=`.
+        if (s[s.len - 1] == '=') return self.parseJsdocType(s[0 .. s.len - 1]);
+        // Array suffix `T[]`.
+        if (s.len >= 2 and s[s.len - 1] == ']' and s[s.len - 2] == '[') {
+            const elem = self.parseJsdocType(s[0 .. s.len - 2]);
+            return self.store.arrayOf(elem) catch tymod.ID_ANY;
+        }
+        // Object literal `{a: T, b: U}`.
+        if (s[0] == '{' and s[s.len - 1] == '}') {
+            return self.parseJsdocObjectType(s[1 .. s.len - 1]);
+        }
+        // Parenthesized.
+        if (s[0] == '(' and s[s.len - 1] == ')') return self.parseJsdocType(s[1 .. s.len - 1]);
+        // `Array<T>` / `Promise<T>` / generic.
+        if (std.mem.indexOfScalar(u8, s, '<')) |lt| {
+            if (s[s.len - 1] == '>') {
+                const base = s[0..lt];
+                const inner = s[lt + 1 .. s.len - 1];
+                if (std.mem.eql(u8, base, "Array")) {
+                    return self.store.arrayOf(self.parseJsdocType(inner)) catch tymod.ID_ANY;
+                }
+                // Other generics → named type_ref with one arg (best effort).
+                const arg = self.parseJsdocType(inner);
+                return self.store.typeRef(base, &.{arg}) catch tymod.ID_ANY;
+            }
+        }
+        // Primitives & keywords.
+        if (std.mem.eql(u8, s, "number")) return tymod.ID_NUMBER;
+        if (std.mem.eql(u8, s, "string")) return tymod.ID_STRING;
+        if (std.mem.eql(u8, s, "boolean")) return tymod.ID_BOOLEAN;
+        if (std.mem.eql(u8, s, "bigint")) return tymod.ID_BIGINT;
+        if (std.mem.eql(u8, s, "symbol")) return tymod.ID_SYMBOL;
+        if (std.mem.eql(u8, s, "undefined")) return tymod.ID_UNDEFINED;
+        if (std.mem.eql(u8, s, "null")) return tymod.ID_NULL;
+        if (std.mem.eql(u8, s, "void")) return tymod.ID_VOID;
+        if (std.mem.eql(u8, s, "any") or std.mem.eql(u8, s, "*")) return tymod.ID_ANY;
+        if (std.mem.eql(u8, s, "unknown")) return tymod.ID_UNKNOWN;
+        if (std.mem.eql(u8, s, "never")) return tymod.ID_NEVER;
+        if (std.mem.eql(u8, s, "object")) return tymod.ID_OBJECT_KW;
+        // String/number literal types.
+        if (s[0] == '"' or s[0] == '\'') {
+            if (s.len >= 2 and s[s.len - 1] == s[0]) {
+                return self.store.add(.{ .kind = .string_literal, .literal_value = .{ .string = s[1 .. s.len - 1] } }) catch tymod.ID_STRING;
+            }
+        }
+        // A bare identifier (possibly dotted) → named type_ref, but only if it
+        // looks like a type name; otherwise `any`.
+        if (jsdocLooksLikeName(s)) return self.store.typeRef(s, &.{}) catch tymod.ID_ANY;
+        return tymod.ID_ANY;
+    }
+
+    /// Parse the body of a JSDoc object type `a: T, b: U` into an object_t.
+    fn parseJsdocObjectType(self: *Checker, body: []const u8) TypeId {
+        var props_buf: [32]tymod.ObjectProp = undefined;
+        var n: usize = 0;
+        var start: usize = 0;
+        var depth: usize = 0;
+        var k: usize = 0;
+        // Split on top-level commas.
+        while (k <= body.len) : (k += 1) {
+            const at_end = k == body.len;
+            const c = if (at_end) ',' else body[k];
+            if (!at_end and (c == '{' or c == '<' or c == '(' or c == '[')) depth += 1
+            else if (!at_end and (c == '}' or c == '>' or c == ')' or c == ']')) {
+                if (depth > 0) depth -= 1;
+            } else if (c == ',' and depth == 0) {
+                const field = std.mem.trim(u8, body[start..k], " \t\r\n");
+                if (field.len > 0 and n < props_buf.len) {
+                    if (self.parseJsdocField(field)) |p| {
+                        props_buf[n] = p;
+                        n += 1;
+                    }
+                }
+                start = k + 1;
+            }
+        }
+        if (n == 0) return tymod.ID_OBJECT_KW;
+        const list = self.store.appendObjectProps(props_buf[0..n]) catch return tymod.ID_ANY;
+        return self.store.add(.{ .kind = .object_t, .object_props = list }) catch tymod.ID_ANY;
+    }
+
+    fn parseJsdocField(self: *Checker, field: []const u8) ?tymod.ObjectProp {
+        const colon = std.mem.indexOfScalar(u8, field, ':') orelse return null;
+        var key = std.mem.trim(u8, field[0..colon], " \t");
+        var optional = false;
+        if (key.len > 0 and key[key.len - 1] == '?') {
+            optional = true;
+            key = std.mem.trim(u8, key[0 .. key.len - 1], " \t");
+        }
+        if (key.len == 0) return null;
+        var vty = self.parseJsdocType(field[colon + 1 ..]);
+        if (optional and !self.typeContainsUndefined(vty)) {
+            vty = self.store.unionOf(&.{ vty, tymod.ID_UNDEFINED }) catch vty;
+        }
+        return .{ .name = key, .type_id = vty, .optional = optional };
+    }
+
+    /// Split a JSDoc type on top-level `|` (union).  Returns null when there's
+    /// no top-level union.  Caller frees the returned slice.
+    fn jsdocSplitUnion(self: *Checker, s: []const u8) ?[][]const u8 {
+        var parts = std.ArrayListUnmanaged([]const u8).empty;
+        var depth: usize = 0;
+        var start: usize = 0;
+        var k: usize = 0;
+        var found = false;
+        while (k < s.len) : (k += 1) {
+            const c = s[k];
+            if (c == '{' or c == '<' or c == '(' or c == '[') depth += 1
+            else if (c == '}' or c == '>' or c == ')' or c == ']') {
+                if (depth > 0) depth -= 1;
+            } else if (c == '|' and depth == 0) {
+                found = true;
+                parts.append(self.gpa, std.mem.trim(u8, s[start..k], " \t")) catch {};
+                start = k + 1;
+            }
+        }
+        if (!found) {
+            parts.deinit(self.gpa);
+            return null;
+        }
+        parts.append(self.gpa, std.mem.trim(u8, s[start..], " \t")) catch {};
+        return parts.toOwnedSlice(self.gpa) catch null;
+    }
+
+    /// True when a JSDoc type string is a plausible type name (identifier,
+    /// possibly dotted/`$`/`_`), so it should become a named type_ref rather
+    /// than `any`.
+    fn jsdocLooksLikeName(s: []const u8) bool {
+        if (s.len == 0) return false;
+        const c0 = s[0];
+        if (!((c0 >= 'A' and c0 <= 'Z') or (c0 >= 'a' and c0 <= 'z') or c0 == '_' or c0 == '$')) return false;
+        for (s) |c| {
+            if (!((c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z') or
+                (c >= '0' and c <= '9') or c == '_' or c == '$' or c == '.')) return false;
+        }
+        return true;
+    }
+
+    /// JSDoc `@param` type string for a parameter — matched by name when the
+    /// param has one, else by ordinal position.
+    fn jsdocParamType(self: *Checker, fn_node: NodeIndex, ordinal: usize, param_name: []const u8) ?[]const u8 {
+        if (!self.jsdoc_built) self.buildJsdoc();
+        const lst = self.jsdoc_params.get(fn_node.toInt()) orelse return null;
+        if (param_name.len > 0) {
+            for (lst.items) |jp| {
+                if (std.mem.eql(u8, jp.name, param_name)) return jp.type_str;
+            }
+        }
+        // Fall back to ordinal (destructured params have no name to match).
+        if (ordinal < lst.items.len) return lst.items[ordinal].type_str;
+        return null;
+    }
+
+    /// Type of a parameter binding from a JSDoc `@param` tag, navigating the
+    /// pattern path for destructured params (`@param {{a:number}} o` →
+    /// `function f({a})` → a : number).  Returns null when no JSDoc applies.
+    fn jsdocParamBindingType(self: *Checker, binding: NodeIndex) ?TypeId {
+        if (!self.jsdoc_built) self.buildJsdoc();
+        if (self.jsdoc_params.count() == 0) return null;
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const PathStep = union(enum) { key: []const u8, index: usize };
+        var path: [16]PathStep = undefined;
+        var npath: usize = 0;
+
+        var node = binding;
+        while (true) {
+            const nidx = node.toInt();
+            if (nidx >= parents.len) return null;
+            const pidx = parents[nidx];
+            if (pidx == NONE) return null;
+            const parent: NodeIndex = @enumFromInt(pidx);
+            switch (self.ast_ref.nodeTag(parent)) {
+                .property => {
+                    const pd = self.ast_ref.nodeData(parent);
+                    const is_value = pd.rhs == node or
+                        (pd.rhs != .none and self.ast_ref.nodeTag(pd.rhs) == .assignment_pattern and
+                            self.ast_ref.nodeData(pd.rhs).lhs == node);
+                    if (!is_value) return null;
+                    if (npath >= path.len) return null;
+                    path[npath] = .{ .key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs)) };
+                    npath += 1;
+                    node = parent;
+                },
+                .shorthand_property => {
+                    const pd = self.ast_ref.nodeData(parent);
+                    var keyn = pd.lhs;
+                    if (keyn != .none and self.ast_ref.nodeTag(keyn) == .assignment_pattern)
+                        keyn = self.ast_ref.nodeData(keyn).lhs;
+                    if (npath >= path.len) return null;
+                    path[npath] = .{ .key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(keyn)) };
+                    npath += 1;
+                    node = parent;
+                },
+                .assignment_pattern, .object_pattern => node = parent,
+                .array_pattern => {
+                    const d = self.ast_ref.nodeData(parent);
+                    const slice = self.directRange(d.lhs, d.rhs) orelse return null;
+                    var idx: usize = 0;
+                    var found = false;
+                    for (slice) |raw| {
+                        if (@as(NodeIndex, @enumFromInt(raw)) == node) { found = true; break; }
+                        idx += 1;
+                    }
+                    if (!found) return null;
+                    if (npath >= path.len) return null;
+                    path[npath] = .{ .index = idx };
+                    npath += 1;
+                    node = parent;
+                },
+                else => {
+                    // `parent` is the function; `node` is the top-level param.
+                    const ord = self.paramOrdinalInFn(parent, node) orelse return null;
+                    // The param's own name (empty for a destructuring pattern).
+                    const pname: []const u8 = if (self.ast_ref.nodeTag(node) == .identifier)
+                        self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node))
+                    else
+                        &.{};
+                    const ty_str = self.jsdocParamType(parent, ord, pname) orelse return null;
+                    var ty = self.parseJsdocType(ty_str);
+                    var k: usize = npath;
+                    while (k > 0) {
+                        k -= 1;
+                        ty = switch (path[k]) {
+                            .key => |key| self.memberOnApparentType(ty, key, node),
+                            .index => |idx| self.tupleOrArrayElement(ty, idx) orelse return null,
+                        };
+                        if (ty.eq(tymod.ID_UNKNOWN) or ty.eq(tymod.ID_ANY)) return ty;
+                    }
+                    return ty;
+                },
+            }
+        }
+    }
+
+    /// Ordinal of `param_node` in a function-like node's parameter list.
+    fn paramOrdinalInFn(self: *Checker, fn_node: NodeIndex, param_node: NodeIndex) ?usize {
+        const data = self.ast_ref.nodeData(fn_node);
+        const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+        var ps: u32 = 0;
+        var pe: u32 = 0;
+        switch (self.ast_ref.nodeTag(fn_node)) {
+            .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+            .ts_declare_function => {
+                if (data.lhs == .none) return null;
+                const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(data.lhs));
+                ps = fd.params;
+                pe = fd.params_end;
+            },
+            .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => {
+                if (data.lhs == .none) return null;
+                const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(data.lhs));
+                ps = fd.params;
+                pe = fd.params_end;
+            },
+            .arrow_fn, .async_arrow_fn => {
+                if (data.lhs == .none) return null;
+                const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(data.lhs));
+                ps = fd.params;
+                pe = fd.params_end;
+            },
+            else => return null,
+        }
+        if (ps > pe or pe > ext_len) return null;
+        var ord: usize = 0;
+        for (self.ast_ref.extra_data[ps..pe]) |raw| {
+            if (@as(NodeIndex, @enumFromInt(raw)) == param_node) return ord;
+            ord += 1;
+        }
+        return null;
+    }
+
     /// Build the pattern→annotation reverse index (lazy, once).  A pattern's
     /// `: T` annotation is a `ts_type_annotation` child node whose parent is the
     /// pattern but which isn't reachable from the pattern's prop/element range.

@@ -1370,7 +1370,9 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
         &ast_result,
         .{ .is_module = true, .build_parents = true },
     );
-    var checker = try Checker.init(arena, &ast_result, &sem, checker_opts);
+    var opts_for_lang = checker_opts;
+    opts_for_lang.is_js_file = (lang == .js or lang == .jsx);
+    var checker = try Checker.init(arena, &ast_result, &sem, opts_for_lang);
 
     const starts = try lineStarts(arena, source);
 
