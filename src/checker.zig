@@ -116,6 +116,8 @@ fn node16UnresolvableSpec(spec: []const u8) bool {
     return true;
 }
 
+const ExpandoProp = struct { name: []const u8, value: NodeIndex };
+
 pub const Checker = struct {
     gpa: std.mem.Allocator,
     ast_ref: *const Ast,
@@ -182,8 +184,10 @@ pub const Checker = struct {
 
     /// Function names that have property assignments on them (`foo.x = 1`)
     /// outside the function body — expando functions.  tsc types these as
-    /// `typeof foo` in value position, not the raw function type.
-    expando_fns: std.StringHashMapUnmanaged(void) = .empty,
+    /// `typeof foo` in value position, not the raw function type.  Each entry
+    /// records the assigned property names with their value nodes so that
+    /// `foo.x` member access can resolve lazily to the widened value type.
+    expando_fns: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(ExpandoProp)) = .empty,
 
     /// Cache: type name → resolved TypeId for declared structural types.
     /// Populated lazily by `resolveDeclaredType`.  Recursion-safe via a
@@ -389,6 +393,10 @@ pub const Checker = struct {
         }
         self.known_type_names.deinit(self.gpa);
         self.enum_kinds.deinit(self.gpa);
+        {
+            var eit = self.expando_fns.valueIterator();
+            while (eit.next()) |lst| lst.deinit(self.gpa);
+        }
         self.expando_fns.deinit(self.gpa);
         self.type_decl_nodes.deinit(self.gpa);
         self.declared_type_cache.deinit(self.gpa);
@@ -7622,6 +7630,17 @@ pub const Checker = struct {
             if (self.ast_ref.nodeTag(ni) != .assign) continue;
             const data = self.ast_ref.nodeData(ni);
             if (data.lhs == .none or data.lhs.toInt() == NONE) continue;
+            // Direct single-level property write `foo.x = v`: remember the
+            // prop so member access can type it later.
+            const direct_prop: ?[]const u8 = blk: {
+                if (self.ast_ref.nodeTag(data.lhs) != .member_expr) break :blk null;
+                const md = self.ast_ref.nodeData(data.lhs);
+                if (md.lhs == .none or md.rhs == .none) break :blk null;
+                if (self.ast_ref.nodeTag(md.lhs) != .identifier) break :blk null;
+                const pt = self.ast_ref.nodeMainToken(md.rhs);
+                const pn = self.ast_ref.tokenText(pt);
+                break :blk if (pn.len > 0) pn else null;
+            };
             // Walk the LHS member chain to find the root identifier.
             var obj = data.lhs;
             var depth: u8 = 0;
@@ -7635,7 +7654,11 @@ pub const Checker = struct {
                                 switch (self.ast_ref.nodeTag(decl_node)) {
                                     .fn_decl, .async_fn_decl,
                                     .generator_fn_decl, .async_generator_fn_decl => {
-                                        try self.expando_fns.put(self.gpa, name, {});
+                                        const gop = try self.expando_fns.getOrPut(self.gpa, name);
+                                        if (!gop.found_existing) gop.value_ptr.* = .empty;
+                                        if (direct_prop) |pn| {
+                                            try gop.value_ptr.append(self.gpa, .{ .name = pn, .value = data.rhs });
+                                        }
                                     },
                                     else => {},
                                 }
@@ -11700,6 +11723,29 @@ pub const Checker = struct {
                 if (self.namespace_import_map.get(obj_name)) |mod_spec| {
                     if (self.inferMemberOnNamespace(mod_spec, prop_name)) |resolved| {
                         return self.maybeAddOptionalUndefined(resolved, obj_ty, in_chain);
+                    }
+                }
+            }
+        }
+        // Expando function props: receiver typed `typeof foo` where foo has
+        // `foo.x = v` assignments — resolve the prop to v's widened type.
+        {
+            const ot2 = self.store.get(lookup_ty);
+            if (ot2.kind == .type_ref and std.mem.startsWith(u8, ot2.name, "typeof ")) {
+                const root = ot2.name["typeof ".len..];
+                if (self.expando_fns.get(root)) |list| {
+                    for (list.items) |ep| {
+                        if (!std.mem.eql(u8, ep.name, prop_name)) continue;
+                        if (ep.value == .none) break;
+                        const raw = self.typeOf(ep.value);
+                        const widened = switch (self.store.get(raw).kind) {
+                            .string_literal => tymod.ID_STRING,
+                            .number_literal => tymod.ID_NUMBER,
+                            .bigint_literal => tymod.ID_BIGINT,
+                            .boolean_literal => tymod.ID_BOOLEAN,
+                            else => raw,
+                        };
+                        return self.maybeAddOptionalUndefined(widened, obj_ty, in_chain);
                     }
                 }
             }
