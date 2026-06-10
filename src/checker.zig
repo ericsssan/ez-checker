@@ -14063,6 +14063,13 @@ pub const Checker = struct {
             }
             return null;
         }
+        // High-fidelity Object/Array statics (lib.es5 shapes tsc prints).
+        if (std.mem.eql(u8, t.name, "ObjectConstructor")) {
+            if (self.objectConstructorProperty(name)) |ty| return ty;
+        }
+        if (std.mem.eql(u8, t.name, "ArrayConstructor")) {
+            if (self.arrayConstructorProperty(name)) |ty| return ty;
+        }
         const struct_key: ?[]const u8 = if (std.mem.eql(u8, t.name, "Math"))
             "__Math_struct"
         else if (std.mem.eql(u8, t.name, "JSON"))
@@ -14089,16 +14096,175 @@ pub const Checker = struct {
         return null;
     }
 
-    fn promisePrototypeProperty(self: *Checker, name: []const u8, _: TypeId) ?TypeId {
-        // The Promise<T> chain methods .then/.catch/.finally all return
-        // Promise<unknown> (loose approximation, doesn't track resolved
-        // handler return types).  Each is a function_t that propagates
-        // chains so 'promise.then(...).catch(...)' is also Promise.
-        const unknown_promise = self.store.typeRef("Promise", &.{tymod.ID_UNKNOWN}) catch return null;
-        if (std.mem.eql(u8, name, "then") or std.mem.eql(u8, name, "catch") or
-            std.mem.eql(u8, name, "finally"))
-        {
-            return self.makeNullaryFn(unknown_promise);
+    fn promisePrototypeProperty(self: *Checker, name: []const u8, inner: TypeId) ?TypeId {
+        if (std.mem.eql(u8, name, "then")) return self.buildPromiseThenSig(inner);
+        if (std.mem.eql(u8, name, "catch")) return self.buildPromiseCatchSig(inner);
+        if (std.mem.eql(u8, name, "finally")) return self.buildPromiseFinallySig(inner);
+        return null;
+    }
+
+    /// `(params) => ret` with named params and per-param optional flags.
+    fn makeNamedFn(
+        self: *Checker,
+        params: []const TypeId,
+        names: []const []const u8,
+        opts: []const bool,
+        ret: TypeId,
+    ) ?TypeId {
+        const pr = self.store.appendSignatureParamsFull(params, names, opts) catch return null;
+        const sig: tymod.Signature = .{
+            .params_start = pr.start,
+            .params_end = pr.end,
+            .return_type = ret,
+        };
+        return self.store.functionType(sig) catch null;
+    }
+
+    /// Wrap a callback type for an optional Promise handler param: strict mode
+    /// shows `(cb) | null | undefined`, non-strict the bare callback type.
+    fn promiseHandlerParam(self: *Checker, cb: TypeId) TypeId {
+        if (!self.checker_opts.strict_null_checks) return cb;
+        return self.store.unionOf(&.{ cb, tymod.ID_NULL, tymod.ID_UNDEFINED }) catch cb;
+    }
+
+    /// Register the generic prefix on a freshly built single-sig lib method so
+    /// arrow rendering shows `<TResult1 = T, …>(…)`.
+    fn tagLibFnPrefix(self: *Checker, fn_ty: TypeId, prefix: []const u8) void {
+        if (!self.fn_type_params.contains(fn_ty)) {
+            const dup = self.gpa.dupe(u8, prefix) catch return;
+            self.fn_type_params.put(self.gpa, fn_ty, dup) catch self.gpa.free(dup);
+        }
+        const ft = self.store.get(fn_ty);
+        if (ft.kind == .function_t) {
+            const slot = ft.signatures.start;
+            if (!self.sig_type_params.contains(slot)) {
+                const dup2 = self.gpa.dupe(u8, prefix) catch return;
+                self.sig_type_params.put(self.gpa, slot, dup2) catch self.gpa.free(dup2);
+            }
+        }
+    }
+
+    /// lib.es5 Promise<T>.then:
+    /// `<TResult1 = T, TResult2 = never>(onfulfilled?: ((value: T) =>
+    /// TResult1 | PromiseLike<TResult1>) | null | undefined, onrejected?:
+    /// ((reason: any) => TResult2 | PromiseLike<TResult2>) | null | undefined)
+    /// => Promise<TResult1 | TResult2>` (the `| null | undefined` only under
+    /// strictNullChecks).
+    fn buildPromiseThenSig(self: *Checker, inner: TypeId) ?TypeId {
+        const tr1 = self.store.add(.{ .kind = .type_param, .name = "TResult1" }) catch return null;
+        const tr2 = self.store.add(.{ .kind = .type_param, .name = "TResult2" }) catch return null;
+        const plike1 = self.store.typeRef("PromiseLike", &.{tr1}) catch return null;
+        const plike2 = self.store.typeRef("PromiseLike", &.{tr2}) catch return null;
+        const cb1_ret = self.store.unionOf(&.{ tr1, plike1 }) catch return null;
+        const cb2_ret = self.store.unionOf(&.{ tr2, plike2 }) catch return null;
+        const cb1 = self.makeNamedFn(&.{inner}, &.{"value"}, &.{false}, cb1_ret) orelse return null;
+        const cb2 = self.makeNamedFn(&.{tymod.ID_ANY}, &.{"reason"}, &.{false}, cb2_ret) orelse return null;
+        const onf = self.promiseHandlerParam(cb1);
+        const onr = self.promiseHandlerParam(cb2);
+        const ret_union = self.store.unionOf(&.{ tr1, tr2 }) catch return null;
+        const ret_promise = self.store.typeRef("Promise", &.{ret_union}) catch return null;
+        const fn_ty = self.makeNamedFn(
+            &.{ onf, onr },
+            &.{ "onfulfilled", "onrejected" },
+            &.{ true, true },
+            ret_promise,
+        ) orelse return null;
+        const t_str = self.typeToString(inner) catch return fn_ty;
+        defer self.gpa.free(t_str);
+        var pbuf: [256]u8 = undefined;
+        const prefix = std.fmt.bufPrint(&pbuf, "<TResult1 = {s}, TResult2 = never>", .{t_str}) catch return fn_ty;
+        self.tagLibFnPrefix(fn_ty, prefix);
+        return fn_ty;
+    }
+
+    /// lib.es5 Promise<T>.catch:
+    /// `<TResult = never>(onrejected?: ((reason: any) => TResult |
+    /// PromiseLike<TResult>) | null | undefined) => Promise<T | TResult>`.
+    fn buildPromiseCatchSig(self: *Checker, inner: TypeId) ?TypeId {
+        const tr = self.store.add(.{ .kind = .type_param, .name = "TResult" }) catch return null;
+        const plike = self.store.typeRef("PromiseLike", &.{tr}) catch return null;
+        const cb_ret = self.store.unionOf(&.{ tr, plike }) catch return null;
+        const cb = self.makeNamedFn(&.{tymod.ID_ANY}, &.{"reason"}, &.{false}, cb_ret) orelse return null;
+        const onr = self.promiseHandlerParam(cb);
+        const ret_union = self.store.unionOf(&.{ inner, tr }) catch return null;
+        const ret_promise = self.store.typeRef("Promise", &.{ret_union}) catch return null;
+        const fn_ty = self.makeNamedFn(&.{onr}, &.{"onrejected"}, &.{true}, ret_promise) orelse return null;
+        self.tagLibFnPrefix(fn_ty, "<TResult = never>");
+        return fn_ty;
+    }
+
+    /// lib.es2018 Promise<T>.finally:
+    /// `(onfinally?: (() => void) | null | undefined) => Promise<T>`.
+    fn buildPromiseFinallySig(self: *Checker, inner: TypeId) ?TypeId {
+        const cb = self.makeNullaryFn(tymod.ID_VOID);
+        const onf = self.promiseHandlerParam(cb);
+        const ret_promise = self.store.typeRef("Promise", &.{inner}) catch return null;
+        return self.makeNamedFn(&.{onf}, &.{"onfinally"}, &.{true}, ret_promise);
+    }
+
+    /// lib.es5 ObjectConstructor statics with tsc-fidelity signatures.
+    fn objectConstructorProperty(self: *Checker, name: []const u8) ?TypeId {
+        const tp_t = self.store.add(.{ .kind = .type_param, .name = "T" }) catch return null;
+        if (std.mem.eql(u8, name, "defineProperty")) {
+            // <T>(o: T, p: PropertyKey, attributes: PropertyDescriptor & ThisType<any>) => T
+            const pkey = self.store.typeRef("PropertyKey", &.{}) catch return null;
+            const pdesc = self.store.typeRef("PropertyDescriptor", &.{}) catch return null;
+            const this_any = self.store.typeRef("ThisType", &.{tymod.ID_ANY}) catch return null;
+            const attrs = self.store.intersectionOf(&.{ pdesc, this_any }) catch return null;
+            const fn_ty = self.makeNamedFn(
+                &.{ tp_t, pkey, attrs },
+                &.{ "o", "p", "attributes" },
+                &.{ false, false, false },
+                tp_t,
+            ) orelse return null;
+            self.tagLibFnPrefix(fn_ty, "<T>");
+            return fn_ty;
+        }
+        if (std.mem.eql(u8, name, "create")) {
+            // { (o: object | null): any; (o: object | null, properties: PropertyDescriptorMap & ThisType<any>): any; }
+            const obj_null = self.store.unionOf(&.{ tymod.ID_OBJECT_KW, tymod.ID_NULL }) catch return null;
+            const pmap = self.store.typeRef("PropertyDescriptorMap", &.{}) catch return null;
+            const this_any = self.store.typeRef("ThisType", &.{tymod.ID_ANY}) catch return null;
+            const props_ty = self.store.intersectionOf(&.{ pmap, this_any }) catch return null;
+            const pr1 = self.store.appendSignatureParamsFull(&.{obj_null}, &.{"o"}, &.{false}) catch return null;
+            const pr2 = self.store.appendSignatureParamsFull(&.{ obj_null, props_ty }, &.{ "o", "properties" }, &.{ false, false }) catch return null;
+            const sigs = [_]tymod.Signature{
+                .{ .params_start = pr1.start, .params_end = pr1.end, .return_type = tymod.ID_ANY },
+                .{ .params_start = pr2.start, .params_end = pr2.end, .return_type = tymod.ID_ANY },
+            };
+            const sl = self.store.appendSignatures(&sigs) catch return null;
+            return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch null;
+        }
+        if (std.mem.eql(u8, name, "keys")) {
+            // { (o: object): string[]; (o: {}): string[]; }
+            const empty_obj = self.store.add(.{ .kind = .object_t }) catch return null;
+            const str_arr = self.store.arrayOf(tymod.ID_STRING) catch return null;
+            const pr1 = self.store.appendSignatureParamsFull(&.{tymod.ID_OBJECT_KW}, &.{"o"}, &.{false}) catch return null;
+            const pr2 = self.store.appendSignatureParamsFull(&.{empty_obj}, &.{"o"}, &.{false}) catch return null;
+            const sigs = [_]tymod.Signature{
+                .{ .params_start = pr1.start, .params_end = pr1.end, .return_type = str_arr },
+                .{ .params_start = pr2.start, .params_end = pr2.end, .return_type = str_arr },
+            };
+            const sl = self.store.appendSignatures(&sigs) catch return null;
+            return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch null;
+        }
+        return null;
+    }
+
+    /// lib.es5 ArrayConstructor statics with tsc-fidelity signatures.
+    fn arrayConstructorProperty(self: *Checker, name: []const u8) ?TypeId {
+        if (std.mem.eql(u8, name, "isArray")) {
+            // (arg: any) => arg is any[]
+            const any_arr = self.store.arrayOf(tymod.ID_ANY) catch return null;
+            const pr = self.store.appendSignatureParamsFull(&.{tymod.ID_ANY}, &.{"arg"}, &.{false}) catch return null;
+            const sig: tymod.Signature = .{
+                .params_start = pr.start,
+                .params_end = pr.end,
+                .return_type = tymod.ID_BOOLEAN,
+                .predicate_param_index = 0,
+                .predicate_target = any_arr,
+            };
+            return self.store.functionType(sig) catch null;
         }
         return null;
     }
