@@ -1416,6 +1416,33 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
             }
         }
         if (!dup) try gop.value_ptr.append(arena, .{ .pos = span.start, .ty = tystr });
+
+        // Annotated declaration names: for `var num: number` / `f(a: string)`
+        // the identifier node's full subtree includes the annotation, so the
+        // span text is "num: number" — but tsc's baseline anchors the bare
+        // name "num".  Also record the main-token text at the token's span so
+        // the name anchors.
+        if (ast_result.nodeTag(ni) == .identifier) {
+            const mt = ast_result.nodeMainToken(ni);
+            const tok_start = ast_result.tokenStart(mt);
+            const tok_len = ast_result.tokens.items(.len)[mt];
+            if (tok_start >= span.start and tok_start + tok_len <= source.len) {
+                const tok_text = source[tok_start .. tok_start + tok_len];
+                if (tok_text.len > 0 and !std.mem.eql(u8, tok_text, text)) {
+                    const tkey = Key{ .line = lineOf(starts, tok_start), .text = tok_text };
+                    const tgop = try map.getOrPut(tkey);
+                    if (!tgop.found_existing) tgop.value_ptr.* = .empty;
+                    var tdup = false;
+                    for (tgop.value_ptr.items) |o| {
+                        if (o.pos == tok_start) {
+                            tdup = true;
+                            break;
+                        }
+                    }
+                    if (!tdup) try tgop.value_ptr.append(arena, .{ .pos = tok_start, .ty = tystr });
+                }
+            }
+        }
     }
     // Sort each occurrence list by source position.
     {
