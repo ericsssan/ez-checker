@@ -12618,6 +12618,21 @@ pub const Checker = struct {
             }
             break;
         }
+        // `new Temporal.Instant(...)` — member-expr callee whose type is a
+        // `Temporal.XConstructor` ref constructs the `Temporal.X` instance.
+        if (self.ast_ref.nodeTag(c) == .member_expr) {
+            const mt = self.store.get(self.typeOf(c));
+            if (mt.kind == .type_ref and
+                std.mem.startsWith(u8, mt.name, "Temporal.") and
+                std.mem.endsWith(u8, mt.name, "Constructor"))
+            {
+                const inst = mt.name[0 .. mt.name.len - "Constructor".len];
+                const owned = self.gpa.dupe(u8, inst) catch return null;
+                self.string_pool.append(self.gpa, owned) catch {};
+                return self.store.typeRef(owned, &.{}) catch null;
+            }
+            return null;
+        }
         if (self.ast_ref.nodeTag(c) != .identifier) return null;
         var args_buf: [4]TypeId = undefined;
         const args_count = blk: {
@@ -14412,7 +14427,7 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, "plainDateTimeISO")) return self.tempTimeZoneFn("Temporal.PlainDateTime", true);
             if (std.mem.eql(u8, name, "plainDateISO")) return self.tempTimeZoneFn("Temporal.PlainDate", true);
             if (std.mem.eql(u8, name, "plainTimeISO")) return self.tempTimeZoneFn("Temporal.PlainTime", true);
-            if (std.mem.eql(u8, name, "timeZoneId")) return tymod.ID_STRING;
+            if (std.mem.eql(u8, name, "timeZoneId")) return self.makeNullaryFn(tymod.ID_STRING);
             return null;
         }
         // Constructor statics.
