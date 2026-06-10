@@ -1347,6 +1347,29 @@ pub const Checker = struct {
         if (self.identifierAsPropertySignatureKey(node)) |ty| return ty;
         if (self.identifierAsClassPropertyKey(node)) |ty| return ty;
         if (self.identifierAsEnumMemberKey(node)) |ty| return ty;
+        // Accessor name or setter parameter: `get x()` / `set x(v)` — these
+        // identifiers have no symbol, but declaredTypeAtBinding dispatches on
+        // the parent accessor node (getter return type / setter param type,
+        // each falling back to the paired accessor).
+        accessor_blk: {
+            const parents_arr = self.semantic.parent_indices;
+            const nidx = node.toInt();
+            if (nidx >= parents_arr.len) break :accessor_blk;
+            var pidx = parents_arr[nidx];
+            if (pidx == @intFromEnum(NodeIndex.none)) break :accessor_blk;
+            // Peel a default-value wrapper: `set x(v = 0)`.
+            if (self.ast_ref.nodeTag(@enumFromInt(pidx)) == .assignment_pattern) {
+                pidx = parents_arr[pidx];
+                if (pidx == @intFromEnum(NodeIndex.none)) break :accessor_blk;
+            }
+            switch (self.ast_ref.nodeTag(@enumFromInt(pidx))) {
+                .getter_def, .setter_def => {
+                    const ty = self.declaredTypeAtBinding(node);
+                    if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
+                },
+                else => {},
+            }
+        }
         // Object-literal property key: `{ x: 0 }` → x has the type of its value (widened).
         // Check before typeOfNameByAstSearch so the property value type takes precedence over
         // an outer variable with the same name.
@@ -3672,14 +3695,33 @@ pub const Checker = struct {
                 return tymod.ID_ANY;
             },
             .setter_def => {
+                // Both the setter's *name* and its *parameter* carry the
+                // accessor property type: the annotated param type if present,
+                // otherwise the paired getter's (body-inferred) return type.
                 const pdata = self.ast_ref.nodeData(parent);
-                if (pdata.lhs != binding) return tymod.ID_ANY;
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
                 const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+                const is_name = pdata.lhs == binding;
+                var is_param = false;
                 if (md.params_start < md.params_end and md.params_end <= ext_len) {
                     const param: NodeIndex = @enumFromInt(self.ast_ref.extra_data[md.params_start]);
-                    const pty = self.paramDeclaredType(param);
-                    if (!pty.eq(tymod.ID_UNKNOWN)) return pty;
+                    is_param = param == binding or
+                        (self.ast_ref.nodeTag(param) == .assignment_pattern and
+                            self.ast_ref.nodeData(param).lhs == binding);
+                    if (is_name or is_param) {
+                        if (self.paramHasAnnotation(param)) {
+                            const pty = self.paramDeclaredType(param);
+                            if (!pty.eq(tymod.ID_UNKNOWN)) return pty;
+                        }
+                    }
+                }
+                if (!is_name and !is_param) return tymod.ID_ANY;
+                if (pdata.lhs != .none) {
+                    const ntag = self.ast_ref.nodeTag(pdata.lhs);
+                    if (ntag == .identifier or ntag == .property_ident) {
+                        const pname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pdata.lhs));
+                        if (self.pairedGetterReturnType(parent, pname)) |t| return t;
+                    }
                 }
                 return tymod.ID_ANY;
             },
@@ -5128,6 +5170,53 @@ pub const Checker = struct {
         if (ctag != .class_decl and ctag != .class_expr) return null;
         const is_static = self.classMemberIsStatic(method_def_node);
         return self.buildClassMethodMergedType(class_node, method_name, is_static);
+    }
+
+    /// Find the same-name, same-staticness getter paired with a set accessor
+    /// in the enclosing class body and return its (body-inferred) return type.
+    /// tsc gives an unannotated setter parameter the getter's return type.
+    fn pairedGetterReturnType(self: *Checker, accessor: NodeIndex, prop_name: []const u8) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const midx = accessor.toInt();
+        if (midx >= parents.len) return null;
+        var p_idx = parents[midx];
+        if (p_idx == NONE) return null;
+        const possible_body: NodeIndex = @enumFromInt(p_idx);
+        if (self.ast_ref.nodeTag(possible_body) == .class_body) {
+            p_idx = parents[p_idx];
+            if (p_idx == NONE) return null;
+        }
+        const class_node: NodeIndex = @enumFromInt(p_idx);
+        const ctag = self.ast_ref.nodeTag(class_node);
+        if (ctag != .class_decl and ctag != .class_expr) return null;
+        const cdata = self.ast_ref.nodeData(class_node);
+        if (cdata.lhs == .none) return null;
+        const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
+        if (cd.body == .none) return null;
+        const body_data = self.ast_ref.nodeData(cd.body);
+        const slice = self.directRange(body_data.lhs, body_data.rhs) orelse return null;
+        const want_static = self.classMemberIsStatic(accessor);
+
+        for (slice) |raw| {
+            const m: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(m) != .getter_def) continue;
+            if (self.classMemberIsStatic(m) != want_static) continue;
+            const mdata = self.ast_ref.nodeData(m);
+            if (mdata.lhs == .none or mdata.rhs == .none) continue;
+            const ktag = self.ast_ref.nodeTag(mdata.lhs);
+            if (ktag != .identifier and ktag != .property_ident) continue;
+            const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+            if (!std.mem.eql(u8, key, prop_name)) continue;
+            const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(mdata.rhs));
+            const fn_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, false, false);
+            const ft = self.store.get(fn_ty);
+            if (ft.kind == .function_t) {
+                const sigs = self.store.signaturesOf(ft.signatures);
+                if (sigs.len > 0) return sigs[0].return_type;
+            }
+        }
+        return null;
     }
 
     /// Return the identifier name of a function parameter binding.
@@ -9674,14 +9763,19 @@ pub const Checker = struct {
                     }
                     return .{ .name = name, .type_id = tymod.ID_ANY };
                 }
-                // Setter: the property value type comes from the first parameter.
+                // Setter: the property value type comes from the first parameter
+                // when annotated, otherwise from the paired getter's return type.
                 if (tag == .setter_def) {
                     const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
                     if (md.params_start < md.params_end and md.params_end <= ext_len) {
                         const param: NodeIndex = @enumFromInt(self.ast_ref.extra_data[md.params_start]);
-                        const pty = self.paramDeclaredType(param);
-                        if (!pty.eq(tymod.ID_UNKNOWN)) return .{ .name = name, .type_id = pty };
+                        if (self.paramHasAnnotation(param)) {
+                            const pty = self.paramDeclaredType(param);
+                            if (!pty.eq(tymod.ID_UNKNOWN)) return .{ .name = name, .type_id = pty };
+                        }
                     }
+                    if (self.pairedGetterReturnType(member, name)) |t|
+                        return .{ .name = name, .type_id = t };
                     return .{ .name = name, .type_id = tymod.ID_ANY };
                 }
                 const fn_ty = self.buildFunctionType(
