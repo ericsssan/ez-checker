@@ -1292,7 +1292,12 @@ pub const Checker = struct {
                     return self.narrowAtUse(node, sym, arr);
                 }
             }
-            if (!base.eq(tymod.ID_UNKNOWN)) return self.narrowAtUse(node, sym, base);
+            if (!base.eq(tymod.ID_UNKNOWN)) {
+                // Annotated const enum vars narrow reads to the initializer's
+                // member type (`const c: Choice = Choice.One` → c : Choice.One).
+                const flow = self.narrowConstEnumAtUse(sym, node, base) orelse base;
+                return self.narrowAtUse(node, sym, flow);
+            }
             // Symbol resolves but has no declared type — distinguish between
             // explicit declarations (return any) and implicit globals (try lib).
             const decl_node = self.semantic.symbols.getDeclNode(sym);
@@ -1541,6 +1546,19 @@ pub const Checker = struct {
         return base_ty;
     }
 
+    /// Enum member type for a *declaration* position: the lone member of a
+    /// single-member enum is alias-tagged to display `E` in expressions, but
+    /// its declaration still renders `E.A` — strip the alias.
+    fn enumMemberDeclType(self: *Checker, id: TypeId) TypeId {
+        const t = self.store.get(id);
+        if (t.enum_name.len > 0 and t.alias_name.len > 0) {
+            var copy = t.*;
+            copy.alias_name = "";
+            return self.store.add(copy) catch id;
+        }
+        return id;
+    }
+
     /// Return the enum-member type `E.MemberName` when `node` is the key
     /// identifier of a `ts_enum_member` declaration (e.g. `A` in `enum E { A = 1 }`).
     fn identifierAsEnumMemberKey(self: *Checker, node: NodeIndex) ?TypeId {
@@ -1572,7 +1590,7 @@ pub const Checker = struct {
                         // Non-literal members (computed initializers) get untagged types
                         // that would conflict with tsc's E.Member rendering — skip those.
                         const pt = self.store.get(p.type_id);
-                        if (pt.enum_name.len > 0) return p.type_id;
+                        if (pt.enum_name.len > 0) return self.enumMemberDeclType(p.type_id);
                         return null;
                     }
                 }
@@ -1636,6 +1654,10 @@ pub const Checker = struct {
                 if (pd.value != .none) {
                     const raw = self.typeOf(pd.value);
                     const t = self.store.get(raw);
+                    // Enum members widen to the enum type (`p1 = E.B` → E).
+                    if (t.enum_name.len > 0 and self.enumInitIsFresh(pd.value, 0)) {
+                        if (self.buildEnumUnionType(t.enum_name)) |eu| return eu;
+                    }
                     return switch (t.kind) {
                         .string_literal => tymod.ID_STRING,
                         .number_literal => tymod.ID_NUMBER,
@@ -1938,13 +1960,148 @@ pub const Checker = struct {
             // statically-known value) stay untagged.
             const member_ty: TypeId = switch (self.store.get(value_ty).kind) {
                 .number_literal, .string_literal => self.store.enumMemberLiteral(value_ty, enum_name, member_name) catch value_ty,
+                // Computed initializers (`A = computed(0)`) still produce an
+                // opaque member type displaying `E.A` — tsc does not widen
+                // computed enum members to number.
+                .number, .string => self.store.enumMemberLiteral(value_ty, enum_name, member_name) catch value_ty,
                 else => value_ty,
             };
             props_list.append(self.gpa, .{ .name = member_name, .type_id = member_ty }) catch return null;
         }
         if (props_list.items.len == 0) return null;
+        // Single-member enum: the member type IS the enum type, and expression
+        // positions display the enum name (`E.A : E`).  Alias-tag the lone
+        // member; declaration sites strip the alias to render `E.A`.
+        if (props_list.items.len == 1) {
+            const only_t = self.store.get(props_list.items[0].type_id);
+            if (only_t.enum_name.len > 0) {
+                var copy = only_t.*;
+                copy.alias_name = enum_name;
+                props_list.items[0].type_id = self.store.add(copy) catch props_list.items[0].type_id;
+            }
+        }
         const list = self.store.appendObjectProps(props_list.items) catch return null;
         return self.store.add(.{ .kind = .object_t, .object_props = list }) catch null;
+    }
+
+    /// Number of members declared on an enum, straight from the AST (no type
+    /// construction) — used by union rendering to decide whether a union of
+    /// members covers the whole enum.
+    fn enumDeclMemberCount(self: *Checker, enum_name: []const u8) ?usize {
+        const decl = self.type_decl_nodes.get(enum_name) orelse return null;
+        if (self.ast_ref.nodeTag(decl) != .ts_enum_decl) return null;
+        const data = self.ast_ref.nodeData(decl);
+        if (data.lhs == .none) return null;
+        const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
+        if (ed.members_start > ed.members_end or ed.members_end > self.ast_ref.extra_data.len) return null;
+        var count: usize = 0;
+        for (self.ast_ref.extra_data[ed.members_start..ed.members_end]) |raw| {
+            const m: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(m) == .ts_enum_member) count += 1;
+        }
+        return count;
+    }
+
+    /// Per-member freshness set for enum-member-typed initializers.  tsc
+    /// widens a let/var initializer member-wise: FRESH members (from direct
+    /// `E.B` accesses, possibly through unannotated const chains) widen to
+    /// the full enum type E (which then absorbs sibling members); non-fresh
+    /// members (from annotated declarations) stay.  Union dedup makes a
+    /// non-fresh copy absorb a fresh one.
+    const EnumFreshSet = struct {
+        ids: [16]TypeId = undefined,
+        fresh: [16]bool = undefined,
+        n: usize = 0,
+        ename: []const u8 = "",
+
+        fn add(s: *EnumFreshSet, store: *tymod.TypeStore, id: TypeId, is_fresh: bool) bool {
+            const t = store.get(id);
+            if (t.enum_name.len == 0) return false;
+            if (s.ename.len == 0) {
+                s.ename = t.enum_name;
+            } else if (!std.mem.eql(u8, s.ename, t.enum_name)) return false;
+            for (s.ids[0..s.n], 0..) |existing, i| {
+                if (existing.eq(id) or std.mem.eql(u8, store.get(existing).name, t.name)) {
+                    // Duplicate member: non-fresh wins (union dedup keeps the
+                    // regular type).
+                    s.fresh[i] = s.fresh[i] and is_fresh;
+                    return true;
+                }
+            }
+            if (s.n >= s.ids.len) return false;
+            s.ids[s.n] = id;
+            s.fresh[s.n] = is_fresh;
+            s.n += 1;
+            return true;
+        }
+
+        /// Add every enum member of `id` (a member or union of members).
+        fn addType(s: *EnumFreshSet, store: *tymod.TypeStore, id: TypeId, is_fresh: bool) bool {
+            const t = store.get(id);
+            if (t.kind == .union_t) {
+                for (store.idsOf(t.list_data)) |m| {
+                    if (!s.add(store, m, is_fresh)) return false;
+                }
+                return true;
+            }
+            return s.add(store, id, is_fresh);
+        }
+    };
+
+    /// Collect the enum members contributed by an initializer expression with
+    /// per-member freshness.  Returns false when the expression isn't a pure
+    /// same-enum member composition (caller keeps the unwidened type).
+    fn collectEnumFreshMembers(self: *Checker, expr: NodeIndex, depth: u8, set: *EnumFreshSet) bool {
+        if (depth > 10 or expr == .none) return false;
+        switch (self.ast_ref.nodeTag(expr)) {
+            .member_expr, .computed_member_expr => {
+                return set.addType(&self.store, self.typeOf(expr), true);
+            },
+            .grouping_expr => return self.collectEnumFreshMembers(self.ast_ref.nodeData(expr).lhs, depth + 1, set),
+            .conditional => {
+                const data = self.ast_ref.nodeData(expr);
+                if (data.rhs == .none) return false;
+                const cd = self.ast_ref.extraData(ast.Conditional, @intFromEnum(data.rhs));
+                return self.collectEnumFreshMembers(cd.consequent, depth + 1, set) and
+                    self.collectEnumFreshMembers(cd.alternate, depth + 1, set);
+            },
+            .identifier => {
+                const sym = self.symbolForIdentRef(expr) orelse return false;
+                const decl = self.semantic.symbols.getDeclNode(sym);
+                if (decl == .none) return false;
+                const parents = self.semantic.parent_indices;
+                var declarator = decl;
+                if (self.ast_ref.nodeTag(declarator) != .declarator) {
+                    const ni = declarator.toInt();
+                    if (ni >= parents.len) return false;
+                    const p = parents[ni];
+                    if (p == @intFromEnum(NodeIndex.none)) return false;
+                    declarator = @enumFromInt(p);
+                    if (self.ast_ref.nodeTag(declarator) != .declarator) return false;
+                }
+                const dd = self.ast_ref.nodeData(declarator);
+                if (dd.lhs != .none) {
+                    const id_data = self.ast_ref.nodeData(dd.lhs);
+                    if (id_data.rhs != .none and self.ast_ref.nodeTag(id_data.rhs) == .ts_type_annotation) {
+                        // Annotated declaration → all its members are non-fresh.
+                        return set.addType(&self.store, self.typeOf(expr), false);
+                    }
+                }
+                return self.collectEnumFreshMembers(dd.rhs, depth + 1, set);
+            },
+            else => return false,
+        }
+    }
+
+    /// Kept for class-field widening: any fresh member in the composition.
+    fn enumInitIsFresh(self: *Checker, expr: NodeIndex, depth: u8) bool {
+        _ = depth;
+        var set = EnumFreshSet{};
+        if (!self.collectEnumFreshMembers(expr, 0, &set)) return false;
+        for (set.fresh[0..set.n]) |f| {
+            if (f) return true;
+        }
+        return false;
     }
 
     /// Build the *type-side* of an enum — the union of its member literals (each
@@ -3152,6 +3309,53 @@ pub const Checker = struct {
     /// applies only to bindings declared *without* one (`var x;`); a binding
     /// with an initializer takes that initializer's type even when we can't
     /// resolve it (`var x = Array()` is `any[]`, not an evolving auto var).
+    /// `const choice: Choice = Choice.One` — tsc narrows reads of an
+    /// annotated, const-declared enum variable to the initializer's member
+    /// type (`choice : Choice.One`).  Safe without flow analysis: a const has
+    /// exactly one assignment.  Returns null to keep the declared type.
+    fn narrowConstEnumAtUse(self: *Checker, sym: symbol_mod.SymbolId, use_node: NodeIndex, base: TypeId) ?TypeId {
+        // Declared type must be enum-ish: a union of enum members, or a
+        // (possibly alias-tagged) lone member type.
+        const bt = self.store.get(base);
+        const enum_base = switch (bt.kind) {
+            .union_t => blk: {
+                const ms = self.store.idsOf(bt.list_data);
+                if (ms.len == 0) break :blk false;
+                for (ms) |m| {
+                    if (self.store.get(m).enum_name.len == 0) break :blk false;
+                }
+                break :blk true;
+            },
+            else => bt.enum_name.len > 0,
+        };
+        if (!enum_base) return null;
+        const decl = self.semantic.symbols.getDeclNode(sym);
+        if (decl == .none or decl == use_node) return null;
+        // Walk decl identifier → declarator → const_decl.
+        const parents = self.semantic.parent_indices;
+        var declarator = decl;
+        if (self.ast_ref.nodeTag(declarator) != .declarator) {
+            const ni = declarator.toInt();
+            if (ni >= parents.len) return null;
+            const p = parents[ni];
+            if (p == @intFromEnum(NodeIndex.none)) return null;
+            declarator = @enumFromInt(p);
+            if (self.ast_ref.nodeTag(declarator) != .declarator) return null;
+        }
+        {
+            const di = declarator.toInt();
+            if (di >= parents.len) return null;
+            const dp = parents[di];
+            if (dp == @intFromEnum(NodeIndex.none)) return null;
+            if (self.ast_ref.nodeTag(@enumFromInt(dp)) != .const_decl) return null;
+        }
+        const init_node = self.ast_ref.nodeData(declarator).rhs;
+        if (init_node == .none) return null;
+        const init_ty = self.typeOf(init_node);
+        if (self.store.get(init_ty).enum_name.len == 0) return null;
+        return init_ty;
+    }
+
     fn bindingHasInitializer(self: *Checker, sym: symbol_mod.SymbolId) bool {
         const decl = self.semantic.symbols.getDeclNode(sym);
         if (decl == .none) return false;
@@ -3469,7 +3673,7 @@ pub const Checker = struct {
                                     for (self.store.propsOf(ot.object_props)) |p| {
                                         if (std.mem.eql(u8, p.name, member_name)) {
                                             const pt = self.store.get(p.type_id);
-                                            if (pt.enum_name.len > 0) return p.type_id;
+                                            if (pt.enum_name.len > 0) return self.enumMemberDeclType(p.type_id);
                                             break;
                                         }
                                     }
@@ -3546,6 +3750,35 @@ pub const Checker = struct {
                         // `var x = null` → x: any (TypeScript's null-widening rule).
                         if (!self.checker_opts.strict_null_checks) {
                             if (t.kind == .null_t or t.kind == .undefined_t) return tymod.ID_ANY;
+                        }
+                        // Enum members widen member-wise on let/var: FRESH
+                        // members (direct `E.B` accesses, through unannotated
+                        // const chains) widen to the full enum type E, which
+                        // absorbs any sibling members; non-fresh members (from
+                        // annotated declarations) keep the member type.
+                        enum_widen: {
+                            const is_enumish = t.enum_name.len > 0 or
+                                (t.kind == .union_t and blk: {
+                                    const ms = self.store.idsOf(t.list_data);
+                                    if (ms.len == 0) break :blk false;
+                                    for (ms) |m| {
+                                        if (self.store.get(m).enum_name.len == 0) break :blk false;
+                                    }
+                                    break :blk true;
+                                });
+                            if (!is_enumish) break :enum_widen;
+                            var set = EnumFreshSet{};
+                            if (!self.collectEnumFreshMembers(data.rhs, 0, &set)) break :enum_widen;
+                            if (set.n == 0 or set.ename.len == 0) break :enum_widen;
+                            var any_fresh = false;
+                            for (set.fresh[0..set.n]) |f| {
+                                if (f) any_fresh = true;
+                            }
+                            // Any fresh member widens to E, and E absorbs the
+                            // rest of the same enum's members.
+                            if (any_fresh) {
+                                if (self.buildEnumUnionType(set.ename)) |eu| return eu;
+                            }
                         }
                         // Handle primitive literals
                         const widened_prim = switch (t.kind) {
@@ -9883,7 +10116,10 @@ pub const Checker = struct {
                     const t = self.store.get(raw);
                     // Class properties without explicit type annotations are widened
                     // from literal types to their base types, like let declarations.
-                    ty = switch (t.kind) {
+                    // Enum members widen to the enum type (`p1 = E.B` → E).
+                    if (t.enum_name.len > 0 and self.enumInitIsFresh(pd.value, 0)) {
+                        ty = self.buildEnumUnionType(t.enum_name) orelse raw;
+                    } else ty = switch (t.kind) {
                         .string_literal => tymod.ID_STRING,
                         .number_literal => tymod.ID_NUMBER,
                         .boolean_literal => tymod.ID_BOOLEAN,
@@ -13187,8 +13423,18 @@ pub const Checker = struct {
             .null_t      => try buf.appendSlice(gpa, "null"),
             .undefined_t => try buf.appendSlice(gpa, "undefined"),
             .void_t      => try buf.appendSlice(gpa, "void"),
-            .number      => try buf.appendSlice(gpa, "number"),
-            .string      => try buf.appendSlice(gpa, "string"),
+            .number, .string => {
+                // Opaque (computed-initializer) enum members display E.A.
+                if (t.enum_name.len > 0 and t.alias_name.len > 0) {
+                    try buf.appendSlice(gpa, t.alias_name);
+                } else if (t.enum_name.len > 0 and t.name.len > 0) {
+                    try buf.appendSlice(gpa, t.enum_name);
+                    try buf.append(gpa, '.');
+                    try buf.appendSlice(gpa, t.name);
+                } else {
+                    try buf.appendSlice(gpa, if (t.kind == .number) "number" else "string");
+                }
+            },
             .boolean     => try buf.appendSlice(gpa, "boolean"),
             .bigint      => try buf.appendSlice(gpa, "bigint"),
             .symbol      => try buf.appendSlice(gpa, "symbol"),
@@ -13208,8 +13454,11 @@ pub const Checker = struct {
             },
             .type_param  => try buf.appendSlice(gpa, t.name),
             .string_literal => {
-                // String enum members render as EnumName.MemberName.
-                if (t.enum_name.len > 0 and t.name.len > 0) {
+                // String enum members render as EnumName.MemberName; a
+                // single-member enum's lone member is aliased to the enum name.
+                if (t.enum_name.len > 0 and t.alias_name.len > 0) {
+                    try buf.appendSlice(gpa, t.alias_name);
+                } else if (t.enum_name.len > 0 and t.name.len > 0) {
                     try buf.appendSlice(gpa, t.enum_name);
                     try buf.append(gpa, '.');
                     try buf.appendSlice(gpa, t.name);
@@ -13244,7 +13493,9 @@ pub const Checker = struct {
             },
             .number_literal => {
                 // Enum member literals render as EnumName.MemberName (e.g. E.B).
-                if (t.enum_name.len > 0 and t.name.len > 0) {
+                if (t.enum_name.len > 0 and t.alias_name.len > 0) {
+                    try buf.appendSlice(gpa, t.alias_name);
+                } else if (t.enum_name.len > 0 and t.name.len > 0) {
                     try buf.appendSlice(gpa, t.enum_name);
                     try buf.append(gpa, '.');
                     try buf.appendSlice(gpa, t.name);
@@ -13661,11 +13912,21 @@ pub const Checker = struct {
                             n_enums += 1;
                         }
                     }
-                    for (enum_names[0..n_enums], 0..) |en, i| {
-                        if (i > 0) try buf.appendSlice(gpa, " | ");
-                        try buf.appendSlice(gpa, en);
+                    // A PARTIAL union of one enum's members stays expanded
+                    // (`E.A | E.B`, not `E`) — collapse only full coverage.
+                    const collapse = blk: {
+                        if (n_enums != 1) break :blk true; // multi-enum: keep legacy collapse
+                        const total = self.enumDeclMemberCount(enum_names[0]) orelse break :blk true;
+                        break :blk members_for_enum.len >= total;
+                    };
+                    if (collapse) {
+                        for (enum_names[0..n_enums], 0..) |en, i| {
+                            if (i > 0) try buf.appendSlice(gpa, " | ");
+                            try buf.appendSlice(gpa, en);
+                        }
+                        return;
                     }
-                    return;
+                    // fall through to normal member-by-member rendering
                 }
                 if (t.alias_name.len > 0) {
                     const members = self.store.idsOf(t.list_data);
