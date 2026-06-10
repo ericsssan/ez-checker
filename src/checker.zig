@@ -13143,7 +13143,32 @@ pub const Checker = struct {
         return std.mem.eql(u8, name, "void");
     }
 
+    /// True when `node` is the direct operand of an `as const` assertion
+    /// (`{…} as const`). tsc types the operand itself with the const form, so
+    /// the literal's OWN `.types` row shows `{ readonly k: "v"; }`, not the
+    /// widened `{ k: string; }`.
+    fn nodeIsAsConstOperand(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const ni = @intFromEnum(node);
+        if (ni >= parents.len) return false;
+        const pidx = parents[ni];
+        if (pidx == @intFromEnum(NodeIndex.none) or pidx >= self.ast_ref.nodes.len) return false;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .ts_as_expr) return false;
+        const as_data = self.ast_ref.nodeData(parent);
+        if (as_data.lhs != node) return false; // must be the operand, not the type
+        if (as_data.rhs == .none or self.ast_ref.nodeTag(as_data.rhs) != .ts_type_reference) return false;
+        const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(as_data.rhs));
+        return std.mem.eql(u8, cname, "const");
+    }
+
     fn inferObjectLiteral(self: *Checker, node: NodeIndex) TypeId {
+        // An object literal directly under `as const` is typed with the const
+        // (readonly, literal-preserving) form on its own row.
+        if (self.nodeIsAsConstOperand(node)) {
+            const cty = self.inferAsConst(node);
+            if (!cty.eq(tymod.ID_UNKNOWN)) return cty;
+        }
         // Walk the property list and build an object_t.  Spread/computed/
         // accessor properties bail out structurally — they widen the
         // type beyond what we can statically represent.
