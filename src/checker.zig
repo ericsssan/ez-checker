@@ -13078,7 +13078,11 @@ pub const Checker = struct {
                 const ids = self.store.idsOf(t.list_data);
                 if (ids.len > 0) {
                     const elem = self.store.get(ids[0]);
-                    const needs_parens = elem.kind == .union_t or elem.kind == .intersection_t or
+                    // A union/intersection that renders as its alias name is a
+                    // single identifier - no parens (`BigUnion[]`, not `(BigUnion)[]`).
+                    const multi_token_compound = (elem.kind == .union_t or elem.kind == .intersection_t) and
+                        elem.alias_name.len == 0;
+                    const needs_parens = multi_token_compound or
                         elem.kind == .function_t or
                         (elem.kind == .type_ref and std.mem.startsWith(u8, elem.name, "typeof "));
                     if (needs_parens) try buf.appendSlice(gpa, "(");
@@ -13094,7 +13098,11 @@ pub const Checker = struct {
                 const ids = self.store.idsOf(t.list_data);
                 if (ids.len > 0) {
                     const elem = self.store.get(ids[0]);
-                    const needs_parens = elem.kind == .union_t or elem.kind == .intersection_t or
+                    // A union/intersection that renders as its alias name is a
+                    // single identifier - no parens (`BigUnion[]`, not `(BigUnion)[]`).
+                    const multi_token_compound = (elem.kind == .union_t or elem.kind == .intersection_t) and
+                        elem.alias_name.len == 0;
+                    const needs_parens = multi_token_compound or
                         elem.kind == .function_t or
                         (elem.kind == .type_ref and std.mem.startsWith(u8, elem.name, "typeof "));
                     if (needs_parens) try buf.appendSlice(gpa, "(");
