@@ -1500,6 +1500,12 @@ pub const Checker = struct {
                 "ArrayConstructor"
             else if (std.mem.eql(u8, name, "Object"))
                 "ObjectConstructor"
+            else if (std.mem.eql(u8, name, "String"))
+                "StringConstructor"
+            else if (std.mem.eql(u8, name, "Number"))
+                "NumberConstructor"
+            else if (std.mem.eql(u8, name, "Boolean"))
+                "BooleanConstructor"
             else
                 null;
             if (named_form) |nf| return self.store.typeRef(nf, &.{}) catch t;
