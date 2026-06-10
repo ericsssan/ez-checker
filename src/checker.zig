@@ -12708,6 +12708,24 @@ pub const Checker = struct {
             // in the enum object or the imported module respectively.
             if (std.mem.startsWith(u8, ref_name, "typeof ")) {
                 const inner_name = ref_name["typeof ".len..];
+                // Expando function property: `function foo(){} foo.x = 1` —
+                // `foo.x` (and the property key `x`) has the widened assigned
+                // value type.  Handled here so both read accesses and write
+                // targets (via inferPropertyIdent) resolve.
+                if (self.expando_fns.get(inner_name)) |elist| {
+                    for (elist.items) |ep| {
+                        if (!std.mem.eql(u8, ep.name, prop_name)) continue;
+                        if (ep.value == .none) break;
+                        const raw = self.typeOf(ep.value);
+                        return switch (self.store.get(raw).kind) {
+                            .string_literal => tymod.ID_STRING,
+                            .number_literal => tymod.ID_NUMBER,
+                            .bigint_literal => tymod.ID_BIGINT,
+                            .boolean_literal => tymod.ID_BOOLEAN,
+                            else => raw,
+                        };
+                    }
+                }
                 if (self.enum_kinds.get(inner_name) != null) {
                     if (self.buildEnumObjectType(inner_name)) |obj_type| {
                         const ot2 = self.store.get(obj_type);
