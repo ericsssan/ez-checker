@@ -1340,6 +1340,16 @@ pub const Checker = struct {
         const tok = self.ast_ref.nodeMainToken(node);
         const name = self.ast_ref.tokenText(tok);
         if (name.len == 0) return tymod.ID_UNKNOWN;
+        // Annotated identifier with no symbol — e.g. a parameter of a bodyless
+        // overload / `declare function` signature.  Its annotation IS its type
+        // (declaredTypeAtBinding also applies the `?:` optional-undefined rule).
+        {
+            const bd = self.ast_ref.nodeData(node);
+            if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
+                const ty = self.declaredTypeAtBinding(node);
+                if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
+            }
+        }
         // If this identifier is the key of a ts_property_signature (e.g., `a`
         // in `interface Foo { a: number }`), return its declared type from the
         // annotation rather than falling through to AST search which may find
