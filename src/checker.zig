@@ -749,10 +749,22 @@ pub const Checker = struct {
                 break :blk tymod.ID_NUMBER;
             },
 
-            .bitwise_not,
-            .bitwise_and, .bitwise_or, .bitwise_xor,
-            .shift_left, .shift_right, .unsigned_shift_right,
-            .prefix_inc, .prefix_dec, .postfix_inc, .postfix_dec => tymod.ID_NUMBER,
+            // Unary bitwise/increment: `~x` / `x++` on a bigint operand → bigint.
+            .bitwise_not, .prefix_inc, .prefix_dec, .postfix_inc, .postfix_dec => blk: {
+                const operand = self.ast_ref.nodeData(node).lhs;
+                if (operand != .none and isBigintish(&self.store, self.typeOf(operand)))
+                    break :blk tymod.ID_BIGINT;
+                break :blk tymod.ID_NUMBER;
+            },
+            // Binary bitwise/shift: `1n & 2n`, `1n << 2n` → bigint when the
+            // operands are bigint. (tsc types even `bigInt >>> 1n` as bigint,
+            // reporting it as an error separately.)
+            .bitwise_and, .bitwise_or, .bitwise_xor, .shift_left, .shift_right, .unsigned_shift_right => blk: {
+                const d = self.ast_ref.nodeData(node);
+                if (d.lhs != .none and isBigintish(&self.store, self.typeOf(d.lhs)))
+                    break :blk tymod.ID_BIGINT;
+                break :blk tymod.ID_NUMBER;
+            },
 
             .array_literal => self.inferArrayLiteral(node),
             .object_literal => self.inferObjectLiteral(node),
