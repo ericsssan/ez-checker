@@ -1359,6 +1359,23 @@ pub const Checker = struct {
                 if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
             }
         }
+        // Rest / defaulted parameter declaration sites (`...args`, `a = 3`)
+        // also have no reference-table symbol — resolve via the binding
+        // dispatch (rest → any[] / annotation, default → widened literal).
+        {
+            const parents_arr = self.semantic.parent_indices;
+            const nidx2 = node.toInt();
+            if (nidx2 < parents_arr.len) {
+                const pi2 = parents_arr[nidx2];
+                if (pi2 != @intFromEnum(NodeIndex.none)) {
+                    const pt2 = self.ast_ref.nodeTag(@enumFromInt(pi2));
+                    if (pt2 == .rest_element or pt2 == .assignment_pattern) {
+                        const ty = self.declaredTypeAtBinding(node);
+                        if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
+                    }
+                }
+            }
+        }
         // If this identifier is the key of a ts_property_signature (e.g., `a`
         // in `interface Foo { a: number }`), return its declared type from the
         // annotation rather than falling through to AST search which may find
@@ -1376,8 +1393,9 @@ pub const Checker = struct {
             if (nidx >= parents_arr.len) break :accessor_blk;
             var pidx = parents_arr[nidx];
             if (pidx == @intFromEnum(NodeIndex.none)) break :accessor_blk;
-            // Peel a default-value wrapper: `set x(v = 0)`.
-            if (self.ast_ref.nodeTag(@enumFromInt(pidx)) == .assignment_pattern) {
+            // Peel a default-value / rest wrapper: `set x(v = 0)`, `set x(...v)`.
+            const wrap_tag = self.ast_ref.nodeTag(@enumFromInt(pidx));
+            if (wrap_tag == .assignment_pattern or wrap_tag == .rest_element) {
                 pidx = parents_arr[pidx];
                 if (pidx == @intFromEnum(NodeIndex.none)) break :accessor_blk;
             }
@@ -3651,7 +3669,14 @@ pub const Checker = struct {
                 }
                 // Unannotated rest *parameter* → any[].  Rest elements inside
                 // destructuring patterns keep their pattern-driven inference.
-                if (self.isFunctionParamNode(parent)) {
+                // Accessor params have no parent link (semantic doesn't wire
+                // them) — a parentless rest_element can only be a param.
+                const rest_orphan = blk: {
+                    const ridx = parent.toInt();
+                    if (ridx >= parents.len) break :blk false;
+                    break :blk parents[ridx] == @intFromEnum(NodeIndex.none);
+                };
+                if (rest_orphan or self.isFunctionParamNode(parent)) {
                     return self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_UNKNOWN;
                 }
                 return tymod.ID_UNKNOWN;
