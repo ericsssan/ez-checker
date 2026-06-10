@@ -3,13 +3,16 @@ const parser = @import("es_parser");
 const Checker = @import("ez_checker").Checker;
 const NodeIndex = parser.ast.NodeIndex;
 
-test "property signature key types" {
+test "class in namespace this members" {
     const gpa = std.testing.allocator;
     const src =
-        \\interface Iface {
-        \\    a: number;
-        \\    b: '9';
-        \\    c: Iface[];
+        \\module TypeScript {
+        \\    export class Stack {
+        \\        public top: number = 0;
+        \\        public count(): number {
+        \\            return this.top + 1;
+        \\        }
+        \\    }
         \\}
     ;
     var lex = try parser.Lexer.tokenizeWithLanguage(gpa, src, .ts);
@@ -28,10 +31,10 @@ test "property signature key types" {
     var n: u32 = 1;
     while (n < ast.nodes.len) : (n += 1) {
         const ni: NodeIndex = @enumFromInt(n);
+        if (ast.nodeTag(ni) != .member_expr and ast.nodeTag(ni) != .this_expr) continue;
         const span = ast.nodeSpan(ni);
-        if (span.end <= span.start or span.end > src.len) continue;
-        const text = src[span.start..span.end];
-        if (text.len != 1) continue;
+        if (span.end > src.len) continue;
+        const text = if (span.end > span.start) src[span.start..span.end] else "<>";
         const ty = checker.typeOf(ni);
         const tystr = try checker.typeToString(ty);
         defer gpa.free(tystr);

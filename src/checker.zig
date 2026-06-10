@@ -3649,6 +3649,11 @@ pub const Checker = struct {
                     const ty_node = self.ast_ref.nodeData(data.rhs).lhs;
                     return self.resolveTypeNode(ty_node);
                 }
+                // Unannotated rest *parameter* → any[].  Rest elements inside
+                // destructuring patterns keep their pattern-driven inference.
+                if (self.isFunctionParamNode(parent)) {
+                    return self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_UNKNOWN;
+                }
                 return tymod.ID_UNKNOWN;
             },
             // Function declarations: build a function_t from the
@@ -3990,6 +3995,25 @@ pub const Checker = struct {
             cur = if (p.toInt() < parents.len) parents[p.toInt()] else NONE;
         }
         return false;
+    }
+
+    /// True when `node` sits directly in a function-like declaration's
+    /// parameter list (its semantic parent is the function node itself).
+    fn isFunctionParamNode(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return false;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return false;
+        return switch (self.ast_ref.nodeTag(@enumFromInt(pidx))) {
+            .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+            .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+            .arrow_fn, .async_arrow_fn, .ts_declare_function,
+            .method_def, .computed_method_def, .constructor_def,
+            .getter_def, .setter_def, .computed_getter_def, .computed_setter_def,
+            => true,
+            else => false,
+        };
     }
 
     /// If `node` is (inside) the declaration binding of a `for...of` loop,
@@ -5530,11 +5554,9 @@ pub const Checker = struct {
                 const ty = self.ast_ref.nodeData(rdata.rhs).lhs;
                 return self.resolveTypeNode(ty);
             }
-            // Unannotated rest parameters default to `any` to match TypeScript's
-            // behavior when noImplicitAny is off (the default). The original design
-            // returned `unknown` to avoid spurious unsafe-* fires, but this causes
-            // mismatches with tsc's actual inferred type.
-            return tymod.ID_ANY;
+            // Unannotated rest parameters are `any[]` (an array of implicit
+            // any), matching tsc with noImplicitAny off.
+            return self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_ANY;
         }
         if (self.ast_ref.nodeTag(node) != .identifier) return tymod.ID_UNKNOWN;
         const bd = self.ast_ref.nodeData(node);
@@ -12514,6 +12536,21 @@ pub const Checker = struct {
         if (std.mem.eql(u8, t.name, "Promise")) {
             const inner = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
             return self.promisePrototypeProperty(name, inner);
+        }
+        // Well-known symbols: `Symbol.iterator` etc. are `unique symbol`.
+        if (std.mem.eql(u8, t.name, "SymbolConstructor")) {
+            const well_known = [_][]const u8{
+                "iterator",     "asyncIterator", "hasInstance",   "isConcatSpreadable",
+                "match",        "matchAll",      "replace",       "search",
+                "species",      "split",         "toPrimitive",   "toStringTag",
+                "unscopables",  "dispose",       "asyncDispose",  "metadata",
+            };
+            for (well_known) |wk| {
+                if (std.mem.eql(u8, name, wk)) {
+                    return self.store.typeRef("unique symbol", &.{}) catch null;
+                }
+            }
+            return null;
         }
         const struct_key: ?[]const u8 = if (std.mem.eql(u8, t.name, "Math"))
             "__Math_struct"
