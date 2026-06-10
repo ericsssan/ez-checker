@@ -1535,6 +1535,7 @@ pub const Checker = struct {
         // annotation rather than falling through to AST search which may find
         // an unrelated variable with the same name.
         if (self.identifierAsPropertySignatureKey(node)) |ty| return ty;
+        if (self.identifierAsMethodSignatureKey(node)) |ty| return ty;
         if (self.identifierAsClassPropertyKey(node)) |ty| return ty;
         if (self.identifierAsEnumMemberKey(node)) |ty| return ty;
         // Accessor name or setter parameter: `get x()` / `set x(v)` — these
@@ -1712,6 +1713,51 @@ pub const Checker = struct {
             return self.store.add(copy) catch id;
         }
         return id;
+    }
+
+    /// Merged overload type for `node` when it is the key identifier of a
+    /// `ts_method_signature` inside an interface — tsc shows the FULL overload
+    /// set at every declaration (`then : { <U>(…): …; <U_1>(…): …; }`).
+    fn identifierAsMethodSignatureKey(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .ts_method_signature) return null;
+        const pdata = self.ast_ref.nodeData(parent);
+        if (pdata.lhs == .none) return null;
+        const sig_data = self.ast_ref.extraData(ast.InterfaceSigData, @intFromEnum(pdata.lhs));
+        if (sig_data.key != node) return null;
+        const method_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+        if (method_name.len == 0) return null;
+        // Walk up to the interface declaration.
+        var q = parents[pidx];
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var depth: u8 = 0;
+        while (q != NONE and depth < 4) : (depth += 1) {
+            const qn: NodeIndex = @enumFromInt(q);
+            if (self.ast_ref.nodeTag(qn) == .ts_interface_decl) {
+                const qdata = self.ast_ref.nodeData(qn);
+                if (qdata.lhs == .none) return null;
+                const iface = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(qdata.lhs));
+                const iface_name = self.ast_ref.tokenText(iface.name);
+                const resolved = self.resolveDeclaredType(iface_name) orelse return null;
+                const rt = self.store.get(resolved);
+                if (rt.kind != .object_t) return null;
+                for (self.store.propsOf(rt.object_props)) |p| {
+                    if (std.mem.eql(u8, p.name, method_name)) {
+                        const pt = self.store.get(p.type_id);
+                        if (pt.kind == .function_t) return p.type_id;
+                        return null;
+                    }
+                }
+                return null;
+            }
+            q = parents[q];
+        }
+        return null;
     }
 
     /// Return the enum-member type `E.MemberName` when `node` is the key
@@ -10710,8 +10756,18 @@ pub const Checker = struct {
                     false,
                     false,
                 );
-                if (sig_data.type_params < sig_data.type_params_end)
+                if (sig_data.type_params < sig_data.type_params_end) {
                     self.registerFnTypeParams(fn_ty, sig_data.type_params, sig_data.type_params_end);
+                    // Also register per-signature (pool-indexed) so overload
+                    // merging keeps the `<U>` prefix per slot.
+                    const ft = self.store.get(fn_ty);
+                    if (ft.kind == .function_t) {
+                        const sl = ft.signatures;
+                        if (self.store.signaturesOf(sl).len == 1) {
+                            self.registerSigTypeParams(sl.start, sig_data.type_params, sig_data.type_params_end);
+                        }
+                    }
+                }
                 return .{ .name = name, .type_id = fn_ty, .is_method = true };
             },
             .ts_index_signature => {
@@ -10735,23 +10791,42 @@ pub const Checker = struct {
         const et = self.store.get(existing_ty);
         const nt = self.store.get(new_ty);
         if (et.kind != .function_t or nt.kind != .function_t) return new_ty;
-        const existing_sigs = self.store.signaturesOf(et.signatures);
-        const new_sigs = self.store.signaturesOf(nt.signatures);
+        // Snapshot the SignatureList headers before any store mutation — the
+        // `et`/`nt` pointers can be invalidated by appendSignatures.
+        const e_list = et.signatures;
+        const n_list = nt.signatures;
+        const existing_sigs = self.store.signaturesOf(e_list);
+        const new_sigs = self.store.signaturesOf(n_list);
         var sig_buf: [8]tymod.Signature = undefined;
+        // Original pool index of each copied signature, for carrying the
+        // per-signature type-param prefix (`<U>`) registry entries — keyed by
+        // pool index, they would otherwise be lost in the copy.
+        var src_idx: [8]u32 = undefined;
         var n: usize = 0;
-        for (existing_sigs) |s| {
+        for (existing_sigs, 0..) |s, i| {
             if (n >= sig_buf.len) break;
             sig_buf[n] = s;
+            src_idx[n] = e_list.start + @as(u32, @intCast(i));
             n += 1;
         }
-        for (new_sigs) |s| {
+        for (new_sigs, 0..) |s, j| {
             if (n >= sig_buf.len) break;
             sig_buf[n] = s;
+            src_idx[n] = n_list.start + @as(u32, @intCast(j));
             n += 1;
         }
         if (n == 0) return new_ty;
         const merged_sigs = self.store.appendSignatures(sig_buf[0..n]) catch return new_ty;
-        return self.store.add(.{ .kind = .function_t, .signatures = merged_sigs }) catch new_ty;
+        for (0..n) |k| {
+            if (self.sig_type_params.get(src_idx[k])) |prefix| {
+                const dst = merged_sigs.start + @as(u32, @intCast(k));
+                if (!self.sig_type_params.contains(dst)) {
+                    const dup = self.gpa.dupe(u8, prefix) catch break;
+                    self.sig_type_params.put(self.gpa, dst, dup) catch self.gpa.free(dup);
+                }
+            }
+        }
+        return self.store.add(.{ .kind = .function_t, .signatures = merged_sigs, .is_overload_set = true }) catch new_ty;
     }
 
     /// Build the INSTANCE type of a class — a record of fields and methods.
@@ -13717,6 +13792,10 @@ pub const Checker = struct {
                 if (sigs_slice.len == 0) return id;
                 var new_sigs_buf: [4]tymod.Signature = undefined;
                 if (sigs_slice.len > new_sigs_buf.len) return id;
+                // Snapshot list header + flags BEFORE any store mutation can
+                // invalidate `t`.
+                const old_list = t.signatures;
+                const was_overload_set = t.is_overload_set;
                 // Snapshot the signatures BEFORE recursing: substituteTypeId below
                 // can appendSignatureParams/appendSignatures, reallocating the
                 // pools and invalidating any slice still borrowed from them.
@@ -13739,14 +13818,21 @@ pub const Checker = struct {
                     }
                     const new_ret = self.substituteTypeId(sig.return_type, keys, vals);
                     if (!new_ret.eq(sig.return_type)) changed = true;
-                    // Snapshot names before appendSignatureParams — that call may grow
-                    // signature_param_name_pool, invalidating the slice we borrow from it.
+                    // Snapshot names + optional flags before appendSignatureParamsFull —
+                    // that call may grow the pools, invalidating borrowed slices.
                     const old_names_slice = self.store.signatureParamNamesOf(sig);
                     var old_names_buf: [8][]const u8 = undefined;
                     if (old_names_slice.len > old_names_buf.len) return id;
                     @memcpy(old_names_buf[0..old_names_slice.len], old_names_slice);
                     const old_names = old_names_buf[0..old_names_slice.len];
-                    const pr = self.store.appendSignatureParams(new_params_buf[0..old_params.len], old_names) catch return id;
+                    const old_opts_slice = self.store.signatureParamOptionalsOf(sig);
+                    var old_opts_buf: [8]bool = undefined;
+                    var old_opts: []const bool = &.{};
+                    if (old_opts_slice.len <= old_opts_buf.len) {
+                        @memcpy(old_opts_buf[0..old_opts_slice.len], old_opts_slice);
+                        old_opts = old_opts_buf[0..old_opts_slice.len];
+                    }
+                    const pr = self.store.appendSignatureParamsFull(new_params_buf[0..old_params.len], old_names, old_opts) catch return id;
                     // Preserve all other signature fields (is_construct, predicate,
                     // assertion) — only the param range and return type change.
                     var ns = sig;
@@ -13757,7 +13843,18 @@ pub const Checker = struct {
                 }
                 if (!changed) return id;
                 const sl = self.store.appendSignatures(new_sigs_buf[0..sigs.len]) catch return id;
-                return self.store.add(.{ .kind = .function_t, .signatures = sl }) catch id;
+                // Carry per-signature type-param prefixes (`<U>`) to the new
+                // pool slots — the registry is keyed by pool index.
+                for (0..sigs.len) |k| {
+                    if (self.sig_type_params.get(old_list.start + @as(u32, @intCast(k)))) |prefix| {
+                        const dst = sl.start + @as(u32, @intCast(k));
+                        if (!self.sig_type_params.contains(dst)) {
+                            const dup = self.gpa.dupe(u8, prefix) catch break;
+                            self.sig_type_params.put(self.gpa, dst, dup) catch self.gpa.free(dup);
+                        }
+                    }
+                }
+                return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = was_overload_set }) catch id;
             },
             else => return id,
         }
