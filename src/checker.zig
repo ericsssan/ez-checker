@@ -47,6 +47,11 @@ pub const CheckerOpts = struct {
     /// In that legacy mode TypeScript types empty arrays as `undefined[]`
     /// rather than `never[]`.
     strict_explicitly_false: bool = false,
+    /// True when JSX is checked in a React-style mode (`jsx: react` /
+    /// `react-jsx` / `react-jsxdev` / `react-native`).  Under these modes a
+    /// JSX element expression has type `JSX.Element`; under `preserve` / unset
+    /// it stays `any`.
+    jsx_react_mode: bool = false,
     target: Target = .es5,
     /// Module resolution strategy.  Affects import resolution rules —
     /// notably, node16/nodenext require explicit .js/.mjs/.cjs extensions
@@ -517,6 +522,12 @@ pub const Checker = struct {
             .super_expr => self.inferSuper(node),
 
             .identifier => self.inferIdentifier(node),
+            // A JSX element / fragment expression evaluates to `JSX.Element`
+            // (the configured JSX factory's element type — `JSX.Element` for
+            // the default React-style factory, which is what tsc's baselines
+            // record).  This makes JSX-returning functions type as
+            // `() => JSX.Element` rather than `() => any`.
+            .jsx_element, .jsx_self_closing, .jsx_fragment => self.jsxElementType(),
             // A JSX element name (`<Foo .../>`) references a value — resolve it
             // like an identifier so the facade can read the component's props.
             .jsx_identifier => self.inferIdentifier(node),
@@ -1062,6 +1073,14 @@ pub const Checker = struct {
 
     fn regexpRefType(self: *Checker) TypeId {
         return self.store.typeRef("RegExp", &.{}) catch tymod.ID_ANY;
+    }
+
+    /// Type of a JSX element/fragment expression — `JSX.Element` under a
+    /// React-style jsx mode, otherwise `any` (preserve mode / no JSX namespace,
+    /// where tsc leaves the element untyped).
+    fn jsxElementType(self: *Checker) TypeId {
+        if (!self.checker_opts.jsx_react_mode) return tymod.ID_ANY;
+        return self.store.typeRef("JSX.Element", &.{}) catch tymod.ID_ANY;
     }
 
     /// Map a value-side TypeId to the string-literal type(s) that `typeof`

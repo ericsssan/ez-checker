@@ -105,6 +105,10 @@ const CompilerOpts = struct {
             .strict_null_checks = self.strict or self.strict_null_checks,
             .no_implicit_any = self.strict or self.no_implicit_any,
             .strict_explicitly_false = self.strict_explicitly_false,
+            // JSX elements type as `JSX.Element` under React-style modes; under
+            // explicit `preserve` they stay `any`.  Default (unset) behaves
+            // React-style, matching how tsc's baselines record .tsx files.
+            .jsx_react_mode = self.jsx != .preserve,
             .use_define_for_class_fields = self.use_define_for_class_fields,
             .target = switch (self.target) {
                 .es5    => .es5,
