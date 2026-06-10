@@ -8320,6 +8320,26 @@ pub const Checker = struct {
             }) |g| {
                 if (std.mem.eql(u8, name, g)) break true;
             } else false;
+            // Qualified unresolvable name (`JSX.Element`, `dom.JSX.Element`) —
+            // preserve the FULL verbatim qualified name, judged by the last
+            // component being capitalized (the type name).
+            {
+                const qd = self.ast_ref.nodeData(ty_node);
+                if (qd.lhs != .none and self.ast_ref.nodeTag(qd.lhs) == .member_expr) {
+                    const md = self.ast_ref.nodeData(qd.lhs);
+                    if (md.rhs != .none) {
+                        const last = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
+                        if (last.len > 0 and last[0] >= 'A' and last[0] <= 'Z') {
+                            const qual = self.qualifiedTypeName(ty_node, md.rhs);
+                            if (qual.len > 0) {
+                                var qa_buf: [8]TypeId = undefined;
+                                const qargs = self.collectTypeArgs(ty_node, &qa_buf);
+                                return self.store.typeRef(qual, qargs) catch tymod.ID_ANY;
+                            }
+                        }
+                    }
+                }
+            }
             if (name.len > 0 and name[0] >= 'A' and name[0] <= 'Z' and
                 !unmodeled_lib_generic and
                 // Exclude in-scope type parameters (`T`, `U`) — they resolve via
