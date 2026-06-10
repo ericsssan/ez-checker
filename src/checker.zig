@@ -8175,26 +8175,45 @@ pub const Checker = struct {
                         const member_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(member_data.rhs));
                         for (self.store.propsOf(rt.object_props)) |p| {
                             if (!std.mem.eql(u8, p.name, member_name)) continue;
+                            const prop_t = self.store.get(p.type_id);
+                            const prop_kind = prop_t.kind;
                             // For class members (object_t stored in namespace) preserve the
                             // qualified name — e.g. render as "lavali.xanthognathus" not structural.
-                            const prop_kind = self.store.get(p.type_id).kind;
                             if (prop_kind == .object_t) {
                                 const qual_name = self.qualifiedTypeName(ty_node, member_data.rhs);
                                 if (qual_name.len > 0) {
+                                    const display = self.displayQualifiedName(ty_node, qual_name);
                                     var args_buf2: [8]TypeId = undefined;
                                     const args2 = self.collectTypeArgs(ty_node, &args_buf2);
-                                    return self.store.typeRef(qual_name, args2) catch p.type_id;
+                                    return self.store.typeRef(display, args2) catch p.type_id;
+                                }
+                            }
+                            // Enum (member union) inside a namespace: keep tsc's
+                            // scope-relative qualified display (`First.E`).
+                            if (prop_kind == .union_t or prop_t.enum_name.len > 0) {
+                                const qual_name = self.qualifiedTypeName(ty_node, member_data.rhs);
+                                if (qual_name.len > 0) {
+                                    const display = self.displayQualifiedName(ty_node, qual_name);
+                                    if (!std.mem.eql(u8, display, member_name) or prop_kind == .union_t) {
+                                        return self.tagAliasName(p.type_id, display);
+                                    }
                                 }
                             }
                             return p.type_id;
                         }
-                        // Member not found in namespace type — return the bare last
-                        // component so `Harness.Compiler.WriterAggregator` resolves
-                        // to `WriterAggregator`, matching tsc's unqualified display.
+                        // Member not found in namespace type — resolve to the
+                        // scope-relative qualified display: bare inside the
+                        // namespace (`WriterAggregator`), qualified outside
+                        // (`N.T7`).
                         if (self.known_type_names.contains(member_name)) {
+                            const qual_name = self.qualifiedTypeName(ty_node, member_data.rhs);
+                            const display = if (qual_name.len > 0)
+                                self.displayQualifiedName(ty_node, qual_name)
+                            else
+                                member_name;
                             var args_buf: [8]TypeId = undefined;
                             const args = self.collectTypeArgs(ty_node, &args_buf);
-                            return self.store.typeRef(member_name, args) catch tymod.ID_ANY;
+                            return self.store.typeRef(display, args) catch tymod.ID_ANY;
                         }
                     }
                 }
@@ -9601,6 +9620,35 @@ pub const Checker = struct {
     /// ts_type_reference like `lavali.xanthognathus` or `Harness.Compiler.C`.
     /// Returns a slice into the source (zero-allocation, valid for checker lifetime).
     /// Returns "" if the span cannot be computed.
+    /// Strip enclosing-namespace prefixes from a qualified type name for
+    /// display: tsc shows the minimal qualification relative to the use site.
+    /// `First.E` referenced at top level stays "First.E"; inside
+    /// `namespace First` it becomes "E".
+    fn displayQualifiedName(self: *Checker, use_site: NodeIndex, qual: []const u8) []const u8 {
+        var result = qual;
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (use_site.toInt() < parents.len) parents[use_site.toInt()] else NONE;
+        var depth: u16 = 0;
+        while (p != NONE and depth < 64) : (depth += 1) {
+            const pn: NodeIndex = @enumFromInt(p);
+            const tag = self.ast_ref.nodeTag(pn);
+            if (tag == .ts_namespace_decl or tag == .ts_module_decl) {
+                const nd = self.ast_ref.nodeData(pn);
+                if (nd.lhs != .none) {
+                    const ns_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(nd.lhs));
+                    if (ns_name.len > 0 and result.len > ns_name.len and
+                        std.mem.startsWith(u8, result, ns_name) and result[ns_name.len] == '.')
+                    {
+                        result = result[ns_name.len + 1 ..];
+                    }
+                }
+            }
+            p = parents[p];
+        }
+        return result;
+    }
+
     fn qualifiedTypeName(self: *Checker, ty_node: NodeIndex, member_rhs: NodeIndex) []const u8 {
         const name_tok = self.ast_ref.nodeMainToken(ty_node);
         const rhs_tok = self.ast_ref.nodeMainToken(member_rhs);
