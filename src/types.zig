@@ -331,6 +331,7 @@ pub const InternContext = struct {
             h.update(std.mem.asBytes(&rv));
             const flags = [_]u8{
                 @intFromBool(s.is_async), @intFromBool(s.is_generator), @intFromBool(s.is_assertion),
+                @intFromBool(s.is_construct),
             };
             h.update(&flags);
             h.update(std.mem.asBytes(&s.predicate_param_index));
@@ -372,7 +373,7 @@ pub const InternContext = struct {
         for (sa, sb) |x, y| {
             if (!x.return_type.eq(y.return_type)) return false;
             if (x.is_async != y.is_async or x.is_generator != y.is_generator or
-                x.is_assertion != y.is_assertion) return false;
+                x.is_assertion != y.is_assertion or x.is_construct != y.is_construct) return false;
             if (x.rest_param_index != y.rest_param_index) return false;
             if (x.predicate_param_index != y.predicate_param_index) return false;
             if (!x.predicate_target.eq(y.predicate_target)) return false;

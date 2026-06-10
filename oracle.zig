@@ -75,6 +75,7 @@ fn langIdx(l: Language) usize {
 const CompilerOpts = struct {
     strict: bool = false,
     strict_null_checks: bool = false,
+    strict_explicitly_false: bool = false, // @strict: false was written explicitly
     no_implicit_any: bool = false,
     target: Target = .es5,
     module: Module = .none,
@@ -103,6 +104,7 @@ const CompilerOpts = struct {
         return .{
             .strict_null_checks = self.strict or self.strict_null_checks,
             .no_implicit_any = self.strict or self.no_implicit_any,
+            .strict_explicitly_false = self.strict_explicitly_false,
             .use_define_for_class_fields = self.use_define_for_class_fields,
             .target = switch (self.target) {
                 .es5    => .es5,
@@ -175,7 +177,10 @@ fn applyVariantOverrides(opts: *CompilerOpts, filename: []const u8) void {
         const val = std.mem.trim(u8, pair[eq + 1 ..], " ");
         if (std.mem.eql(u8, key, "module")) opts.module = parseModule(val)
         else if (std.mem.eql(u8, key, "target")) opts.target = parseTarget(val)
-        else if (std.mem.eql(u8, key, "strict")) opts.strict = isTrue(val)
+        else if (std.mem.eql(u8, key, "strict")) {
+            opts.strict = isTrue(val);
+            if (!opts.strict) opts.strict_explicitly_false = true;
+        }
         else if (std.mem.eql(u8, key, "strictNullChecks")) opts.strict_null_checks = isTrue(val)
         else if (std.mem.eql(u8, key, "noImplicitAny")) opts.no_implicit_any = isTrue(val)
         else if (std.mem.eql(u8, key, "jsx")) opts.jsx = parseJsx(val)
@@ -246,6 +251,7 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
         if (ci(key, "filename")) break;
         if (ci(key, "strict")) {
             opts.strict = isTrue(val);
+            if (!opts.strict) opts.strict_explicitly_false = true;
         } else if (ci(key, "strictNullChecks")) {
             opts.strict_null_checks = isTrue(val);
         } else if (ci(key, "noImplicitAny")) {

@@ -43,6 +43,10 @@ pub const CheckerOpts = struct {
     strict_null_checks: bool = false,
     no_implicit_any: bool = false,
     use_define_for_class_fields: bool = false,
+    /// True when the source file explicitly declares `// @strict: false`.
+    /// In that legacy mode TypeScript types empty arrays as `undefined[]`
+    /// rather than `never[]`.
+    strict_explicitly_false: bool = false,
     target: Target = .es5,
     /// Module resolution strategy.  Affects import resolution rules —
     /// notably, node16/nodenext require explicit .js/.mjs/.cjs extensions
@@ -175,6 +179,11 @@ pub const Checker = struct {
     /// re-scanning all N nodes per call — was O(calls × nodes) on
     /// declaration-dense code.
     value_decl_by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
+
+    /// Function names that have property assignments on them (`foo.x = 1`)
+    /// outside the function body — expando functions.  tsc types these as
+    /// `typeof foo` in value position, not the raw function type.
+    expando_fns: std.StringHashMapUnmanaged(void) = .empty,
 
     /// Cache: type name → resolved TypeId for declared structural types.
     /// Populated lazily by `resolveDeclaredType`.  Recursion-safe via a
@@ -380,6 +389,7 @@ pub const Checker = struct {
         }
         self.known_type_names.deinit(self.gpa);
         self.enum_kinds.deinit(self.gpa);
+        self.expando_fns.deinit(self.gpa);
         self.type_decl_nodes.deinit(self.gpa);
         self.declared_type_cache.deinit(self.gpa);
         self.global_value_types.deinit(self.gpa);
@@ -564,40 +574,43 @@ pub const Checker = struct {
                 break :blk tymod.ID_BOOLEAN;
             },
 
-            // Fold `!<boolean literal>` to the opposite literal so that
-            // `!true` → `false` and `!!true` → `true`.
             .logical_not => blk: {
                 const operand = self.ast_ref.nodeData(node).lhs;
                 if (operand == .none) break :blk tymod.ID_BOOLEAN;
                 const ot = self.typeOf(operand);
-                const lit = self.store.get(ot);
-                if (lit.kind != .boolean_literal) break :blk tymod.ID_BOOLEAN;
-                break :blk self.store.booleanLiteral(!lit.literal_value.boolean) catch tymod.ID_BOOLEAN;
+                const nt = self.store.get(ot);
+                // Fold !<boolean_literal> to the opposite literal.  This keeps
+                // chains like `!!promise` working: !promise → false → !false → true.
+                if (nt.kind == .boolean_literal) {
+                    break :blk self.store.booleanLiteral(!nt.literal_value.boolean) catch tymod.ID_BOOLEAN;
+                }
+                // type_ref (class/interface/namespace), arrays, objects, functions,
+                // non-zero/non-empty literals, and unions of all-truthy members.
+                if (self.alwaysTruthyForNot(ot)) {
+                    break :blk self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN;
+                }
+                // null, undefined, void, 0, "" etc., and unions of all-falsy members.
+                if (self.alwaysFalsyForNot(ot)) {
+                    break :blk self.store.booleanLiteral(true) catch tymod.ID_BOOLEAN;
+                }
+                break :blk tymod.ID_BOOLEAN;
             },
 
             .typeof_expr => blk: {
-                const operand = self.ast_ref.nodeData(node).lhs;
-                if (operand == .none) break :blk tymod.ID_STRING;
-                // typeof on property access returns the full typeof union
-                // (TypeScript treats member access conservatively since
-                // properties can be reassigned and their runtime type may
-                // not match their declared type).
-                const op_tag = self.ast_ref.nodeTag(operand);
-                if (op_tag == .member_expr or op_tag == .optional_member_expr or
-                    op_tag == .computed_member_expr or op_tag == .optional_computed_member_expr)
-                {
-                    var buf: [8]TypeId = undefined;
-                    buf[0] = self.store.stringLiteral("bigint") catch tymod.ID_STRING;
-                    buf[1] = self.store.stringLiteral("boolean") catch tymod.ID_STRING;
-                    buf[2] = self.store.stringLiteral("function") catch tymod.ID_STRING;
-                    buf[3] = self.store.stringLiteral("number") catch tymod.ID_STRING;
-                    buf[4] = self.store.stringLiteral("object") catch tymod.ID_STRING;
-                    buf[5] = self.store.stringLiteral("string") catch tymod.ID_STRING;
-                    buf[6] = self.store.stringLiteral("symbol") catch tymod.ID_STRING;
-                    buf[7] = self.store.stringLiteral("undefined") catch tymod.ID_STRING;
-                    break :blk self.store.unionOf(&buf) catch tymod.ID_STRING;
-                }
-                break :blk self.typeofStringIdOf(self.typeOf(operand));
+                if (self.ast_ref.nodeData(node).lhs == .none) break :blk tymod.ID_STRING;
+                // TypeScript always returns the full typeof-string union for any `typeof expr`,
+                // regardless of the operand's static type. Narrowing happens via type guards,
+                // not by restricting the type of the typeof expression itself.
+                var buf: [8]TypeId = undefined;
+                buf[0] = self.store.stringLiteral("bigint") catch tymod.ID_STRING;
+                buf[1] = self.store.stringLiteral("boolean") catch tymod.ID_STRING;
+                buf[2] = self.store.stringLiteral("function") catch tymod.ID_STRING;
+                buf[3] = self.store.stringLiteral("number") catch tymod.ID_STRING;
+                buf[4] = self.store.stringLiteral("object") catch tymod.ID_STRING;
+                buf[5] = self.store.stringLiteral("string") catch tymod.ID_STRING;
+                buf[6] = self.store.stringLiteral("symbol") catch tymod.ID_STRING;
+                buf[7] = self.store.stringLiteral("undefined") catch tymod.ID_STRING;
+                break :blk self.store.unionOf(&buf) catch tymod.ID_STRING;
             },
             .void_expr => tymod.ID_UNDEFINED,
             .delete_expr => tymod.ID_BOOLEAN,
@@ -610,9 +623,18 @@ pub const Checker = struct {
                 if (operand == .none) break :blk tymod.ID_NUMBER;
                 const ot = self.typeOf(operand);
                 const lit = self.store.get(ot);
-                if (lit.kind != .number_literal) break :blk tymod.ID_NUMBER;
-                if (self.ast_ref.nodeTag(node) == .unary_plus) break :blk ot;
-                break :blk self.store.numberLiteral(-lit.literal_value.number) catch tymod.ID_NUMBER;
+                if (lit.kind == .number_literal) {
+                    if (self.ast_ref.nodeTag(node) == .unary_plus) break :blk ot;
+                    break :blk self.store.numberLiteral(-lit.literal_value.number) catch tymod.ID_NUMBER;
+                }
+                if (lit.kind == .bigint_literal) {
+                    if (self.ast_ref.nodeTag(node) == .unary_plus) break :blk ot;
+                    const pos = lit.literal_value.bigint;
+                    const neg = std.fmt.allocPrint(self.gpa, "-{s}", .{pos}) catch break :blk tymod.ID_BIGINT;
+                    break :blk self.store.bigintLiteral(neg) catch tymod.ID_BIGINT;
+                }
+                if (lit.kind == .bigint) break :blk tymod.ID_BIGINT;
+                break :blk tymod.ID_NUMBER;
             },
 
             .bitwise_not,
@@ -881,6 +903,81 @@ pub const Checker = struct {
 
     /// Evaluate a template literal to a string literal when all
     /// substitutions are string/number/boolean literals.
+    /// Recursively evaluate a numeric literal expression to an f64 value.
+    /// Handles number literals, unary +/-, and binary arithmetic on literal operands.
+    /// Returns null when the expression is not a numeric constant.
+    fn evalLiteralNumericExpr(self: *Checker, node: NodeIndex) ?f64 {
+        const tag = self.ast_ref.nodeTag(node);
+        const data = self.ast_ref.nodeData(node);
+        switch (tag) {
+            .number_literal => {
+                const tok = self.ast_ref.nodeMainToken(node);
+                const text = self.ast_ref.tokenText(tok);
+                // Legacy octal literals (0-prefixed, no 'x'/'o'/'b') are only
+                // valid in non-strict mode; parse them specially.
+                if (text.len >= 2 and text[0] == '0' and
+                    text[1] >= '0' and text[1] <= '7')
+                {
+                    return @floatFromInt(std.fmt.parseInt(u64, text[1..], 8) catch return null);
+                }
+                return std.fmt.parseFloat(f64, text) catch null;
+            },
+            .unary_minus => {
+                const operand = data.lhs;
+                if (operand == .none) return null;
+                return if (self.evalLiteralNumericExpr(operand)) |v| -v else null;
+            },
+            .unary_plus => {
+                const operand = data.lhs;
+                if (operand == .none) return null;
+                return self.evalLiteralNumericExpr(operand);
+            },
+            .grouping_expr => {
+                if (data.lhs == .none) return null;
+                return self.evalLiteralNumericExpr(data.lhs);
+            },
+            .add, .subtract, .multiply, .divide, .modulo, .exponentiate => {
+                if (data.lhs == .none or data.rhs == .none) return null;
+                const av = self.evalLiteralNumericExpr(data.lhs) orelse return null;
+                const bv = self.evalLiteralNumericExpr(data.rhs) orelse return null;
+                return switch (tag) {
+                    .add => av + bv,
+                    .subtract => av - bv,
+                    .multiply => av * bv,
+                    .divide => if (bv != 0) av / bv else null,
+                    .modulo => @rem(av, bv),
+                    .exponentiate => std.math.pow(f64, av, bv),
+                    else => unreachable,
+                };
+            },
+            .bitwise_and, .bitwise_or, .bitwise_xor,
+            .shift_left, .shift_right, .unsigned_shift_right => {
+                if (data.lhs == .none or data.rhs == .none) return null;
+                const av = self.evalLiteralNumericExpr(data.lhs) orelse return null;
+                const bv = self.evalLiteralNumericExpr(data.rhs) orelse return null;
+                const ai: i32 = @intFromFloat(av);
+                const bi: i32 = @intFromFloat(bv);
+                const ri: i32 = switch (tag) {
+                    .bitwise_and => ai & bi,
+                    .bitwise_or => ai | bi,
+                    .bitwise_xor => ai ^ bi,
+                    .shift_left => ai << @intCast(@mod(bi, 32)),
+                    .shift_right => ai >> @intCast(@mod(bi, 32)),
+                    .unsigned_shift_right => @bitCast(@as(u32, @bitCast(ai)) >> @intCast(@mod(bi, 32))),
+                    else => unreachable,
+                };
+                return @floatFromInt(ri);
+            },
+            .bitwise_not => {
+                if (data.lhs == .none) return null;
+                const v = self.evalLiteralNumericExpr(data.lhs) orelse return null;
+                const i: i32 = @intFromFloat(v);
+                return @floatFromInt(~i);
+            },
+            else => return null,
+        }
+    }
+
     /// Otherwise returns ID_STRING (plain string type).
     fn inferTemplateLiteral(self: *Checker, node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(node);
@@ -918,21 +1015,24 @@ pub const Checker = struct {
                 continue;
             }
 
-            // Interpolation expression — try to evaluate as a literal
-            const expr_ty = self.typeOf(part);
-            const t = self.store.get(expr_ty);
-
-            const expr_str = switch (t.kind) {
-                .string_literal => switch (t.literal_value) { .string => |s| s, else => return tymod.ID_STRING },
-                .number_literal => blk: {
-                    const num = switch (t.literal_value) { .number => |n| n, else => return tymod.ID_STRING };
-                    // Format number as it would appear in template literal
-                    // Use allocPrint to format the number
-                    const formatted = std.fmt.allocPrint(self.gpa, "{}", .{num}) catch return tymod.ID_STRING;
-                    break :blk formatted;
-                },
-                .boolean_literal => switch (t.literal_value) { .boolean => |b| if (b) "true" else "false", else => return tymod.ID_STRING },
-                else => return tymod.ID_STRING,
+            // Interpolation expression — try to evaluate as a literal.
+            // First try direct literal evaluation (handles arithmetic on literals).
+            const maybe_num = self.evalLiteralNumericExpr(part);
+            const expr_str: []const u8 = if (maybe_num) |num| blk: {
+                const formatted = std.fmt.allocPrint(self.gpa, "{}", .{num}) catch return tymod.ID_STRING;
+                break :blk formatted;
+            } else blk: {
+                const expr_ty = self.typeOf(part);
+                const t = self.store.get(expr_ty);
+                break :blk switch (t.kind) {
+                    .string_literal => switch (t.literal_value) { .string => |s| s, else => return tymod.ID_STRING },
+                    .number_literal => inner: {
+                        const num = switch (t.literal_value) { .number => |n| n, else => return tymod.ID_STRING };
+                        break :inner std.fmt.allocPrint(self.gpa, "{}", .{num}) catch return tymod.ID_STRING;
+                    },
+                    .boolean_literal => switch (t.literal_value) { .boolean => |b| if (b) "true" else "false", else => return tymod.ID_STRING },
+                    else => return tymod.ID_STRING,
+                };
             };
 
             result.appendSlice(self.gpa, expr_str) catch return tymod.ID_STRING;
@@ -1094,6 +1194,48 @@ pub const Checker = struct {
                             const base_c2 = self.declaredTypeForSymbol(sym);
                             return self.narrowAtUse(node, sym, base_c2);
                         }
+                        // Heritage clause: `extends C<T>` — C is wrapped in ts_instantiation_expr
+                        // whose grandparent is the OUTER class_decl.  tsc annotates this as `C<T>`
+                        // (the instantiated supertype), not `typeof C`.
+                        if (par_tag == .ts_instantiation_expr) {
+                            const NONE2: u32 = @intFromEnum(NodeIndex.none);
+                            const gp = if (pidx < parents.len) parents[pidx] else NONE2;
+                            if (gp != NONE2 and gp < self.ast_ref.nodes.len) {
+                                switch (self.ast_ref.nodeTag(@enumFromInt(gp))) {
+                                    .class_decl, .class_expr => {
+                                        const tok_c = self.ast_ref.nodeMainToken(node);
+                                        const cls_name = self.ast_ref.tokenText(tok_c);
+                                        if (cls_name.len > 0) {
+                                            const inst_d = self.ast_ref.nodeData(@enumFromInt(pidx));
+                                            if (inst_d.rhs != .none) {
+                                                const ta_sr = self.ast_ref.extraData(ast.SubRange, @intFromEnum(inst_d.rhs));
+                                                if (ta_sr.start < ta_sr.end and ta_sr.end <= self.ast_ref.extra_data.len) {
+                                                    const raw_args = self.ast_ref.extra_data[ta_sr.start..ta_sr.end];
+                                                    var arg_buf: [8]TypeId = undefined;
+                                                    const argc = @min(raw_args.len, arg_buf.len);
+                                                    for (0..argc) |ai| {
+                                                        const arg_node: NodeIndex = @enumFromInt(raw_args[ai]);
+                                                        // Preserve bare type-parameter names (e.g. `T` in `extends C<T>`):
+                                                        // resolveTypeNode would collapse T → its constraint, losing the name.
+                                                        const arg_tag = self.ast_ref.nodeTag(arg_node);
+                                                        if (arg_tag == .ts_type_reference) {
+                                                            const arg_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(arg_node));
+                                                            arg_buf[ai] = self.store.typeRef(arg_name, &.{}) catch tymod.ID_ANY;
+                                                        } else {
+                                                            arg_buf[ai] = self.resolveTypeNode(arg_node);
+                                                        }
+                                                    }
+                                                    return self.store.typeRef(cls_name, arg_buf[0..argc]) catch tymod.ID_ANY;
+                                                }
+                                            }
+                                            // No type args: return bare class type.
+                                            return self.store.typeRef(cls_name, &.{}) catch tymod.ID_ANY;
+                                        }
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
                     }
                 }
                 // Value reference to the class → typeof C.
@@ -1105,6 +1247,28 @@ pub const Checker = struct {
                     return self.store.typeRef(typeof_name, &.{}) catch self.narrowAtUse(node, sym, base_c);
                 }
                 return self.narrowAtUse(node, sym, base_c);
+            }
+            // Fundule: function declaration merged with a namespace → value type is
+            // `typeof F` (same as if the symbol had bkind == namespace_decl).
+            if ((bkind == .function_decl or bkind == .function_decl_annex_b) and
+                !self.identifierInTypePosition(node))
+            {
+                const tok_f = self.ast_ref.nodeMainToken(node);
+                const fn_name = self.ast_ref.tokenText(tok_f);
+                if (fn_name.len > 0) {
+                    if (self.type_decl_nodes.get(fn_name)) |ns_node| {
+                        const ns_tag = self.ast_ref.nodeTag(ns_node);
+                        if (ns_tag == .ts_namespace_decl or ns_tag == .ts_module_decl) {
+                            const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{fn_name}) catch return tymod.ID_ANY;
+                            return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                        }
+                    }
+                    // Expando function: `function foo() {} foo.x = 1` → typeof foo.
+                    if (self.expando_fns.contains(fn_name)) {
+                        const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{fn_name}) catch return tymod.ID_ANY;
+                        return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                    }
+                }
             }
             const base = self.declaredTypeForSymbol(sym);
             // Evolving array (`let x = []`): the binding's declared type is the
@@ -1207,7 +1371,24 @@ pub const Checker = struct {
             }
             if (self.isForInLoopBinding(node)) return tymod.ID_STRING;
         }
-        if (self.typeOfNameByAstSearch(name)) |t| return t;
+        if (self.typeOfNameByAstSearch(name)) |t| {
+            // Fundule (function + namespace merge): the name maps to both a
+            // function in value_decl_by_name AND a namespace in type_decl_nodes.
+            // tsc types such an identifier as `typeof F`, not the function type.
+            if (self.type_decl_nodes.get(name)) |ns_node| {
+                const ns_tag = self.ast_ref.nodeTag(ns_node);
+                if (ns_tag == .ts_namespace_decl or ns_tag == .ts_module_decl) {
+                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return t;
+                    return self.store.typeRef(typeof_name, &.{}) catch t;
+                }
+            }
+            // Expando function: `function foo() {} foo.x = 1` → typeof foo.
+            if (self.expando_fns.contains(name)) {
+                const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return t;
+                return self.store.typeRef(typeof_name, &.{}) catch t;
+            }
+            return t;
+        }
         // Class declaration name: `class C { }` or `class C<T>` — return the
         // named type matching tsc's annotation (e.g. `>C : C` / `>C : C<T>`).
         if (self.typeForClassDeclarationName(node, name)) |ty| return ty;
@@ -1285,7 +1466,11 @@ pub const Checker = struct {
             return tymod.ID_ANY;
         }
         const ty_node = self.ast_ref.nodeData(pdata.rhs).lhs;
-        return self.resolveSimpleTypeNodeSafe(ty_node);
+        const base_ty = self.resolveSimpleTypeNodeSafe(ty_node) orelse return null;
+        if (self.propertyHasOptionalMarker(node) and !self.typeContainsUndefined(base_ty)) {
+            return self.store.unionOf(&.{ base_ty, tymod.ID_UNDEFINED }) catch base_ty;
+        }
+        return base_ty;
     }
 
     /// Return the enum-member type `E.MemberName` when `node` is the key
@@ -1348,7 +1533,11 @@ pub const Checker = struct {
                 const tok = self.ast_ref.nodeMainToken(node);
                 const prop_name = self.ast_ref.tokenText(tok);
                 if (prop_name.len == 0) return tymod.ID_ANY;
-                return self.memberOnApparentType(obj_ty, prop_name, pdata.lhs);
+                const is_optional = ptag == .optional_member_expr;
+                const in_chain = is_optional or self.calleeIsInOptionalChain(pdata.lhs);
+                const lookup_ty = if (in_chain) self.stripNullishForLookup(obj_ty) else obj_ty;
+                const inner = self.memberOnApparentType(lookup_ty, prop_name, pdata.lhs);
+                return self.maybeAddOptionalUndefined(inner, obj_ty, in_chain);
             },
             else => return tymod.ID_ANY,
         }
@@ -1575,7 +1764,17 @@ pub const Checker = struct {
             switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
                 // Parts of a qualified name (`FG.A`) — keep walking up.
                 .member_expr, .optional_member_expr, .identifier, .grouping_expr => {},
-                .ts_type_reference, .ts_type_query, .ts_type_annotation => return true,
+                .ts_type_reference => {
+                    // `typeof X` in type position: the identifier X is looked up
+                    // in VALUE space, not type space. Return false so the class/
+                    // namespace block produces `typeof X` instead of the instance type.
+                    const pp = if (p < parents.len) parents[p] else NONE;
+                    if (pp != NONE and pp < self.ast_ref.nodes.len and
+                        self.ast_ref.nodeTag(@enumFromInt(pp)) == .ts_typeof_type)
+                        return false;
+                    return true;
+                },
+                .ts_type_query, .ts_type_annotation => return true,
                 else => return false,
             }
             p = parents[p];
@@ -1638,12 +1837,11 @@ pub const Checker = struct {
         const data = self.ast_ref.nodeData(decl);
         if (data.lhs == .none) return null;
         const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
-        var props_buf: [64]tymod.ObjectProp = undefined;
-        var n: usize = 0;
         if (ed.members_start >= ed.members_end or ed.members_end > self.ast_ref.extra_data.len) return null;
+        var props_list = std.ArrayListUnmanaged(tymod.ObjectProp).empty;
+        defer props_list.deinit(self.gpa);
         var auto_idx: f64 = 0;
         for (self.ast_ref.extra_data[ed.members_start..ed.members_end]) |raw| {
-            if (n >= props_buf.len) break;
             const m: NodeIndex = @enumFromInt(raw);
             if (self.ast_ref.nodeTag(m) != .ts_enum_member) continue;
             const md = self.ast_ref.nodeData(m);
@@ -1674,11 +1872,10 @@ pub const Checker = struct {
                 .number_literal, .string_literal => self.store.enumMemberLiteral(value_ty, enum_name, member_name) catch value_ty,
                 else => value_ty,
             };
-            props_buf[n] = .{ .name = member_name, .type_id = member_ty };
-            n += 1;
+            props_list.append(self.gpa, .{ .name = member_name, .type_id = member_ty }) catch return null;
         }
-        if (n == 0) return null;
-        const list = self.store.appendObjectProps(props_buf[0..n]) catch return null;
+        if (props_list.items.len == 0) return null;
+        const list = self.store.appendObjectProps(props_list.items) catch return null;
         return self.store.add(.{ .kind = .object_t, .object_props = list }) catch null;
     }
 
@@ -1700,7 +1897,9 @@ pub const Checker = struct {
             n += 1;
         }
         if (n == 0) return null;
-        return self.store.unionOf(members_buf[0..n]) catch null;
+        const raw = self.store.unionOf(members_buf[0..n]) catch return null;
+        // Tag with the enum name so typeToStringInner emits "E" instead of "E.A | E.B | …".
+        return self.tagAliasName(raw, enum_name);
     }
 
     /// Walk the AST looking for a top-level declarator/fn_decl/class_decl
@@ -3097,6 +3296,7 @@ pub const Checker = struct {
             }
         }
         if (n == 0) return any_arr;
+        sortUnionByTypePriority(&self.store, buf[0..n]);
         const elem = self.store.unionOf(buf[0..n]) catch return any_arr;
         return self.store.arrayOf(elem) catch any_arr;
     }
@@ -3230,6 +3430,7 @@ pub const Checker = struct {
                     // widens `['c', 'd']` to `string[]` for both let and const
                     // (only `as const` produces a readonly tuple literal type).
                     if (t.kind == .tuple_t) {
+                        if (t.name.len > 0) return raw; // readonly tuple from `as const` — preserve
                         const elems = self.store.idsOf(t.list_data);
                         if (elems.len == 0) {
                             return self.store.arrayOf(tymod.ID_NEVER) catch raw;
@@ -3248,6 +3449,7 @@ pub const Checker = struct {
                             };
                             widened_buf[j] = widened;
                         }
+                        sortUnionByTypePriority(&self.store, widened_buf[0..widen_count]);
                         const elem_t = self.store.unionOf(widened_buf[0..widen_count]) catch elems[0];
                         return self.store.arrayOf(elem_t) catch raw;
                     }
@@ -3272,11 +3474,27 @@ pub const Checker = struct {
                         break :blk std.mem.eql(u8, name, "const");
                     };
                     if (is_mutable and !is_as_const) {
+                        // In non-strict mode, null/undefined initializers widen to any.
+                        // `var x = null` → x: any (TypeScript's null-widening rule).
+                        if (!self.checker_opts.strict_null_checks) {
+                            if (t.kind == .null_t or t.kind == .undefined_t) return tymod.ID_ANY;
+                        }
                         // Handle primitive literals
                         const widened_prim = switch (t.kind) {
                             .string_literal => tymod.ID_STRING,
                             .number_literal => tymod.ID_NUMBER,
                             .bigint_literal => tymod.ID_BIGINT,
+                            // Boolean literals are widened only for direct literals
+                            // (true/false) or `!expr` — not for &&/|| results which
+                            // propagate non-widening literal types from parameters.
+                            .boolean_literal => blk: {
+                                const init_tag = self.ast_ref.nodeTag(data.rhs);
+                                break :blk if (init_tag == .boolean_literal or
+                                    init_tag == .logical_not)
+                                    tymod.ID_BOOLEAN
+                                else
+                                    raw;
+                            },
                             else => raw,
                         };
                         if (widened_prim != raw) return widened_prim;
@@ -3351,9 +3569,15 @@ pub const Checker = struct {
                         .boolean_literal => return tymod.ID_BOOLEAN,
                         else => {},
                     }
+                    // Function/arrow defaults (`cb = function(){}`, `cb = () => 1`):
+                    // tsc uses the inferred function type as the parameter type.
+                    switch (rhs_tag) {
+                        .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                        .arrow_fn, .async_arrow_fn => return self.typeOf(data.rhs),
+                        else => {},
+                    }
                     // Composed default (e.g. `x = arr[0]`): infer, then widen
-                    // fresh literal types to their base, matching declaration
-                    // widening.  Non-literals fall through to unknown.
+                    // fresh literal types to their base, other non-literals → unknown.
                     const raw = self.typeOf(data.rhs);
                     return switch (self.store.get(raw).kind) {
                         .string_literal => tymod.ID_STRING,
@@ -4539,7 +4763,34 @@ pub const Checker = struct {
         const data = self.ast_ref.nodeData(arrow_node);
         const ad = self.ast_ref.extraData(ast.ArrowData, @intFromEnum(data.lhs));
         const is_async = self.ast_ref.nodeTag(arrow_node) == .async_arrow_fn;
-        return self.buildFunctionType(ad.params_start, ad.params_end, ad.return_type, ad.body, is_async, false);
+        const fn_ty = self.buildFunctionType(ad.params_start, ad.params_end, ad.return_type, ad.body, is_async, false);
+        // ArrowData has no type_params field. For generic arrows <T>(params) => body,
+        // the parser stores type param node indices in extra_data immediately before
+        // params_start. Only generic arrows have type params: non-async generic arrows
+        // start with '<' (less_than main_token); async generic arrows have 'async'
+        // as main_token and '<' as the very next token.
+        const main_tok = self.ast_ref.nodeMainToken(arrow_node);
+        const main_tag = self.ast_ref.tokenTag(main_tok);
+        const tok_count: u32 = @intCast(self.ast_ref.tokens.len);
+        const is_generic_arrow = main_tag == .less_than or
+            (is_async and main_tag == .kw_async and
+             main_tok + 1 < tok_count and
+             self.ast_ref.tokenTag(main_tok + 1) == .less_than);
+        if (is_generic_arrow and !self.fn_type_params.contains(fn_ty)) {
+            const ext = self.ast_ref.extra_data;
+            const total_nodes: u32 = @intCast(self.ast_ref.nodes.len);
+            const tp_end = ad.params_start;
+            var tp_start = tp_end;
+            while (tp_start > 0) {
+                const raw = ext[tp_start - 1];
+                if (raw >= total_nodes) break;
+                const ni: NodeIndex = @enumFromInt(raw);
+                if (self.ast_ref.nodeTag(ni) != .ts_type_parameter) break;
+                tp_start -= 1;
+            }
+            if (tp_start < tp_end) self.registerFnTypeParams(fn_ty, tp_start, tp_end);
+        }
+        return fn_ty;
     }
 
     fn buildFunctionType(
@@ -4589,13 +4840,29 @@ pub const Checker = struct {
                 const is_default = self.ast_ref.nodeTag(pn) == .assignment_pattern;
                 if (is_default) pn = self.ast_ref.nodeData(pn).lhs;
                 if (self.ast_ref.nodeTag(pn) == .ts_parameter_property) pn = self.ast_ref.nodeData(pn).lhs;
-                if (self.ast_ref.nodeTag(pn) == .rest_element) rest_idx = @intCast(count);
+                const is_rest = self.ast_ref.nodeTag(pn) == .rest_element;
+                if (is_rest) rest_idx = @intCast(count);
                 var pty = self.paramDeclaredType(param);
                 // An un-annotated first parameter of a Promise rejection
                 // callback (`p.catch(e=>…)` / `p.then(onF, e=>…)`) is `any`,
                 // not `unknown` — drives use-unknown-in-catch-callback-variable.
                 if (count == 0 and pty.eq(tymod.ID_UNKNOWN) and !self.paramHasAnnotation(param)) {
                     if (self.contextualPromiseRejectionParamType(param)) |t| pty = t;
+                }
+                // Rest parameters are always array-typed in TypeScript.
+                // `...args` (unannotated) → any[], `...args: any` → any[].
+                // Skip wrapping when the type is already an array/tuple/union
+                // or a named type ref (could be a generic extending any[]).
+                if (is_rest) {
+                    const pty_k = self.store.get(pty).kind;
+                    if (pty.eq(tymod.ID_ANY) or pty.eq(tymod.ID_UNKNOWN)) {
+                        pty = self.store.arrayOf(tymod.ID_ANY) catch pty;
+                    } else if (pty_k != .array_t and pty_k != .readonly_array_t and
+                               pty_k != .tuple_t and pty_k != .union_t and
+                               pty_k != .type_ref and pty_k != .type_param)
+                    {
+                        pty = self.store.arrayOf(pty) catch pty;
+                    }
                 }
                 param_buf[count] = pty;
                 name_buf[count] = self.paramName(param);
@@ -4672,6 +4939,11 @@ pub const Checker = struct {
             } else {
                 ret_ty = self.inferBlockReturn(body_for_inference);
             }
+            // In non-strict mode, null/undefined return types widen to any (same rule as var decls).
+            if (!self.checker_opts.strict_null_checks) {
+                const ret_info = self.store.get(ret_ty);
+                if (ret_info.kind == .null_t or ret_info.kind == .undefined_t) ret_ty = tymod.ID_ANY;
+            }
         }
         // A generator function returns Generator<…> (async: AsyncGenerator<…>)
         // at the call site — what backs await-thenable's for-await `Symbol.
@@ -4681,8 +4953,13 @@ pub const Checker = struct {
         if (is_generator) {
             if (!was_annotated) {
                 const gen_name: []const u8 = if (is_async) "AsyncGenerator" else "Generator";
-                const arg: TypeId = if (ret_ty.eq(tymod.ID_UNKNOWN)) tymod.ID_UNKNOWN else ret_ty;
-                ret_ty = self.store.typeRef(gen_name, &.{arg}) catch ret_ty;
+                // Generator<T, TReturn, TNext>: T = yielded type, TReturn = return type, TNext = unknown.
+                const t_yield = if (body_for_inference != .none)
+                    self.inferYieldType(body_for_inference)
+                else
+                    tymod.ID_UNKNOWN;
+                const t_return = if (ret_ty.eq(tymod.ID_UNKNOWN)) tymod.ID_VOID else ret_ty;
+                ret_ty = self.store.typeRef(gen_name, &.{ t_yield, t_return, tymod.ID_UNKNOWN }) catch ret_ty;
             }
         }
         // Async (non-generator) functions return Promise<T> at the call site,
@@ -4863,10 +5140,16 @@ pub const Checker = struct {
         return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(n));
     }
 
-    /// True when an identifier-type param node has an explicit `?` optional marker
-    /// between the identifier token and the `:` or end of its span.
+    /// True when an identifier-type param node has an explicit `?` optional marker.
+    /// Checks both the token immediately after the identifier (`success?:` → next
+    /// token is `?`) and the source-text fallback for robustness.
     fn paramHasOptionalMarker(self: *Checker, ident_node: NodeIndex) bool {
         if (self.ast_ref.nodeTag(ident_node) != .identifier) return false;
+        const name_tok = self.ast_ref.nodeMainToken(ident_node);
+        const token_tags = self.ast_ref.tokens.items(.tag);
+        const next_tok: u32 = name_tok + 1;
+        if (next_tok < token_tags.len and token_tags[next_tok] == .question) return true;
+        // Fallback: scan source text after the identifier span.
         const span = self.ast_ref.nodeSpan(ident_node);
         const src = self.ast_ref.source;
         var i: usize = span.end;
@@ -4954,6 +5237,62 @@ pub const Checker = struct {
             result = self.store.unionOf(&ids) catch result;
         }
         return result;
+    }
+
+    /// Infer the yield type `T` for a Generator<T, TReturn, TNext> by collecting
+    /// the types of all `yield <expr>` expressions in `body` (direct — not nested
+    /// in inner functions) and returning their union.  Returns `never` when there
+    /// are no yield statements (a generator that never yields).
+    fn inferYieldType(self: *Checker, body: NodeIndex) TypeId {
+        const parents = self.semantic.parent_indices;
+        if (parents.len == 0) return tymod.ID_NEVER;
+        const body_idx = @intFromEnum(body);
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var result: TypeId = TypeId.none;
+        var i: u32 = 0;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            const ntag = self.ast_ref.nodeTag(ni);
+            if (ntag != .yield_expr and ntag != .yield_delegate) continue;
+            // Check that this yield is directly inside this body (not an inner generator).
+            var p = parents[i];
+            var reached = false;
+            while (p != NONE) : (p = parents[p]) {
+                if (p == body_idx) { reached = true; break; }
+                const pt = self.ast_ref.nodeTag(@enumFromInt(p));
+                if (pt == .fn_decl or pt == .async_fn_decl or pt == .generator_fn_decl or
+                    pt == .async_generator_fn_decl or pt == .fn_expr or pt == .async_fn_expr or
+                    pt == .generator_fn_expr or pt == .async_generator_fn_expr or
+                    pt == .arrow_fn or pt == .async_arrow_fn)
+                {
+                    break;
+                }
+            }
+            if (!reached) continue;
+            const arg = self.ast_ref.nodeData(ni).lhs;
+            const raw_yt: TypeId = if (arg == .none)
+                tymod.ID_UNDEFINED
+            else if (ntag == .yield_delegate)
+                // `yield* iterable` — use element type of the delegated iterable.
+                (self.elementTypeOf(self.typeOf(arg)) orelse tymod.ID_UNKNOWN)
+            else
+                self.typeOf(arg);
+            // Widen primitive literals — tsc widens yield types in Generator<T,...>.
+            const yt: TypeId = switch (self.store.get(raw_yt).kind) {
+                .string_literal => tymod.ID_STRING,
+                .number_literal => tymod.ID_NUMBER,
+                .bigint_literal => tymod.ID_BIGINT,
+                .boolean_literal => tymod.ID_BOOLEAN,
+                else => raw_yt,
+            };
+            if (result.eq(TypeId.none)) {
+                result = yt;
+            } else if (!result.eq(yt)) {
+                result = self.store.unionOf(&.{ result, yt }) catch result;
+            }
+        }
+        return if (result.eq(TypeId.none)) tymod.ID_NEVER else result;
     }
 
     fn bodyCanFallThrough(self: *Checker, body: NodeIndex) bool {
@@ -5166,6 +5505,7 @@ pub const Checker = struct {
             .params_end = param_range.end,
             .return_type = ret_ty,
             .rest_param_index = rest_idx,
+            .is_construct = (self.ast_ref.nodeTag(ty_node) == .ts_constructor_type),
         };
         const fn_ty = self.store.functionType(sig) catch return tymod.ID_UNKNOWN;
         if (fd.type_params < fd.type_params_end)
@@ -6669,24 +7009,45 @@ pub const Checker = struct {
         try self.natively_bound_type_ids.put(self.gpa, console_ty, {});
 
         // Math — selection of common methods returning number.
-        const num_fn = try h.fnType(tymod.ID_NUMBER);
-        const math_methods = [_][]const u8{
-            "random", "floor", "ceil", "round", "trunc", "abs",
-            "min", "max", "sign", "sqrt", "cbrt", "pow", "exp",
-            "log", "log2", "log10", "log1p", "expm1", "hypot",
-            "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
-            "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
-            "fround", "clz32", "imul",
+        // (number) => number — single-arg methods. Unnamed param so user-code
+        // enrichment can supply the actual param name via the intern mechanism.
+        const num_x_fn = try h.fnTypeWithParams(&.{tymod.ID_NUMBER}, tymod.ID_NUMBER);
+        // (number, number) => number — two-arg methods.
+        const num_xy_fn = try h.fnTypeWithParams(&.{ tymod.ID_NUMBER, tymod.ID_NUMBER }, tymod.ID_NUMBER);
+        // (...number[]) => number — variadic methods (min, max, hypot).
+        const num_rest_fn = blk: {
+            const num_arr = try self.store.arrayOf(tymod.ID_NUMBER);
+            const pr = try self.store.appendSignatureParams(&.{num_arr}, &.{});
+            const sig: tymod.Signature = .{ .params_start = pr.start, .params_end = pr.end, .rest_param_index = 0, .return_type = tymod.ID_NUMBER };
+            break :blk try self.store.functionType(sig);
         };
-        var math_props_buf: [math_methods.len + 8]tymod.ObjectProp = undefined;
+        // () => number — random.
+        const num_fn = try h.fnType(tymod.ID_NUMBER);
+        const math_1arg = [_][]const u8{
+            "floor", "ceil", "round", "trunc", "abs",
+            "sign", "sqrt", "cbrt", "exp", "log", "log2", "log10",
+            "log1p", "expm1", "sin", "cos", "tan", "asin", "acos",
+            "atan", "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+            "fround", "clz32",
+        };
+        const math_2arg = [_][]const u8{ "pow", "atan2", "imul" };
+        const math_variadic = [_][]const u8{ "min", "max", "hypot" };
+        var math_props_buf: [math_1arg.len + math_2arg.len + math_variadic.len + 10]tymod.ObjectProp = undefined;
         var math_n: usize = 0;
-        for (math_methods) |name| {
-            // is_method=true so union fn_property checks see Math methods
-            // as real methods (not fn_properties), which matters when Math
-            // appears alongside a class that has a matching fn_property field.
-            math_props_buf[math_n] = .{ .name = name, .type_id = num_fn, .is_method = true };
+        for (math_1arg) |name| {
+            math_props_buf[math_n] = .{ .name = name, .type_id = num_x_fn, .is_method = true };
             math_n += 1;
         }
+        for (math_2arg) |name| {
+            math_props_buf[math_n] = .{ .name = name, .type_id = num_xy_fn, .is_method = true };
+            math_n += 1;
+        }
+        for (math_variadic) |name| {
+            math_props_buf[math_n] = .{ .name = name, .type_id = num_rest_fn, .is_method = true };
+            math_n += 1;
+        }
+        math_props_buf[math_n] = .{ .name = "random", .type_id = num_fn, .is_method = true };
+        math_n += 1;
         // Math constants — number-typed.
         const math_constants = [_][]const u8{ "E", "LN10", "LN2", "LOG10E", "LOG2E", "PI", "SQRT1_2", "SQRT2" };
         for (math_constants) |name| {
@@ -7089,6 +7450,55 @@ pub const Checker = struct {
                 else => {},
             }
         }
+        try self.buildExpandoFns();
+    }
+
+    /// Scan all assignment expressions for `funcName.prop = value` patterns.
+    /// Any function/function-expression whose name appears as the root of such
+    /// an LHS is an "expando function" — tsc types it as `typeof funcName`
+    /// rather than the raw function signature.
+    fn buildExpandoFns(self: *Checker) !void {
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 0;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .assign) continue;
+            const data = self.ast_ref.nodeData(ni);
+            if (data.lhs == .none or data.lhs.toInt() == NONE) continue;
+            // Walk the LHS member chain to find the root identifier.
+            var obj = data.lhs;
+            var depth: u8 = 0;
+            while (depth < 8) : (depth += 1) {
+                const obj_tag = self.ast_ref.nodeTag(obj);
+                if (obj_tag == .identifier) {
+                    const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(obj));
+                    if (name.len > 0) {
+                        if (self.value_decl_by_name.get(name)) |decls| {
+                            for (decls.items) |decl_node| {
+                                switch (self.ast_ref.nodeTag(decl_node)) {
+                                    .fn_decl, .async_fn_decl,
+                                    .generator_fn_decl, .async_generator_fn_decl => {
+                                        try self.expando_fns.put(self.gpa, name, {});
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                switch (obj_tag) {
+                    .member_expr, .optional_member_expr,
+                    .computed_member_expr, .optional_computed_member_expr => {
+                        const od = self.ast_ref.nodeData(obj);
+                        if (od.lhs == .none or od.lhs.toInt() == NONE) break;
+                        obj = od.lhs;
+                    },
+                    else => break,
+                }
+            }
+        }
     }
 
     /// Tag a type-alias resolution with the alias name (`type Foo = …` → the
@@ -7257,6 +7667,28 @@ pub const Checker = struct {
             const ty_data = self.ast_ref.nodeData(ty_node);
             if (ty_data.lhs != .none and self.ast_ref.nodeTag(ty_data.lhs) == .member_expr) {
                 const rt = self.store.get(resolved);
+                // Qualified enum member type `Choice.Yes`: resolveDeclaredType
+                // returned the enum's member UNION, not an object_t, so the
+                // namespace-style member lookup below would silently skip the
+                // `.Yes` access and yield the whole enum. Look the member up in
+                // the enum's object shape instead — its props carry the
+                // enum-tagged literal (renders as "Choice.Yes").
+                if (self.type_decl_nodes.get(name)) |edecl| {
+                    if (self.ast_ref.nodeTag(edecl) == .ts_enum_decl) {
+                        const member_data = self.ast_ref.nodeData(ty_data.lhs);
+                        if (member_data.rhs != .none) {
+                            const member_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(member_data.rhs));
+                            if (self.buildEnumObjectType(name)) |obj| {
+                                const ot = self.store.get(obj);
+                                if (ot.kind == .object_t) {
+                                    for (self.store.propsOf(ot.object_props)) |p| {
+                                        if (std.mem.eql(u8, p.name, member_name)) return p.type_id;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 if (rt.kind == .object_t) {
                     const member_data = self.ast_ref.nodeData(ty_data.lhs);
                     if (member_data.rhs != .none) {
@@ -9497,7 +9929,8 @@ pub const Checker = struct {
         const src_tag = self.ast_ref.nodeTag(src);
         if (src_tag == .array_literal) {
             const data = self.ast_ref.nodeData(src);
-            const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
+            const empty_slice: []const u32 = &.{};
+            const slice: []const u32 = self.directRange(data.lhs, data.rhs) orelse empty_slice;
             var buf: [32]TypeId = undefined;
             const n = @min(slice.len, buf.len);
             var i: usize = 0;
@@ -9603,6 +10036,8 @@ pub const Checker = struct {
         // `a && b` evaluates to `a` when falsy, else `b`.  A statically-falsy LHS
         // short-circuits to `a` (RHS unreachable — `false && p()` is just `false`,
         // not `false | Promise`); a statically-truthy LHS evaluates to `b`.
+        // `any && b` → `any`; tsc propagates `any` through logical operators.
+        if (tymod.isAny(&self.store, a)) return a;
         if (self.alwaysFalsy(a)) return a;
         if (self.alwaysTruthy(a)) return b;
         // For `a && b`, narrow b by the condition a and return false | narrowed_b
@@ -9738,6 +10173,44 @@ pub const Checker = struct {
         };
     }
 
+    /// Broader truthiness check used only for the `!` operator.  Includes
+    /// type_ref (class/interface instances) and union types where every member
+    /// is always truthy.  NOT used for `&&`/`||` short-circuiting (too broad).
+    fn alwaysTruthyForNot(self: *Checker, id: TypeId) bool {
+        const t = self.store.get(id);
+        if (t.kind == .type_ref) return true;
+        if (t.kind == .union_t) {
+            for (self.store.idsOf(t.list_data)) |mid| {
+                if (!self.alwaysTruthyForNot(mid)) return false;
+            }
+            return true;
+        }
+        return self.alwaysTruthy(id);
+    }
+
+    /// Broader falsy check used for the `!` operator: includes union types where
+    /// every member is always falsy.
+    fn alwaysFalsyForNot(self: *Checker, id: TypeId) bool {
+        const t = self.store.get(id);
+        if (t.kind == .union_t) {
+            for (self.store.idsOf(t.list_data)) |mid| {
+                if (!self.alwaysFalsyForNot(mid)) return false;
+            }
+            return true;
+        }
+        return self.alwaysFalsy(id);
+    }
+
+    /// True when the named enum is a `const enum` — const enums preserve
+    /// literal member types at use sites, non-const enums widen to the enum type.
+    fn isConstEnum(self: *Checker, enum_name: []const u8) bool {
+        const decl = self.type_decl_nodes.get(enum_name) orelse return false;
+        if (self.ast_ref.nodeTag(decl) != .ts_enum_decl) return false;
+        const enum_tok = self.ast_ref.nodeMainToken(decl);
+        if (enum_tok == 0) return false;
+        return self.ast_ref.tokenTag(enum_tok - 1) == .kw_const;
+    }
+
     /// True when `id` provably has no null/undefined/void constituent (so the
     /// RHS of `a ?? b` is unreachable).  `any`/`unknown`/`error` could be
     /// nullish → not folded.
@@ -9808,6 +10281,10 @@ pub const Checker = struct {
         // `Promise.resolve<T>(...)` → `Promise<T>` (uses the explicit type arg) so
         // no-unsafe-return's Promise<any> detection fires.
         if (self.promiseResolveReturn(callee)) |ty| return ty;
+        // `promise.then(onF?, onR?)` / `.catch(onR?)` / `.finally(cb?)` —
+        // infer Promise<X> from the callback return type rather than always
+        // returning Promise<unknown>.
+        if (self.promiseThenCallReturn(node)) |ty| return ty;
         // `super()` calls the superclass constructor, which returns void.
         if (self.ast_ref.nodeTag(callee) == .super_expr) return tymod.ID_VOID;
         if (self.ast_ref.nodeTag(node) == .new_expr or
@@ -9837,10 +10314,13 @@ pub const Checker = struct {
         const callee_unresolved = lookup_ty.eq(tymod.ID_UNKNOWN) or lookup_ty.eq(tymod.ID_ERROR);
         var result: TypeId = tymod.ID_UNKNOWN;
         if (t.kind == .function_t) {
-            const sigs = self.store.signaturesOf(t.signatures);
-            if (sigs.len > 0) {
+            // Copy the SignatureList range (just two u32s) before any typeOf calls
+            // that may grow signature_pool and invalidate a slice into it.
+            const sig_range = t.signatures;
+            const sig_count = sig_range.end - sig_range.start;
+            if (sig_count > 0) {
                 const best: usize = blk: {
-                    if (sigs.len == 1) break :blk 0;
+                    if (sig_count == 1) break :blk 0;
                     const args_range = self.safeSubRange(data.rhs) orelse break :blk 0;
                     const extra = self.ast_ref.extra_data;
                     if (args_range.start > extra.len or args_range.end > extra.len) break :blk 0;
@@ -9852,8 +10332,11 @@ pub const Checker = struct {
                         arg_types_buf[argc] = self.typeOf(@enumFromInt(raw));
                         argc += 1;
                     }
+                    // Re-fetch sigs after typeOf calls that may have reallocated the pool.
+                    const sigs = self.store.signaturesOf(sig_range);
                     break :blk self.pickOverload(sigs, arg_types_buf[0..argc]);
                 };
+                const sigs = self.store.signaturesOf(sig_range);
                 result = sigs[best].return_type;
             }
         }
@@ -9927,6 +10410,104 @@ pub const Checker = struct {
         else
             return null;
         return self.store.typeRef("Promise", &.{inner}) catch tymod.ID_UNKNOWN;
+    }
+
+    /// Infer the return type of `promise.then(onF?, onR?)`, `.catch(onR?)`,
+    /// and `.finally(cb?)` from the supplied callback arguments.
+    /// Returns null if the callee is not one of those methods on a Promise receiver.
+    fn promiseThenCallReturn(self: *Checker, call_node: NodeIndex) ?TypeId {
+        const data = self.ast_ref.nodeData(call_node);
+        const callee = data.lhs;
+        if (callee == .none) return null;
+
+        var c = callee;
+        while (self.ast_ref.nodeTag(c) == .grouping_expr) c = self.ast_ref.nodeData(c).lhs;
+
+        const ctag = self.ast_ref.nodeTag(c);
+        if (ctag != .member_expr and ctag != .optional_member_expr) return null;
+        const md = self.ast_ref.nodeData(c);
+        if (md.lhs == .none or md.rhs == .none) return null;
+
+        const method = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
+        const is_then = std.mem.eql(u8, method, "then");
+        const is_catch = std.mem.eql(u8, method, "catch");
+        const is_finally = std.mem.eql(u8, method, "finally");
+        if (!is_then and !is_catch and !is_finally) return null;
+
+        // Receiver must be a concrete Promise<T>, not any/unknown.
+        const recv_ty = self.typeOf(md.lhs);
+        if (!tymod.isPromiseRef(&self.store, recv_ty)) return null;
+        const recv_t = self.store.get(recv_ty);
+        const recv_args = self.store.idsOf(recv_t.list_data);
+        const T = if (recv_args.len > 0) recv_args[0] else tymod.ID_UNKNOWN;
+
+        // .finally() always returns Promise<T>.
+        if (is_finally) return self.store.typeRef("Promise", &.{T}) catch null;
+
+        // Read call arguments.
+        const args_range = self.safeSubRange(data.rhs) orelse {
+            // No args: then()/catch() with no callback → Promise<T>.
+            return self.store.typeRef("Promise", &.{T}) catch null;
+        };
+        const extra = self.ast_ref.extra_data;
+        if (args_range.start > extra.len or args_range.end > extra.len) return null;
+        const args = extra[args_range.start..args_range.end];
+
+        if (is_then) {
+            // TResult1 = onFulfilled return, or T if omitted/null/undefined.
+            const tresult1: TypeId = if (args.len > 0)
+                (self.callbackReturnInner(@enumFromInt(args[0])) orelse T)
+            else
+                T;
+            // TResult2 = onRejected return, or never if omitted.
+            const tresult2: TypeId = if (args.len > 1)
+                (self.callbackReturnInner(@enumFromInt(args[1])) orelse tymod.ID_NEVER)
+            else
+                tymod.ID_NEVER;
+
+            const combined: TypeId = if (tresult2.eq(tymod.ID_NEVER))
+                tresult1
+            else if (tresult1.eq(tymod.ID_NEVER))
+                tresult2
+            else
+                self.store.unionOf(&.{ tresult1, tresult2 }) catch tresult1;
+            return self.store.typeRef("Promise", &.{combined}) catch null;
+        }
+
+        // .catch(onR?) — TResult = onRejected return, or never if omitted.
+        const tresult: TypeId = if (args.len > 0)
+            (self.callbackReturnInner(@enumFromInt(args[0])) orelse tymod.ID_NEVER)
+        else
+            tymod.ID_NEVER;
+
+        const combined: TypeId = if (tresult.eq(tymod.ID_NEVER))
+            T
+        else if (T.eq(tymod.ID_NEVER))
+            tresult
+        else
+            self.store.unionOf(&.{ T, tresult }) catch T;
+        return self.store.typeRef("Promise", &.{combined}) catch null;
+    }
+
+    /// Returns the "inner" result type of a callback argument — i.e. the return
+    /// type of the callback function with Promise<X> unwrapped to X.
+    /// Returns null when the arg is null/undefined (treat as absent callback).
+    fn callbackReturnInner(self: *Checker, node: NodeIndex) ?TypeId {
+        const cb_ty = self.typeOf(node);
+        if (cb_ty.eq(tymod.ID_NULL) or cb_ty.eq(tymod.ID_UNDEFINED)) return null;
+        if (tymod.isAny(&self.store, cb_ty)) return tymod.ID_ANY;
+        const t = self.store.get(cb_ty);
+        if (t.kind != .function_t) return null;
+        const sigs = self.store.signaturesOf(t.signatures);
+        if (sigs.len == 0) return tymod.ID_UNKNOWN;
+        const ret = sigs[0].return_type;
+        // Unwrap Promise<X> → X (promise flattening).
+        if (tymod.isPromiseRef(&self.store, ret)) {
+            const pt = self.store.get(ret);
+            const pt_args = self.store.idsOf(pt.list_data);
+            return if (pt_args.len > 0) pt_args[0] else tymod.ID_UNKNOWN;
+        }
+        return ret;
     }
 
     /// Match argument types against parameter types looking for
@@ -10396,13 +10977,22 @@ pub const Checker = struct {
             // Either side any → any (so unsafe-* fires through arithmetic).
             if (tymod.isAny(&self.store, a) or tymod.isAny(&self.store, b)) return tymod.ID_ANY;
             if (isBigintish(&self.store, a) or isBigintish(&self.store, b)) return tymod.ID_BIGINT;
-            return tymod.ID_NUMBER;
+            // For `+`, both operands must be numeric (number or number_literal).
+            // Non-numeric operands (boolean, Object, type parameter, null, undefined,
+            // void, etc.) make the operation invalid → TypeScript returns `any`.
+            if (isNumericish(&self.store, a) and isNumericish(&self.store, b)) return tymod.ID_NUMBER;
+            return tymod.ID_ANY;
         }
         // `*`, `/`, `%`, `-`, `**` always coerce to number at runtime.
         // TypeScript types these as `number` even when operands are `any`,
         // so we do NOT short-circuit to `any` here.
         if (isBigintish(&self.store, a) or isBigintish(&self.store, b)) return tymod.ID_BIGINT;
         return tymod.ID_NUMBER;
+    }
+
+    fn isNumericish(store: *const tymod.TypeStore, id: TypeId) bool {
+        const t = store.get(id);
+        return t.kind == .number or t.kind == .number_literal;
     }
 
     fn isStringish(store: *const tymod.TypeStore, id: TypeId) bool {
@@ -10471,6 +11061,28 @@ pub const Checker = struct {
         return self.ast_ref.nodeTag(pn_data.lhs) == .array_pattern;
     }
 
+    /// Returns true when `node` (an array literal) is the direct operand of a
+    /// spread_element that is itself a call argument (`f(...[1, 2])`).
+    /// TypeScript types spread array literals as tuples in this position only.
+    fn isArrayInSpreadArg(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        if (node.toInt() >= parents.len) return false;
+        const p = parents[node.toInt()];
+        if (p == @intFromEnum(NodeIndex.none)) return false;
+        const pn: NodeIndex = @enumFromInt(p);
+        if (self.ast_ref.nodeTag(pn) != .spread_element) return false;
+        // Verify the spread_element itself is inside a call (not an array literal).
+        if (pn.toInt() >= parents.len) return false;
+        const gp_raw = parents[pn.toInt()];
+        if (gp_raw == @intFromEnum(NodeIndex.none)) return false;
+        const gp: NodeIndex = @enumFromInt(gp_raw);
+        return switch (self.ast_ref.nodeTag(gp)) {
+            .call_expr, .optional_call_expr,
+            .new_expr, .tagged_template => true,
+            else => false,
+        };
+    }
+
     /// This matches both rules at once: `const arg = []` passes restrict-template-
     /// expressions' allowArray (any element), while `return []` stays safe for
     /// no-unsafe-return (never[] is not an any-array).
@@ -10480,10 +11092,19 @@ pub const Checker = struct {
         const p = parents[node.toInt()];
         if (p == @intFromEnum(NodeIndex.none)) return tymod.ID_NEVER;
         const pn: NodeIndex = @enumFromInt(p);
-        // The array is the initializer (rhs) of a `const`/`let`/`var` declarator.
-        if (self.ast_ref.nodeTag(pn) == .declarator and self.ast_ref.nodeData(pn).rhs == node) {
+        const pn_tag = self.ast_ref.nodeTag(pn);
+        // The array is the initializer of a `const`/`let`/`var` declarator or a
+        // class property (`private x = []`) — both use evolving-array `any[]`.
+        if (pn_tag == .declarator and self.ast_ref.nodeData(pn).rhs == node) {
             return tymod.ID_ANY;
         }
+        if (pn_tag == .property_def or pn_tag == .computed_property_def) {
+            return tymod.ID_ANY;
+        }
+        // In files compiled with `@strict: false`, TypeScript uses legacy widening
+        // where an empty array not bound to a variable gets element type `undefined`
+        // rather than `never`.
+        if (self.checker_opts.strict_explicitly_false) return tymod.ID_UNDEFINED;
         return tymod.ID_NEVER;
     }
 
@@ -10560,14 +11181,32 @@ pub const Checker = struct {
             // All elements same primitive literal kind → T[] in most contexts.
             // Exception: when the array literal is the RHS of an array-destructuring
             // declarator, tsc infers a fixed-length tuple ([1, 2] → [number, number]).
-            const elem_t: TypeId = switch (first_kind) {
-                .string_literal => tymod.ID_STRING,
-                .number_literal => tymod.ID_NUMBER,
-                .bigint_literal => tymod.ID_BIGINT,
-                .boolean_literal => tymod.ID_BOOLEAN,
-                else => unreachable,
+            // Special case: enum members widen to their enum type, not the underlying number.
+            const elem_t: TypeId = blk: {
+                if (first_kind == .number_literal) {
+                    const first_enum_name = self.store.get(buf[0]).enum_name;
+                    if (first_enum_name.len > 0) {
+                        var all_same_enum = true;
+                        for (1..n_used) |j| {
+                            if (!std.mem.eql(u8, self.store.get(buf[j]).enum_name, first_enum_name)) {
+                                all_same_enum = false;
+                                break;
+                            }
+                        }
+                        if (all_same_enum) {
+                            break :blk self.store.typeRef(first_enum_name, &.{}) catch tymod.ID_NUMBER;
+                        }
+                    }
+                }
+                break :blk switch (first_kind) {
+                    .string_literal => tymod.ID_STRING,
+                    .number_literal => tymod.ID_NUMBER,
+                    .bigint_literal => tymod.ID_BIGINT,
+                    .boolean_literal => tymod.ID_BOOLEAN,
+                    else => unreachable,
+                };
             };
-            if (self.isArrayInDestructuringRhs(node)) {
+            if (self.isArrayInDestructuringRhs(node) or self.isArrayInSpreadArg(node)) {
                 var tup_buf: [32]TypeId = undefined;
                 for (0..n_used) |j| tup_buf[j] = elem_t;
                 const list = self.store.appendTypeIds(tup_buf[0..n_used]) catch
@@ -10603,7 +11242,7 @@ pub const Checker = struct {
                 }
             }
             if (all_same_id) {
-                if (self.isArrayInDestructuringRhs(node)) {
+                if (self.isArrayInDestructuringRhs(node) or self.isArrayInSpreadArg(node)) {
                     const list = self.store.appendTypeIds(widened_elems_buf[0..n_used]) catch
                         return self.store.arrayOf(widened_elems_buf[0]) catch tymod.ID_ANY;
                     return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
@@ -10620,11 +11259,12 @@ pub const Checker = struct {
         // In destructuring (`const [a, b] = [d1, d2]`) keep per-position types as a tuple.
         // Otherwise TypeScript infers a union array: [d1, d2] → (Derived1 | Derived2)[].
         if (!has_spread) {
-            if (self.isArrayInDestructuringRhs(node)) {
+            if (self.isArrayInDestructuringRhs(node) or self.isArrayInSpreadArg(node)) {
                 const list = self.store.appendTypeIds(buf[0..n_used]) catch
                     return self.store.arrayOf(self.store.unionOf(buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
                 return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
             }
+            sortUnionByTypePriority(&self.store, buf[0..n_used]);
             return self.store.arrayOf(self.store.unionOf(buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
         }
         var widened_buf: [32]TypeId = undefined;
@@ -11189,8 +11829,17 @@ pub const Checker = struct {
             // Polymorphic `this` type: resolve member access via the enclosing class.
             if (std.mem.eql(u8, ref_name, "this")) {
                 if (self.thisEnclosingClassType(obj_node)) |class_ty| {
-                    const t = self.memberOnApparentType(class_ty, prop_name, obj_node);
-                    if (!tymod.isUnknown(&self.store, t)) return t;
+                    if (class_ty.eq(tymod.ID_UNKNOWN)) {
+                        // Class is still being built (sentinel) — memberOnApparentType
+                        // would return any, masking the real type.  Directly scan the
+                        // class body for an annotated property declaration instead.
+                        if (self.thisClassDirectPropLookup(obj_node, prop_name)) |direct_ty| {
+                            return direct_ty;
+                        }
+                    } else {
+                        const t = self.memberOnApparentType(class_ty, prop_name, obj_node);
+                        if (!tymod.isUnknown(&self.store, t)) return t;
+                    }
                 }
             }
             // Type parameter: chase constraint (apparent type).
@@ -11216,6 +11865,16 @@ pub const Checker = struct {
                 }
                 if (self.namespace_import_map.get(inner_name)) |mod_spec| {
                     if (self.inferMemberOnNamespace(mod_spec, prop_name)) |resolved| return resolved;
+                }
+                // `typeof ClassName` — look up static member on the class.
+                if (self.type_decl_nodes.get(inner_name)) |cls_decl| {
+                    if (self.ast_ref.nodeTag(cls_decl) == .class_decl) {
+                        const st = self.buildClassStaticType(cls_decl, inner_name);
+                        if (!st.eq(tymod.ID_UNKNOWN)) {
+                            const t = self.memberOnApparentType(st, prop_name, obj_node);
+                            if (!tymod.isUnknown(&self.store, t)) return t;
+                        }
+                    }
                 }
             }
             return tymod.ID_ANY;
@@ -11645,6 +12304,11 @@ pub const Checker = struct {
             }
             return null;
         }
+        if (std.mem.eql(u8, t.name, "IArguments")) {
+            if (std.mem.eql(u8, name, "length")) return tymod.ID_NUMBER;
+            if (std.mem.eql(u8, name, "callee")) return self.store.typeRef("Function", &.{}) catch null;
+            return tymod.ID_ANY;
+        }
         return null;
     }
 
@@ -11866,6 +12530,67 @@ pub const Checker = struct {
         return null;
     }
 
+    /// Direct AST property lookup for `this.prop` inside a class method.
+    /// Used as a fallback when the class type is still being built (the normal
+    /// resolveDeclaredType path returns the ID_UNKNOWN sentinel).  Scans the
+    /// class body for an annotated instance property with the given name.
+    fn thisClassDirectPropLookup(self: *Checker, node: NodeIndex, prop_name: []const u8) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        if (parents.len == 0) return null;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        var p = parents[nidx];
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var class_decl: NodeIndex = .none;
+        outer: while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .method_def, .computed_method_def, .getter_def, .setter_def,
+                .computed_getter_def, .computed_setter_def, .constructor_def,
+                .property_def => {
+                    var q = parents[p];
+                    while (q != NONE) : (q = parents[q]) {
+                        const qn: NodeIndex = @enumFromInt(q);
+                        const qtag = self.ast_ref.nodeTag(qn);
+                        if (qtag == .class_decl or qtag == .class_expr) {
+                            class_decl = qn;
+                            break :outer;
+                        }
+                        if (qtag == .class_body) continue;
+                    }
+                    break :outer;
+                },
+                .fn_decl, .async_fn_decl, .generator_fn_decl,
+                .async_generator_fn_decl, .fn_expr, .async_fn_expr,
+                .generator_fn_expr, .async_generator_fn_expr => break,
+                else => {},
+            }
+        }
+        if (class_decl == .none) return null;
+        const cdata_node = self.ast_ref.nodeData(class_decl);
+        if (cdata_node.lhs == .none) return null;
+        const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata_node.lhs));
+        if (cd.body == .none) return null;
+        const body_data = self.ast_ref.nodeData(cd.body);
+        const slice = self.directRange(body_data.lhs, body_data.rhs) orelse return null;
+        for (slice) |raw| {
+            const m: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(m) != .property_def) continue;
+            if (self.classMemberIsStatic(m)) continue;
+            const mdata = self.ast_ref.nodeData(m);
+            if (mdata.lhs == .none or mdata.rhs == .none) continue;
+            const ktag = self.ast_ref.nodeTag(mdata.lhs);
+            if (ktag != .identifier and ktag != .property_ident) continue;
+            const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+            if (!std.mem.eql(u8, key, prop_name)) continue;
+            const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(mdata.rhs));
+            if (pd.type_annotation == .none) return null;
+            const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
+            return self.resolveTypeNode(ty_node);
+        }
+        return null;
+    }
+
     /// `this` inside a class method/getter/setter/constructor resolves
     /// to the enclosing class's instance type.  Walks parents to find
     /// the nearest method-or-class declaration.  A stand-alone function's
@@ -11887,12 +12612,28 @@ pub const Checker = struct {
                 .method_def, .computed_method_def, .getter_def, .setter_def,
                 .computed_getter_def, .computed_setter_def, .constructor_def,
                 .property_def => {
+                    const is_static = self.classMemberIsStatic(@enumFromInt(p));
                     // Walk up to the class_decl / class_expr.
                     var q = parents[p];
                     while (q != NONE) : (q = parents[q]) {
                         const qn: NodeIndex = @enumFromInt(q);
                         const qtag = self.ast_ref.nodeTag(qn);
                         if (qtag == .class_decl or qtag == .class_expr) {
+                            if (is_static) {
+                                // Static context: `this` is the class constructor → typeof C.
+                                const cdata = self.ast_ref.nodeData(qn);
+                                if (cdata.lhs != .none) {
+                                    const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
+                                    if (cd.name != .none) {
+                                        const cls_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+                                        if (cls_name.len > 0) {
+                                            const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{cls_name}) catch return tymod.ID_ANY;
+                                            return self.store.typeRef(tn, &.{}) catch tymod.ID_ANY;
+                                        }
+                                    }
+                                }
+                                return tymod.ID_ANY;
+                            }
                             return self.store.typeRef("this", &.{}) catch tymod.ID_ANY;
                         }
                         // class_body sits between member and class_decl/expr;
@@ -12151,17 +12892,22 @@ pub const Checker = struct {
                     try buf.appendSlice(gpa, t.name);
                 } else {
                     const n = t.literal_value.number;
-                    // Integer-valued literals print without a decimal point — but
-                    // only when in i64 range, else @intFromFloat is illegal behavior
-                    // (e.g. 1e300). Out-of-range/fractional fall back to float fmt.
-                    const i64_min: f64 = -9223372036854775808.0; // -2^63
-                    const i64_max: f64 = 9223372036854775808.0; //  2^63 (exclusive)
-                    if (n == @trunc(n) and !std.math.isInf(n) and !std.math.isNan(n) and
-                        n >= i64_min and n < i64_max)
-                    {
-                        try buf.print(gpa, "{d}", .{@as(i64, @intFromFloat(n))});
+                    if (std.math.isPositiveInf(n)) {
+                        try buf.appendSlice(gpa, "Infinity");
+                    } else if (std.math.isNegativeInf(n)) {
+                        try buf.appendSlice(gpa, "-Infinity");
+                    } else if (std.math.isNan(n)) {
+                        try buf.appendSlice(gpa, "NaN");
                     } else {
-                        try buf.print(gpa, "{d}", .{n});
+                        // Integer-valued literals print without a decimal point — but
+                        // only when in i64 range, else @intFromFloat is UB (e.g. 1e300).
+                        const i64_min: f64 = -9223372036854775808.0;
+                        const i64_max: f64 = 9223372036854775808.0;
+                        if (n == @trunc(n) and n >= i64_min and n < i64_max) {
+                            try buf.print(gpa, "{d}", .{@as(i64, @intFromFloat(n))});
+                        } else {
+                            try buf.print(gpa, "{d}", .{n});
+                        }
                     }
                 }
             },
@@ -12199,6 +12945,10 @@ pub const Checker = struct {
                 try buf.appendSlice(gpa, "[]");
             },
             .tuple_t => {
+                if (t.alias_name.len > 0) {
+                    try buf.appendSlice(gpa, t.alias_name);
+                    return;
+                }
                 if (t.name.len > 0) try buf.appendSlice(gpa, "readonly ");
                 try buf.appendSlice(gpa, "[");
                 for (self.store.idsOf(t.list_data), 0..) |m, i| {
@@ -12225,6 +12975,11 @@ pub const Checker = struct {
                 }
             },
             .function_t => {
+                // If tagged with a type-alias name, render as the alias (e.g. `type Handler = (...) => void`).
+                if (t.alias_name.len > 0) {
+                    try buf.appendSlice(gpa, t.alias_name);
+                    return;
+                }
                 const sigs = self.store.signaturesOf(t.signatures);
                 if (sigs.len == 0) {
                     try buf.appendSlice(gpa, "() => unknown");
@@ -12233,6 +12988,7 @@ pub const Checker = struct {
                     const params = self.store.signatureParamsOf(sig);
                     const names = self.store.signatureParamNamesOf(sig);
                     const opts = self.store.signatureParamOptionalsOf(sig);
+                    if (sig.is_construct) try buf.appendSlice(gpa, "new ");
                     if (self.fn_type_params.get(id)) |tp_prefix|
                         try buf.appendSlice(gpa, tp_prefix);
                     try buf.append(gpa, '(');
@@ -12304,6 +13060,13 @@ pub const Checker = struct {
                 }
             },
             .object_t => {
+                // If tagged with a type-alias name (e.g. `type A = {...}`), render
+                // as the alias name matching tsc, not the structural expansion.
+                // Guard against internal sentinels like "__static__".
+                if (t.alias_name.len > 0 and !std.mem.eql(u8, t.alias_name, "__static__")) {
+                    try buf.appendSlice(gpa, t.alias_name);
+                    return;
+                }
                 const props = self.store.propsOf(t.object_props);
                 const call_sigs = self.store.signaturesOf(t.signatures);
                 // Count renderable regular properties (skip index-signature sentinels).
@@ -12321,15 +13084,20 @@ pub const Checker = struct {
                     const sig = call_sigs[0];
                     const sparams = self.store.signatureParamsOf(sig);
                     const snames = self.store.signatureParamNamesOf(sig);
+                    const sopts = self.store.signatureParamOptionalsOf(sig);
                     if (sig.is_construct) try buf.appendSlice(gpa, "new ");
                     if (self.sig_type_params.get(t.signatures.start)) |tp_prefix|
                         try buf.appendSlice(gpa, tp_prefix);
                     try buf.append(gpa, '(');
                     for (sparams, 0..) |sp, si| {
                         if (si > 0) try buf.appendSlice(gpa, ", ");
+                        const is_rest = sig.rest_param_index != 0xFFFF and si == sig.rest_param_index;
+                        if (is_rest) try buf.appendSlice(gpa, "...");
                         const sn = if (si < snames.len) snames[si] else "";
+                        const is_opt = !is_rest and si < sopts.len and sopts[si];
                         if (sn.len > 0) {
                             try buf.appendSlice(gpa, sn);
+                            if (is_opt) try buf.append(gpa, '?');
                             try buf.appendSlice(gpa, ": ");
                         }
                         try self.typeToStringInner(sp, buf, depth + 1);
@@ -12347,6 +13115,7 @@ pub const Checker = struct {
                         first = false;
                         const sparams = self.store.signatureParamsOf(sig);
                         const snames = self.store.signatureParamNamesOf(sig);
+                        const sopts = self.store.signatureParamOptionalsOf(sig);
                         if (sig.is_construct) try buf.appendSlice(gpa, "new ");
                         const pool_idx: u32 = t.signatures.start + @as(u32, @intCast(csi));
                         if (self.sig_type_params.get(pool_idx)) |tp_prefix| {
@@ -12355,9 +13124,13 @@ pub const Checker = struct {
                         try buf.append(gpa, '(');
                         for (sparams, 0..) |sp, si| {
                             if (si > 0) try buf.appendSlice(gpa, ", ");
+                            const is_rest = sig.rest_param_index != 0xFFFF and si == sig.rest_param_index;
+                            if (is_rest) try buf.appendSlice(gpa, "...");
                             const sn = if (si < snames.len) snames[si] else "";
+                            const is_opt = !is_rest and si < sopts.len and sopts[si];
                             if (sn.len > 0) {
                                 try buf.appendSlice(gpa, sn);
+                                if (is_opt) try buf.append(gpa, '?');
                                 try buf.appendSlice(gpa, ": ");
                             }
                             try self.typeToStringInner(sp, buf, depth + 1);
@@ -12391,7 +13164,13 @@ pub const Checker = struct {
                         if (!first) try buf.appendSlice(gpa, "; ");
                         first = false;
                         if (p.readonly) try buf.appendSlice(gpa, "readonly ");
-                        try buf.appendSlice(gpa, p.name);
+                        if (needsPropertyQuoting(p.name)) {
+                            try buf.append(gpa, '"');
+                            try buf.appendSlice(gpa, p.name);
+                            try buf.append(gpa, '"');
+                        } else {
+                            try buf.appendSlice(gpa, p.name);
+                        }
                         const pv = self.store.get(p.type_id);
                         if (p.is_method and pv.kind == .function_t) {
                             // Render method shorthand: name(): T
@@ -12427,7 +13206,13 @@ pub const Checker = struct {
                                     if (msi > 0) {
                                         try buf.appendSlice(gpa, "; ");
                                         if (p.readonly) try buf.appendSlice(gpa, "readonly ");
-                                        try buf.appendSlice(gpa, p.name);
+                                        if (needsPropertyQuoting(p.name)) {
+                                            try buf.append(gpa, '"');
+                                            try buf.appendSlice(gpa, p.name);
+                                            try buf.append(gpa, '"');
+                                        } else {
+                                            try buf.appendSlice(gpa, p.name);
+                                        }
                                     }
                                     const sig_pool_idx_m: u32 = pv.signatures.start + @as(u32, @intCast(msi));
                                     if (self.sig_type_params.get(sig_pool_idx_m)) |tp_prefix|
@@ -12480,6 +13265,42 @@ pub const Checker = struct {
                 // the alias. TypeScript reports `All` for `type All = A | B` when
                 // A/B are object/named types, but expands simple scalar unions like
                 // `type MaybeStr = string | undefined` to `string | undefined`.
+                // EXCEPTION: when all members are enum literals from the same enum,
+                // output the enum name (e.g. `E.A | E.B` → `E`).
+                const members_for_enum = self.store.idsOf(t.list_data);
+                // Check if all members are enum literals (from one or more enums).
+                // If so, collapse to enum name(s): `E.a | E.b | F.c` → `E | F`.
+                const all_enum_members = blk: {
+                    if (members_for_enum.len == 0) break :blk false;
+                    for (members_for_enum) |m| {
+                        if (self.store.get(m).enum_name.len == 0) break :blk false;
+                    }
+                    break :blk true;
+                };
+                if (all_enum_members) {
+                    if (t.alias_name.len > 0) {
+                        try buf.appendSlice(gpa, t.alias_name);
+                        return;
+                    }
+                    // Collect unique enum names in encounter order.
+                    var enum_names: [16][]const u8 = undefined;
+                    var n_enums: usize = 0;
+                    for (members_for_enum) |m| {
+                        const ename = self.store.get(m).enum_name;
+                        const already = for (enum_names[0..n_enums]) |en| {
+                            if (std.mem.eql(u8, en, ename)) break true;
+                        } else false;
+                        if (!already and n_enums < enum_names.len) {
+                            enum_names[n_enums] = ename;
+                            n_enums += 1;
+                        }
+                    }
+                    for (enum_names[0..n_enums], 0..) |en, i| {
+                        if (i > 0) try buf.appendSlice(gpa, " | ");
+                        try buf.appendSlice(gpa, en);
+                    }
+                    return;
+                }
                 if (t.alias_name.len > 0) {
                     const members = self.store.idsOf(t.list_data);
                     const has_complex = for (members) |m| {
@@ -12497,14 +13318,45 @@ pub const Checker = struct {
                 }
                 const ids = self.store.idsOf(t.list_data);
                 // Output union members in insertion order (matches tsc's declaration order).
+                // Function types in a union need parens to distinguish `(() => T) | U`
+                // from `() => T | U` (which reads as `() => (T | U)`).
                 for (ids, 0..) |m, i| {
                     if (i > 0) try buf.appendSlice(gpa, " | ");
+                    const mt = self.store.get(m);
+                    const needs_parens = mt.kind == .function_t and !mt.is_overload_set;
+                    if (needs_parens) try buf.appendSlice(gpa, "(");
                     try self.typeToStringInner(m, buf, depth + 1);
+                    if (needs_parens) try buf.appendSlice(gpa, ")");
                 }
             },
         }
     }
 };
+
+/// Returns true when a property key must be quoted in type display output.
+/// Valid JS identifiers and non-negative integer literals are unquoted; anything
+/// else (hyphens, dots, spaces, leading digits, etc.) needs double-quotes.
+fn needsPropertyQuoting(name: []const u8) bool {
+    if (name.len == 0) return true;
+    // Non-negative numeric literal (integer or decimal float): unquoted by tsc.
+    // Matches: digits, or digits.digits
+    const is_numeric = blk: {
+        var dot_seen = false;
+        for (name) |c| {
+            if (c == '.' and !dot_seen) { dot_seen = true; continue; }
+            if (c < '0' or c > '9') break :blk false;
+        }
+        break :blk true;
+    };
+    if (is_numeric) return false;
+    // Valid identifier: [a-zA-Z_$][a-zA-Z0-9_$]*
+    const first = name[0];
+    if (!std.ascii.isAlphabetic(first) and first != '_' and first != '$') return true;
+    for (name[1..]) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '$') return true;
+    }
+    return false;
+}
 
 /// TypeScript canonical TypeFlags priority for union member ordering in inferred
 /// array element unions. Matches TS's output: string < number < bigint < boolean
