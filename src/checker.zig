@@ -6628,7 +6628,8 @@ pub const Checker = struct {
                 if (pt == .fn_decl or pt == .async_fn_decl or pt == .generator_fn_decl or
                     pt == .async_generator_fn_decl or pt == .fn_expr or pt == .async_fn_expr or
                     pt == .generator_fn_expr or pt == .async_generator_fn_expr or
-                    pt == .arrow_fn or pt == .async_arrow_fn)
+                    pt == .arrow_fn or pt == .async_arrow_fn or
+                    pt == .method_def or pt == .getter_def or pt == .setter_def)
                 {
                     break;
                 }
@@ -6701,7 +6702,8 @@ pub const Checker = struct {
                 if (pt == .fn_decl or pt == .async_fn_decl or pt == .generator_fn_decl or
                     pt == .async_generator_fn_decl or pt == .fn_expr or pt == .async_fn_expr or
                     pt == .generator_fn_expr or pt == .async_generator_fn_expr or
-                    pt == .arrow_fn or pt == .async_arrow_fn)
+                    pt == .arrow_fn or pt == .async_arrow_fn or
+                    pt == .method_def or pt == .getter_def or pt == .setter_def)
                 {
                     break;
                 }
