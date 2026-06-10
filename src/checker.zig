@@ -55,6 +55,11 @@ pub const CheckerOpts = struct {
     /// True for `.js`/`.jsx` source files, where JSDoc `@param`/`@type`/
     /// `@returns` annotations supply types (in `.ts` they're ignored).
     is_js_file: bool = false,
+    /// File names of sibling modules concatenated into this AST (multi-file
+    /// test sources).  An import whose specifier matches one of these can be
+    /// resolved by bare-name lookup in the combined AST; others are external
+    /// and stay `any`.
+    available_modules: []const []const u8 = &.{},
     target: Target = .es5,
     /// Module resolution strategy.  Affects import resolution rules —
     /// notably, node16/nodenext require explicit .js/.mjs/.cjs extensions
@@ -8706,6 +8711,38 @@ pub const Checker = struct {
                     }
                 },
                 .import_decl => {
+                    // TS import-equals (`import mod = require("./m")`): the
+                    // parser stores no ImportData (lhs == .none); the local
+                    // binding is the token after `import` and tsc types it
+                    // `typeof mod` — same as a namespace import.
+                    if (data.lhs == .none) {
+                        if (data.rhs != .none and self.ast_ref.nodeTag(data.rhs) == .call_expr) {
+                            const local_tok = self.ast_ref.nodeMainToken(ni) + 1;
+                            if (local_tok < self.ast_ref.tokens.len) {
+                                const local_name = self.ast_ref.tokenText(local_tok);
+                                if (local_name.len > 0) {
+                                    // require("spec") argument, if a string literal.
+                                    var spec: []const u8 = "";
+                                    const cd2 = self.ast_ref.nodeData(data.rhs);
+                                    if (cd2.rhs != .none) {
+                                        const args = self.directRange(cd2.rhs, cd2.rhs);
+                                        _ = args;
+                                    }
+                                    // The call's first argument is the lone
+                                    // string_literal child created before it.
+                                    const arg_node: NodeIndex = @enumFromInt(data.rhs.toInt() - 1);
+                                    if (self.ast_ref.nodeTag(arg_node) == .string_literal) {
+                                        const raw_arg = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(arg_node));
+                                        if (raw_arg.len >= 2 and (raw_arg[0] == '\'' or raw_arg[0] == '"'))
+                                            spec = raw_arg[1 .. raw_arg.len - 1];
+                                    }
+                                    try self.known_type_names.put(self.gpa, local_name, {});
+                                    try self.namespace_import_map.put(self.gpa, local_name, spec);
+                                }
+                            }
+                        }
+                        continue;
+                    }
                     const idata = self.ast_ref.extraData(ast.ImportData, @intFromEnum(data.lhs));
                     // Get unquoted module specifier from the string_literal source node.
                     const raw_module = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(idata.source));
@@ -9322,6 +9359,25 @@ pub const Checker = struct {
                         var args_buf: [8]TypeId = undefined;
                         const args = self.collectTypeArgs(ty_node, &args_buf);
                         return self.store.typeRef(display, args) catch tymod.ID_ANY;
+                    }
+                }
+            }
+        }
+        // Qualified name rooted at a namespace-import binding
+        // (`import React = require("react")` + `React.StatelessComponent<T>`):
+        // preserve the full qualified display.
+        {
+            const qd2 = self.ast_ref.nodeData(ty_node);
+            if (self.namespace_import_map.get(name) != null and
+                qd2.lhs != .none and self.ast_ref.nodeTag(qd2.lhs) == .member_expr)
+            {
+                const md2 = self.ast_ref.nodeData(qd2.lhs);
+                if (md2.rhs != .none) {
+                    const qual2 = self.qualifiedTypeName(ty_node, md2.rhs);
+                    if (qual2.len > 0) {
+                        var qa2_buf: [8]TypeId = undefined;
+                        const qargs2 = self.collectTypeArgs(ty_node, &qa2_buf);
+                        return self.store.typeRef(qual2, qargs2) catch tymod.ID_ANY;
                     }
                 }
             }
@@ -13132,10 +13188,54 @@ pub const Checker = struct {
     }
 
     fn inferMemberOnNamespace(self: *Checker, module_spec: []const u8, member_name: []const u8) ?TypeId {
-        const resolver = self.module_resolver orelse return null;
-        if (self.file_path.len == 0) return null;
-        const from_dir = std.fs.path.dirname(self.file_path) orelse ".";
-        return resolver.resolveExportedType(from_dir, module_spec, member_name, &self.store, self.gpa);
+        if (self.module_resolver) |resolver| {
+            if (self.file_path.len > 0) {
+                const from_dir = std.fs.path.dirname(self.file_path) orelse ".";
+                if (resolver.resolveExportedType(from_dir, module_spec, member_name, &self.store, self.gpa)) |t| return t;
+            }
+        }
+        // Same-AST fallback: multi-file test sources are concatenated into one
+        // AST (the oracle's combined sections), so the imported module's
+        // exported declarations are resolvable by bare name — but ONLY when
+        // the specifier names one of the concatenated sections; anything else
+        // is genuinely external (stays any).  Skip when the member name is
+        // itself an import binding (avoid resolving `b.b` to the alias `b`).
+        if (self.moduleSpecIsLocalSection(module_spec) and
+            self.namespace_import_map.get(member_name) == null)
+        {
+            if (self.typeOfNameByAstSearch(member_name)) |t| {
+                if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ANY)) return t;
+            }
+            if (self.resolveDeclaredType(member_name)) |t| {
+                if (!t.eq(tymod.ID_UNKNOWN)) return t;
+            }
+        }
+        return null;
+    }
+
+    /// True when an import specifier refers to one of the sibling sections
+    /// concatenated into this AST (`./mod` matches section name `mod.ts`).
+    fn moduleSpecIsLocalSection(self: *Checker, spec: []const u8) bool {
+        if (self.checker_opts.available_modules.len == 0) return false;
+        // node16/nodenext require explicit .js/.mjs/.cjs extensions on relative
+        // imports — without one the module is unresolvable (tsc says any).
+        if (self.checker_opts.isNode16Style() and node16UnresolvableSpec(spec)) return false;
+        var base = spec;
+        if (std.mem.lastIndexOfScalar(u8, base, '/')) |sl| base = base[sl + 1 ..];
+        if (base.len == 0) return false;
+        for (self.checker_opts.available_modules) |m| {
+            var mn = m;
+            if (std.mem.lastIndexOfScalar(u8, mn, '/')) |sl| mn = mn[sl + 1 ..];
+            // Strip the extension (.ts/.tsx/.d.ts/.js/...) from the section name.
+            if (std.mem.lastIndexOfScalar(u8, mn, '.')) |dot| mn = mn[0..dot];
+            if (std.mem.endsWith(u8, mn, ".d")) mn = mn[0 .. mn.len - 2];
+            if (std.mem.eql(u8, mn, base)) return true;
+            // Specifier may itself carry an extension (`./mod.js`).
+            if (std.mem.lastIndexOfScalar(u8, base, '.')) |bdot| {
+                if (std.mem.eql(u8, mn, base[0..bdot])) return true;
+            }
+        }
+        return false;
     }
 
     fn stripNullishForLookup(self: *Checker, ty: TypeId) TypeId {

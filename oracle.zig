@@ -492,7 +492,7 @@ pub fn run(opts: Options) !Result {
                     stats.sections_large += 1;
                     continue;
                 }
-                const r = evalSection(fa, sec, lang, comp_opts, &coll);
+                const r = evalSection(fa, sec, lang, comp_opts, &coll, &.{});
                 accumulateResult(&stats, r, lang, comp_opts);
             }
             continue;
@@ -512,7 +512,14 @@ pub fn run(opts: Options) !Result {
                 stats.sections_large += count;
                 continue;
             }
-            const r = evalSection(fa, combined, lang, comp_opts, &coll);
+            var names_buf: [64][]const u8 = undefined;
+            var names_n: usize = 0;
+            for (sections[grp.start..grp.end]) |s2| {
+                if (names_n >= names_buf.len) break;
+                names_buf[names_n] = s2.name;
+                names_n += 1;
+            }
+            const r = evalSection(fa, combined, lang, comp_opts, &coll, names_buf[0..names_n]);
             // Count sections_eval once per section in the group.
             const section_count = grp.end - grp.start;
             accumulateResultN(&stats, r, lang, comp_opts, section_count);
@@ -1354,8 +1361,10 @@ fn lineOf(starts: []const u32, offset: u32) u32 {
     return @intCast(lo - 1);
 }
 
-fn evalSection(arena: std.mem.Allocator, sec: Section, lang: Language, opts: CompilerOpts, coll: *Collector) SecResult {
-    return evalSectionInner(arena, sec, lang, opts.toCheckerOpts(), coll) catch SecResult{ .status = .errored };
+fn evalSection(arena: std.mem.Allocator, sec: Section, lang: Language, opts: CompilerOpts, coll: *Collector, module_names: []const []const u8) SecResult {
+    var copts = opts.toCheckerOpts();
+    copts.available_modules = module_names;
+    return evalSectionInner(arena, sec, lang, copts, coll) catch SecResult{ .status = .errored };
 }
 
 fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, checker_opts: ez.CheckerOpts, coll: *Collector) !SecResult {
