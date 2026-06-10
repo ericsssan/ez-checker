@@ -116,6 +116,11 @@ pub const ObjectProp = struct {
     index_key_name: []const u8 = "",
     /// True when the index signature key type is `number` (vs string/symbol).
     index_key_is_number: bool = false,
+    /// True when this property's key came from a SINGLE-quoted string literal
+    /// in source (`{ 'a-b': 1 }`). tsc preserves the source quote character when
+    /// rendering a quoted key, so the renderer emits `'…'` instead of `"…"`.
+    /// Only meaningful when the key actually needs quoting.
+    key_single_quoted: bool = false,
 };
 
 pub const Signature = struct {
@@ -314,6 +319,7 @@ pub const InternContext = struct {
                 @intFromBool(p.is_method), @intFromBool(p.is_fn_property),
                 @intFromBool(p.is_static),
                 @intFromBool(p.index_key_is_number),
+                @intFromBool(p.key_single_quoted),
             };
             h.update(&flags);
             h.update(p.index_key_name);
@@ -366,6 +372,7 @@ pub const InternContext = struct {
                 x.is_static != y.is_static) return false;
             if (!std.mem.eql(u8, x.index_key_name, y.index_key_name)) return false;
             if (x.index_key_is_number != y.index_key_is_number) return false;
+            if (x.key_single_quoted != y.key_single_quoted) return false;
         }
         const sa = self.store.signaturesOf(ta.signatures);
         const sb = self.store.signaturesOf(tb.signatures);

@@ -13210,6 +13210,7 @@ pub const Checker = struct {
                             .type_id = widened_ty,
                             .is_method = false,
                             .is_fn_property = false,
+                            .key_single_quoted = self.keyIsSingleQuoted(pd.lhs),
                         };
                         n += 1;
                     }
@@ -13256,6 +13257,7 @@ pub const Checker = struct {
                         .type_id = fn_ty,
                         .is_method = !this_void,
                         .is_fn_property = false,
+                        .key_single_quoted = self.keyIsSingleQuoted(pd.lhs),
                     };
                     n += 1;
                 },
@@ -13302,7 +13304,7 @@ pub const Checker = struct {
                         break;
                     }
                     if (!found) {
-                        buf[n] = .{ .name = key_name, .type_id = ret, .readonly = true };
+                        buf[n] = .{ .name = key_name, .type_id = ret, .readonly = true, .key_single_quoted = self.keyIsSingleQuoted(pd.lhs) };
                         acc_kind[n] = ACC_GET;
                         n += 1;
                     }
@@ -13342,7 +13344,7 @@ pub const Checker = struct {
                         // often resolves it (contextual / getter) — bail when we'd
                         // emit `any`/`unknown` to avoid a guess.
                         if (pty.eq(tymod.ID_ANY) or pty.eq(tymod.ID_UNKNOWN)) return tymod.ID_UNKNOWN;
-                        buf[n] = .{ .name = key_name, .type_id = pty };
+                        buf[n] = .{ .name = key_name, .type_id = pty, .key_single_quoted = self.keyIsSingleQuoted(pd.lhs) };
                         acc_kind[n] = ACC_SET;
                         n += 1;
                     }
@@ -13362,6 +13364,16 @@ pub const Checker = struct {
     /// literal keys (`0x20` → "32") that `staticPropertyKey` doesn't cover.
     fn objectMemberKey(self: *Checker, key: NodeIndex) ?[]const u8 {
         return self.staticPropertyKey(key) orelse self.numericKeyString(key);
+    }
+
+    /// True when a property key is a SINGLE-quoted string literal in source.
+    /// tsc preserves the source quote character for quoted keys, so this drives
+    /// `'…'` vs `"…"` rendering. Number-literal and identifier keys → false.
+    fn keyIsSingleQuoted(self: *Checker, key: NodeIndex) bool {
+        if (key == .none) return false;
+        if (self.ast_ref.nodeTag(key) != .string_literal) return false;
+        const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(key));
+        return raw.len > 0 and raw[0] == '\'';
     }
 
     /// The canonical property-key string for a numeric literal key, matching
@@ -16109,9 +16121,10 @@ pub const Checker = struct {
                         first = false;
                         if (p.readonly) try buf.appendSlice(gpa, "readonly ");
                         if (needsPropertyQuoting(p.name)) {
-                            try buf.append(gpa, '"');
+                            const q: u8 = if (p.key_single_quoted) '\'' else '"';
+                            try buf.append(gpa, q);
                             try buf.appendSlice(gpa, p.name);
-                            try buf.append(gpa, '"');
+                            try buf.append(gpa, q);
                         } else {
                             try buf.appendSlice(gpa, p.name);
                         }
@@ -16151,9 +16164,10 @@ pub const Checker = struct {
                                         try buf.appendSlice(gpa, "; ");
                                         if (p.readonly) try buf.appendSlice(gpa, "readonly ");
                                         if (needsPropertyQuoting(p.name)) {
-                                            try buf.append(gpa, '"');
+                                            const q: u8 = if (p.key_single_quoted) '\'' else '"';
+                                            try buf.append(gpa, q);
                                             try buf.appendSlice(gpa, p.name);
-                                            try buf.append(gpa, '"');
+                                            try buf.append(gpa, q);
                                         } else {
                                             try buf.appendSlice(gpa, p.name);
                                         }
@@ -16292,17 +16306,18 @@ pub const Checker = struct {
 /// else (hyphens, dots, spaces, leading digits, etc.) needs double-quotes.
 fn needsPropertyQuoting(name: []const u8) bool {
     if (name.len == 0) return true;
-    // Non-negative numeric literal (integer or decimal float): unquoted by tsc.
-    // Matches: digits, or digits.digits
-    const is_numeric = blk: {
-        var dot_seen = false;
-        for (name) |c| {
-            if (c == '.' and !dot_seen) { dot_seen = true; continue; }
-            if (c < '0' or c > '9') break :blk false;
-        }
-        break :blk true;
-    };
-    if (is_numeric) return false;
+    // tsc renders a property key unquoted iff it is a CANONICAL numeric-literal
+    // name: `(+name).toString() === name`. So "0"/"100"/"1.5" are unquoted, but
+    // "1.0", "1.", "007", "0.0" (non-canonical) stay quoted. We only consider the
+    // numeric path when the name begins with a digit or '.' (leading '-' / other
+    // forms keep their current quoted behavior). A valid identifier can never
+    // start with a digit, so there is no conflict with the identifier check.
+    if ((name[0] >= '0' and name[0] <= '9') or name[0] == '.') {
+        const f = std.fmt.parseFloat(f64, name) catch return true;
+        var buf: [64]u8 = undefined;
+        const canon = std.fmt.bufPrint(&buf, "{d}", .{f}) catch return true;
+        return !std.mem.eql(u8, canon, name);
+    }
     // Valid identifier: [a-zA-Z_$][a-zA-Z0-9_$]*
     const first = name[0];
     if (!std.ascii.isAlphabetic(first) and first != '_' and first != '$') return true;
