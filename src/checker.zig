@@ -7676,6 +7676,26 @@ pub const Checker = struct {
         return self.store.add(copy) catch id;
     }
 
+    /// Stamp a structurally-resolved utility type (`Record<string, number>`,
+    /// `Partial<Foo>`, ...) with its display name, since tsc renders these
+    /// by name rather than expanding them.
+    fn tagUtilityAlias(self: *Checker, id: TypeId, name: []const u8, args: []const TypeId) TypeId {
+        if (args.len == 0) return id;
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(self.gpa);
+        buf.appendSlice(self.gpa, name) catch return id;
+        buf.append(self.gpa, '<') catch return id;
+        for (args, 0..) |a, i| {
+            if (i > 0) buf.appendSlice(self.gpa, ", ") catch return id;
+            const s = self.typeToString(a) catch return id;
+            defer self.gpa.free(s);
+            buf.appendSlice(self.gpa, s) catch return id;
+        }
+        buf.append(self.gpa, '>') catch return id;
+        const display = self.gpa.dupe(u8, buf.items) catch return id;
+        return self.tagAliasName(id, display);
+    }
+
     fn resolveTypeRef(self: *Checker, ty_node: NodeIndex) TypeId {
         const name_tok = self.ast_ref.nodeMainToken(ty_node);
         const name = self.ast_ref.tokenText(name_tok);
@@ -8201,7 +8221,8 @@ pub const Checker = struct {
             const v = if (args.len > 1) args[1] else tymod.ID_UNKNOWN;
             const props = [_]tymod.ObjectProp{.{ .name = "[]", .type_id = v }};
             const list = self.store.appendObjectProps(&props) catch return null;
-            return self.store.add(.{ .kind = .object_t, .object_props = list }) catch null;
+            const obj = self.store.add(.{ .kind = .object_t, .object_props = list }) catch return null;
+            return self.tagUtilityAlias(obj, name, args);
         }
         // NonNullable<T> — remove null and undefined from T's union members.
         if (std.mem.eql(u8, name, "NonNullable")) {
@@ -8226,17 +8247,17 @@ pub const Checker = struct {
         // Partial<T> — make every property of T optional.
         if (std.mem.eql(u8, name, "Partial")) {
             const t = if (args.len > 0) args[0] else return tymod.ID_UNKNOWN;
-            return self.resolvePartial(t, true);
+            return self.tagUtilityAlias(self.resolvePartial(t, true), name, args);
         }
         // Required<T> — make every property of T required (non-optional).
         if (std.mem.eql(u8, name, "Required")) {
             const t = if (args.len > 0) args[0] else return tymod.ID_UNKNOWN;
-            return self.resolvePartial(t, false);
+            return self.tagUtilityAlias(self.resolvePartial(t, false), name, args);
         }
         // Readonly<T> — structural alias (all props readonly, same shape).
         if (std.mem.eql(u8, name, "Readonly")) {
             const t = if (args.len > 0) args[0] else return tymod.ID_UNKNOWN;
-            return self.resolveReadonly(t);
+            return self.tagUtilityAlias(self.resolveReadonly(t), name, args);
         }
         // Exclude<T, U> — union T minus members assignable to U.
         if (std.mem.eql(u8, name, "Exclude")) {
@@ -8254,13 +8275,13 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "Pick")) {
             const t = if (args.len > 0) args[0] else return tymod.ID_UNKNOWN;
             const k = if (args.len > 1) args[1] else return tymod.ID_UNKNOWN;
-            return self.resolvePick(t, k);
+            return self.tagUtilityAlias(self.resolvePick(t, k), name, args);
         }
         // Omit<T, K> — object type without the keys in K.
         if (std.mem.eql(u8, name, "Omit")) {
             const t = if (args.len > 0) args[0] else return tymod.ID_UNKNOWN;
             const k = if (args.len > 1) args[1] else return tymod.ID_UNKNOWN;
-            return self.resolveOmit(t, k);
+            return self.tagUtilityAlias(self.resolveOmit(t, k), name, args);
         }
         return null;
     }
