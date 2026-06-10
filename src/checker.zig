@@ -52,6 +52,9 @@ pub const CheckerOpts = struct {
     /// resolve to the generic `CallableFunction`/`NewableFunction` overloads;
     /// otherwise to the loose base `Function` signatures.
     strict_bind_call_apply: bool = false,
+    /// True under `--noUncheckedIndexedAccess`: an index-signature access
+    /// (`record[k]` / `record.prop`) yields `V | undefined` instead of `V`.
+    no_unchecked_indexed_access: bool = false,
     /// True when JSX is checked in a React-style mode (`jsx: react` /
     /// `react-jsx` / `react-jsxdev` / `react-native`).  Under these modes a
     /// JSX element expression has type `JSX.Element`; under `preserve` / unset
@@ -374,6 +377,11 @@ pub const Checker = struct {
 
     /// Compiler options that affect type inference.
     checker_opts: CheckerOpts = .{},
+    /// Set while resolving a member access through a union/intersection
+    /// receiver — suppresses the string-index-signature fallback so a member
+    /// served only by an index signature counts as "absent" (the union access
+    /// then yields `any`, matching tsc's behavior for mixed index-sig unions).
+    suppress_index_fallback: bool = false,
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -9728,7 +9736,14 @@ pub const Checker = struct {
         // sentinel prop on object_t.
         if (std.mem.eql(u8, name, "Record")) {
             const v = if (args.len > 1) args[1] else tymod.ID_UNKNOWN;
-            const props = [_]tymod.ObjectProp{.{ .name = "[]", .type_id = v }};
+            // The `[]` index entry is a STRING index signature only when the key
+            // type is plain `string`. A restricted/generic key (literal unions,
+            // `keyof T`, number) does NOT accept arbitrary string property names —
+            // tsc errors (→ `any`) on `rec.unlistedKey` there — so mark it as a
+            // non-string (number) index so the `.prop` fallback won't serve it.
+            const key = if (args.len > 0) args[0] else tymod.ID_STRING;
+            const key_is_string = key.eq(tymod.ID_STRING);
+            const props = [_]tymod.ObjectProp{.{ .name = "[]", .type_id = v, .index_key_is_number = !key_is_string }};
             const list = self.store.appendObjectProps(&props) catch return null;
             const obj = self.store.add(.{ .kind = .object_t, .object_props = list }) catch return null;
             return self.tagUtilityAlias(obj, name, args);
@@ -13839,6 +13854,49 @@ pub const Checker = struct {
     ///     type) and re-do the lookup.
     ///   - array_t / readonly_array_t / tuple_t: Array.prototype.
     ///   - object_t: direct property lookup.
+    /// True for the inherited Object.prototype member names — these resolve to
+    /// real method signatures, not a string index signature's value type.
+    fn isObjectPrototypeName(name: []const u8) bool {
+        const names = [_][]const u8{
+            "hasOwnProperty", "toString",         "toLocaleString", "valueOf",
+            "isPrototypeOf",  "propertyIsEnumerable", "constructor",
+        };
+        for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+        return false;
+    }
+
+    /// True when `id` is `unknown` or structurally contains an `unknown` leaf
+    /// (inside type args, unions, arrays, tuples, object props, signatures).
+    /// Used to reject half-resolved mapped-type index values like
+    /// `Proxy<unknown>` from the string-index member-access fallback.
+    fn typeMentionsUnknown(self: *Checker, id: TypeId, depth: u8) bool {
+        if (depth > 6) return false;
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .unknown => return true,
+            .union_t, .intersection_t, .tuple_t, .type_ref, .array_t, .readonly_array_t, .rest_t => {
+                for (self.store.idsOf(t.list_data)) |m| {
+                    if (self.typeMentionsUnknown(m, depth + 1)) return true;
+                }
+            },
+            .object_t => {
+                for (self.store.propsOf(t.object_props)) |p| {
+                    if (self.typeMentionsUnknown(p.type_id, depth + 1)) return true;
+                }
+            },
+            .function_t => {
+                for (self.store.signaturesOf(t.signatures)) |s| {
+                    if (self.typeMentionsUnknown(s.return_type, depth + 1)) return true;
+                    for (self.store.signatureParamsOf(s)) |pp| {
+                        if (self.typeMentionsUnknown(pp, depth + 1)) return true;
+                    }
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
     fn memberOnApparentType(self: *Checker, obj_ty: TypeId, prop_name: []const u8, obj_node: NodeIndex) TypeId {
         const obj = self.store.get(obj_ty);
         // Remember if input obj_ty is unknown/error so we return `any`
@@ -13856,6 +13914,9 @@ pub const Checker = struct {
             // reach the prop when the receiver could be nullish).
             var buf: [16]TypeId = undefined;
             var n: usize = 0;
+            const prev_suppress = self.suppress_index_fallback;
+            self.suppress_index_fallback = true;
+            defer self.suppress_index_fallback = prev_suppress;
             for (self.store.idsOf(obj.list_data)) |m| {
                 if (n >= buf.len) break;
                 const mk = self.store.get(m).kind;
@@ -13990,12 +14051,45 @@ pub const Checker = struct {
             return tymod.ID_ANY;
         }
         if (obj.kind == .object_t) {
+            var string_index_val: ?TypeId = null;
             for (self.store.propsOf(obj.object_props)) |p| {
+                // Index-signature entry (name "[]"/"[]L"/"[]U"). A `.prop` access
+                // uses a STRING key, so it's served by the STRING index signature
+                // (a number index sig only applies to numeric element access).
+                if (std.mem.startsWith(u8, p.name, "[]")) {
+                    if (!p.index_key_is_number) string_index_val = p.type_id;
+                    continue;
+                }
                 if (std.mem.eql(u8, p.name, prop_name)) {
                     if (p.optional) {
                         return self.store.unionOf(&.{ p.type_id, tymod.ID_UNDEFINED }) catch p.type_id;
                     }
                     return p.type_id;
+                }
+            }
+            // No explicit property matched — fall back to the string index
+            // signature value type (`Record<string, V>.anything` → V). Only when
+            // the value is a CONCRETE, fully-resolved type: a mapped/generic type
+            // modeled with a synthetic index sig holds a type-param or a value
+            // that still mentions `unknown` (e.g. `Proxy<unknown>` from an
+            // unresolved `Props[P]`), and tsc resolves those members elsewhere
+            // (or shows `any`) rather than leaking the placeholder.
+            if (string_index_val) |v| {
+                const vk = self.store.get(v).kind;
+                if (!self.suppress_index_fallback and
+                    vk != .type_param and !v.eq(tymod.ID_UNKNOWN) and
+                    !tymod.isAny(&self.store, v) and !self.typeMentionsUnknown(v, 0) and
+                    // An inherited Object.prototype member (`record.hasOwnProperty`)
+                    // is a real method, not served by the index signature — leave
+                    // it for the normal path rather than returning the value type.
+                    !isObjectPrototypeName(prop_name) and
+                    // Under --noUncheckedIndexedAccess an index access is
+                    // `V | undefined`, and flow-narrowing (`k in obj`) /
+                    // assignment-target positions further refine it — more than
+                    // this fallback models. Leave those to the normal path.
+                    !self.checker_opts.no_unchecked_indexed_access)
+                {
+                    return v;
                 }
             }
         }

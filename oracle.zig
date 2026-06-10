@@ -80,6 +80,7 @@ const CompilerOpts = struct {
     strict_bind_call_apply: ?bool = null,
     strict_explicitly_false: bool = false, // @strict: false was written explicitly
     no_implicit_any: bool = false,
+    no_unchecked_indexed_access: bool = false,
     target: Target = .es5,
     module: Module = .none,
     jsx: Jsx = .none,
@@ -113,6 +114,7 @@ const CompilerOpts = struct {
             .strict_bind_call_apply = if (self.strict_bind_call_apply) |v| v
                 else !self.strict_explicitly_false,
             .strict_explicitly_false = self.strict_explicitly_false,
+            .no_unchecked_indexed_access = self.no_unchecked_indexed_access,
             // JSX elements type as `JSX.Element` under React-style modes; under
             // explicit `preserve` they stay `any`.  Default (unset) behaves
             // React-style, matching how tsc's baselines record .tsx files.
@@ -196,6 +198,7 @@ fn applyVariantOverrides(opts: *CompilerOpts, filename: []const u8) void {
         else if (std.mem.eql(u8, key, "strictNullChecks")) opts.strict_null_checks = isTrue(val)
         else if (std.mem.eql(u8, key, "strictBindCallApply")) opts.strict_bind_call_apply = isTrue(val)
         else if (std.mem.eql(u8, key, "noImplicitAny")) opts.no_implicit_any = isTrue(val)
+        else if (std.mem.eql(u8, key, "noUncheckedIndexedAccess")) opts.no_unchecked_indexed_access = isTrue(val)
         else if (std.mem.eql(u8, key, "jsx")) opts.jsx = parseJsx(val)
         else if (std.mem.eql(u8, key, "useDefineForClassFields")) opts.use_define_for_class_fields = isTrue(val)
         else if (std.mem.eql(u8, key, "experimentalDecorators")) opts.experimental_decorators = isTrue(val)
@@ -271,6 +274,8 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
             opts.strict_bind_call_apply = isTrue(val);
         } else if (ci(key, "noImplicitAny")) {
             opts.no_implicit_any = isTrue(val);
+        } else if (ci(key, "noUncheckedIndexedAccess")) {
+            opts.no_unchecked_indexed_access = isTrue(val);
         } else if (ci(key, "target")) {
             opts.target = parseTarget(val);
         } else if (ci(key, "module")) {
