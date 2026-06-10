@@ -504,8 +504,9 @@ pub const Checker = struct {
                 break :blk tymod.ID_UNKNOWN;
             },
             .this_expr => self.inferThis(node),
-            // super's type depends on the base class — default to any when not modeled.
-            .super_expr => tymod.ID_ANY,
+            // `super` types as the base class: instance side in instance
+            // members (`super : A`), constructor side in statics (`typeof A`).
+            .super_expr => self.inferSuper(node),
 
             .identifier => self.inferIdentifier(node),
             // A JSX element name (`<Foo .../>`) references a value — resolve it
@@ -12817,6 +12818,73 @@ pub const Checker = struct {
             return self.resolveTypeNode(ty_node);
         }
         return null;
+    }
+
+    /// `super` inside a class member types as the base class — the instance
+    /// type in instance members (`super : A`), the constructor type in
+    /// static members (`super : typeof A`).  Arrow functions inherit the
+    /// enclosing member's `super` binding; other functions break it.
+    fn inferSuper(self: *Checker, node: NodeIndex) TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return tymod.ID_ANY;
+        // `super(...)` invokes the base constructor → `typeof A`, while
+        // `super.x` accesses the base instance → `A`.
+        const is_call = blk: {
+            const pi = parents[nidx];
+            if (pi == @intFromEnum(NodeIndex.none)) break :blk false;
+            const par: NodeIndex = @enumFromInt(pi);
+            const pt = self.ast_ref.nodeTag(par);
+            if (pt != .call_expr and pt != .optional_call_expr) break :blk false;
+            break :blk self.ast_ref.nodeData(par).lhs == node;
+        };
+        var p = parents[nidx];
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .method_def, .computed_method_def, .getter_def, .setter_def,
+                .computed_getter_def, .computed_setter_def, .constructor_def,
+                .property_def => {
+                    const is_static = self.classMemberIsStatic(pn) or is_call;
+                    var q = parents[p];
+                    while (q != NONE) : (q = parents[q]) {
+                        const qn: NodeIndex = @enumFromInt(q);
+                        const qtag = self.ast_ref.nodeTag(qn);
+                        if (qtag == .class_decl or qtag == .class_expr) {
+                            const cdata = self.ast_ref.nodeData(qn);
+                            if (cdata.lhs == .none) return tymod.ID_ANY;
+                            const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
+                            if (cd.super_class == .none) return tymod.ID_ANY;
+                            var sc = cd.super_class;
+                            while (true) {
+                                const sct = self.ast_ref.nodeTag(sc);
+                                if (sct == .grouping_expr or sct == .ts_instantiation_expr) {
+                                    sc = self.ast_ref.nodeData(sc).lhs;
+                                    continue;
+                                }
+                                break;
+                            }
+                            if (self.ast_ref.nodeTag(sc) != .identifier) return tymod.ID_ANY;
+                            const base = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(sc));
+                            if (base.len == 0) return tymod.ID_ANY;
+                            if (is_static) {
+                                const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{base}) catch return tymod.ID_ANY;
+                                return self.store.typeRef(tn, &.{}) catch tymod.ID_ANY;
+                            }
+                            return self.store.typeRef(base, &.{}) catch tymod.ID_ANY;
+                        }
+                        if (qtag != .class_body) break;
+                    }
+                    return tymod.ID_ANY;
+                },
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                .class_decl, .class_expr => return tymod.ID_ANY,
+                else => {},
+            }
+        }
+        return tymod.ID_ANY;
     }
 
     /// `this` inside a class method/getter/setter/constructor resolves
