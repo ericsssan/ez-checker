@@ -7076,7 +7076,7 @@ pub const Checker = struct {
                 }
                 const optional = propertyHasOptionalMarker(self, name_node);
                 const is_readonly = propertyHasReadonlyModifier(self, name_node);
-                props_buf[prop_count] = .{ .name = name, .type_id = prop_ty, .optional = optional, .readonly = is_readonly };
+                props_buf[prop_count] = .{ .name = name, .type_id = prop_ty, .optional = optional, .readonly = is_readonly, .key_single_quoted = self.keyIsSingleQuoted(name_node) };
                 prop_count += 1;
             } else {
                 // ts_method_signature: name is in InterfaceSigData.key.
