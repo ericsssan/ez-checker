@@ -8284,7 +8284,37 @@ pub const Checker = struct {
             // user-declared so they never appear in known_type_names, but
             // they still have structural shapes we can resolve.
             if (self.resolveLibType(ty_node, name)) |resolved| return resolved;
-            // Unresolved type name → `any` to match TypeScript's permissive behavior.
+            // Unresolved type name referenced by a `///<reference>`'d file
+            // (e.g. `Type`, `NodeType` in the parser sources) — tsc resolves it
+            // cross-file and prints the verbatim name.  Preserve the name as a
+            // type_ref rather than collapsing to `any`, so annotated fields and
+            // `this.x` accesses show the real type.  Only for capitalized
+            // identifiers (a heuristic for "names a type", avoiding stray
+            // lowercase value-ish references).
+            // Lib generics we don't model structurally but whose name carries
+            // semantics elsewhere (await unwrapping, spread, iteration) —
+            // leaving them as a bare typeRef would block those, so keep `any`.
+            const unmodeled_lib_generic = for ([_][]const u8{
+                "Promise", "PromiseLike", "Awaited", "Iterable", "AsyncIterable",
+                "Iterator", "AsyncIterator", "IterableIterator", "ArrayLike",
+                "Generator", "AsyncGenerator", "ThisType",
+            }) |g| {
+                if (std.mem.eql(u8, name, g)) break true;
+            } else false;
+            if (name.len > 0 and name[0] >= 'A' and name[0] <= 'Z' and
+                !unmodeled_lib_generic and
+                // Exclude in-scope type parameters (`T`, `U`) — they resolve via
+                // their constraint above, or stay generic, not a cross-file ref.
+                !self.argIsInScopeTypeParam(ty_node) and
+                // Exclude short generic-style names (`T`, `R`, `X2`) that are
+                // almost always type params rather than cross-file types.
+                !(name.len <= 2 and (name.len == 1 or (name[1] >= '0' and name[1] <= '9'))))
+            {
+                var ua_buf: [8]TypeId = undefined;
+                const uargs = self.collectTypeArgs(ty_node, &ua_buf);
+                return self.store.typeRef(name, uargs) catch tymod.ID_ANY;
+            }
+            // Unresolved lowercase name → `any` to match TypeScript's permissive behavior.
             return tymod.ID_ANY;
         }
         // User-declared class or interface → named type_ref so the type
