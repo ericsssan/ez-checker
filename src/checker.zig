@@ -15230,6 +15230,130 @@ pub const Checker = struct {
         return tymod.ID_ANY;
     }
 
+    /// The object literal whose method/accessor lexically binds `this` at
+    /// `node`, looking through arrow functions (transparent to `this`).
+    /// Returns null when `this` is bound by a class, a plain function, or
+    /// module scope.
+    fn thisHostObjectLiteral(self: *Checker, node: NodeIndex) ?NodeIndex {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = parents[nidx];
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                // Arrow functions don't bind their own `this` — keep walking.
+                .arrow_fn, .async_arrow_fn => {},
+                .method_def, .computed_method_def, .getter_def, .setter_def,
+                .computed_getter_def, .computed_setter_def => {
+                    const cp = parents[p];
+                    if (cp == NONE) return null;
+                    if (self.ast_ref.nodeTag(@as(NodeIndex, @enumFromInt(cp))) == .object_literal)
+                        return @enumFromInt(cp);
+                    return null; // class member or other → not object-literal `this`
+                },
+                // A non-arrow function (incl. a `prop: function(){}` value) owns
+                // its own `this` binding — `this` does not reach the object.
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                .property => return null,
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// The contextual type of an object literal that is the initializer of an
+    /// annotated `let/const/var` declarator (`let p: Point = { … }` → Point).
+    fn objectLiteralContextualType(self: *Checker, objlit: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const oidx = objlit.toInt();
+        if (oidx >= parents.len) return null;
+        const pi = parents[oidx];
+        if (pi == @intFromEnum(NodeIndex.none)) return null;
+        const pn: NodeIndex = @enumFromInt(pi);
+        if (self.ast_ref.nodeTag(pn) != .declarator) return null;
+        const dd = self.ast_ref.nodeData(pn);
+        if (dd.lhs == .none or self.ast_ref.nodeTag(dd.lhs) != .identifier) return null;
+        const ann = self.ast_ref.nodeData(dd.lhs).rhs;
+        if (ann == .none or self.ast_ref.nodeTag(ann) != .ts_type_annotation) return null;
+        const ty = self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs);
+        if (ty.eq(tymod.ID_UNKNOWN) or ty.eq(tymod.ID_ANY)) return null;
+        return ty;
+    }
+
+    /// The effective type of `this` in an object-literal method: the enclosing
+    /// method's contextual `this:` parameter when its signature declares one,
+    /// otherwise the object literal's (nullish-stripped) contextual type.  Only
+    /// the contextual case is modeled — the no-contextual-type case interacts
+    /// with noImplicitThis and structural-vs-`this` rendering, so it stays `any`.
+    fn objectLiteralThisType(self: *Checker, this_node: NodeIndex, objlit: NodeIndex) ?TypeId {
+        const ctx = self.objectLiteralContextualType(objlit) orelse return null;
+        // The contextual signature of the enclosing method may pin `this`
+        // (`interface I { m(this: void): … }`) — that overrides the object type.
+        if (self.contextualMethodThisParam(this_node, objlit, ctx)) |tp| return tp;
+        const stripped = self.stripNullishForLookup(ctx);
+        // A union contextual type (`LikeA | LikeB`) is refined to a single
+        // member against the literal's shape — not modeled; leave `this` `any`.
+        if (self.store.get(stripped).kind == .union_t) return null;
+        return stripped;
+    }
+
+    /// When `this_node`'s enclosing object-literal method corresponds to a
+    /// method in the contextual type `ctx` whose signature declares a `this:`
+    /// parameter, return that parameter's type (the explicit `this` overrides
+    /// the object type).  Returns null otherwise.
+    fn contextualMethodThisParam(self: *Checker, this_node: NodeIndex, objlit: NodeIndex, ctx: TypeId) ?TypeId {
+        // Find the method/accessor key between `this_node` and `objlit`.
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (this_node.toInt() < parents.len) parents[this_node.toInt()] else NONE;
+        var method_key: ?[]const u8 = null;
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            const tag = self.ast_ref.nodeTag(pn);
+            if (tag == .method_def or tag == .computed_method_def or
+                tag == .getter_def or tag == .setter_def)
+            {
+                if (parents[p] != objlit.toInt()) return null;
+                method_key = self.staticPropertyKey(self.ast_ref.nodeData(pn).lhs);
+                break;
+            }
+            if (@as(NodeIndex, @enumFromInt(p)) == objlit) break;
+        }
+        const key = method_key orelse return null;
+        // Resolve ctx structurally and find the method property's function type.
+        const ct = self.store.get(ctx);
+        if (ct.kind != .object_t) {
+            // Named type — resolve its declared structural form.
+            const resolved = if (ct.kind == .type_ref) self.resolveDeclaredType(ct.name) else null;
+            if (resolved == null) return null;
+            return self.thisParamOfMethod(resolved.?, key);
+        }
+        return self.thisParamOfMethod(ctx, key);
+    }
+
+    /// The `this:` parameter type of property `key`'s method signature in the
+    /// object type `obj_ty`, or null when there is none.
+    fn thisParamOfMethod(self: *Checker, obj_ty: TypeId, key: []const u8) ?TypeId {
+        const ot = self.store.get(obj_ty);
+        if (ot.kind != .object_t) return null;
+        for (self.store.propsOf(ot.object_props)) |prop| {
+            if (!std.mem.eql(u8, prop.name, key)) continue;
+            const ft = self.store.get(prop.type_id);
+            if (ft.kind != .function_t) return null;
+            const sigs = self.store.signaturesOf(ft.signatures);
+            if (sigs.len == 0) return null;
+            const params = self.store.signatureParamsOf(sigs[0]);
+            const names = self.store.signatureParamNamesOf(sigs[0]);
+            if (params.len > 0 and names.len > 0 and std.mem.eql(u8, names[0], "this"))
+                return params[0];
+            return null;
+        }
+        return null;
+    }
+
     /// `this` inside a class method/getter/setter/constructor resolves
     /// to the enclosing class's instance type.  Walks parents to find
     /// the nearest method-or-class declaration.  A stand-alone function's
@@ -15238,6 +15362,13 @@ pub const Checker = struct {
         const parents = self.semantic.parent_indices;
         const nidx = node.toInt();
         if (nidx >= parents.len) return tymod.ID_ANY;
+        // `this` in an object-literal method is the object literal's contextual
+        // type (`let p: Point = { move() { this.x } }` → `this` is Point).
+        // Returns null for class / plain-function / module-scope receivers,
+        // leaving the class / this-param walk below intact.
+        if (self.thisHostObjectLiteral(node)) |objlit| {
+            if (self.objectLiteralThisType(node, objlit)) |t| return t;
+        }
         var p = parents[nidx];
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         while (p != NONE) : (p = parents[p]) {
