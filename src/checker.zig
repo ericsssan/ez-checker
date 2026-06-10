@@ -198,6 +198,15 @@ pub const Checker = struct {
     /// `foo.x` member access can resolve lazily to the widened value type.
     expando_fns: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(ExpandoProp)) = .empty,
 
+    /// Names declared `var X = {}` (JS) that receive later `X.prop = …`
+    /// assignments — salsa expando objects; tsc types them `typeof X`.
+    /// Their props live in `expando_fns` alongside function expandos.
+    expando_objs: std.StringHashMapUnmanaged(void) = .empty,
+
+    /// True when the file contains `module.exports = { … }` (object-literal
+    /// RHS) — only then does tsc display `typeof module.exports`.
+    module_exports_literal: bool = false,
+
     /// Lazily-built map: destructuring pattern node → its `ts_type_annotation`
     /// node.  Patterns store their `: T` annotation as a child node parented to
     /// the pattern (not in the pattern's lhs/rhs range), so this reverse index
@@ -425,6 +434,7 @@ pub const Checker = struct {
             while (eit.next()) |lst| lst.deinit(self.gpa);
         }
         self.expando_fns.deinit(self.gpa);
+        self.expando_objs.deinit(self.gpa);
         self.pattern_annotations.deinit(self.gpa);
         {
             var jit = self.jsdoc_params.valueIterator();
@@ -565,7 +575,40 @@ pub const Checker = struct {
             .grouping_expr => self.typeOf(self.ast_ref.nodeData(node).lhs),
             .sequence_expr => self.inferSequence(node),
             .conditional => self.inferConditional(node),
-            .assign => self.typeOf(self.ast_ref.nodeData(node).rhs),
+            .assign => blk: {
+                const ad = self.ast_ref.nodeData(node);
+                if (self.checker_opts.is_js_file and ad.lhs != .none and
+                    self.ast_ref.nodeTag(ad.lhs) == .member_expr)
+                {
+                    // CommonJS `module.exports = {…}` evaluates to the exports
+                    // object (`typeof module.exports`).
+                    if (self.isModuleExportsMember(ad.lhs) and
+                        self.isEmptyObjectLiteral(ad.rhs))
+                    {
+                        break :blk self.typeOf(ad.lhs);
+                    }
+                    // Salsa expando-prop declaration (`Outer.Inner = function(){}`,
+                    // `Host.Metrics = {}`): when the member itself resolves to a
+                    // named `typeof X` entity, the assignment displays it too.
+                    if (ad.rhs != .none) {
+                        switch (self.ast_ref.nodeTag(ad.rhs)) {
+                            .fn_expr, .async_fn_expr, .generator_fn_expr,
+                            .async_generator_fn_expr, .arrow_fn, .async_arrow_fn,
+                            .class_expr, .object_literal => {
+                                const lt = self.typeOf(ad.lhs);
+                                const ltt = self.store.get(lt);
+                                if (ltt.kind == .type_ref and
+                                    std.mem.startsWith(u8, ltt.name, "typeof "))
+                                {
+                                    break :blk lt;
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                }
+                break :blk self.typeOf(ad.rhs);
+            },
             // Compound assignments: result is the new value of LHS.  If
             // LHS is any, result is any.  Otherwise approximate based on
             // operator class (most produce number; string/bigint variants
@@ -1097,6 +1140,28 @@ pub const Checker = struct {
         return self.store.typeRef("RegExp", &.{}) catch tymod.ID_ANY;
     }
 
+    /// True when `node` is an object literal with no properties (`{}`).
+    fn isEmptyObjectLiteral(self: *Checker, node: NodeIndex) bool {
+        if (node == .none) return false;
+        if (self.ast_ref.nodeTag(node) != .object_literal) return false;
+        const d = self.ast_ref.nodeData(node);
+        const slice = self.directRange(d.lhs, d.rhs) orelse return true;
+        return slice.len == 0;
+    }
+
+    /// True when `node` is the member expression `module.exports`.
+    fn isModuleExportsMember(self: *Checker, node: NodeIndex) bool {
+        if (node == .none) return false;
+        if (self.ast_ref.nodeTag(node) != .member_expr) return false;
+        const d = self.ast_ref.nodeData(node);
+        if (d.lhs == .none or d.rhs == .none) return false;
+        if (self.ast_ref.nodeTag(d.lhs) != .identifier) return false;
+        const obj = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs));
+        if (!std.mem.eql(u8, obj, "module")) return false;
+        const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.rhs));
+        return std.mem.eql(u8, prop, "exports");
+    }
+
     /// Type of a JSX element/fragment expression — `JSX.Element` under a
     /// React-style jsx mode, otherwise `any` (preserve mode / no JSX namespace,
     /// where tsc leaves the element untyped).
@@ -1326,6 +1391,17 @@ pub const Checker = struct {
                         const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{fn_name}) catch return tymod.ID_ANY;
                         return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
                     }
+                }
+            }
+            // JS expando object: `var Outer = {}` + `Outer.x = …` → typeof Outer.
+            if ((bkind == .@"var" or bkind == .let or bkind == .@"const") and
+                !self.identifierInTypePosition(node))
+            {
+                const tok_v = self.ast_ref.nodeMainToken(node);
+                const v_name = self.ast_ref.tokenText(tok_v);
+                if (v_name.len > 0 and self.expando_objs.contains(v_name)) {
+                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{v_name}) catch return tymod.ID_ANY;
+                    return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
                 }
             }
             const base = self.declaredTypeForSymbol(sym);
@@ -8655,6 +8731,13 @@ pub const Checker = struct {
             if (self.ast_ref.nodeTag(ni) != .assign) continue;
             const data = self.ast_ref.nodeData(ni);
             if (data.lhs == .none or data.lhs.toInt() == NONE) continue;
+            // CommonJS: note `module.exports = { … }` (object-literal RHS).
+            if (self.checker_opts.is_js_file and !self.module_exports_literal and
+                self.isModuleExportsMember(data.lhs) and
+                self.isEmptyObjectLiteral(data.rhs))
+            {
+                self.module_exports_literal = true;
+            }
             // Direct single-level property write `foo.x = v`: remember the
             // prop so member access can type it later.
             const direct_prop: ?[]const u8 = blk: {
@@ -8679,6 +8762,23 @@ pub const Checker = struct {
                                 switch (self.ast_ref.nodeTag(decl_node)) {
                                     .fn_decl, .async_fn_decl,
                                     .generator_fn_decl, .async_generator_fn_decl => {
+                                        const gop = try self.expando_fns.getOrPut(self.gpa, name);
+                                        if (!gop.found_existing) gop.value_ptr.* = .empty;
+                                        if (direct_prop) |pn| {
+                                            try gop.value_ptr.append(self.gpa, .{ .name = pn, .value = data.rhs });
+                                        }
+                                    },
+                                    // JS expando object: `var Outer = {}` with
+                                    // later `Outer.x = …` — tsc (salsa) types
+                                    // Outer as `typeof Outer`.
+                                    .declarator => {
+                                        if (!self.checker_opts.is_js_file) continue;
+                                        const dd = self.ast_ref.nodeData(decl_node);
+                                        // Only EMPTY literals (`var X = {}`) get the
+                                        // `typeof X` expando treatment; non-empty
+                                        // literals display structurally.
+                                        if (!self.isEmptyObjectLiteral(dd.rhs)) continue;
+                                        try self.expando_objs.put(self.gpa, name, {});
                                         const gop = try self.expando_fns.getOrPut(self.gpa, name);
                                         if (!gop.found_existing) gop.value_ptr.* = .empty;
                                         if (direct_prop) |pn| {
@@ -12842,6 +12942,15 @@ pub const Checker = struct {
 
     fn inferMember(self: *Checker, node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(node);
+        // CommonJS: `module.exports` is the module's export object — tsc
+        // displays `typeof module.exports`, but only when the module assigns
+        // an object literal (`module.exports = {…}`); assigning an existing
+        // entity (`module.exports = Foo`) shows that entity's type instead.
+        if (self.checker_opts.is_js_file and self.isModuleExportsMember(node) and
+            self.module_exports_literal)
+        {
+            return self.store.typeRef("typeof module.exports", &.{}) catch tymod.ID_ANY;
+        }
         const obj_ty = self.typeOf(data.lhs);
         // Special case: enum member access (e.g. `SyntaxKind.Block`).
         // Enum values are typed as `any`, but we still want to look up
@@ -13281,6 +13390,24 @@ pub const Checker = struct {
                     for (elist.items) |ep| {
                         if (!std.mem.eql(u8, ep.name, prop_name)) continue;
                         if (ep.value == .none) break;
+                        // Salsa naming: a function expression assigned to an
+                        // expando prop becomes a named entity (`typeof Inner`);
+                        // a nested object literal is referenced by its path
+                        // (`typeof Host.UserMetrics`).
+                        switch (self.ast_ref.nodeTag(ep.value)) {
+                            .fn_expr, .async_fn_expr, .generator_fn_expr,
+                            .async_generator_fn_expr, .class_expr => {
+                                const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{prop_name}) catch break;
+                                return self.store.typeRef(tn, &.{}) catch tymod.ID_ANY;
+                            },
+                            .object_literal => {
+                                if (self.isEmptyObjectLiteral(ep.value)) {
+                                    const tn = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ inner_name, prop_name }) catch break;
+                                    return self.store.typeRef(tn, &.{}) catch tymod.ID_ANY;
+                                }
+                            },
+                            else => {},
+                        }
                         const raw = self.typeOf(ep.value);
                         return switch (self.store.get(raw).kind) {
                             .string_literal => tymod.ID_STRING,
