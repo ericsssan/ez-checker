@@ -2589,6 +2589,17 @@ pub const Checker = struct {
         return ty;
     }
 
+    /// `typeof <target-path> <op> "<kind>"` narrowing for a member access
+    /// path (mirrors tryTypeofNarrow, but matches the path structurally).
+    fn memberTypeofNarrow(self: *Checker, typeof_side: NodeIndex, str_side: NodeIndex, target: NodeIndex, ty: TypeId, is_neq: bool, negate: bool) ?TypeId {
+        if (self.ast_ref.nodeTag(typeof_side) != .typeof_expr) return null;
+        const operand = self.ast_ref.nodeData(typeof_side).lhs;
+        if (!self.accessPathsEqual(operand, target)) return null;
+        const kind = self.typeofStringValue(str_side) orelse return null;
+        const keep_only = (!is_neq) != negate;
+        return self.intersectNarrow(ty, kind, keep_only);
+    }
+
     /// Apply narrowing implied by `test` to the access path `target`.
     fn applyMemberNarrowing(self: *Checker, test_node: NodeIndex, target: NodeIndex, ty: TypeId, negate: bool) TypeId {
         var t = test_node;
@@ -2619,6 +2630,10 @@ pub const Checker = struct {
             },
             .strict_not_equal, .not_equal, .strict_equal, .equal => {
                 const data = self.ast_ref.nodeData(t);
+                const is_neq0 = tag == .strict_not_equal or tag == .not_equal;
+                // `typeof <path> === "kind"` narrows the access path.
+                if (self.memberTypeofNarrow(data.lhs, data.rhs, target, ty, is_neq0, neg)) |nt| return nt;
+                if (self.memberTypeofNarrow(data.rhs, data.lhs, target, ty, is_neq0, neg)) |nt| return nt;
                 var lit_node: NodeIndex = .none;
                 if (self.accessPathsEqual(data.lhs, target)) {
                     lit_node = data.rhs;
@@ -13135,6 +13150,13 @@ pub const Checker = struct {
         const data = self.ast_ref.nodeData(node);
         const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
         var buf: [16]tymod.ObjectProp = undefined;
+        // Tracks the accessor kind of each buf entry (bit0 = has getter, bit1 =
+        // has setter; 0 = plain property/method).  Lets a get+set pair merge
+        // (writable) while keeping get-only readonly and bailing on a duplicate
+        // property+accessor clash (an error case tsc renders specially).
+        var acc_kind = std.mem.zeroes([16]u8);
+        const ACC_GET: u8 = 1;
+        const ACC_SET: u8 = 2;
         var n: usize = 0;
         for (slice) |raw| {
             if (n >= buf.len) break;
@@ -13144,6 +13166,12 @@ pub const Checker = struct {
                 .property => {
                     const pd = self.ast_ref.nodeData(p);
                     const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
+                    // A property clashing with an earlier accessor is a
+                    // duplicate-member error tsc renders specially — bail.
+                    for (buf[0..n], 0..) |bp, bi| {
+                        if (acc_kind[bi] != 0 and std.mem.eql(u8, bp.name, key_name))
+                            return tymod.ID_UNKNOWN;
+                    }
                     const val_ty = self.typeOf(pd.rhs);
                     // Widen primitive literal types to their base types, but
                     // preserve the literal when an explicit type assertion pins
@@ -13222,11 +13250,99 @@ pub const Checker = struct {
                     };
                     n += 1;
                 },
+                .getter_def => {
+                    // `get d() {…}` → `readonly d: <return>`.  A matching setter
+                    // (below, in source order) clears readonly.  A name clash
+                    // with a non-accessor prop is a duplicate-member error tsc
+                    // renders specially — bail.
+                    const pd = self.ast_ref.nodeData(p);
+                    if (pd.lhs == .none or pd.rhs == .none) return tymod.ID_UNKNOWN;
+                    const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
+                    // Private accessor (`get #x`) isn't part of the structural
+                    // type; an `any`/`unknown` accessor type usually means the
+                    // body depends on an unresolved `this` — bail rather than
+                    // emit a guessed type.
+                    if (key_name.len > 0 and key_name[0] == '#') return tymod.ID_UNKNOWN;
+                    const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pd.rhs));
+                    // Skip body inference when the getter is annotated — typing
+                    // the body can re-enter the (in-progress) object literal via
+                    // a self-reference (`get foo(): string { return a.foo }`).
+                    const gbody = if (md.return_type != .none) NodeIndex.none else md.body;
+                    const fn_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, gbody, false, false);
+                    var ret: TypeId = tymod.ID_ANY;
+                    const ft = self.store.get(fn_ty);
+                    if (ft.kind == .function_t) {
+                        const sigs = self.store.signaturesOf(ft.signatures);
+                        if (sigs.len > 0) ret = sigs[0].return_type;
+                    }
+                    if (ret.eq(tymod.ID_ANY) or ret.eq(tymod.ID_UNKNOWN) or ret.eq(tymod.ID_NEVER))
+                        return tymod.ID_UNKNOWN;
+                    var found = false;
+                    for (buf[0..n], 0..) |*bp, bi| {
+                        if (!std.mem.eql(u8, bp.name, key_name)) continue;
+                        if (acc_kind[bi] == 0) return tymod.ID_UNKNOWN; // dup prop+get
+                        // Merge into an existing accessor.  tsc renders the
+                        // get/set syntax when accessor types differ — not
+                        // modeled, so bail then.
+                        if (!bp.type_id.eq(ret)) return tymod.ID_UNKNOWN;
+                        acc_kind[bi] |= ACC_GET;
+                        bp.type_id = ret;
+                        // Writable only once a setter is present.
+                        bp.readonly = (acc_kind[bi] & ACC_SET) == 0;
+                        found = true;
+                        break;
+                    }
+                    if (!found) {
+                        buf[n] = .{ .name = key_name, .type_id = ret, .readonly = true };
+                        acc_kind[n] = ACC_GET;
+                        n += 1;
+                    }
+                },
+                .setter_def => {
+                    // `set e(v) {…}` → `e: <param>` (writable).  Merge with a
+                    // getter of the same key; bail on a non-accessor clash.
+                    const pd = self.ast_ref.nodeData(p);
+                    if (pd.lhs == .none or pd.rhs == .none) return tymod.ID_UNKNOWN;
+                    const key_name = self.staticPropertyKey(pd.lhs) orelse return tymod.ID_UNKNOWN;
+                    if (key_name.len > 0 and key_name[0] == '#') return tymod.ID_UNKNOWN;
+                    const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pd.rhs));
+                    // Only the parameter type matters — skip body inference (it can
+                    // re-enter the in-progress object via `a.foo = value`).
+                    const fn_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, NodeIndex.none, false, false);
+                    var pty: TypeId = tymod.ID_ANY;
+                    const ft = self.store.get(fn_ty);
+                    if (ft.kind == .function_t) {
+                        const sigs = self.store.signaturesOf(ft.signatures);
+                        if (sigs.len > 0) {
+                            const params = self.store.signatureParamsOf(sigs[0]);
+                            if (params.len > 0) pty = params[params.len - 1];
+                        }
+                    }
+                    var found = false;
+                    for (buf[0..n], 0..) |*bp, bi| {
+                        if (!std.mem.eql(u8, bp.name, key_name)) continue;
+                        if (acc_kind[bi] == 0) return tymod.ID_UNKNOWN; // dup prop+set
+                        if (!bp.type_id.eq(pty)) return tymod.ID_UNKNOWN; // get/set diff types
+                        acc_kind[bi] |= ACC_SET;
+                        bp.readonly = false;
+                        found = true;
+                        break;
+                    }
+                    if (!found) {
+                        // Setter-only: an unannotated param infers `any`, but tsc
+                        // often resolves it (contextual / getter) — bail when we'd
+                        // emit `any`/`unknown` to avoid a guess.
+                        if (pty.eq(tymod.ID_ANY) or pty.eq(tymod.ID_UNKNOWN)) return tymod.ID_UNKNOWN;
+                        buf[n] = .{ .name = key_name, .type_id = pty };
+                        acc_kind[n] = ACC_SET;
+                        n += 1;
+                    }
+                },
                 .spread_element => {
                     // Spreading any value (any/object/unknown/complex) makes the whole object `any`.
                     return tymod.ID_ANY;
                 },
-                // Bail on computed / accessors — structural type would not be sound.
+                // Bail on computed members — structural type would not be sound.
                 else => return tymod.ID_UNKNOWN,
             }
         }
