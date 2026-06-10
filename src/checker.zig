@@ -4758,6 +4758,34 @@ pub const Checker = struct {
         return true;
     }
 
+    /// JSDoc `@returns {T}` type for the function enclosing `body`, parsed to a
+    /// TypeId.  Returns null when not a JS file, no body, or no `@returns`.
+    fn jsdocReturnTypeForBody(self: *Checker, body: NodeIndex) ?TypeId {
+        if (body == .none) return null;
+        if (!self.checker_opts.is_js_file) return null;
+        if (!self.jsdoc_built) self.buildJsdoc();
+        if (self.jsdoc_returns.count() == 0) return null;
+        // The body's parent chain reaches the enclosing function node.
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (body.toInt() < parents.len) parents[body.toInt()] else NONE;
+        var depth: u8 = 0;
+        while (p != NONE and depth < 8) : (depth += 1) {
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                .arrow_fn, .async_arrow_fn, .ts_declare_function => {
+                    if (self.jsdoc_returns.get(pn.toInt())) |ts| return self.parseJsdocType(ts);
+                    return null;
+                },
+                else => {},
+            }
+            p = if (pn.toInt() < parents.len) parents[pn.toInt()] else NONE;
+        }
+        return null;
+    }
+
     /// JSDoc `@param` type string for a parameter — matched by name when the
     /// param has one, else by ordinal position.
     fn jsdocParamType(self: *Checker, fn_node: NodeIndex, ordinal: usize, param_name: []const u8) ?[]const u8 {
@@ -5946,6 +5974,14 @@ pub const Checker = struct {
                 const is_rest = self.ast_ref.nodeTag(pn) == .rest_element;
                 if (is_rest) rest_idx = @intCast(count);
                 var pty = self.paramDeclaredType(param);
+                // JSDoc `@param {T}` supplies the type for an unannotated JS
+                // parameter, so the rendered signature shows `(x: number)`.
+                if (self.checker_opts.is_js_file and !self.paramHasAnnotation(param) and
+                    (pty.eq(tymod.ID_ANY) or pty.eq(tymod.ID_UNKNOWN)))
+                {
+                    const jbind = if (self.ast_ref.nodeTag(pn) == .identifier) pn else param;
+                    if (self.jsdocParamBindingType(jbind)) |jt| pty = jt;
+                }
                 // An un-annotated first parameter of a Promise rejection
                 // callback (`p.catch(e=>…)` / `p.then(onF, e=>…)`) is `any`,
                 // not `unknown` — drives use-unknown-in-catch-callback-variable.
@@ -6026,6 +6062,11 @@ pub const Checker = struct {
             } else {
                 ret_ty = self.resolveTypeNode(ty_inner);
             }
+        } else if (self.jsdocReturnTypeForBody(body_for_inference)) |jret| {
+            // JSDoc `@returns {T}` supplies the return type in JS when there's
+            // no TS annotation.  Treated like body inference so async/generator
+            // wrapping still applies below.
+            ret_ty = jret;
         } else if (body_for_inference != .none) {
             const btag = self.ast_ref.nodeTag(body_for_inference);
             if (btag != .block_stmt) {
