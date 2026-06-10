@@ -1403,6 +1403,7 @@ pub const Checker = struct {
                 else => break :blk,
             }
             if (self.isForInLoopBinding(node)) return tymod.ID_STRING;
+            if (self.forOfBindingElementType(node)) |t| return t;
         }
         if (self.typeOfNameByAstSearch(name)) |t| {
             // Fundule (function + namespace merge): the name maps to both a
@@ -3569,6 +3570,8 @@ pub const Checker = struct {
                 // No annotation and no initializer: check if this is a for-in binding.
                 // `for (const x in obj)` — x is always string (a property key).
                 if (self.isForInLoopBinding(parent)) return tymod.ID_STRING;
+                // `for (const x of arr)` — x is arr's element type.
+                if (self.forOfBindingElementType(parent)) |t| return t;
                 return tymod.ID_UNKNOWN;
             },
             .assignment_pattern => {
@@ -3844,6 +3847,8 @@ pub const Checker = struct {
                 if (self.contextualPromiseRejectionParamType(binding)) |t| return t;
                 // For-in destructuring: `for (var [a, b] in obj)` — all bindings are string.
                 if (self.isForInLoopBinding(binding)) return tymod.ID_STRING;
+                // For-of simple binding: `for (var x of arr)` — element type.
+                if (self.forOfBindingElementType(binding)) |t| return t;
                 return tymod.ID_ANY;
             },
         }
@@ -3969,6 +3974,51 @@ pub const Checker = struct {
             cur = if (p.toInt() < parents.len) parents[p.toInt()] else NONE;
         }
         return false;
+    }
+
+    /// If `node` is (inside) the declaration binding of a `for...of` loop,
+    /// return the element type of the iterated expression:
+    /// `for (const x of arr)` → arr's element type, `of "str"` → string.
+    fn forOfBindingElementType(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var child = node;
+        var cur: u32 = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var depth: u32 = 0;
+        while (cur != NONE and depth < 8) : (depth += 1) {
+            const p: NodeIndex = @enumFromInt(cur);
+            switch (self.ast_ref.nodeTag(p)) {
+                .for_of_stmt, .for_await_of_stmt => {
+                    const data = self.ast_ref.nodeData(p);
+                    if (data.lhs == .none) return null;
+                    const fd = self.ast_ref.extraData(ast.ForInOfData, @intFromEnum(data.lhs));
+                    if (fd.binding != child) return null; // reached via expr/body subtree
+                    // `for (const v of [])` — tsc types v as any, not undefined.
+                    if (self.ast_ref.nodeTag(fd.expr) == .array_literal) {
+                        const ad = self.ast_ref.nodeData(fd.expr);
+                        if (self.directRange(ad.lhs, ad.rhs)) |elems| {
+                            if (elems.len == 0) return tymod.ID_ANY;
+                        } else return tymod.ID_ANY;
+                    }
+                    const iter_ty = self.typeOf(fd.expr);
+                    const it = self.store.get(iter_ty);
+                    if (it.kind == .string or it.kind == .string_literal) return tymod.ID_STRING;
+                    return self.elementTypeOf(iter_ty);
+                },
+                // Destructured for-of bindings (`for (const [a, b] of …)`) need
+                // per-slot types, not the whole element type — bail.
+                .array_pattern, .object_pattern, .rest_element,
+                .for_in_stmt, .for_stmt, .while_stmt, .do_while_stmt,
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                .arrow_fn, .async_arrow_fn,
+                .block_stmt => return null,
+                else => {},
+            }
+            child = p;
+            cur = if (p.toInt() < parents.len) parents[p.toInt()] else NONE;
+        }
+        return null;
     }
 
     /// Walk up through pattern parents (array/object patterns) to find
