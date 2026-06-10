@@ -12045,9 +12045,9 @@ pub const Checker = struct {
         // `Object.create(...)` is typed `any` by the lib — surface that so
         // no-unsafe-return / -assignment flag returning or assigning it.
         if (self.calleeIsObjectCreate(callee)) return tymod.ID_ANY;
-        // `Promise.resolve<T>(...)` → `Promise<T>` (uses the explicit type arg) so
-        // no-unsafe-return's Promise<any> detection fires.
-        if (self.promiseResolveReturn(callee)) |ty| return ty;
+        // `Promise.resolve<T>(...)` → `Promise<T>` (explicit type arg), else infer
+        // T from the argument (`Promise.resolve(1)` → `Promise<number>`).
+        if (self.promiseResolveReturn(node, callee)) |ty| return ty;
         // `promise.then(onF?, onR?)` / `.catch(onR?)` / `.finally(cb?)` —
         // infer Promise<X> from the callback return type rather than always
         // returning Promise<unknown>.
@@ -12197,7 +12197,27 @@ pub const Checker = struct {
     /// `Promise.resolve<T>(x)` → `Promise<T>` (the global `Promise`, dot-accessed
     /// `resolve`, using its explicit type argument). Returns null for any other
     /// callee. Lets no-unsafe-return flag returning `Promise.resolve<any>(…)`.
-    fn promiseResolveReturn(self: *Checker, callee: NodeIndex) ?TypeId {
+    /// The resolved-value type for `Promise.resolve(arg)` (no explicit type arg):
+    /// `Awaited<typeof arg>` widened from literals. `resolve()` → `void`.
+    fn promiseResolveArgInner(self: *Checker, call_node: NodeIndex) TypeId {
+        const data = self.ast_ref.nodeData(call_node);
+        const args = self.safeSubRange(data.rhs) orelse return tymod.ID_VOID;
+        if (args.end <= args.start or args.end > self.ast_ref.extra_data.len) return tymod.ID_VOID;
+        const first_raw = self.ast_ref.extra_data[args.start];
+        if (first_raw == @intFromEnum(NodeIndex.none)) return tymod.ID_UNKNOWN;
+        const arg_ty = self.typeOf(@enumFromInt(first_raw));
+        // `Promise.resolve(promise)` flattens — use Awaited<T>.
+        const unwrapped = self.resolveAwaited(arg_ty);
+        return switch (self.store.get(unwrapped).kind) {
+            .string_literal => tymod.ID_STRING,
+            .number_literal => tymod.ID_NUMBER,
+            .boolean_literal => tymod.ID_BOOLEAN,
+            .bigint_literal => tymod.ID_BIGINT,
+            else => unwrapped,
+        };
+    }
+
+    fn promiseResolveReturn(self: *Checker, call_node: NodeIndex, callee: NodeIndex) ?TypeId {
         var c = callee;
         var type_arg: NodeIndex = .none;
         if (self.ast_ref.nodeTag(c) == .ts_instantiation_expr) {
@@ -12223,7 +12243,10 @@ pub const Checker = struct {
         //   all/allSettled/race/any → Promise<unknown>.
         const method = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
         const inner: TypeId = if (std.mem.eql(u8, method, "resolve"))
-            (if (type_arg != .none) self.resolveTypeNode(type_arg) else tymod.ID_UNKNOWN)
+            (if (type_arg != .none)
+                self.resolveTypeNode(type_arg)
+            else
+                self.promiseResolveArgInner(call_node))
         else if (std.mem.eql(u8, method, "reject"))
             tymod.ID_NEVER
         else if (std.mem.eql(u8, method, "all") or std.mem.eql(u8, method, "allSettled") or
@@ -15798,12 +15821,39 @@ pub const Checker = struct {
     }
 
     fn inferAwait(self: *Checker, node: NodeIndex) TypeId {
+        const operand = self.ast_ref.nodeData(node).lhs;
+        // In a NON-async function `await` isn't a keyword, so `await(x)` parses as
+        // a CALL to an identifier `await` → tsc types it `any`. tsc still unwraps
+        // a real `await expr` (even in a sync function, with an error), so only
+        // the call form (sync context + a parenthesized operand) yields `any`.
+        if (operand != .none and self.ast_ref.nodeTag(operand) == .grouping_expr and
+            !self.awaitInAsyncContext(node))
+        {
+            return tymod.ID_ANY;
+        }
         // await unwraps Promise<T> → T, recursing through unions (await of
-        // `Promise<A> | Promise<B>` → `A | B`) and nested promises — so a
-        // conditional like `if (await (p ?? Promise.reject()))` is seen as its
-        // awaited value, not a thenable.
-        const inner = self.typeOf(self.ast_ref.nodeData(node).lhs);
-        return self.resolveAwaited(inner);
+        // `Promise<A> | Promise<B>` → `A | B`) and nested promises.
+        return self.resolveAwaited(self.typeOf(operand));
+    }
+
+    /// True when an `await` at `node` is in a valid async context: the nearest
+    /// enclosing function is async, or there is no enclosing function (module
+    /// top-level await).
+    fn awaitInAsyncContext(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var guard: u32 = 0;
+        while (p != NONE and guard < 256) : (guard += 1) {
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .async_fn_decl, .async_fn_expr, .async_arrow_fn, .async_generator_fn_decl, .async_generator_fn_expr => return true,
+                .fn_decl, .fn_expr, .arrow_fn, .generator_fn_decl, .generator_fn_expr => return false,
+                else => {},
+            }
+            p = if (pn.toInt() < parents.len) parents[pn.toInt()] else NONE;
+        }
+        return true; // no enclosing function → module top-level await
     }
 
     /// True when the class/function declaration `decl_node` has a decorator
