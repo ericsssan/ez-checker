@@ -8630,6 +8630,9 @@ pub const Checker = struct {
         try self.global_value_types.put(self.gpa, "structuredClone", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY));
         try self.global_value_types.put(self.gpa, "eval",             try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY));
 
+        // Temporal (lib.esnext): the namespace value renders `typeof Temporal`.
+        try self.global_value_types.put(self.gpa, "Temporal", try self.store.typeRef("typeof Temporal", &.{}));
+
         // Node.js globals.
         try self.global_value_types.put(self.gpa, "__dirname",  tymod.ID_STRING);
         try self.global_value_types.put(self.gpa, "__filename", tymod.ID_STRING);
@@ -14152,6 +14155,23 @@ pub const Checker = struct {
             }
             return null;
         }
+        // Date.prototype essentials.
+        if (std.mem.eql(u8, t.name, "Date")) {
+            if (eqAny(name, &.{ "getTime", "getFullYear", "getMonth", "getDate", "getDay", "getHours", "getMinutes", "getSeconds", "getMilliseconds", "getTimezoneOffset", "getUTCFullYear", "getUTCMonth", "getUTCDate", "getUTCDay", "getUTCHours", "getUTCMinutes", "getUTCSeconds", "getUTCMilliseconds", "valueOf", "setTime" })) {
+                return self.makeNullaryFn(tymod.ID_NUMBER);
+            }
+            if (eqAny(name, &.{ "toISOString", "toUTCString", "toDateString", "toTimeString", "toJSON", "toLocaleDateString", "toLocaleTimeString" })) {
+                return self.makeNullaryFn(tymod.ID_STRING);
+            }
+            if (std.mem.eql(u8, name, "toTemporalInstant")) return self.tempNullaryFn("Temporal.Instant");
+        }
+        // Temporal namespace (lib.esnext) — curated from the corpus surface.
+        if (std.mem.eql(u8, t.name, "typeof Temporal") or
+            std.mem.eql(u8, t.name, "typeof Temporal.Now") or
+            std.mem.startsWith(u8, t.name, "Temporal."))
+        {
+            if (self.temporalProperty(t.name, name)) |ty| return ty;
+        }
         // High-fidelity Object/Array statics (lib.es5 shapes tsc prints).
         if (std.mem.eql(u8, t.name, "ObjectConstructor")) {
             if (self.objectConstructorProperty(name)) |ty| return ty;
@@ -14289,6 +14309,274 @@ pub const Checker = struct {
         const onf = self.promiseHandlerParam(cb);
         const ret_promise = self.store.typeRef("Promise", &.{inner}) catch return null;
         return self.makeNamedFn(&.{onf}, &.{"onfinally"}, &.{true}, ret_promise);
+    }
+
+
+    // ── Temporal namespace (curated; matches tsc's lib.esnext surface) ──────
+
+    fn tempRef(self: *Checker, name: []const u8) ?TypeId {
+        return self.store.typeRef(name, &.{}) catch null;
+    }
+
+    /// `(item: Temporal.XLike[, options?: OPT]) => Temporal.X` — the static
+    /// `from` shape shared by every Temporal type.
+    fn tempFromFn(self: *Checker, like: []const u8, opt: ?[]const u8, ret: []const u8) ?TypeId {
+        const like_t = self.tempRef(like) orelse return null;
+        const ret_t = self.tempRef(ret) orelse return null;
+        if (opt) |o| {
+            const opt_t = self.tempRef(o) orelse return null;
+            return self.makeNamedFn(&.{ like_t, opt_t }, &.{ "item", "options" }, &.{ false, true }, ret_t);
+        }
+        return self.makeNamedFn(&.{like_t}, &.{"item"}, &.{false}, ret_t);
+    }
+
+    /// `(one: XLike, two: XLike[, options?]) => number` — static `compare`.
+    fn tempCompareFn(self: *Checker, like: []const u8, opt: ?[]const u8) ?TypeId {
+        const like_t = self.tempRef(like) orelse return null;
+        if (opt) |o| {
+            const opt_t = self.tempRef(o) orelse return null;
+            return self.makeNamedFn(&.{ like_t, like_t, opt_t }, &.{ "one", "two", "options" }, &.{ false, false, true }, tymod.ID_NUMBER);
+        }
+        return self.makeNamedFn(&.{ like_t, like_t }, &.{ "one", "two" }, &.{ false, false }, tymod.ID_NUMBER);
+    }
+
+    /// `(other: XLike) => boolean` — instance `equals`.
+    fn tempEqualsFn(self: *Checker, like: []const u8) ?TypeId {
+        const like_t = self.tempRef(like) orelse return null;
+        return self.makeNamedFn(&.{like_t}, &.{"other"}, &.{false}, tymod.ID_BOOLEAN);
+    }
+
+    /// `(duration: DurationLike[, options?: OverflowOptions]) => X` — add/subtract.
+    fn tempAddFn(self: *Checker, ret: []const u8, with_overflow: bool) ?TypeId {
+        const dur_like = self.tempRef("Temporal.DurationLike") orelse return null;
+        const ret_t = self.tempRef(ret) orelse return null;
+        if (with_overflow) {
+            const opt_t = self.tempRef("Temporal.OverflowOptions") orelse return null;
+            return self.makeNamedFn(&.{ dur_like, opt_t }, &.{ "duration", "options" }, &.{ false, true }, ret_t);
+        }
+        return self.makeNamedFn(&.{dur_like}, &.{"duration"}, &.{false}, ret_t);
+    }
+
+    /// `(other: XLike, options?: RoundingOptionsWithLargestUnit<UNITS>) => Duration` — until/since.
+    fn tempUntilFn(self: *Checker, like: []const u8, units: []const u8) ?TypeId {
+        const like_t = self.tempRef(like) orelse return null;
+        const dur_t = self.tempRef("Temporal.Duration") orelse return null;
+        const units_t = self.tempRef(units) orelse return null;
+        const opt_t = self.store.typeRef("Temporal.RoundingOptionsWithLargestUnit", &.{units_t}) catch return null;
+        return self.makeNamedFn(&.{ like_t, opt_t }, &.{ "other", "options" }, &.{ false, true }, dur_t);
+    }
+
+    /// `(options?: XToStringOptions) => string` — instance toString.
+    fn tempToStringFn(self: *Checker, opt: []const u8) ?TypeId {
+        const opt_t = self.tempRef(opt) orelse return null;
+        return self.makeNamedFn(&.{opt_t}, &.{"options"}, &.{true}, tymod.ID_STRING);
+    }
+
+    /// `() => Temporal.X` — conversion methods.
+    fn tempNullaryFn(self: *Checker, ret: []const u8) ?TypeId {
+        const ret_t = self.tempRef(ret) orelse return null;
+        return self.makeNullaryFn(ret_t);
+    }
+
+    /// `(timeZone[?]: TimeZoneLike) => X`.
+    fn tempTimeZoneFn(self: *Checker, ret: []const u8, optional: bool) ?TypeId {
+        const tz = self.tempRef("Temporal.TimeZoneLike") orelse return null;
+        const ret_t = self.tempRef(ret) orelse return null;
+        return self.makeNamedFn(&.{tz}, &.{"timeZone"}, &.{optional}, ret_t);
+    }
+
+    fn eqAny(name: []const u8, comptime list: []const []const u8) bool {
+        inline for (list) |c| {
+            if (std.mem.eql(u8, name, c)) return true;
+        }
+        return false;
+    }
+
+    fn temporalProperty(self: *Checker, owner: []const u8, name: []const u8) ?TypeId {
+        // `typeof Temporal` → constructor refs / Now.
+        if (std.mem.eql(u8, owner, "typeof Temporal")) {
+            if (eqAny(name, &.{ "Instant", "ZonedDateTime", "PlainDate", "PlainTime", "PlainDateTime", "PlainYearMonth", "PlainMonthDay", "Duration" })) {
+                var buf: [64]u8 = undefined;
+                const ctor = std.fmt.bufPrint(&buf, "Temporal.{s}Constructor", .{name}) catch return null;
+                const owned = self.gpa.dupe(u8, ctor) catch return null;
+                self.string_pool.append(self.gpa, owned) catch {};
+                return self.store.typeRef(owned, &.{}) catch null;
+            }
+            if (std.mem.eql(u8, name, "Now")) return self.tempRef("typeof Temporal.Now");
+            return null;
+        }
+        // `typeof Temporal.Now` statics.
+        if (std.mem.eql(u8, owner, "typeof Temporal.Now")) {
+            if (std.mem.eql(u8, name, "instant")) return self.tempNullaryFn("Temporal.Instant");
+            if (std.mem.eql(u8, name, "zonedDateTimeISO")) return self.tempTimeZoneFn("Temporal.ZonedDateTime", true);
+            if (std.mem.eql(u8, name, "plainDateTimeISO")) return self.tempTimeZoneFn("Temporal.PlainDateTime", true);
+            if (std.mem.eql(u8, name, "plainDateISO")) return self.tempTimeZoneFn("Temporal.PlainDate", true);
+            if (std.mem.eql(u8, name, "plainTimeISO")) return self.tempTimeZoneFn("Temporal.PlainTime", true);
+            if (std.mem.eql(u8, name, "timeZoneId")) return tymod.ID_STRING;
+            return null;
+        }
+        // Constructor statics.
+        if (std.mem.eql(u8, owner, "Temporal.InstantConstructor")) {
+            if (std.mem.eql(u8, name, "from")) return self.tempFromFn("Temporal.InstantLike", null, "Temporal.Instant");
+            if (std.mem.eql(u8, name, "compare")) return self.tempCompareFn("Temporal.InstantLike", null);
+            if (std.mem.eql(u8, name, "fromEpochMilliseconds")) {
+                const ret = self.tempRef("Temporal.Instant") orelse return null;
+                return self.makeNamedFn(&.{tymod.ID_NUMBER}, &.{"epochMilliseconds"}, &.{false}, ret);
+            }
+            if (std.mem.eql(u8, name, "fromEpochNanoseconds")) {
+                const ret = self.tempRef("Temporal.Instant") orelse return null;
+                return self.makeNamedFn(&.{tymod.ID_BIGINT}, &.{"epochNanoseconds"}, &.{false}, ret);
+            }
+            return null;
+        }
+        if (std.mem.eql(u8, owner, "Temporal.DurationConstructor")) {
+            if (std.mem.eql(u8, name, "from")) return self.tempFromFn("Temporal.DurationLike", null, "Temporal.Duration");
+            if (std.mem.eql(u8, name, "compare")) return self.tempCompareFn("Temporal.DurationLike", "Temporal.DurationRelativeToOptions");
+            return null;
+        }
+        if (std.mem.eql(u8, owner, "Temporal.ZonedDateTimeConstructor")) {
+            if (std.mem.eql(u8, name, "from")) return self.tempFromFn("Temporal.ZonedDateTimeLike", "Temporal.ZonedDateTimeFromOptions", "Temporal.ZonedDateTime");
+            if (std.mem.eql(u8, name, "compare")) return self.tempCompareFn("Temporal.ZonedDateTimeLike", null);
+            return null;
+        }
+        inline for (.{ "PlainDate", "PlainTime", "PlainDateTime", "PlainYearMonth", "PlainMonthDay" }) |base| {
+            if (std.mem.eql(u8, owner, "Temporal." ++ base ++ "Constructor")) {
+                if (std.mem.eql(u8, name, "from")) return self.tempFromFn("Temporal." ++ base ++ "Like", "Temporal.OverflowOptions", "Temporal." ++ base);
+                if (std.mem.eql(u8, name, "compare")) return self.tempCompareFn("Temporal." ++ base ++ "Like", null);
+                return null;
+            }
+        }
+        // Instance members.
+        if (std.mem.eql(u8, owner, "Temporal.Instant")) {
+            if (std.mem.eql(u8, name, "epochNanoseconds")) return tymod.ID_BIGINT;
+            if (std.mem.eql(u8, name, "epochMilliseconds")) return tymod.ID_NUMBER;
+            if (eqAny(name, &.{ "add", "subtract" })) return self.tempAddFn("Temporal.Instant", false);
+            if (eqAny(name, &.{ "until", "since" })) return self.tempUntilFn("Temporal.InstantLike", "Temporal.TimeUnit");
+            if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.InstantLike");
+            if (std.mem.eql(u8, name, "toString")) return self.tempToStringFn("Temporal.InstantToStringOptions");
+            if (std.mem.eql(u8, name, "toJSON")) return self.makeNullaryFn(tymod.ID_STRING);
+            if (std.mem.eql(u8, name, "toZonedDateTimeISO")) return self.tempTimeZoneFn("Temporal.ZonedDateTime", false);
+            return null;
+        }
+        if (std.mem.eql(u8, owner, "Temporal.Duration")) {
+            if (eqAny(name, &.{ "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds", "nanoseconds", "sign" })) return tymod.ID_NUMBER;
+            if (std.mem.eql(u8, name, "blank")) return tymod.ID_BOOLEAN;
+            if (eqAny(name, &.{ "add", "subtract" })) {
+                const dl = self.tempRef("Temporal.DurationLike") orelse return null;
+                const dr = self.tempRef("Temporal.Duration") orelse return null;
+                return self.makeNamedFn(&.{dl}, &.{"other"}, &.{false}, dr);
+            }
+            if (eqAny(name, &.{ "abs", "negated" })) return self.tempNullaryFn("Temporal.Duration");
+            if (std.mem.eql(u8, name, "toString")) return self.tempToStringFn("Temporal.DurationToStringOptions");
+            if (std.mem.eql(u8, name, "toJSON")) return self.makeNullaryFn(tymod.ID_STRING);
+            return null;
+        }
+        // Shared calendar-date properties.
+        const is_date_like = eqAny(owner, &.{ "Temporal.PlainDate", "Temporal.PlainDateTime", "Temporal.ZonedDateTime" });
+        const is_time_like = eqAny(owner, &.{ "Temporal.PlainTime", "Temporal.PlainDateTime", "Temporal.ZonedDateTime" });
+        if (is_date_like) {
+            if (eqAny(name, &.{ "year", "month", "day", "daysInMonth", "daysInYear", "monthsInYear", "dayOfWeek", "dayOfYear", "daysInWeek", "weekOfYear", "yearOfWeek" })) return tymod.ID_NUMBER;
+            if (eqAny(name, &.{ "monthCode", "calendarId" })) return tymod.ID_STRING;
+            if (std.mem.eql(u8, name, "inLeapYear")) return tymod.ID_BOOLEAN;
+        }
+        if (is_time_like) {
+            if (eqAny(name, &.{ "hour", "minute", "second", "millisecond", "microsecond", "nanosecond" })) return tymod.ID_NUMBER;
+        }
+        if (std.mem.eql(u8, owner, "Temporal.PlainDate")) {
+            if (eqAny(name, &.{ "add", "subtract" })) return self.tempAddFn("Temporal.PlainDate", true);
+            if (eqAny(name, &.{ "until", "since" })) return self.tempUntilFn("Temporal.PlainDateLike", "Temporal.DateUnit");
+            if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.PlainDateLike");
+            if (std.mem.eql(u8, name, "toString")) return self.tempToStringFn("Temporal.PlainDateToStringOptions");
+            if (std.mem.eql(u8, name, "toPlainYearMonth")) return self.tempNullaryFn("Temporal.PlainYearMonth");
+            if (std.mem.eql(u8, name, "toPlainMonthDay")) return self.tempNullaryFn("Temporal.PlainMonthDay");
+            if (std.mem.eql(u8, name, "toPlainDateTime")) {
+                const ptl = self.tempRef("Temporal.PlainTimeLike") orelse return null;
+                const ret = self.tempRef("Temporal.PlainDateTime") orelse return null;
+                return self.makeNamedFn(&.{ptl}, &.{"time"}, &.{true}, ret);
+            }
+            return null;
+        }
+        if (std.mem.eql(u8, owner, "Temporal.PlainTime")) {
+            if (eqAny(name, &.{ "add", "subtract" })) return self.tempAddFn("Temporal.PlainTime", false);
+            if (eqAny(name, &.{ "until", "since" })) return self.tempUntilFn("Temporal.PlainTimeLike", "Temporal.TimeUnit");
+            if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.PlainTimeLike");
+            if (std.mem.eql(u8, name, "toString")) return self.tempToStringFn("Temporal.PlainTimeToStringOptions");
+            return null;
+        }
+        if (std.mem.eql(u8, owner, "Temporal.PlainDateTime")) {
+            if (eqAny(name, &.{ "add", "subtract" })) return self.tempAddFn("Temporal.PlainDateTime", true);
+            if (eqAny(name, &.{ "until", "since" })) {
+                const du = self.tempRef("Temporal.DateUnit") orelse return null;
+                const tu = self.tempRef("Temporal.TimeUnit") orelse return null;
+                const units = self.store.unionOf(&.{ du, tu }) catch return null;
+                const like_t = self.tempRef("Temporal.PlainDateTimeLike") orelse return null;
+                const dur_t = self.tempRef("Temporal.Duration") orelse return null;
+                const opt_t = self.store.typeRef("Temporal.RoundingOptionsWithLargestUnit", &.{units}) catch return null;
+                return self.makeNamedFn(&.{ like_t, opt_t }, &.{ "other", "options" }, &.{ false, true }, dur_t);
+            }
+            if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.PlainDateTimeLike");
+            if (std.mem.eql(u8, name, "toString")) return self.tempToStringFn("Temporal.PlainDateTimeToStringOptions");
+            if (std.mem.eql(u8, name, "toPlainDate")) return self.tempNullaryFn("Temporal.PlainDate");
+            if (std.mem.eql(u8, name, "toPlainTime")) return self.tempNullaryFn("Temporal.PlainTime");
+            if (std.mem.eql(u8, name, "withPlainTime")) {
+                const ptl = self.tempRef("Temporal.PlainTimeLike") orelse return null;
+                const ret = self.tempRef("Temporal.PlainDateTime") orelse return null;
+                return self.makeNamedFn(&.{ptl}, &.{"plainTime"}, &.{true}, ret);
+            }
+            if (std.mem.eql(u8, name, "withCalendar")) {
+                const cl = self.tempRef("Temporal.CalendarLike") orelse return null;
+                const ret = self.tempRef("Temporal.PlainDateTime") orelse return null;
+                return self.makeNamedFn(&.{cl}, &.{"calendar"}, &.{false}, ret);
+            }
+            return null;
+        }
+        if (std.mem.eql(u8, owner, "Temporal.ZonedDateTime")) {
+            if (std.mem.eql(u8, name, "epochNanoseconds")) return tymod.ID_BIGINT;
+            if (eqAny(name, &.{ "epochMilliseconds", "offsetNanoseconds", "hoursInDay" })) return tymod.ID_NUMBER;
+            if (eqAny(name, &.{ "timeZoneId", "offset" })) return tymod.ID_STRING;
+            if (eqAny(name, &.{ "add", "subtract" })) return self.tempAddFn("Temporal.ZonedDateTime", true);
+            if (eqAny(name, &.{ "until", "since" })) {
+                const du = self.tempRef("Temporal.DateUnit") orelse return null;
+                const tu = self.tempRef("Temporal.TimeUnit") orelse return null;
+                const units = self.store.unionOf(&.{ du, tu }) catch return null;
+                const like_t = self.tempRef("Temporal.ZonedDateTimeLike") orelse return null;
+                const dur_t = self.tempRef("Temporal.Duration") orelse return null;
+                const opt_t = self.store.typeRef("Temporal.RoundingOptionsWithLargestUnit", &.{units}) catch return null;
+                return self.makeNamedFn(&.{ like_t, opt_t }, &.{ "other", "options" }, &.{ false, true }, dur_t);
+            }
+            if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.ZonedDateTimeLike");
+            if (std.mem.eql(u8, name, "toString")) return self.tempToStringFn("Temporal.ZonedDateTimeToStringOptions");
+            if (std.mem.eql(u8, name, "toPlainDate")) return self.tempNullaryFn("Temporal.PlainDate");
+            if (std.mem.eql(u8, name, "toPlainTime")) return self.tempNullaryFn("Temporal.PlainTime");
+            if (std.mem.eql(u8, name, "toPlainDateTime")) return self.tempNullaryFn("Temporal.PlainDateTime");
+            if (std.mem.eql(u8, name, "toInstant")) return self.tempNullaryFn("Temporal.Instant");
+            if (std.mem.eql(u8, name, "startOfDay")) return self.tempNullaryFn("Temporal.ZonedDateTime");
+            if (std.mem.eql(u8, name, "withTimeZone")) return self.tempTimeZoneFn("Temporal.ZonedDateTime", false);
+            if (std.mem.eql(u8, name, "withCalendar")) {
+                const cl = self.tempRef("Temporal.CalendarLike") orelse return null;
+                const ret = self.tempRef("Temporal.ZonedDateTime") orelse return null;
+                return self.makeNamedFn(&.{cl}, &.{"calendar"}, &.{false}, ret);
+            }
+            if (std.mem.eql(u8, name, "withPlainTime")) {
+                const ptl = self.tempRef("Temporal.PlainTimeLike") orelse return null;
+                const ret = self.tempRef("Temporal.ZonedDateTime") orelse return null;
+                return self.makeNamedFn(&.{ptl}, &.{"plainTime"}, &.{true}, ret);
+            }
+            return null;
+        }
+        if (std.mem.eql(u8, owner, "Temporal.PlainYearMonth")) {
+            if (eqAny(name, &.{ "add", "subtract" })) return self.tempAddFn("Temporal.PlainYearMonth", true);
+            if (eqAny(name, &.{ "until", "since" })) return self.tempUntilFn("Temporal.PlainYearMonthLike", "Temporal.DateUnit");
+            if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.PlainYearMonthLike");
+            return null;
+        }
+        if (std.mem.eql(u8, owner, "Temporal.PlainMonthDay")) {
+            if (std.mem.eql(u8, name, "monthCode")) return tymod.ID_STRING;
+            if (std.mem.eql(u8, name, "day")) return tymod.ID_NUMBER;
+            if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.PlainMonthDayLike");
+            return null;
+        }
+        return null;
     }
 
     /// lib.es5 ObjectConstructor statics with tsc-fidelity signatures.
