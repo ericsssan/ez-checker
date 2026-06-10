@@ -1843,7 +1843,11 @@ pub const Checker = struct {
                 const in_chain = is_optional or self.calleeIsInOptionalChain(pdata.lhs);
                 const lookup_ty = if (in_chain) self.stripNullishForLookup(obj_ty) else obj_ty;
                 const inner = self.memberOnApparentType(lookup_ty, prop_name, pdata.lhs);
-                return self.maybeAddOptionalUndefined(inner, obj_ty, in_chain);
+                const result = self.maybeAddOptionalUndefined(inner, obj_ty, in_chain);
+                // Apply the same flow narrowing the full member expression gets
+                // (keyed on the parent member access), so the property-key node
+                // matches `obj.prop`'s narrowed type rather than the raw one.
+                return self.narrowMemberAtUse(parent, result);
             },
             else => return tymod.ID_ANY,
         }
