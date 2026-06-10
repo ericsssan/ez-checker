@@ -5571,6 +5571,85 @@ pub const Checker = struct {
         return result;
     }
 
+    /// True when a type (shallow walk) mentions a `.type_param`.
+    fn typeMentionsTypeParam(self: *Checker, id: TypeId) bool {
+        return self.typeMentionsTypeParamDepth(id, 0);
+    }
+
+    fn typeMentionsTypeParamDepth(self: *Checker, id: TypeId, depth: u8) bool {
+        if (depth > 4) return false;
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .type_param => return true,
+            .array_t, .readonly_array_t, .tuple_t, .union_t, .intersection_t, .type_ref => {
+                for (self.store.idsOf(t.list_data)) |m| {
+                    if (self.typeMentionsTypeParamDepth(m, depth + 1)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
+    /// For a call whose callee signature has fn-typed params returning a bare
+    /// type param (`callbackfn: (...) => U`), infer that param from the
+    /// argument function's return type and substitute it into `ret`.
+    fn instantiateFromCallbackArgs(self: *Checker, call_node: NodeIndex, callee_ty: TypeId, ret: TypeId) ?TypeId {
+        const ct = self.store.get(callee_ty);
+        if (ct.kind != .function_t) return null;
+        const sigs = self.store.signaturesOf(ct.signatures);
+        if (sigs.len == 0) return null;
+        const sig = sigs[0];
+        const sparams_slice = self.store.signatureParamsOf(sig);
+        var sp_buf: [8]TypeId = undefined;
+        if (sparams_slice.len > sp_buf.len) return null;
+        @memcpy(sp_buf[0..sparams_slice.len], sparams_slice);
+        const sparams = sp_buf[0..sparams_slice.len];
+
+        const data = self.ast_ref.nodeData(call_node);
+        const args_range = self.safeSubRange(data.rhs) orelse return null;
+        const extra = self.ast_ref.extra_data;
+        if (args_range.start > extra.len or args_range.end > extra.len) return null;
+        const args = extra[args_range.start..args_range.end];
+
+        var keys_buf: [4][]const u8 = undefined;
+        var vals_buf: [4]TypeId = undefined;
+        var n: usize = 0;
+        for (sparams, 0..) |sp, i| {
+            if (i >= args.len or n >= keys_buf.len) break;
+            const spt = self.store.get(sp);
+            if (spt.kind != .function_t) continue;
+            const cb_sigs = self.store.signaturesOf(spt.signatures);
+            if (cb_sigs.len == 0) continue;
+            const cb_ret = self.store.get(cb_sigs[0].return_type);
+            if (cb_ret.kind != .type_param) continue;
+            const tp_name = cb_ret.name;
+            const arg_ty = self.typeOf(@enumFromInt(args[i]));
+            const at = self.store.get(arg_ty);
+            if (at.kind != .function_t) continue;
+            const arg_sigs = self.store.signaturesOf(at.signatures);
+            if (arg_sigs.len == 0) continue;
+            const concrete = arg_sigs[0].return_type;
+            if (self.typeMentionsTypeParam(concrete)) continue;
+            if (concrete.eq(tymod.ID_UNKNOWN)) continue;
+            // Widen literal returns (`x => 0` infers U = number).
+            const widened = switch (self.store.get(concrete).kind) {
+                .string_literal => tymod.ID_STRING,
+                .number_literal => tymod.ID_NUMBER,
+                .bigint_literal => tymod.ID_BIGINT,
+                .boolean_literal => tymod.ID_BOOLEAN,
+                else => concrete,
+            };
+            keys_buf[n] = tp_name;
+            vals_buf[n] = widened;
+            n += 1;
+        }
+        if (n == 0) return null;
+        const substituted = self.substituteTypeId(ret, keys_buf[0..n], vals_buf[0..n]);
+        if (substituted.eq(ret)) return null;
+        return substituted;
+    }
+
     fn isArrayPredicateMethodName(name: []const u8) bool {
         return std.mem.eql(u8, name, "filter") or
             std.mem.eql(u8, name, "find") or
@@ -11975,6 +12054,16 @@ pub const Checker = struct {
         if (self.inferGenericReturn(callee, node, result)) |substituted| {
             result = substituted;
         }
+        // Lib-style generic method instantiation: when the picked signature's
+        // return still contains bare type params (`U[]` from Array.map's
+        // `<U>(callbackfn: (...) => U) => U[]`), unify each fn-typed signature
+        // param's RETURN type param against the corresponding argument's
+        // inferred return and substitute into the result.
+        if (t.kind == .function_t and self.typeMentionsTypeParam(result)) {
+            if (self.instantiateFromCallbackArgs(node, lookup_ty, result)) |inst| {
+                result = inst;
+            }
+        }
         if (in_optional_chain and !result.eq(tymod.ID_UNKNOWN)) {
             if (self.typeContainsNullish(callee_ty) and !self.typeContainsUndefined(result)) {
                 return self.store.unionOf(&.{ result, tymod.ID_UNDEFINED }) catch result;
@@ -14309,10 +14398,48 @@ pub const Checker = struct {
             return self.makeNullaryFn(tymod.ID_NUMBER);
         }
         // string returners.
-        if (std.mem.eql(u8, name, "join") or std.mem.eql(u8, name, "toString") or
-            std.mem.eql(u8, name, "toLocaleString"))
-        {
+        if (std.mem.eql(u8, name, "toString") or std.mem.eql(u8, name, "toLocaleString")) {
             return self.makeNullaryFn(tymod.ID_STRING);
+        }
+        // join: (separator?: string) => string
+        if (std.mem.eql(u8, name, "join")) {
+            return self.makeNamedOptionalFn(tymod.ID_STRING, "separator", tymod.ID_STRING);
+        }
+        // map: <U>(callbackfn: (value: T, index: number, array: T[]) => U, thisArg?: any) => U[]
+        if (std.mem.eql(u8, name, "map")) {
+            const u_t = self.store.add(.{ .kind = .type_param, .name = "U" }) catch return tymod.ID_ANY;
+            const arr_t = self.store.arrayOf(elem) catch return tymod.ID_ANY;
+            const cb = self.makeNamedFn(
+                &.{ elem, tymod.ID_NUMBER, arr_t },
+                &.{ "value", "index", "array" },
+                &.{ false, false, false },
+                u_t,
+            ) orelse return tymod.ID_ANY;
+            const u_arr = self.store.arrayOf(u_t) catch return tymod.ID_ANY;
+            const fn_ty = self.makeNamedFn(
+                &.{ cb, tymod.ID_ANY },
+                &.{ "callbackfn", "thisArg" },
+                &.{ false, true },
+                u_arr,
+            ) orelse return tymod.ID_ANY;
+            self.tagLibFnPrefix(fn_ty, "<U>");
+            return fn_ty;
+        }
+        // forEach: (callbackfn: (value: T, index: number, array: T[]) => void, thisArg?: any) => void
+        if (std.mem.eql(u8, name, "forEach")) {
+            const arr_t = self.store.arrayOf(elem) catch return tymod.ID_ANY;
+            const cb = self.makeNamedFn(
+                &.{ elem, tymod.ID_NUMBER, arr_t },
+                &.{ "value", "index", "array" },
+                &.{ false, false, false },
+                tymod.ID_VOID,
+            ) orelse return tymod.ID_ANY;
+            return self.makeNamedFn(
+                &.{ cb, tymod.ID_ANY },
+                &.{ "callbackfn", "thisArg" },
+                &.{ false, true },
+                tymod.ID_VOID,
+            ) orelse tymod.ID_ANY;
         }
         return tymod.ID_ANY;
     }
@@ -14368,7 +14495,20 @@ pub const Checker = struct {
             const pname: []const u8 = if (std.mem.eql(u8, name, "toString")) "radix" else "fractionDigits";
             return self.makeNamedOptionalFn(tymod.ID_NUMBER, pname, tymod.ID_STRING);
         }
-        if (std.mem.eql(u8, name, "toLocaleString")) return self.makeNullaryFn(tymod.ID_STRING);
+        if (std.mem.eql(u8, name, "toLocaleString")) {
+            // lib.es5: { (): string; (locales: string | string[], options?: Intl.NumberFormatOptions): string; }
+            const str_arr = self.store.arrayOf(tymod.ID_STRING) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const locales = self.store.unionOf(&.{ tymod.ID_STRING, str_arr }) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const nfo = self.store.typeRef("Intl.NumberFormatOptions", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const pr1 = self.store.appendSignatureParamsFull(&.{}, &.{}, &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const pr2 = self.store.appendSignatureParamsFull(&.{ locales, nfo }, &.{ "locales", "options" }, &.{ false, true }) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const sigs = [_]tymod.Signature{
+                .{ .params_start = pr1.start, .params_end = pr1.end, .return_type = tymod.ID_STRING },
+                .{ .params_start = pr2.start, .params_end = pr2.end, .return_type = tymod.ID_STRING },
+            };
+            const sl = self.store.appendSignatures(&sigs) catch return self.makeNullaryFn(tymod.ID_STRING);
+            return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch self.makeNullaryFn(tymod.ID_STRING);
+        }
         if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(tymod.ID_NUMBER);
         return null;
     }
