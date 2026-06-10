@@ -75,6 +75,9 @@ fn langIdx(l: Language) usize {
 const CompilerOpts = struct {
     strict: bool = false,
     strict_null_checks: bool = false,
+    // @strictBindCallApply directive — tri-state: null = unset (corpus default
+    // is ON, except under @strict:false).  Set explicitly to override.
+    strict_bind_call_apply: ?bool = null,
     strict_explicitly_false: bool = false, // @strict: false was written explicitly
     no_implicit_any: bool = false,
     target: Target = .es5,
@@ -104,6 +107,11 @@ const CompilerOpts = struct {
         return .{
             .strict_null_checks = self.strict or self.strict_null_checks,
             .no_implicit_any = self.strict or self.no_implicit_any,
+            // CallableFunction/NewableFunction overloads for apply/call/bind are
+            // the corpus default; the loose base-Function signatures apply only
+            // under an explicit @strict:false (or @strictBindCallApply:false).
+            .strict_bind_call_apply = if (self.strict_bind_call_apply) |v| v
+                else !self.strict_explicitly_false,
             .strict_explicitly_false = self.strict_explicitly_false,
             // JSX elements type as `JSX.Element` under React-style modes; under
             // explicit `preserve` they stay `any`.  Default (unset) behaves
@@ -186,6 +194,7 @@ fn applyVariantOverrides(opts: *CompilerOpts, filename: []const u8) void {
             if (!opts.strict) opts.strict_explicitly_false = true;
         }
         else if (std.mem.eql(u8, key, "strictNullChecks")) opts.strict_null_checks = isTrue(val)
+        else if (std.mem.eql(u8, key, "strictBindCallApply")) opts.strict_bind_call_apply = isTrue(val)
         else if (std.mem.eql(u8, key, "noImplicitAny")) opts.no_implicit_any = isTrue(val)
         else if (std.mem.eql(u8, key, "jsx")) opts.jsx = parseJsx(val)
         else if (std.mem.eql(u8, key, "useDefineForClassFields")) opts.use_define_for_class_fields = isTrue(val)
@@ -258,6 +267,8 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
             if (!opts.strict) opts.strict_explicitly_false = true;
         } else if (ci(key, "strictNullChecks")) {
             opts.strict_null_checks = isTrue(val);
+        } else if (ci(key, "strictBindCallApply")) {
+            opts.strict_bind_call_apply = isTrue(val);
         } else if (ci(key, "noImplicitAny")) {
             opts.no_implicit_any = isTrue(val);
         } else if (ci(key, "target")) {

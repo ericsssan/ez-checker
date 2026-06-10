@@ -47,6 +47,11 @@ pub const CheckerOpts = struct {
     /// In that legacy mode TypeScript types empty arrays as `undefined[]`
     /// rather than `never[]`.
     strict_explicitly_false: bool = false,
+    /// True when `strictBindCallApply` is in effect (implied by `strict`, or
+    /// set explicitly).  Under it, a function value's `apply`/`call`/`bind`
+    /// resolve to the generic `CallableFunction`/`NewableFunction` overloads;
+    /// otherwise to the loose base `Function` signatures.
+    strict_bind_call_apply: bool = false,
     /// True when JSX is checked in a React-style mode (`jsx: react` /
     /// `react-jsx` / `react-jsxdev` / `react-native`).  Under these modes a
     /// JSX element expression has type `JSX.Element`; under `preserve` / unset
@@ -12013,6 +12018,13 @@ pub const Checker = struct {
         if (self.promiseThenCallReturn(node)) |ty| return ty;
         // `super()` calls the superclass constructor, which returns void.
         if (self.ast_ref.nodeTag(callee) == .super_expr) return tymod.ID_VOID;
+        // A call through Function.prototype `apply`/`call`/`bind` on a function
+        // value or class constructor.  The member resolves to a display-only
+        // synthetic signature (a non-callable type_ref), so the generic call
+        // path would yield `unknown`; model the result as `any` instead —
+        // matching the loose base-`Function` return and preserving the
+        // many call sites tsc types `any`.
+        if (self.calleeIsFunctionBindCallApply(callee)) return tymod.ID_ANY;
         if (self.ast_ref.nodeTag(node) == .new_expr or
             self.calleeIsConstructible(callee))
         {
@@ -12094,6 +12106,44 @@ pub const Checker = struct {
 
     /// True when `callee` is the member access `Object.create` (the global
     /// `Object`, dot-accessed `create`). Its lib return type is `any`.
+    /// True when `callee` is a member access `<fn-or-class>.apply/.call/.bind`,
+    /// where the receiver is a function value (`function_t`) or a class
+    /// constructor (`typeof Class`).  Used to type the call result as `any`
+    /// (see inferCallReturn) rather than `unknown`, since the member's type is
+    /// a display-only synthetic signature.
+    fn calleeIsFunctionBindCallApply(self: *Checker, callee: NodeIndex) bool {
+        var n = callee;
+        while (self.ast_ref.nodeTag(n) == .grouping_expr) n = self.ast_ref.nodeData(n).lhs;
+        const tag = self.ast_ref.nodeTag(n);
+        if (tag != .member_expr and tag != .optional_member_expr) return false;
+        const d = self.ast_ref.nodeData(n);
+        if (d.lhs == .none or d.rhs == .none) return false;
+        const pname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.rhs));
+        if (!std.mem.eql(u8, pname, "apply") and !std.mem.eql(u8, pname, "call") and
+            !std.mem.eql(u8, pname, "bind")) return false;
+        return self.typeIsCallableForBindCallApply(self.typeOf(d.lhs));
+    }
+
+    /// Whether `ty` is a function value or class constructor (directly, or as a
+    /// non-nullish member of a union — covers optional-chain receivers like
+    /// `fn?.bind(...)` where `fn` is `T | undefined`).
+    fn typeIsCallableForBindCallApply(self: *Checker, ty: TypeId) bool {
+        const t = self.store.get(ty);
+        if (t.kind == .function_t) return true;
+        if (t.kind == .type_ref and std.mem.startsWith(u8, t.name, "typeof ")) {
+            const inner = t.name["typeof ".len..];
+            if (self.type_decl_nodes.get(inner)) |decl| {
+                return self.ast_ref.nodeTag(decl) == .class_decl;
+            }
+        }
+        if (t.kind == .union_t) {
+            for (self.store.idsOf(t.list_data)) |m| {
+                if (self.typeIsCallableForBindCallApply(m)) return true;
+            }
+        }
+        return false;
+    }
+
     fn calleeIsObjectCreate(self: *Checker, callee: NodeIndex) bool {
         var n = callee;
         while (self.ast_ref.nodeTag(n) == .grouping_expr) n = self.ast_ref.nodeData(n).lhs;
@@ -13737,6 +13787,9 @@ pub const Checker = struct {
                             const t = self.memberOnApparentType(st, prop_name, obj_node);
                             if (!tymod.isUnknown(&self.store, t)) return t;
                         }
+                        // Function.prototype apply/call/bind on the class
+                        // constructor value — NewableFunction overloads.
+                        if (self.functionBindCallApplyType(prop_name, true)) |ty| return ty;
                     }
                 }
             }
@@ -13759,6 +13812,18 @@ pub const Checker = struct {
         // Number prototype.
         if (obj.kind == .number or obj.kind == .number_literal) {
             if (self.numberPrototypeProperty(prop_name)) |ty| return ty;
+        }
+        // Function.prototype apply/call/bind on a callable value.  A construct
+        // signature selects the NewableFunction overloads.
+        if (obj.kind == .function_t and !self.bindCallApplyTPCollision(obj_node)) {
+            var newable = false;
+            for (self.store.signaturesOf(obj.signatures)) |sig| {
+                if (sig.is_construct) {
+                    newable = true;
+                    break;
+                }
+            }
+            if (self.functionBindCallApplyType(prop_name, newable)) |ty| return ty;
         }
         // Fallback: for non-primitive types where the property wasn't found,
         // return `any` to match TypeScript's permissive behavior on missing
@@ -14830,6 +14895,107 @@ pub const Checker = struct {
         }
         if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(tymod.ID_NUMBER);
         return null;
+    }
+
+    /// Function.prototype `apply`/`call`/`bind`.  Under `strictBindCallApply`
+    /// these resolve to the generic `CallableFunction`/`NewableFunction`
+    /// interface overloads (lib.es5.d.ts); otherwise to the loose base
+    /// `Function` signatures.  The rendered member type is the SAME verbatim
+    /// string for every function value (tsc does not instantiate it to the
+    /// receiver), so we return a no-arg `type_ref` whose name is that string —
+    /// it renders verbatim.  `newable` selects the constructor overloads (a
+    /// `typeof Class` / construct-signature receiver).
+    fn functionBindCallApplyType(self: *Checker, name: []const u8, newable: bool) ?TypeId {
+        const which: enum { apply, call, bind } =
+            if (std.mem.eql(u8, name, "apply")) .apply
+            else if (std.mem.eql(u8, name, "call")) .call
+            else if (std.mem.eql(u8, name, "bind")) .bind
+            else return null;
+        const strict = self.checker_opts.strict_bind_call_apply;
+        const s: []const u8 = switch (which) {
+            .apply => if (!strict)
+                "(this: Function, thisArg: any, argArray?: any) => any"
+            else if (newable)
+                "{ <T>(this: new () => T, thisArg: T): void; <T, A extends any[]>(this: new (...args: A) => T, thisArg: T, args: A): void; }"
+            else
+                "{ <T, R>(this: (this: T) => R, thisArg: T): R; <T, A extends any[], R>(this: (this: T, ...args: A) => R, thisArg: T, args: A): R; }",
+            .call => if (!strict)
+                "(this: Function, thisArg: any, ...argArray: any[]) => any"
+            else if (newable)
+                "<T, A extends any[]>(this: new (...args: A) => T, thisArg: T, ...args: A) => void"
+            else
+                "<T, A extends any[], R>(this: (this: T, ...args: A) => R, thisArg: T, ...args: A) => R",
+            .bind => if (!strict)
+                "(this: Function, thisArg: any, ...argArray: any[]) => any"
+            else if (newable)
+                "{ <T>(this: T, thisArg: any): T; <A extends any[], B extends any[], R>(this: new (...args: [...A, ...B]) => R, thisArg: any, ...args: A): new (...args: B) => R; }"
+            else
+                "{ <T>(this: T, thisArg: ThisParameterType<T>): OmitThisParameter<T>; <T, A extends any[], B extends any[], R>(this: (this: T, ...args: [...A, ...B]) => R, thisArg: T, ...args: A): (...args: B) => R; }",
+        };
+        return self.store.typeRef(s, &.{}) catch null;
+    }
+
+    /// True when a type parameter named one of the synthetic apply/call/bind
+    /// parameters (`T`/`A`/`B`/`R`) is declared in an ENCLOSING scope of the
+    /// receiver expression `at_node`.  tsc renames the colliding synthetic
+    /// parameter (`T` → `T_1`) in that case (and wraps optional-chain receivers
+    /// in `| undefined`); we model neither, so we suppress the synthetic member
+    /// type there, leaving the access `any`.  A function's OWN generic
+    /// parameters (`generic<T>(x: T): T`, used outside its body) are not
+    /// enclosing the use site and render the plain form.  This lexical test
+    /// also catches receivers whose free `T` is hidden behind an unmodeled
+    /// conditional type (`...args: T extends 1 ? […] : […]`).  Modeling the
+    /// exact renames needs type-parameter symbol identity
+    /// (see [[fn-signature-and-crossmodule]]).
+    fn bindCallApplyTPCollision(self: *Checker, at_node: NodeIndex) bool {
+        if (at_node == .none) return false;
+        for ([_][]const u8{ "T", "A", "B", "R" }) |nm| {
+            if (self.enclosingTypeParamInScope(at_node, nm)) return true;
+        }
+        return false;
+    }
+
+    /// Presence-only variant of `typeParamConstraintNode`: true when a
+    /// `ts_type_parameter` named `name` is declared by a function/class/etc.
+    /// scope enclosing `ref_node` (ignores whether it has a constraint).
+    fn enclosingTypeParamInScope(self: *Checker, ref_node: NodeIndex, name: []const u8) bool {
+        const tree = self.ast_ref;
+        const parents = self.semantic.parent_indices;
+        const rni = ref_node.toInt();
+        if (rni >= parents.len) return false;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var anc_buf: [16]u32 = undefined;
+        var nanc: usize = 0;
+        var p = parents[rni];
+        while (p != NONE and p < parents.len and nanc < anc_buf.len) : (p = parents[p]) {
+            anc_buf[nanc] = p;
+            nanc += 1;
+        }
+        const ref_pos = tree.tokenStart(tree.nodeMainToken(ref_node));
+        for (self.type_param_nodes.items) |ni| {
+            if (!std.mem.eql(u8, tree.tokenText(tree.nodeMainToken(ni)), name)) continue;
+            const tp_pos = tree.tokenStart(tree.nodeMainToken(ni));
+            if (tp_pos >= ref_pos) continue;
+            for (anc_buf[0..nanc]) |anc_idx| {
+                const anc: NodeIndex = @enumFromInt(anc_idx);
+                const tag = tree.nodeTag(anc);
+                const is_scope = tag == .fn_decl or tag == .async_fn_decl or
+                    tag == .generator_fn_decl or tag == .async_generator_fn_decl or
+                    tag == .ts_declare_function or tag == .fn_expr or
+                    tag == .async_fn_expr or tag == .generator_fn_expr or
+                    tag == .async_generator_fn_expr or tag == .arrow_fn or
+                    tag == .async_arrow_fn or tag == .method_def or
+                    tag == .computed_method_def or tag == .class_decl or
+                    tag == .class_expr or tag == .ts_type_alias_decl or
+                    tag == .ts_interface_decl or tag == .ts_function_type or
+                    tag == .ts_constructor_type or tag == .ts_call_signature or
+                    tag == .ts_construct_signature or tag == .ts_method_signature;
+                if (!is_scope) continue;
+                if (tp_pos < tree.tokenStart(tree.nodeMainToken(anc))) continue;
+                return true;
+            }
+        }
+        return false;
     }
 
     /// `(pname?: T) => R` — single named optional parameter.
