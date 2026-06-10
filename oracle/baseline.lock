@@ -9,10 +9,10 @@
 #   * any section raises a pipeline error
 #
 # Full corpus snapshot:
-#   all-types correct = 478044/657474 (72.7%)   wrong = 53001   gap = 104371   no-node = 22058   ambig = 0
-#   primitive correct = 322395/372262 (86.6%)   wrong = 10457   gap = 30931   no-node = 8479
+#   all-types correct = 484152/657474 (73.6%)   wrong = 55630   gap = 95634   no-node = 22058   ambig = 0
+#   primitive correct = 325467/372262 (87.4%)   wrong = 10342   gap = 27974   no-node = 8479
 sections_eval_min 18921
-match_min 478044
-wrong_max 53001
-prim_match_min 322395
-prim_wrong_max 10457
+match_min 484152
+wrong_max 55630
+prim_match_min 325467
+prim_wrong_max 10342

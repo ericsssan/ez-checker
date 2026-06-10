@@ -1500,7 +1500,14 @@ pub const Checker = struct {
             return tymod.ID_ANY;
         }
         const ty_node = self.ast_ref.nodeData(pdata.rhs).lhs;
-        const base_ty = self.resolveSimpleTypeNodeSafe(ty_node) orelse return null;
+        // Try the conservative resolver first (cheap, recursion-proof), then
+        // fall back to the full resolver for literal types, arrays, named
+        // references etc. (`name: '0'`, `children: BigUnion[]`).
+        const base_ty = self.resolveSimpleTypeNodeSafe(ty_node) orelse blk: {
+            const full = self.resolveTypeNode(ty_node);
+            if (full.eq(tymod.ID_UNKNOWN)) return null;
+            break :blk full;
+        };
         if (self.propertyHasOptionalMarker(node) and !self.typeContainsUndefined(base_ty)) {
             return self.store.unionOf(&.{ base_ty, tymod.ID_UNDEFINED }) catch base_ty;
         }
