@@ -8188,14 +8188,24 @@ pub const Checker = struct {
                                     return self.store.typeRef(display, args2) catch p.type_id;
                                 }
                             }
-                            // Enum (member union) inside a namespace: keep tsc's
-                            // scope-relative qualified display (`First.E`).
-                            if (prop_kind == .union_t or prop_t.enum_name.len > 0) {
+                            // Enum inside a namespace: tsc shows it with
+                            // scope-relative qualification (`First.E`).  The
+                            // namespace prop may be the enum's member union or a
+                            // bare type_ref to the enum name — resolve to the
+                            // union for assignability and tag the display name.
+                            const names_enum = prop_kind == .type_ref and
+                                self.type_decl_nodes.get(prop_t.name) != null and
+                                self.ast_ref.nodeTag(self.type_decl_nodes.get(prop_t.name).?) == .ts_enum_decl;
+                            if (prop_kind == .union_t or prop_t.enum_name.len > 0 or names_enum) {
                                 const qual_name = self.qualifiedTypeName(ty_node, member_data.rhs);
                                 if (qual_name.len > 0) {
                                     const display = self.displayQualifiedName(ty_node, qual_name);
-                                    if (!std.mem.eql(u8, display, member_name) or prop_kind == .union_t) {
-                                        return self.tagAliasName(p.type_id, display);
+                                    const resolved_enum = if (names_enum)
+                                        (self.buildEnumUnionType(prop_t.name) orelse p.type_id)
+                                    else
+                                        p.type_id;
+                                    if (!std.mem.eql(u8, display, member_name) or prop_kind == .union_t or names_enum) {
+                                        return self.tagAliasName(resolved_enum, display);
                                     }
                                 }
                             }
@@ -8313,9 +8323,29 @@ pub const Checker = struct {
                 if (member_data.rhs != .none) {
                     const last_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(member_data.rhs));
                     if (self.known_type_names.contains(last_name)) {
+                        // Enum member inside a namespace: resolve to the enum's
+                        // member union so assignability works, displayed with
+                        // tsc's scope-relative qualification (`First.E`).
+                        if (self.type_decl_nodes.get(last_name)) |edecl| {
+                            if (self.ast_ref.nodeTag(edecl) == .ts_enum_decl) {
+                                if (self.buildEnumUnionType(last_name)) |eu| {
+                                    const qual = self.qualifiedTypeName(ty_node, member_data.rhs);
+                                    const display = if (qual.len > 0)
+                                        self.displayQualifiedName(ty_node, qual)
+                                    else
+                                        last_name;
+                                    return self.tagAliasName(eu, display);
+                                }
+                            }
+                        }
+                        const qual = self.qualifiedTypeName(ty_node, member_data.rhs);
+                        const display = if (qual.len > 0)
+                            self.displayQualifiedName(ty_node, qual)
+                        else
+                            last_name;
                         var args_buf: [8]TypeId = undefined;
                         const args = self.collectTypeArgs(ty_node, &args_buf);
-                        return self.store.typeRef(last_name, args) catch tymod.ID_ANY;
+                        return self.store.typeRef(display, args) catch tymod.ID_ANY;
                     }
                 }
             }
