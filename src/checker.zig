@@ -15261,33 +15261,51 @@ pub const Checker = struct {
     }
 
     fn stringPrototypeProperty(self: *Checker, name: []const u8) ?TypeId {
-        if (std.mem.eql(u8, name, "length")) return tymod.ID_NUMBER;
-        // string returners
-        if (std.mem.eql(u8, name, "charAt") or
-            std.mem.eql(u8, name, "concat") or std.mem.eql(u8, name, "slice") or
-            std.mem.eql(u8, name, "substring") or std.mem.eql(u8, name, "toUpperCase") or
+        const S = tymod.ID_STRING;
+        const N = tymod.ID_NUMBER;
+        if (std.mem.eql(u8, name, "length")) return N;
+        // lib.es5 String.prototype signatures with named params (tsc fidelity).
+        const named = struct {
+            fn one(c: *Checker, t: TypeId, nm: []const u8, opt: bool, ret: TypeId) ?TypeId {
+                return c.makeNamedFn(&.{t}, &.{nm}, &.{opt}, ret);
+            }
+            fn two(c: *Checker, t0: TypeId, n0: []const u8, o0: bool, t1: TypeId, n1: []const u8, o1: bool, ret: TypeId) ?TypeId {
+                return c.makeNamedFn(&.{ t0, t1 }, &.{ n0, n1 }, &.{ o0, o1 }, ret);
+            }
+        };
+        if (std.mem.eql(u8, name, "charAt")) return named.one(self, N, "pos", false, S);
+        if (std.mem.eql(u8, name, "charCodeAt")) return named.one(self, N, "index", false, N);
+        if (std.mem.eql(u8, name, "codePointAt"))
+            return named.one(self, N, "pos", false, self.store.unionOf(&.{ N, tymod.ID_UNDEFINED }) catch N);
+        if (std.mem.eql(u8, name, "at"))
+            return named.one(self, N, "index", false, self.store.unionOf(&.{ S, tymod.ID_UNDEFINED }) catch S);
+        if (std.mem.eql(u8, name, "substring")) return named.two(self, N, "start", false, N, "end", true, S);
+        if (std.mem.eql(u8, name, "slice")) return named.two(self, N, "start", true, N, "end", true, S);
+        if (std.mem.eql(u8, name, "substr")) return named.two(self, N, "from", false, N, "length", true, S);
+        if (std.mem.eql(u8, name, "indexOf")) return named.two(self, S, "searchString", false, N, "position", true, N);
+        if (std.mem.eql(u8, name, "lastIndexOf")) return named.two(self, S, "searchString", false, N, "position", true, N);
+        if (std.mem.eql(u8, name, "includes")) return named.two(self, S, "searchString", false, N, "position", true, tymod.ID_BOOLEAN);
+        if (std.mem.eql(u8, name, "startsWith")) return named.two(self, S, "searchString", false, N, "position", true, tymod.ID_BOOLEAN);
+        if (std.mem.eql(u8, name, "endsWith")) return named.two(self, S, "searchString", false, N, "endPosition", true, tymod.ID_BOOLEAN);
+        if (std.mem.eql(u8, name, "repeat")) return named.one(self, N, "count", false, S);
+        if (std.mem.eql(u8, name, "padStart")) return named.two(self, N, "maxLength", false, S, "fillString", true, S);
+        if (std.mem.eql(u8, name, "padEnd")) return named.two(self, N, "maxLength", false, S, "fillString", true, S);
+        if (std.mem.eql(u8, name, "normalize")) return named.one(self, S, "form", true, S);
+        // string returners (nullary / unmodeled-param forms)
+        if (std.mem.eql(u8, name, "concat") or
+            std.mem.eql(u8, name, "toUpperCase") or
             std.mem.eql(u8, name, "toLowerCase") or std.mem.eql(u8, name, "trim") or
             std.mem.eql(u8, name, "trimStart") or std.mem.eql(u8, name, "trimEnd") or
-            std.mem.eql(u8, name, "repeat") or std.mem.eql(u8, name, "replace") or
-            std.mem.eql(u8, name, "replaceAll") or std.mem.eql(u8, name, "normalize") or
-            std.mem.eql(u8, name, "padStart") or std.mem.eql(u8, name, "padEnd") or
-            std.mem.eql(u8, name, "at") or std.mem.eql(u8, name, "toString") or
+            std.mem.eql(u8, name, "replace") or
+            std.mem.eql(u8, name, "replaceAll") or
+            std.mem.eql(u8, name, "toString") or
             std.mem.eql(u8, name, "valueOf"))
         {
-            return self.makeNullaryFn(tymod.ID_STRING);
+            return self.makeNullaryFn(S);
         }
         // number returners
-        if (std.mem.eql(u8, name, "charCodeAt") or std.mem.eql(u8, name, "codePointAt") or
-            std.mem.eql(u8, name, "indexOf") or std.mem.eql(u8, name, "lastIndexOf") or
-            std.mem.eql(u8, name, "search"))
-        {
-            return self.makeNullaryFn(tymod.ID_NUMBER);
-        }
-        // boolean returners
-        if (std.mem.eql(u8, name, "includes") or std.mem.eql(u8, name, "startsWith") or
-            std.mem.eql(u8, name, "endsWith"))
-        {
-            return self.makeNullaryFn(tymod.ID_BOOLEAN);
+        if (std.mem.eql(u8, name, "search")) {
+            return self.makeNullaryFn(N);
         }
         // string[] returners
         if (std.mem.eql(u8, name, "split")) {
