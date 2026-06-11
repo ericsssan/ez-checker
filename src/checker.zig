@@ -6508,7 +6508,7 @@ pub const Checker = struct {
                     }
                 }
                 param_buf[count] = pty;
-                name_buf[count] = self.paramName(param);
+                name_buf[count] = self.paramDisplayName(param);
                 // A param is optional if it has a default value, or has an
                 // explicit `?` marker between the identifier and the annotation.
                 opt_buf[count] = is_default or self.paramHasOptionalMarker(pn);
@@ -6839,6 +6839,105 @@ pub const Checker = struct {
         return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(n));
     }
 
+    /// Display name for a parameter — like `paramName`, but a destructuring
+    /// binding pattern renders to tsc's canonical text (`{ x, a }`,
+    /// `[a, b, [[c]]]`, `{ z: { x, y: { j } } }`) so the function signature
+    /// shows the pattern instead of a bare `unknown`.  The rendered string is
+    /// owned by `string_pool` (freed at deinit).  Falls back to `paramName`
+    /// (empty for patterns) when the pattern has an unexpected shape.
+    fn paramDisplayName(self: *Checker, param: NodeIndex) []const u8 {
+        var n = param;
+        if (self.ast_ref.nodeTag(n) == .assignment_pattern) n = self.ast_ref.nodeData(n).lhs;
+        if (self.ast_ref.nodeTag(n) == .ts_parameter_property) n = self.ast_ref.nodeData(n).lhs;
+        if (self.ast_ref.nodeTag(n) == .rest_element) n = self.ast_ref.nodeData(n).lhs;
+        const tag = self.ast_ref.nodeTag(n);
+        if (tag != .object_pattern and tag != .array_pattern) return self.paramName(param);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.gpa);
+        if (!self.renderBindingPattern(n, &out, 0)) return &.{};
+        const owned = self.gpa.dupe(u8, out.items) catch return &.{};
+        self.string_pool.append(self.gpa, owned) catch {
+            self.gpa.free(owned);
+            return &.{};
+        };
+        return owned;
+    }
+
+    /// Append tsc's canonical text for a binding pattern to `out`.  Strips
+    /// in-pattern defaults (tsc omits them).  Returns false on an unexpected
+    /// node shape so the caller can fall back to an empty name.
+    fn renderBindingPattern(self: *Checker, node: NodeIndex, out: *std.ArrayList(u8), depth: u8) bool {
+        if (depth > 16) return false;
+        const gpa = self.gpa;
+        var nd = node;
+        // Peel a default-value wrapper — only the binding side is displayed.
+        if (self.ast_ref.nodeTag(nd) == .assignment_pattern) nd = self.ast_ref.nodeData(nd).lhs;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        switch (self.ast_ref.nodeTag(nd)) {
+            .identifier => {
+                out.appendSlice(gpa, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(nd))) catch return false;
+                return true;
+            },
+            .rest_element => {
+                out.appendSlice(gpa, "...") catch return false;
+                return self.renderBindingPattern(self.ast_ref.nodeData(nd).lhs, out, depth + 1);
+            },
+            .object_pattern => {
+                const d = self.ast_ref.nodeData(nd);
+                const items = self.directRange(d.lhs, d.rhs) orelse {
+                    out.appendSlice(gpa, "{}") catch return false;
+                    return true;
+                };
+                if (items.len == 0) {
+                    out.appendSlice(gpa, "{}") catch return false;
+                    return true;
+                }
+                out.appendSlice(gpa, "{ ") catch return false;
+                for (items, 0..) |raw, i| {
+                    if (i > 0) out.appendSlice(gpa, ", ") catch return false;
+                    const child: NodeIndex = @enumFromInt(raw);
+                    switch (self.ast_ref.nodeTag(child)) {
+                        .shorthand_property => {
+                            var keyn = self.ast_ref.nodeData(child).lhs;
+                            if (keyn != .none and self.ast_ref.nodeTag(keyn) == .assignment_pattern)
+                                keyn = self.ast_ref.nodeData(keyn).lhs;
+                            out.appendSlice(gpa, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(keyn))) catch return false;
+                        },
+                        .property => {
+                            const pd = self.ast_ref.nodeData(child);
+                            out.appendSlice(gpa, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs))) catch return false;
+                            out.appendSlice(gpa, ": ") catch return false;
+                            if (!self.renderBindingPattern(pd.rhs, out, depth + 1)) return false;
+                        },
+                        .rest_element => {
+                            out.appendSlice(gpa, "...") catch return false;
+                            if (!self.renderBindingPattern(self.ast_ref.nodeData(child).lhs, out, depth + 1)) return false;
+                        },
+                        else => return false,
+                    }
+                }
+                out.appendSlice(gpa, " }") catch return false;
+                return true;
+            },
+            .array_pattern => {
+                const d = self.ast_ref.nodeData(nd);
+                const items = self.directRange(d.lhs, d.rhs) orelse {
+                    out.appendSlice(gpa, "[]") catch return false;
+                    return true;
+                };
+                out.append(gpa, '[') catch return false;
+                for (items, 0..) |raw, i| {
+                    if (i > 0) out.appendSlice(gpa, ", ") catch return false;
+                    if (raw == NONE) continue; // elision / hole
+                    if (!self.renderBindingPattern(@enumFromInt(raw), out, depth + 1)) return false;
+                }
+                out.append(gpa, ']') catch return false;
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     /// True when an identifier-type param node has an explicit `?` optional marker.
     /// Checks both the token immediately after the identifier (`success?:` → next
     /// token is `?`) and the source-text fallback for robustness.
@@ -7037,13 +7136,93 @@ pub const Checker = struct {
             }
             return tymod.ID_ANY;
         }
-        if (self.ast_ref.nodeTag(node) != .identifier) return tymod.ID_UNKNOWN;
+        const ntag = self.ast_ref.nodeTag(node);
+        if (ntag == .object_pattern or ntag == .array_pattern) {
+            if (self.patternParamAnnotationType(node, true)) |t| return t;
+            return self.impliedPatternType(node, 0);
+        }
+        if (ntag != .identifier) return tymod.ID_UNKNOWN;
         const bd = self.ast_ref.nodeData(node);
         if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
             const ty = self.ast_ref.nodeData(bd.rhs).lhs;
             return self.resolveTypeNodeParamAware(ty);
         }
         return tymod.ID_ANY;
+    }
+
+    /// Declared type of a destructuring-pattern parameter from its own
+    /// `: T` annotation (`{ x }: T` / `[a]: U`).  Returns null when the node
+    /// isn't an annotated pattern.  `param_aware` selects the type-position
+    /// resolver so type-parameter references render as their names.
+    fn patternParamAnnotationType(self: *Checker, pattern: NodeIndex, param_aware: bool) ?TypeId {
+        const ptag = self.ast_ref.nodeTag(pattern);
+        if (ptag != .object_pattern and ptag != .array_pattern) return null;
+        if (!self.pattern_annotations_built) self.buildPatternAnnotations();
+        const ann = self.pattern_annotations.get(pattern.toInt()) orelse return null;
+        const ann_ty = self.ast_ref.nodeData(ann).lhs;
+        if (ann_ty == .none) return null;
+        return if (param_aware) self.resolveTypeNodeParamAware(ann_ty) else self.resolveTypeNode(ann_ty);
+    }
+
+    /// Implied structural type of a binding pattern with no annotation and no
+    /// initializer — tsc's "implied type" (section 5.1.3) with every leaf
+    /// binding `any`.  `{ z: { x } }` → `{ z: { x: any; } }`; `[a, [[c]]]` →
+    /// `[any, [[any]]]`.  Plain identifiers / unexpected shapes resolve to
+    /// `any`.  Array rest elements aren't modelled here (bail to `any`).
+    fn impliedPatternType(self: *Checker, node: NodeIndex, depth: u8) TypeId {
+        if (depth > 16) return tymod.ID_ANY;
+        var nd = node;
+        if (self.ast_ref.nodeTag(nd) == .assignment_pattern) nd = self.ast_ref.nodeData(nd).lhs;
+        switch (self.ast_ref.nodeTag(nd)) {
+            .object_pattern => {
+                const d = self.ast_ref.nodeData(nd);
+                const items = self.directRange(d.lhs, d.rhs) orelse return tymod.ID_ANY;
+                var props: [32]tymod.ObjectProp = undefined;
+                var np: usize = 0;
+                for (items) |raw| {
+                    if (np >= props.len) return tymod.ID_ANY;
+                    const child: NodeIndex = @enumFromInt(raw);
+                    switch (self.ast_ref.nodeTag(child)) {
+                        .shorthand_property => {
+                            var keyn = self.ast_ref.nodeData(child).lhs;
+                            if (keyn != .none and self.ast_ref.nodeTag(keyn) == .assignment_pattern)
+                                keyn = self.ast_ref.nodeData(keyn).lhs;
+                            props[np] = .{ .name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(keyn)), .type_id = tymod.ID_ANY };
+                            np += 1;
+                        },
+                        .property => {
+                            const pd = self.ast_ref.nodeData(child);
+                            props[np] = .{
+                                .name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs)),
+                                .type_id = self.impliedPatternType(pd.rhs, depth + 1),
+                            };
+                            np += 1;
+                        },
+                        // Object rest (`{ ...r }`) — implied type isn't modelled.
+                        else => return tymod.ID_ANY,
+                    }
+                }
+                const list = self.store.appendObjectProps(props[0..np]) catch return tymod.ID_ANY;
+                return self.store.add(.{ .kind = .object_t, .object_props = list }) catch tymod.ID_ANY;
+            },
+            .array_pattern => {
+                const d = self.ast_ref.nodeData(nd);
+                const items = self.directRange(d.lhs, d.rhs) orelse return tymod.ID_ANY;
+                var elems: [32]tymod.TypeId = undefined;
+                var ne: usize = 0;
+                const NONE: u32 = @intFromEnum(NodeIndex.none);
+                for (items) |raw| {
+                    if (ne >= elems.len) return tymod.ID_ANY;
+                    // Array rest (`...x`) — tuple-rest display not modelled; bail.
+                    if (raw != NONE and self.ast_ref.nodeTag(@enumFromInt(raw)) == .rest_element)
+                        return tymod.ID_ANY;
+                    elems[ne] = if (raw == NONE) tymod.ID_ANY else self.impliedPatternType(@enumFromInt(raw), depth + 1);
+                    ne += 1;
+                }
+                return self.store.tupleOf(elems[0..ne]) catch tymod.ID_ANY;
+            },
+            else => return tymod.ID_ANY,
+        }
     }
 
     fn paramDeclaredType(self: *Checker, param: NodeIndex) TypeId {
@@ -7070,7 +7249,21 @@ pub const Checker = struct {
             // any), matching tsc with noImplicitAny off.
             return self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_ANY;
         }
-        if (self.ast_ref.nodeTag(node) != .identifier) return tymod.ID_UNKNOWN;
+        // Destructuring-pattern parameter (`{ x }: T`, `[a]: U`): the type
+        // comes from the pattern's own annotation, navigated by the binding
+        // path in `destructuredParamBindingType` for the inner names.  Here we
+        // resolve the whole pattern's declared type for the signature display.
+        const ntag = self.ast_ref.nodeTag(node);
+        if (ntag == .object_pattern or ntag == .array_pattern) {
+            if (self.patternParamAnnotationType(node, false)) |t| return t;
+            // Bare pattern (no annotation, no initializer): tsc infers the
+            // implied structural type with `any` leaves.  Default-valued
+            // patterns derive their type from the initializer instead — left
+            // as `unknown` here (handled elsewhere / future work).
+            if (default_val == .none) return self.impliedPatternType(node, 0);
+            return tymod.ID_UNKNOWN;
+        }
+        if (ntag != .identifier) return tymod.ID_UNKNOWN;
         const bd = self.ast_ref.nodeData(node);
         if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
             const ty = self.ast_ref.nodeData(bd.rhs).lhs;
@@ -7195,7 +7388,7 @@ pub const Checker = struct {
                 if (self.ast_ref.nodeTag(pn) == .ts_parameter_property) pn = self.ast_ref.nodeData(pn).lhs;
                 if (self.ast_ref.nodeTag(pn) == .rest_element) rest_idx = @intCast(count);
                 param_buf[count] = self.paramDeclaredTypeParamAware(param);
-                name_buf[count] = self.paramName(param);
+                name_buf[count] = self.paramDisplayName(param);
                 opt_buf[count] = is_default or self.paramHasOptionalMarker(pn);
                 count += 1;
             }
