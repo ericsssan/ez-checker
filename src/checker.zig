@@ -12896,6 +12896,19 @@ pub const Checker = struct {
             }
             return;
         }
+        // `[T, U]` matched against a tuple arg — bind element-wise.
+        if (tag == .ts_tuple_type) {
+            const at = self.store.get(arg_ty);
+            if (at.kind != .tuple_t and at.kind != .array_t and at.kind != .readonly_array_t) return;
+            const elems = self.store.idsOf(at.list_data);
+            const d = self.ast_ref.nodeData(n);
+            const slice = self.directRange(d.lhs, d.rhs) orelse return;
+            for (slice, 0..) |raw, i| {
+                if (i >= elems.len) break;
+                self.matchTypeParam(@enumFromInt(raw), self.peelRestElem(elems[i]), names, bindings);
+            }
+            return;
+        }
         // `{ prop: T }` matched against an object_t arg — bind each prop's type.
         if (tag == .ts_type_literal) {
             const at = self.store.get(arg_ty);
