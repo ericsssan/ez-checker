@@ -8749,6 +8749,34 @@ pub const Checker = struct {
     /// are statically resolvable: object types looked up by a string-
     /// literal key, array/tuple types indexed by `number` or a numeric
     /// literal, and unions distribute member-wise.
+    /// Display-only `Obj[Index]` indexed-access type for the generic case that
+    /// can't be evaluated (e.g. `T[P]`), as an opaque type_ref.  The index uses
+    /// its resolved display, or — when that resolves to `any` (e.g. a mapped-type
+    /// key param `P` not in scope) — the index node's source name.
+    fn indexedAccessDisplay(self: *Checker, obj_ty: TypeId, idx_node: NodeIndex) TypeId {
+        const o = self.typeToString(obj_ty) catch return tymod.ID_UNKNOWN;
+        defer self.gpa.free(o);
+        const idx_ty = self.resolveTypeNode(idx_node);
+        var ix: []const u8 = "";
+        var ix_owned = true;
+        if (tymod.isAny(&self.store, idx_ty)) {
+            const nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(idx_node));
+            if (nm.len > 0) {
+                ix = nm;
+                ix_owned = false;
+            }
+        }
+        if (ix_owned) ix = self.typeToString(idx_ty) catch return tymod.ID_UNKNOWN;
+        defer if (ix_owned) self.gpa.free(ix);
+        const s = std.fmt.allocPrint(self.gpa, "{s}[{s}]", .{ o, ix }) catch return tymod.ID_UNKNOWN;
+        const r = self.store.typeRef(s, &.{}) catch {
+            self.gpa.free(s);
+            return tymod.ID_UNKNOWN;
+        };
+        self.string_pool.append(self.gpa, s) catch self.gpa.free(s);
+        return r;
+    }
+
     fn resolveIndexedAccess(self: *Checker, ty_node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(ty_node);
         if (data.lhs == .none or data.rhs == .none) return tymod.ID_UNKNOWN;
@@ -8768,6 +8796,10 @@ pub const Checker = struct {
             } else if (ot.kind == .tuple_t) {
                 const elems = self.store.idsOf(ot.list_data);
                 if (elems.len > 0) return self.store.unionOf(elems) catch tymod.ID_UNKNOWN;
+            } else if (ot.kind == .type_param) {
+                // `T[P]` / `T[keyof U]` over a generic object — can't evaluate;
+                // tsc keeps it symbolic as `T[Index]`.
+                return self.indexedAccessDisplay(obj_ty, data.rhs);
             }
             return tymod.ID_UNKNOWN;
         };
