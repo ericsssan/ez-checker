@@ -13088,6 +13088,29 @@ pub const Checker = struct {
             if (tymod.isAny(&self.store, elem)) return tymod.ID_ANY;
             return self.store.arrayOf(elem) catch tymod.ID_ANY;
         }
+        // Contextual tuple typing: `[1, 'a']` with an expected tuple type infers
+        // a TUPLE (not `(number | string)[]`), preserving literals where the
+        // contextual element pins one. Only for spread-free literals of the
+        // matching arity.
+        if (slice.len <= 32) tuple_blk: {
+            const exp = self.expectedTypeOf(node) orelse break :tuple_blk;
+            const et = self.store.get(exp);
+            if (et.kind != .tuple_t) break :tuple_blk;
+            const exp_elems = self.store.idsOf(et.list_data);
+            // Don't reshape when the tuple has rest/optional elements of a
+            // different arity — keep it simple and exact.
+            if (exp_elems.len != slice.len) break :tuple_blk;
+            var tup_buf: [32]TypeId = undefined;
+            var i: usize = 0;
+            while (i < slice.len) : (i += 1) {
+                const en: NodeIndex = @enumFromInt(slice[i]);
+                if (en == .none or self.ast_ref.nodeTag(en) == .spread_element) break :tuple_blk;
+                const vty = self.typeOf(en);
+                tup_buf[i] = self.contextualElementType(vty, self.peelRestElem(exp_elems[i]));
+            }
+            const list = self.store.appendTypeIds(tup_buf[0..slice.len]) catch break :tuple_blk;
+            return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch break :tuple_blk;
+        }
         // Element type = union of element types.
         // For type inference, TypeScript excludes hole elements (elisions) — e.g.
         // `[,, 2, 3, 4]` infers as `number[]`, not a tuple with undefined holes.
@@ -13324,7 +13347,7 @@ pub const Checker = struct {
         const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
         // Contextual type from an enclosing `let x: T = {…}` annotation — used to
         // PRESERVE a literal property value when T expects a literal (union).
-        const ctx_obj_ty = self.objectLiteralContextualType(node);
+        const ctx_obj_ty = self.expectedTypeOf(node);
         var buf: [16]tymod.ObjectProp = undefined;
         // Tracks the accessor kind of each buf entry (bit0 = has getter, bit1 =
         // has setter; 0 = plain property/method).  Lets a get+set pair merge
@@ -15795,6 +15818,162 @@ pub const Checker = struct {
             },
             else => return false,
         }
+    }
+
+    // ── Contextual typing ────────────────────────────────────────────────
+    // The EXPECTED type of an expression, derived from its syntactic position
+    // (an annotation, call-argument slot, return type, assignment target, or —
+    // recursively — the matching slot of an enclosing array/object literal or
+    // conditional). Drives literal preservation and array→tuple inference.
+
+    fn expectedTypeOf(self: *Checker, node: NodeIndex) ?TypeId {
+        return self.expectedTypeOfD(node, 0);
+    }
+
+    fn expectedTypeOfD(self: *Checker, node: NodeIndex, depth: u8) ?TypeId {
+        if (depth > 8) return null;
+        const parents = self.semantic.parent_indices;
+        const ni = node.toInt();
+        if (ni >= parents.len) return null;
+        const pidx = parents[ni];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const pn: NodeIndex = @enumFromInt(pidx);
+        switch (self.ast_ref.nodeTag(pn)) {
+            .declarator => {
+                const dd = self.ast_ref.nodeData(pn);
+                if (dd.rhs != node) return null;
+                if (dd.lhs == .none or self.ast_ref.nodeTag(dd.lhs) != .identifier) return null;
+                const ann = self.ast_ref.nodeData(dd.lhs).rhs;
+                if (ann == .none or self.ast_ref.nodeTag(ann) != .ts_type_annotation) return null;
+                return self.nonNullExpected(self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs));
+            },
+            .call_expr, .optional_call_expr, .new_expr => return self.callArgContextualType(pn, node),
+            .return_stmt => return self.enclosingFnReturnType(pn),
+            // (assignment-target contextual typing is omitted — typeOf(lhs) can
+            //  recurse into expando/circular receivers and poison the node cache.)
+            .grouping_expr, .ts_as_expr, .ts_satisfies_expr, .conditional =>
+                return self.expectedTypeOfD(pn, depth + 1),
+            .property => {
+                const pdata = self.ast_ref.nodeData(pn);
+                if (pdata.rhs != node) return null;
+                const key_name = self.staticPropertyKey(pdata.lhs) orelse return null;
+                const ppi = pn.toInt();
+                if (ppi >= parents.len) return null;
+                const objp = parents[ppi];
+                if (objp == @intFromEnum(NodeIndex.none)) return null;
+                const obj_lit: NodeIndex = @enumFromInt(objp);
+                if (self.ast_ref.nodeTag(obj_lit) != .object_literal) return null;
+                const obj_expected = self.expectedTypeOfD(obj_lit, depth + 1) orelse return null;
+                return self.objectPropExpectedType(obj_expected, key_name);
+            },
+            .array_literal => {
+                const arr_expected = self.expectedTypeOfD(pn, depth + 1) orelse return null;
+                const idx = self.arrayElementIndex(pn, node) orelse return null;
+                return self.arrayElementExpectedType(arr_expected, idx);
+            },
+            else => return null,
+        }
+    }
+
+    /// An array/tuple element's type under a contextual element type: keep the
+    /// literal when the context pins one (`["a"]` ⊢ `["a"]`), else widen.
+    fn contextualElementType(self: *Checker, vty: TypeId, exp_el: TypeId) TypeId {
+        if (exp_el != .none and self.typeExpectsLiteral(exp_el, vty)) return vty;
+        return switch (self.store.get(vty).kind) {
+            .string_literal => tymod.ID_STRING,
+            .number_literal => tymod.ID_NUMBER,
+            .boolean_literal => tymod.ID_BOOLEAN,
+            .bigint_literal => tymod.ID_BIGINT,
+            else => vty,
+        };
+    }
+
+    fn nonNullExpected(_: *Checker, ty: TypeId) ?TypeId {
+        if (ty.eq(tymod.ID_ANY) or ty.eq(tymod.ID_UNKNOWN) or ty.eq(tymod.ID_ERROR)) return null;
+        return ty;
+    }
+
+    /// Parameter type the literal `arg` is contextually typed by as an argument
+    /// of `call_node`. Null if the callee isn't a resolvable function.
+    fn callArgContextualType(self: *Checker, call_node: NodeIndex, arg: NodeIndex) ?TypeId {
+        const cdata = self.ast_ref.nodeData(call_node);
+        if (cdata.lhs == .none) return null;
+        const args_range = self.safeSubRange(cdata.rhs) orelse return null;
+        const extra = self.ast_ref.extra_data;
+        if (args_range.start > extra.len or args_range.end > extra.len) return null;
+        var idx: ?usize = null;
+        for (extra[args_range.start..args_range.end], 0..) |raw, i| {
+            if (raw == arg.toInt()) { idx = i; break; }
+        }
+        const ai = idx orelse return null;
+        const ct = self.store.get(self.typeOf(cdata.lhs));
+        if (ct.kind != .function_t) return null;
+        const sigs = self.store.signaturesOf(ct.signatures);
+        if (sigs.len == 0) return null;
+        const params = self.store.signatureParamsOf(sigs[0]);
+        if (ai >= params.len) return null;
+        return self.nonNullExpected(params[ai]);
+    }
+
+    /// Return-type annotation of the function enclosing `from_node`.
+    fn enclosingFnReturnType(self: *Checker, from_node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (from_node.toInt() < parents.len) parents[from_node.toInt()] else NONE;
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            const d = self.ast_ref.nodeData(pn);
+            const rt: NodeIndex = switch (self.ast_ref.nodeTag(pn)) {
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => blk: {
+                    if (d.lhs == .none) break :blk NodeIndex.none;
+                    break :blk self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs)).return_type;
+                },
+                .arrow_fn, .async_arrow_fn => self.ast_ref.extraData(ast.ArrowData, @intFromEnum(d.lhs)).return_type,
+                .method_def, .computed_method_def, .getter_def, .setter_def, .constructor_def => blk: {
+                    if (d.rhs == .none) break :blk NodeIndex.none;
+                    break :blk self.ast_ref.extraData(ast.MethodData, @intFromEnum(d.rhs)).return_type;
+                },
+                else => continue,
+            };
+            if (rt != .none and self.ast_ref.nodeTag(rt) == .ts_type_annotation) {
+                return self.nonNullExpected(self.resolveTypeNode(self.ast_ref.nodeData(rt).lhs));
+            }
+            return null; // reached the enclosing function; no return annotation
+        }
+        return null;
+    }
+
+    fn objectPropExpectedType(self: *Checker, obj_ty: TypeId, key: []const u8) ?TypeId {
+        const t = self.store.get(obj_ty);
+        if (t.kind != .object_t) return null;
+        for (self.store.propsOf(t.object_props)) |p| {
+            if (std.mem.eql(u8, p.name, key)) return p.type_id;
+        }
+        return null;
+    }
+
+    fn arrayElementExpectedType(self: *Checker, arr_ty: TypeId, idx: usize) ?TypeId {
+        const t = self.store.get(arr_ty);
+        if (t.kind == .tuple_t) {
+            const elems = self.store.idsOf(t.list_data);
+            if (idx < elems.len) return self.peelRestElem(elems[idx]);
+            return null;
+        }
+        if (t.kind == .array_t or t.kind == .readonly_array_t) {
+            const elems = self.store.idsOf(t.list_data);
+            if (elems.len > 0) return elems[0];
+        }
+        return null;
+    }
+
+    fn arrayElementIndex(self: *Checker, arr_node: NodeIndex, elem: NodeIndex) ?usize {
+        const data = self.ast_ref.nodeData(arr_node);
+        const slice = self.directRange(data.lhs, data.rhs) orelse return null;
+        for (slice, 0..) |raw, i| {
+            if (raw == elem.toInt()) return i;
+        }
+        return null;
     }
 
     fn objectLiteralContextualType(self: *Checker, objlit: NodeIndex) ?TypeId {
