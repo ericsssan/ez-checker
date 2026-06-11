@@ -1519,6 +1519,45 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
                 }
             }
         }
+
+        // Computed member names: a `[Symbol.iterator]() {}` method or
+        // `[k]: v` property is typed at the whole member, but tsc anchors the
+        // type on the bracketed name `[Symbol.iterator]`.  The node's main_token
+        // is the `[`; scan to the matching `]` and record the member type there.
+        switch (ast_result.nodeTag(ni)) {
+            .computed_method_def, .computed_property_def => {
+                const mt = ast_result.nodeMainToken(ni);
+                const tags = ast_result.tokens.items(.tag);
+                if (mt < tags.len and tags[mt] == .l_bracket) {
+                    var depth: u32 = 0;
+                    var t: u32 = mt;
+                    const close: ?u32 = while (t < tags.len) : (t += 1) {
+                        if (tags[t] == .l_bracket) depth += 1;
+                        if (tags[t] == .r_bracket) {
+                            depth -= 1;
+                            if (depth == 0) break t;
+                        }
+                    } else null;
+                    if (close) |rb| {
+                        const ns = ast_result.tokenStart(mt);
+                        const ne = ast_result.tokenStart(rb) + ast_result.tokens.items(.len)[rb];
+                        if (ne <= source.len and ne > ns and
+                            std.mem.indexOfScalar(u8, source[ns..ne], '\n') == null)
+                        {
+                            const ckey = Key{ .line = lineOf(starts, ns), .text = source[ns..ne] };
+                            const cgop = try map.getOrPut(ckey);
+                            if (!cgop.found_existing) cgop.value_ptr.* = .empty;
+                            var cdup = false;
+                            for (cgop.value_ptr.items) |o| {
+                                if (o.pos == ns) { cdup = true; break; }
+                            }
+                            if (!cdup) try cgop.value_ptr.append(arena, .{ .pos = ns, .ty = tystr });
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
     }
     // Sort each occurrence list by source position.
     {
