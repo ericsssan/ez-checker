@@ -1459,9 +1459,23 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
         const ni: NodeIndex = @enumFromInt(n);
         const span = nodeSpanFull(&ast_result, ni);
         if (span.end <= span.start or span.end > source.len) continue;
-        const text = source[span.start..span.end];
-        if (text.len == 0) continue;
-        if (std.mem.indexOfScalar(u8, text, '\n') != null) continue;
+        const raw_text = source[span.start..span.end];
+        if (raw_text.len == 0) continue;
+        // tsc's .types baseline writes a multi-line expression on one line by
+        // deleting newlines (other whitespace preserved): the source arrow
+        // `() => {\n        a;\n    }` becomes `() => {        a;    }`.  Mirror
+        // that: for a multi-line node strip the newlines and anchor at its first
+        // line, so multi-line arrows/functions/calls match instead of no-node.
+        const text = if (std.mem.indexOfScalar(u8, raw_text, '\n') != null) blk: {
+            const buf = arena.alloc(u8, raw_text.len) catch continue;
+            var w: usize = 0;
+            for (raw_text) |ch| {
+                if (ch == '\n' or ch == '\r') continue;
+                buf[w] = ch;
+                w += 1;
+            }
+            break :blk buf[0..w];
+        } else raw_text;
         const line = lineOf(starts, span.start);
         const ty = checker.typeOf(ni);
         const tystr = checker.typeToString(ty) catch continue;
