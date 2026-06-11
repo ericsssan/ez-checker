@@ -611,6 +611,10 @@ pub const Checker = struct {
                 }
                 break :blk tymod.ID_UNKNOWN;
             },
+            // `import.meta` meta-property — tsc types it `ImportMeta` (a global
+            // lib interface).  Members aren't modelled, so member access on it
+            // stays a coverage gap rather than a wrong concrete.
+            .import_meta => self.store.typeRef("ImportMeta", &.{}) catch tymod.ID_ANY,
             .this_expr => self.inferThis(node),
             // `super` types as the base class: instance side in instance
             // members (`super : A`), constructor side in statics (`typeof A`).
@@ -1962,6 +1966,16 @@ pub const Checker = struct {
         const ptag = self.ast_ref.nodeTag(parent);
         const pdata = self.ast_ref.nodeData(parent);
         switch (ptag) {
+            // The `meta` property-name node inside `import.meta` — tsc types
+            // this token `ImportMeta` (matching the meta-property expression).
+            // The sibling `import` keyword token isn't typed by tsc, so gate on
+            // the `meta` name.
+            .import_meta => {
+                const tok = self.ast_ref.nodeMainToken(node);
+                if (std.mem.eql(u8, self.ast_ref.tokenText(tok), "meta"))
+                    return self.store.typeRef("ImportMeta", &.{}) catch tymod.ID_ANY;
+                return tymod.ID_ANY;
+            },
             .member_expr, .optional_member_expr => {
                 if (pdata.rhs != node) return tymod.ID_ANY;
                 if (pdata.lhs == .none) return tymod.ID_ANY;
@@ -9564,6 +9578,30 @@ pub const Checker = struct {
         // Temporal (lib.esnext): the namespace value renders `typeof Temporal`.
         try self.global_value_types.put(self.gpa, "Temporal", try self.store.typeRef("typeof Temporal", &.{}));
 
+        // TypedArray / ArrayBuffer constructors — the bare global in value
+        // position is `typeof Xxx` which tsc prints as `XxxConstructor`.
+        {
+            // BigInt64Array / BigUint64Array / SharedArrayBuffer are omitted:
+            // they're lib-target-dependent (esnext/es2020+), so tsc types them
+            // `any` in the many corpus cases compiled against older libs.
+            const typed_arrays = [_][]const u8{
+                "Int8Array",  "Uint8Array",  "Uint8ClampedArray",
+                "Int16Array", "Uint16Array", "Int32Array",
+                "Uint32Array", "Float32Array", "Float64Array",
+                "ArrayBuffer", "DataView",
+            };
+            inline for (typed_arrays) |ta| {
+                try self.global_value_types.put(self.gpa, ta, try self.store.typeRef(ta ++ "Constructor", &.{}));
+            }
+        }
+
+        // DOM singleton globals (lib.dom.d.ts) — named type_refs so member
+        // access resolves through libTypeRefProperty / the facade.  Only the
+        // bare singleton value is typed; structural members stay lazy.
+        try self.global_value_types.put(self.gpa, "document",    try self.store.typeRef("Document",    &.{}));
+        try self.global_value_types.put(self.gpa, "performance", try self.store.typeRef("Performance", &.{}));
+        try self.global_value_types.put(self.gpa, "navigator",   try self.store.typeRef("Navigator",   &.{}));
+
         // Node.js globals.
         try self.global_value_types.put(self.gpa, "__dirname",  tymod.ID_STRING);
         try self.global_value_types.put(self.gpa, "__filename", tymod.ID_STRING);
@@ -13934,6 +13972,11 @@ pub const Checker = struct {
         {
             return self.store.typeRef(name, args) catch null;
         }
+        // `new Image()` constructs an `HTMLImageElement` (lib.dom.d.ts maps the
+        // `Image` constructor alias to that interface).
+        if (std.mem.eql(u8, name, "Image")) {
+            return self.store.typeRef("HTMLImageElement", &.{}) catch null;
+        }
         // User-declared class or interface — return typeRef so the instance
         // type renders as the class name (matching tsc) rather than expanding
         // to the structural object shape.  Member access resolves lazily via
@@ -15986,6 +16029,24 @@ pub const Checker = struct {
                 }
             }
             return null;
+        }
+        // `XConstructor.prototype` → the instance type `X` (e.g. `Date.prototype`
+        // is `Date`, `RegExp.prototype` is `RegExp`).  Array/collection
+        // prototypes render with type args in tsc (`any[]`, `Map<any, any>`),
+        // so leave those to their dedicated handling rather than a bare name.
+        if (std.mem.eql(u8, name, "prototype") and std.mem.endsWith(u8, t.name, "Constructor")) {
+            const inst = t.name[0 .. t.name.len - "Constructor".len];
+            if (inst.len > 0 and !eqAny(inst, &.{ "Array", "Map", "Set", "WeakMap", "WeakSet", "Promise" })) {
+                return self.store.typeRef(inst, &.{}) catch null;
+            }
+        }
+        // Document singleton essentials — `body` is the one accessor tsc types
+        // as the base `HTMLElement` (head/documentElement are element-specific
+        // subtypes, activeElement is `Element | null`, so leave those lazy).
+        if (std.mem.eql(u8, t.name, "Document")) {
+            if (std.mem.eql(u8, name, "body")) {
+                return self.store.typeRef("HTMLElement", &.{}) catch null;
+            }
         }
         // Date.prototype essentials.
         if (std.mem.eql(u8, t.name, "Date")) {
