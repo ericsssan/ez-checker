@@ -13170,6 +13170,18 @@ pub const Checker = struct {
                 return self.store.typeRef("unique symbol", &.{}) catch tymod.ID_SYMBOL;
             return tymod.ID_SYMBOL;
         }
+        // `Error(...)` / `TypeError(...)` / … called WITHOUT `new` returns an
+        // instance of the same type (the lib gives the Error constructors a
+        // call signature equal to their construct signature).  Only fires when
+        // the name isn't a user-declared value in scope.
+        if (self.ast_ref.nodeTag(callee) == .identifier) {
+            const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(callee));
+            if (eqAny(cname, &.{ "Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "EvalError", "URIError", "AggregateError" }) and
+                self.symbolForIdentRef(callee) == null)
+            {
+                return self.store.typeRef(cname, &.{}) catch tymod.ID_UNKNOWN;
+            }
+        }
         // `Object.create(...)` is typed `any` by the lib — surface that so
         // no-unsafe-return / -assignment flag returning or assigning it.
         if (self.calleeIsObjectCreate(callee)) return tymod.ID_ANY;
@@ -13968,7 +13980,12 @@ pub const Checker = struct {
             std.mem.eql(u8, name, "RangeError") or std.mem.eql(u8, name, "SyntaxError") or
             std.mem.eql(u8, name, "ReferenceError") or std.mem.eql(u8, name, "EvalError") or
             std.mem.eql(u8, name, "URIError") or std.mem.eql(u8, name, "AggregateError") or
-            std.mem.eql(u8, name, "URL") or std.mem.eql(u8, name, "URLSearchParams"))
+            std.mem.eql(u8, name, "URL") or std.mem.eql(u8, name, "URLSearchParams") or
+            // `new ArrayBuffer(n)` → `ArrayBuffer`.  TypedArray and DataView
+            // instances are omitted: tsc renders them with a buffer type arg
+            // (`Uint8Array<ArrayBuffer>`, `DataView<ArrayBuffer>`) that's
+            // lib-target-dependent.
+            std.mem.eql(u8, name, "ArrayBuffer"))
         {
             return self.store.typeRef(name, args) catch null;
         }
