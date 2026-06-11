@@ -2979,8 +2979,12 @@ pub const Checker = struct {
                 n += 1;
                 continue;
             }
+            const mt = self.store.get(m);
             const is_falsy_literal = m.eq(tymod.ID_NULL) or
-                m.eq(tymod.ID_UNDEFINED) or m.eq(tymod.ID_VOID);
+                m.eq(tymod.ID_UNDEFINED) or m.eq(tymod.ID_VOID) or
+                (mt.kind == .number_literal and mt.literal_value.number == 0) or
+                (mt.kind == .string_literal and mt.literal_value.string.len == 0) or
+                (mt.kind == .boolean_literal and !mt.literal_value.boolean);
             const keep = if (negate) is_falsy_literal else !is_falsy_literal;
             if (keep) {
                 if (n >= buf.len) return ty;
