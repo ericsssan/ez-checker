@@ -377,6 +377,10 @@ pub const Checker = struct {
 
     /// Compiler options that affect type inference.
     checker_opts: CheckerOpts = .{},
+    /// The contextual RETURN type for the arrow currently being built (from
+    /// `expectedTypeOf` of the arrow node). Lets a concise literal body preserve
+    /// its literal when the context expects one (`const f: () => "a" = () => "a"`).
+    contextual_arrow_return: ?TypeId = null,
     /// Set while resolving a member access through a union/intersection
     /// receiver — suppresses the string-index-signature fallback so a member
     /// served only by an index signature counts as "absent" (the union access
@@ -6369,11 +6373,32 @@ pub const Checker = struct {
     }
 
     /// Build a function_t from an arrow_fn / async_arrow_fn node.
+    /// The contextual return type for `arrow_node`: the return type of the
+    /// arrow's expected function type, when that return is a literal (union) —
+    /// used to preserve a concise literal body.
+    fn arrowContextualReturn(self: *Checker, arrow_node: NodeIndex) ?TypeId {
+        const exp = self.expectedTypeOf(arrow_node) orelse return null;
+        const ft = self.store.get(exp);
+        if (ft.kind != .function_t) return null;
+        const sigs = self.store.signaturesOf(ft.signatures);
+        if (sigs.len == 0) return null;
+        const ret = sigs[0].return_type;
+        const rk = self.store.get(ret).kind;
+        if (rk == .string_literal or rk == .number_literal or rk == .boolean_literal or
+            rk == .bigint_literal or rk == .union_t) return ret;
+        return null;
+    }
+
     fn functionTypeFromArrow(self: *Checker, arrow_node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(arrow_node);
         const ad = self.ast_ref.extraData(ast.ArrowData, @intFromEnum(data.lhs));
         const is_async = self.ast_ref.nodeTag(arrow_node) == .async_arrow_fn;
+        // Contextual return type (`const f: () => "a" = () => "a"`): preserve a
+        // concise literal body when the context expects that literal.
+        const saved_ctx_ret = self.contextual_arrow_return;
+        self.contextual_arrow_return = self.arrowContextualReturn(arrow_node);
         const fn_ty = self.buildFunctionType(ad.params_start, ad.params_end, ad.return_type, ad.body, is_async, false);
+        self.contextual_arrow_return = saved_ctx_ret;
         // ArrowData has no type_params field. For generic arrows <T>(params) => body,
         // the parser stores type param node indices in extra_data immediately before
         // params_start. Only generic arrows have type params: non-async generic arrows
@@ -6550,9 +6575,13 @@ pub const Checker = struct {
             const btag = self.ast_ref.nodeTag(body_for_inference);
             if (btag != .block_stmt) {
                 const raw_ret = self.typeOf(body_for_inference);
-                // Widen primitive literal types in arrow expression bodies to their base types.
-                const ret_info = self.store.get(raw_ret);
-                ret_ty = switch (ret_info.kind) {
+                // A contextual return type that expects this literal preserves it;
+                // otherwise widen the literal to its base type.
+                const ctx_preserve = if (self.contextual_arrow_return) |cr|
+                    self.typeExpectsLiteral(cr, raw_ret)
+                else
+                    false;
+                ret_ty = if (ctx_preserve) raw_ret else switch (self.store.get(raw_ret).kind) {
                     .string_literal => tymod.ID_STRING,
                     .number_literal => tymod.ID_NUMBER,
                     .bigint_literal => tymod.ID_BIGINT,
