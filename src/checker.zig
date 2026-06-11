@@ -10523,7 +10523,119 @@ pub const Checker = struct {
             const k = if (args.len > 1) args[1] else return tymod.ID_UNKNOWN;
             return self.tagUtilityAlias(self.resolveOmit(t, k), name, args);
         }
+        // InstanceType<typeof C> → the instance type `C`.
+        // ConstructorParameters<typeof C> → the constructor's parameter tuple
+        // `[a: number, b: string]`.  Both inspect the `typeof <Class>` argument
+        // node directly (the class static type isn't modelled with a usable
+        // construct signature).
+        // Only the concrete `typeof <Class>` form is computed; for a type
+        // parameter / indexed-access argument fall through to `null` so the
+        // caller keeps the symbolic `InstanceType<…>` / `ConstructorParameters<…>`
+        // display (which is what tsc shows for the unresolved case).
+        if (std.mem.eql(u8, name, "InstanceType")) {
+            if (self.typeofClassArgDecl(ty_node)) |c|
+                return self.store.typeRef(c.name, &.{}) catch tymod.ID_UNKNOWN;
+            return null;
+        }
+        if (std.mem.eql(u8, name, "ConstructorParameters")) {
+            if (self.typeofClassArgDecl(ty_node)) |c|
+                return self.constructorParamsTuple(c.decl);
+            return null;
+        }
         return null;
+    }
+
+    const ClassArgRef = struct { decl: NodeIndex, name: []const u8 };
+
+    /// For a `Foo<typeof C>` type-reference node, returns the class decl + name
+    /// of the `typeof C` first argument, or null if the argument isn't `typeof`
+    /// a known class.
+    fn typeofClassArgDecl(self: *Checker, ref_node: NodeIndex) ?ClassArgRef {
+        const data = self.ast_ref.nodeData(ref_node);
+        const range = self.safeSubRange(data.rhs) orelse return null;
+        if (range.start >= range.end) return null;
+        const arg_node: NodeIndex = @enumFromInt(self.ast_ref.extra_data[range.start]);
+        if (self.ast_ref.nodeTag(arg_node) != .ts_typeof_type) return null;
+        var inner = self.ast_ref.nodeData(arg_node).lhs;
+        while (inner != .none and self.ast_ref.nodeTag(inner) == .grouping_expr)
+            inner = self.ast_ref.nodeData(inner).lhs;
+        if (inner == .none) return null;
+        const itag = self.ast_ref.nodeTag(inner);
+        if (itag != .identifier and itag != .ts_type_reference) return null;
+        const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(inner));
+        if (cname.len == 0) return null;
+        const decl = self.classAstNodeByName(cname) orelse return null;
+        return .{ .decl = decl, .name = cname };
+    }
+
+    /// The MethodData of a class's constructor (a `method_def` keyed
+    /// "constructor" for an implemented ctor, or a `constructor_def`), or null.
+    fn classConstructorMethodData(self: *Checker, decl: NodeIndex) ?ast.MethodData {
+        const data = self.ast_ref.nodeData(decl);
+        const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(data.lhs));
+        if (cd.body == .none) return null;
+        const body_data = self.ast_ref.nodeData(cd.body);
+        const slice = self.directRange(body_data.lhs, body_data.rhs) orelse return null;
+        for (slice) |raw| {
+            const member: NodeIndex = @enumFromInt(raw);
+            const mtag = self.ast_ref.nodeTag(member);
+            if (mtag != .method_def and mtag != .constructor_def) continue;
+            const mdata = self.ast_ref.nodeData(member);
+            if (mtag == .method_def) {
+                if (mdata.lhs == .none) continue;
+                const kt = self.ast_ref.nodeTag(mdata.lhs);
+                if (kt != .identifier and kt != .property_ident) continue;
+                if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs)), "constructor")) continue;
+            }
+            if (mdata.rhs == .none) continue;
+            return self.ast_ref.extraData(ast.MethodData, @intFromEnum(mdata.rhs));
+        }
+        return null;
+    }
+
+    /// `[a: number, b: string]` — the named parameter tuple of `decl`'s
+    /// constructor (an empty `[]` when there is no constructor / no params).
+    /// Built as an opaque type_ref since the tuple representation is unnamed.
+    fn constructorParamsTuple(self: *Checker, decl: NodeIndex) TypeId {
+        const md = self.classConstructorMethodData(decl) orelse
+            return self.store.typeRef("[]", &.{}) catch tymod.ID_UNKNOWN;
+        if (md.params_start >= md.params_end)
+            return self.store.typeRef("[]", &.{}) catch tymod.ID_UNKNOWN;
+        const fn_ty = self.buildFunctionTypeG(md.params_start, md.params_end, .none, .none, false, false, 0, 0);
+        const t = self.store.get(fn_ty);
+        if (t.kind != .function_t) return self.store.typeRef("[]", &.{}) catch tymod.ID_UNKNOWN;
+        const sigs = self.store.signaturesOf(t.signatures);
+        if (sigs.len == 0) return self.store.typeRef("[]", &.{}) catch tymod.ID_UNKNOWN;
+        const sig = sigs[0];
+        const params = self.store.signatureParamsOf(sig);
+        const names = self.store.signatureParamNamesOf(sig);
+        const opts = self.store.signatureParamOptionalsOf(sig);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        buf.append(self.gpa, '[') catch return tymod.ID_UNKNOWN;
+        for (params, 0..) |pty, pi| {
+            if (pi > 0) buf.appendSlice(self.gpa, ", ") catch return tymod.ID_UNKNOWN;
+            const is_rest = sig.rest_param_index != 0xFFFF and pi == sig.rest_param_index;
+            if (is_rest) buf.appendSlice(self.gpa, "...") catch return tymod.ID_UNKNOWN;
+            const pname = if (pi < names.len) names[pi] else "";
+            const is_opt = !is_rest and pi < opts.len and opts[pi];
+            if (pname.len > 0) {
+                buf.appendSlice(self.gpa, pname) catch return tymod.ID_UNKNOWN;
+                if (is_opt) buf.append(self.gpa, '?') catch return tymod.ID_UNKNOWN;
+                buf.appendSlice(self.gpa, ": ") catch return tymod.ID_UNKNOWN;
+            }
+            const s = self.typeToString(pty) catch return tymod.ID_UNKNOWN;
+            defer self.gpa.free(s);
+            buf.appendSlice(self.gpa, s) catch return tymod.ID_UNKNOWN;
+        }
+        buf.append(self.gpa, ']') catch return tymod.ID_UNKNOWN;
+        const owned = buf.toOwnedSlice(self.gpa) catch return tymod.ID_UNKNOWN;
+        const r = self.store.typeRef(owned, &.{}) catch {
+            self.gpa.free(owned);
+            return tymod.ID_UNKNOWN;
+        };
+        self.string_pool.append(self.gpa, owned) catch self.gpa.free(owned);
+        return r;
     }
 
     fn removeNullUndefined(self: *Checker, id: TypeId) TypeId {
