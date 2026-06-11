@@ -15578,6 +15578,18 @@ pub const Checker = struct {
             }
             if (self.functionBindCallApplyType(prop_name, newable)) |ty| return ty;
         }
+        // `.constructor` on a primitive or plain object literal is the inherited
+        // `Object.prototype.constructor`, typed `Function` by tsc.  (Class
+        // instances are `type_ref`s and resolve to `typeof TheClass` elsewhere,
+        // so they don't reach this point.)
+        if (std.mem.eql(u8, prop_name, "constructor")) {
+            switch (obj.kind) {
+                .string, .string_literal, .number, .number_literal,
+                .boolean, .boolean_literal, .bigint, .bigint_literal,
+                .symbol, .object_t => return self.store.typeRef("Function", &.{}) catch tymod.ID_ANY,
+                else => {},
+            }
+        }
         // Fallback: for non-primitive types where the property wasn't found,
         // return `any` to match TypeScript's permissive behavior on missing
         // properties (e.g., class instance members not in the model).
