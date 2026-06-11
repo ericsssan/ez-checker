@@ -1525,7 +1525,7 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
         // type on the bracketed name `[Symbol.iterator]`.  The node's main_token
         // is the `[`; scan to the matching `]` and record the member type there.
         switch (ast_result.nodeTag(ni)) {
-            .computed_method_def, .computed_property_def => {
+            .computed_method_def, .computed_property_def, .computed_property => {
                 const mt = ast_result.nodeMainToken(ni);
                 const tags = ast_result.tokens.items(.tag);
                 if (mt < tags.len and tags[mt] == .l_bracket) {
