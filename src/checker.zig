@@ -6241,6 +6241,23 @@ pub const Checker = struct {
     /// Returns true when `const <name> = Symbol(...)` exists in the AST —
     /// i.e., a declarator whose lhs is the identifier `name` and whose rhs
     /// is a call_expr whose callee is the global `Symbol` identifier.
+    /// True when `node` (a call/expression) is the initializer of a `const`
+    /// declarator (`const x = <node>`).
+    fn callIsConstInit(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const ni = node.toInt();
+        if (ni >= parents.len) return false;
+        const p = parents[ni];
+        if (p == NONE) return false;
+        const parent: NodeIndex = @enumFromInt(p);
+        if (self.ast_ref.nodeTag(parent) != .declarator) return false;
+        if (self.ast_ref.nodeData(parent).rhs != node) return false;
+        const pp = if (parent.toInt() < parents.len) parents[parent.toInt()] else NONE;
+        if (pp == NONE) return false;
+        return self.ast_ref.nodeTag(@enumFromInt(pp)) == .const_decl;
+    }
+
     pub fn constInitIsSymbolCall(self: *Checker, name: []const u8) bool {
         const list = self.value_decl_by_name.get(name) orelse return false;
         for (list.items) |ni| {
@@ -12726,6 +12743,15 @@ pub const Checker = struct {
         const data = self.ast_ref.nodeData(node);
         const callee = data.lhs;
         if (callee == .none) return tymod.ID_UNKNOWN;
+        // `Symbol()` / `Symbol("desc")`: a `const` binding captures a fresh
+        // `unique symbol`; any other position widens to `symbol`.
+        if (self.ast_ref.nodeTag(callee) == .identifier and
+            std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(callee)), "Symbol"))
+        {
+            if (self.callIsConstInit(node))
+                return self.store.typeRef("unique symbol", &.{}) catch tymod.ID_SYMBOL;
+            return tymod.ID_SYMBOL;
+        }
         // `Object.create(...)` is typed `any` by the lib — surface that so
         // no-unsafe-return / -assignment flag returning or assigning it.
         if (self.calleeIsObjectCreate(callee)) return tymod.ID_ANY;
