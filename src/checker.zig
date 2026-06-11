@@ -2535,10 +2535,48 @@ pub const Checker = struct {
         const disc = self.ast_ref.nodeData(sw).lhs;
         const label = self.ast_ref.nodeData(case_node).lhs;
         if (disc == .none or label == .none) return ty;
+        // `switch (typeof x) { case 'kind': }`
         if (self.tryTypeofNarrow(disc, label, sym, false, false)) |spec| {
             return self.intersectNarrow(ty, spec.kind, spec.keep_only);
         }
+        // `switch (x.kind) { case "A": }` — discriminated-union narrowing.
+        if (self.isMemberAccessOfSym(disc, sym)) |prop_name| {
+            return self.narrowDiscriminantProp(ty, prop_name, label, true);
+        }
+        // `switch (x) { case 1: }` — keep the union member matching the label.
+        if (self.identifierBindsToSym(disc, sym)) {
+            return self.narrowToCaseLiteral(ty, label);
+        }
         return ty;
+    }
+
+    /// Keep the union member(s) of `ty` that the `switch` case label selects.
+    /// For a broad primitive receiver (`x: number`, `case 1:`) narrow to the
+    /// label's literal type.
+    fn narrowToCaseLiteral(self: *Checker, ty: TypeId, label: NodeIndex) TypeId {
+        const label_ty = self.typeOf(label);
+        const lt = self.store.get(label_ty);
+        // Only literal labels narrow precisely.
+        switch (lt.kind) {
+            .string_literal, .number_literal, .boolean_literal, .bigint_literal => {},
+            else => return ty,
+        }
+        const t = self.store.get(ty);
+        // Only a finite union narrows to a specific member; a wide primitive
+        // (`x: number`, `case 3:`) stays `number` in tsc.
+        if (t.kind != .union_t) return ty;
+        var buf: [16]TypeId = undefined;
+        var n: usize = 0;
+        for (self.store.idsOf(t.list_data)) |m| {
+            if (m.eq(label_ty) or tymod.isAssignableTo(&self.store, label_ty, m)) {
+                if (n >= buf.len) return ty;
+                buf[n] = m;
+                n += 1;
+            }
+        }
+        if (n == 0) return ty;
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch ty;
     }
 
     /// Structural equality of two access paths (`foo.a.b` ≡ `foo.a.b`).
