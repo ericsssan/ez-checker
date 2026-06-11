@@ -800,11 +800,10 @@ pub const Checker = struct {
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(d.rhs));
                 const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                 const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
-                const mresult = self.buildFunctionType(
+                const mresult = self.buildFunctionTypeG(
                     md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator,
+                    md.type_params, md.type_params_end,
                 );
-                if (md.type_params < md.type_params_end)
-                    self.registerFnTypeParams(mresult, md.type_params, md.type_params_end);
                 break :blk mresult;
             },
             .class_decl => tymod.ID_ANY,
@@ -1940,9 +1939,7 @@ pub const Checker = struct {
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
                 const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                 const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
-                const mres = self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator);
-                if (md.type_params < md.type_params_end)
-                    self.registerFnTypeParams(mres, md.type_params, md.type_params_end);
+                const mres = self.buildFunctionTypeG(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator, md.type_params, md.type_params_end);
                 return mres;
             },
             else => return null,
@@ -4452,9 +4449,7 @@ pub const Checker = struct {
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
                 const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                 const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
-                const mres2 = self.buildFunctionType(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator);
-                if (md.type_params < md.type_params_end)
-                    self.registerFnTypeParams(mres2, md.type_params, md.type_params_end);
+                const mres2 = self.buildFunctionTypeG(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator, md.type_params, md.type_params_end);
                 return mres2;
             },
             .getter_def => {
@@ -6366,9 +6361,7 @@ pub const Checker = struct {
             .async_generator_fn_decl, .async_generator_fn_expr => true,
             else => false,
         };
-        const result = self.buildFunctionType(fd.params, fd.params_end, fd.return_type, fd.body, is_async, is_generator);
-        if (fd.type_params < fd.type_params_end)
-            self.registerFnTypeParams(result, fd.type_params, fd.type_params_end);
+        const result = self.buildFunctionTypeG(fd.params, fd.params_end, fd.return_type, fd.body, is_async, is_generator, fd.type_params, fd.type_params_end);
         return result;
     }
 
@@ -6395,15 +6388,12 @@ pub const Checker = struct {
         const is_async = self.ast_ref.nodeTag(arrow_node) == .async_arrow_fn;
         // Contextual return type (`const f: () => "a" = () => "a"`): preserve a
         // concise literal body when the context expects that literal.
-        const saved_ctx_ret = self.contextual_arrow_return;
-        self.contextual_arrow_return = self.arrowContextualReturn(arrow_node);
-        const fn_ty = self.buildFunctionType(ad.params_start, ad.params_end, ad.return_type, ad.body, is_async, false);
-        self.contextual_arrow_return = saved_ctx_ret;
         // ArrowData has no type_params field. For generic arrows <T>(params) => body,
         // the parser stores type param node indices in extra_data immediately before
         // params_start. Only generic arrows have type params: non-async generic arrows
         // start with '<' (less_than main_token); async generic arrows have 'async'
-        // as main_token and '<' as the very next token.
+        // as main_token and '<' as the very next token.  Recover the range first so
+        // it can be folded into the function type's identity at intern time.
         const main_tok = self.ast_ref.nodeMainToken(arrow_node);
         const main_tag = self.ast_ref.tokenTag(main_tok);
         const tok_count: u32 = @intCast(self.ast_ref.tokens.len);
@@ -6411,20 +6401,35 @@ pub const Checker = struct {
             (is_async and main_tag == .kw_async and
              main_tok + 1 < tok_count and
              self.ast_ref.tokenTag(main_tok + 1) == .less_than);
-        if (is_generic_arrow and !self.fn_type_params.contains(fn_ty)) {
+        var tp_start: u32 = ad.params_start;
+        var tp_end: u32 = ad.params_start;
+        if (is_generic_arrow) {
             const ext = self.ast_ref.extra_data;
             const total_nodes: u32 = @intCast(self.ast_ref.nodes.len);
-            const tp_end = ad.params_start;
-            var tp_start = tp_end;
-            while (tp_start > 0) {
-                const raw = ext[tp_start - 1];
-                if (raw >= total_nodes) break;
-                const ni: NodeIndex = @enumFromInt(raw);
-                if (self.ast_ref.nodeTag(ni) != .ts_type_parameter) break;
-                tp_start -= 1;
-            }
-            if (tp_start < tp_end) self.registerFnTypeParams(fn_ty, tp_start, tp_end);
+            const isTp = struct {
+                fn f(c: *Checker, raw: u32, total: u32) bool {
+                    return raw < total and c.ast_ref.nodeTag(@enumFromInt(raw)) == .ts_type_parameter;
+                }
+            }.f;
+            // The type-parameter block sits before the params but isn't always
+            // adjacent: a param's own type (e.g. `(arg: T) => U`) inserts nodes
+            // into extra_data between the `<T, U>` block and the param list, so
+            // skip over those to reach the block's contiguous run.  (ArrowData
+            // records no type_params range — see es-parser limitation.)
+            while (tp_end > 0 and !isTp(self, ext[tp_end - 1], total_nodes)) tp_end -= 1;
+            tp_start = tp_end;
+            while (tp_start > 0 and isTp(self, ext[tp_start - 1], total_nodes)) tp_start -= 1;
+            // The contiguous run can also pick up an *enclosing* generic's type
+            // parameters when they sit adjacent in extra_data.  Those precede
+            // this arrow's `<`, so drop leading entries whose token is before
+            // the arrow's main token (`<`, or `async` for async arrows).
+            while (tp_start < tp_end and self.ast_ref.nodeMainToken(@enumFromInt(ext[tp_start])) < main_tok)
+                tp_start += 1;
         }
+        const saved_ctx_ret = self.contextual_arrow_return;
+        self.contextual_arrow_return = self.arrowContextualReturn(arrow_node);
+        const fn_ty = self.buildFunctionTypeG(ad.params_start, ad.params_end, ad.return_type, ad.body, is_async, false, tp_start, tp_end);
+        self.contextual_arrow_return = saved_ctx_ret;
         return fn_ty;
     }
 
@@ -6439,6 +6444,59 @@ pub const Checker = struct {
     ) TypeId {
         const sig = self.buildSignatureRaw(params_start, params_end, return_type_node, body_for_inference, is_async, is_generator) orelse return tymod.ID_UNKNOWN;
         return self.store.functionType(sig) catch tymod.ID_UNKNOWN;
+    }
+
+    /// Like `buildFunctionType`, but for a *generic* function: the type-param
+    /// range [tp_start, tp_end) is folded into the interned type's identity
+    /// (so it doesn't collide with a structurally-identical non-generic type)
+    /// and its `<T>` prefix is registered for rendering.  Replaces the old
+    /// `buildFunctionType(...)` + `registerFnTypeParams(...)` call pairs.
+    fn buildFunctionTypeG(
+        self: *Checker,
+        params_start: u32,
+        params_end: u32,
+        return_type_node: NodeIndex,
+        body_for_inference: NodeIndex,
+        is_async: bool,
+        is_generator: bool,
+        tp_start: u32,
+        tp_end: u32,
+    ) TypeId {
+        const sig = self.buildSignatureRaw(params_start, params_end, return_type_node, body_for_inference, is_async, is_generator) orelse return tymod.ID_UNKNOWN;
+        return self.internFnSig(sig, tp_start, tp_end);
+    }
+
+    /// Intern a single-signature function type whose generic type parameters
+    /// live at [tp_start, tp_end).  Sets `sig.type_param_fp` from the prefix so
+    /// the type interns distinctly from a non-generic look-alike, then records
+    /// the prefix string in `fn_type_params` keyed by the resulting TypeId.
+    /// Falls back to a plain intern when there are no type parameters.
+    fn internFnSig(self: *Checker, sig_in: tymod.Signature, tp_start: u32, tp_end: u32) TypeId {
+        var sig = sig_in;
+        if (tp_start >= tp_end) return self.store.functionType(sig) catch tymod.ID_UNKNOWN;
+        const prefix = self.buildTypeParamsPrefix(tp_start, tp_end) orelse
+            return self.store.functionType(sig) catch tymod.ID_UNKNOWN;
+        sig.type_param_fp = std.hash.Wyhash.hash(0, prefix);
+        const ty = self.store.functionType(sig) catch {
+            self.gpa.free(prefix);
+            return tymod.ID_UNKNOWN;
+        };
+        if (self.fn_type_params.contains(ty)) {
+            self.gpa.free(prefix);
+        } else {
+            self.fn_type_params.put(self.gpa, ty, prefix) catch self.gpa.free(prefix);
+        }
+        return ty;
+    }
+
+    /// Fingerprint of a function's type-parameter prefix (0 when none), for
+    /// callers that set `Signature.type_param_fp` directly (e.g. overload-set
+    /// builders that append signatures before interning the function_t).
+    fn typeParamsFingerprint(self: *Checker, tp_start: u32, tp_end: u32) u64 {
+        if (tp_start >= tp_end) return 0;
+        const prefix = self.buildTypeParamsPrefix(tp_start, tp_end) orelse return 0;
+        defer self.gpa.free(prefix);
+        return std.hash.Wyhash.hash(0, prefix);
     }
 
     /// Build a Signature (appending params to the store's param pool) without
@@ -6682,6 +6740,11 @@ pub const Checker = struct {
             }
         }
         if (sig_count == 0) return null;
+        // Fold each signature's type-param prefix into its identity so the
+        // interned function_t stays distinct from a non-generic look-alike.
+        for (sig_buf[0..sig_count], tp_buf[0..sig_count]) |*s, tp| {
+            if (tp.start < tp.end) s.type_param_fp = self.typeParamsFingerprint(tp.start, tp.end);
+        }
         const sig_list = self.store.appendSignatures(sig_buf[0..sig_count]) catch return null;
         for (tp_buf[0..sig_count], 0..) |tp, i| {
             if (tp.start < tp.end) {
@@ -6741,6 +6804,10 @@ pub const Checker = struct {
             sig_count += 1;
         }
         if (sig_count == 0) return null;
+        // Fold each signature's type-param prefix into its identity (see above).
+        for (sig_buf[0..sig_count], tp_buf[0..sig_count]) |*s, tp| {
+            if (tp.start < tp.end) s.type_param_fp = self.typeParamsFingerprint(tp.start, tp.end);
+        }
         const sig_list = self.store.appendSignatures(sig_buf[0..sig_count]) catch return null;
         // Register per-signature type params so rendering uses <T> prefixes correctly.
         for (tp_buf[0..sig_count], 0..) |tp, i| {
@@ -7452,9 +7519,7 @@ pub const Checker = struct {
             .rest_param_index = rest_idx,
             .is_construct = (self.ast_ref.nodeTag(ty_node) == .ts_constructor_type),
         };
-        const fn_ty = self.store.functionType(sig) catch return tymod.ID_UNKNOWN;
-        if (fd.type_params < fd.type_params_end)
-            self.registerFnTypeParams(fn_ty, fd.type_params, fd.type_params_end);
+        const fn_ty = self.internFnSig(sig, fd.type_params, fd.type_params_end);
         return fn_ty;
     }
 
@@ -7593,16 +7658,16 @@ pub const Checker = struct {
                     else
                         raw_name;
                 };
-                const fn_ty = self.buildFunctionType(
+                const fn_ty = self.buildFunctionTypeG(
                     sig_data.params_start,
                     sig_data.params_end,
                     sig_data.return_type,
                     .none,
                     false,
                     false,
+                    sig_data.type_params,
+                    sig_data.type_params_end,
                 );
-                if (sig_data.type_params < sig_data.type_params_end)
-                    self.registerFnTypeParams(fn_ty, sig_data.type_params, sig_data.type_params_end);
                 const m_optional = propertyHasOptionalMarker(self, sig_data.key);
                 props_buf[prop_count] = .{ .name = name, .type_id = fn_ty, .is_method = true, .optional = m_optional };
                 prop_count += 1;
@@ -11466,16 +11531,17 @@ pub const Checker = struct {
                 const name_tok = self.ast_ref.nodeMainToken(sig_data.key);
                 const name = self.ast_ref.tokenText(name_tok);
                 // Build a function_t for the method.
-                const fn_ty = self.buildFunctionType(
+                const fn_ty = self.buildFunctionTypeG(
                     sig_data.params_start,
                     sig_data.params_end,
                     sig_data.return_type,
                     .none,
                     false,
                     false,
+                    sig_data.type_params,
+                    sig_data.type_params_end,
                 );
                 if (sig_data.type_params < sig_data.type_params_end) {
-                    self.registerFnTypeParams(fn_ty, sig_data.type_params, sig_data.type_params_end);
                     // Also register per-signature (pool-indexed) so overload
                     // merging keeps the `<U>` prefix per slot.
                     const ft = self.store.get(fn_ty);
@@ -11656,9 +11722,7 @@ pub const Checker = struct {
                             if (md.body != .none) continue; // implementation hidden by overloads
                             const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                             const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
-                            const new_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, .none, is_async, is_generator);
-                            if (md.type_params < md.type_params_end)
-                                self.registerFnTypeParams(new_ty, md.type_params, md.type_params_end);
+                            const new_ty = self.buildFunctionTypeG(md.params_start, md.params_end, md.return_type, .none, is_async, is_generator, md.type_params, md.type_params_end);
                             var found_existing = false;
                             for (props.items) |*existing| {
                                 if (std.mem.eql(u8, existing.name, key)) {
@@ -11852,9 +11916,7 @@ pub const Checker = struct {
                             if (md.body != .none) continue;
                             const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                             const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
-                            const new_ty = self.buildFunctionType(md.params_start, md.params_end, md.return_type, .none, is_async, is_generator);
-                            if (md.type_params < md.type_params_end)
-                                self.registerFnTypeParams(new_ty, md.type_params, md.type_params_end);
+                            const new_ty = self.buildFunctionTypeG(md.params_start, md.params_end, md.return_type, .none, is_async, is_generator, md.type_params, md.type_params_end);
                             var found_existing = false;
                             for (props.items) |*existing| {
                                 if (std.mem.eql(u8, existing.name, key)) {
@@ -11974,16 +12036,16 @@ pub const Checker = struct {
                         return .{ .name = name, .type_id = t };
                     return .{ .name = name, .type_id = tymod.ID_ANY };
                 }
-                const fn_ty = self.buildFunctionType(
+                const fn_ty = self.buildFunctionTypeG(
                     md.params_start,
                     md.params_end,
                     md.return_type,
                     md.body,
                     is_async,
                     is_generator,
+                    md.type_params,
+                    md.type_params_end,
                 );
-                if (md.type_params < md.type_params_end)
-                    self.registerFnTypeParams(fn_ty, md.type_params, md.type_params_end);
                 return .{
                     .name = name,
                     .type_id = fn_ty,
@@ -13922,16 +13984,16 @@ pub const Checker = struct {
                     const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pd.rhs));
                     const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                     const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
-                    const fn_ty = self.buildFunctionType(
+                    const fn_ty = self.buildFunctionTypeG(
                         md.params_start,
                         md.params_end,
                         md.return_type,
                         md.body,
                         is_async,
                         is_generator,
+                        md.type_params,
+                        md.type_params_end,
                     );
-                    if (md.type_params < md.type_params_end)
-                        self.registerFnTypeParams(fn_ty, md.type_params, md.type_params_end);
                     // `m(this: void, …)` is explicitly not a this-bound
                     // method — unbound-method should ignore it.
                     const this_void = self.methodFirstParamIsThisVoid(md.params_start, md.params_end);

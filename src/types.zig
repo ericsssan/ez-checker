@@ -148,6 +148,15 @@ pub const Signature = struct {
     /// the signature has none.  Lets the type-aware facade tell
     /// no-unsafe-argument which trailing param consumes the spread.
     rest_param_index: u16 = 0xFFFF,
+    /// Fingerprint of the generic type-parameter prefix (`<T>`, `<T extends X>`),
+    /// or 0 for a non-generic signature.  Generic type parameters live in a
+    /// checker-side table keyed by TypeId, *not* on the Type, so without this
+    /// discriminator `<T>() => void` and `() => void` hash/compare identically
+    /// and dedup to one TypeId — the first writer's `<T>` prefix then leaks onto
+    /// the other.  Folding the fingerprint into the type's structural identity
+    /// keeps generic and non-generic (and differently-parameterized) signatures
+    /// distinct.  Set by the checker before interning.
+    type_param_fp: u64 = 0,
 };
 
 pub const Type = struct {
@@ -343,6 +352,7 @@ pub const InternContext = struct {
             h.update(std.mem.asBytes(&s.predicate_param_index));
             const pt = s.predicate_target.toInt();
             h.update(std.mem.asBytes(&pt));
+            h.update(std.mem.asBytes(&s.type_param_fp));
         }
         return h.final();
     }
@@ -384,6 +394,7 @@ pub const InternContext = struct {
             if (x.rest_param_index != y.rest_param_index) return false;
             if (x.predicate_param_index != y.predicate_param_index) return false;
             if (!x.predicate_target.eq(y.predicate_target)) return false;
+            if (x.type_param_fp != y.type_param_fp) return false;
             const xpa = self.store.signatureParamsOf(x);
             const ypa = self.store.signatureParamsOf(y);
             if (xpa.len != ypa.len) return false;
