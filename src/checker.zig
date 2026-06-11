@@ -2939,6 +2939,11 @@ pub const Checker = struct {
     /// everything else as-is (we don't model literal-falsy types).
     fn narrowTruthy(self: *Checker, ty: TypeId, negate: bool) TypeId {
         const t = self.store.get(ty);
+        // A bare `boolean` narrows to the matching literal under a truthy/falsy
+        // guard: `if (b)` ⊢ `b: true`, `if (!b)` / else ⊢ `b: false`.
+        if (ty.eq(tymod.ID_BOOLEAN)) {
+            return self.store.booleanLiteral(!negate) catch ty;
+        }
         if (t.kind != .union_t) return ty;
         var buf: [16]TypeId = undefined;
         var n: usize = 0;
