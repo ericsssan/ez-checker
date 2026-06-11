@@ -14397,7 +14397,7 @@ pub const Checker = struct {
     /// specifier, unresolvable module, CJS/JSON interop) keep the `any` fallback —
     /// those render with module-shape-dependent types we can't reconstruct here.
     fn inferImportExpr(self: *Checker, node: NodeIndex) TypeId {
-        const inner = self.importExprAwaitedType(node) orelse return tymod.ID_ANY;
+        const inner = self.importExprAwaitedType(node) orelse return self.importExprAnyFallback(node);
         // Opaque `Promise<…>` type_ref: renders correctly and exposes no members,
         // so `import(…).then(…)` stays a gap rather than diverging from tsc's lib
         // Promise signature.  `await import(…)` is special-cased in inferAwait.
@@ -14409,6 +14409,23 @@ pub const Checker = struct {
         };
         self.string_pool.append(self.gpa, pn) catch self.gpa.free(pn);
         return r;
+    }
+
+    /// `Promise<any>` for a dynamic import whose result type can't be a concrete
+    /// `typeof import(...)`: a non-literal specifier (`import(expr)`) — which tsc
+    /// always types `Promise<any>` since the target is statically unknown.  A
+    /// string-literal specifier that simply doesn't match a local section is left
+    /// as plain `any`: tsc may still have resolved it on disk to a CJS/JSON/typeof
+    /// shape we can't reconstruct, so emitting `Promise<any>` there risks divergence.
+    fn importExprAnyFallback(self: *Checker, node: NodeIndex) TypeId {
+        const data = self.ast_ref.nodeData(node);
+        if (data.lhs == .none) return tymod.ID_ANY; // `import()` — error, any
+        // A string-literal spec that didn't resolve to a local section may still be
+        // resolved on disk by tsc to a concrete CJS/JSON/typeof shape — stay `any`.
+        if (self.ast_ref.nodeTag(data.lhs) == .string_literal) return tymod.ID_ANY;
+        // Non-literal specifier → Promise<any> (target statically unknown).
+        const any_inner = [_]TypeId{tymod.ID_ANY};
+        return self.store.typeRef("Promise", &any_inner) catch tymod.ID_ANY;
     }
 
     /// The awaited (unwrapped) type of a dynamic-import expression `import("spec")`:
