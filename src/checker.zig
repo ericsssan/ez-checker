@@ -2992,6 +2992,7 @@ pub const Checker = struct {
         if (std.mem.eql(u8, inner, "boolean")) return .boolean;
         if (std.mem.eql(u8, inner, "bigint")) return .bigint;
         if (std.mem.eql(u8, inner, "symbol")) return .symbol;
+        if (std.mem.eql(u8, inner, "object")) return .object;
         if (std.mem.eql(u8, inner, "undefined")) return .undefined_t;
         if (std.mem.eql(u8, inner, "function")) return .function;
         return null;
@@ -3001,6 +3002,10 @@ pub const Checker = struct {
     /// in truthy branch, keep_only=true → keep only string-ish from a
     /// union (or replace primitive `ID_STRING` etc.).  For !==, drop.
     fn intersectNarrow(self: *Checker, ty: TypeId, kind: Narrowable, keep_only: bool) TypeId {
+        // `typeof x === 'object'` on an `any` value leaves it `any` — the
+        // `object` typeof bucket is ambiguous (object | null), so tsc doesn't
+        // refine `any` to `object` (unlike the precise primitive buckets).
+        if (kind == .object and keep_only and tymod.isAny(&self.store, ty)) return ty;
         // Map the narrowable to its primitive TypeId for whole-type
         // replacement when ty isn't a union.
         const target: TypeId = switch (kind) {
@@ -3009,6 +3014,7 @@ pub const Checker = struct {
             .boolean => tymod.ID_BOOLEAN,
             .bigint => tymod.ID_BIGINT,
             .symbol => tymod.ID_SYMBOL,
+            .object => tymod.ID_OBJECT_KW,
             .undefined_t => tymod.ID_UNDEFINED,
             .null_t => tymod.ID_NULL,
             .void_t => tymod.ID_VOID,
@@ -3029,7 +3035,7 @@ pub const Checker = struct {
         return self.narrowUnion(ty, kind, keep_only);
     }
 
-    const Narrowable = enum(u8) { none, null_t, undefined_t, void_t, string, number, boolean, bigint, symbol, function };
+    const Narrowable = enum(u8) { none, null_t, undefined_t, void_t, string, number, boolean, bigint, symbol, object, function };
 
     fn narrowKindFromLiteral(self: *Checker, lit: NodeIndex) Narrowable {
         var n = lit;
@@ -3110,6 +3116,7 @@ pub const Checker = struct {
             .boolean => id.eq(tymod.ID_BOOLEAN),
             .bigint => id.eq(tymod.ID_BIGINT),
             .symbol => id.eq(tymod.ID_SYMBOL),
+            .object => id.eq(tymod.ID_OBJECT_KW),
             .function => k == .function_t,
             .none => false,
         };
@@ -3122,6 +3129,10 @@ pub const Checker = struct {
             .boolean => k == .boolean or k == .boolean_literal,
             .bigint => k == .bigint or k == .bigint_literal,
             .symbol => k == .symbol,
+            // `typeof x === 'object'` keeps object-like members (and null), but
+            // NOT functions or primitives.
+            .object => k == .object_t or k == .object_keyword or k == .array_t or
+                k == .readonly_array_t or k == .tuple_t or k == .type_ref or k == .null_t,
             .undefined_t => k == .undefined_t or k == .void_t,
             .null_t => k == .null_t,
             .void_t => k == .void_t,
