@@ -3063,10 +3063,16 @@ pub const Checker = struct {
         const t = self.store.get(ty);
         if (t.kind != .union_t) {
             if (keep_only) {
-                // typeof of a non-union value that matches → keep ty;
-                // doesn't match → never.
-                if (typeIsKindOf(self.store.get(ty).kind, kind)) return ty;
-                return target;
+                if (typeIsKindOf(t.kind, kind)) return ty;
+                // A CONCRETE primitive that isn't `kind` is impossible → never
+                // (`x: string; typeof x === 'number'` is never). Broad types
+                // (any/unknown/{}) and abstract refs narrow to the typeof bucket.
+                return switch (t.kind) {
+                    .string, .string_literal, .number, .number_literal,
+                    .boolean, .boolean_literal, .bigint, .bigint_literal,
+                    .symbol, .null_t, .undefined_t, .void_t => tymod.ID_NEVER,
+                    else => target,
+                };
             }
             return ty;
         }
