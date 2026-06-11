@@ -2991,6 +2991,7 @@ pub const Checker = struct {
         if (std.mem.eql(u8, inner, "number")) return .number;
         if (std.mem.eql(u8, inner, "boolean")) return .boolean;
         if (std.mem.eql(u8, inner, "bigint")) return .bigint;
+        if (std.mem.eql(u8, inner, "symbol")) return .symbol;
         if (std.mem.eql(u8, inner, "undefined")) return .undefined_t;
         if (std.mem.eql(u8, inner, "function")) return .function;
         return null;
@@ -3007,6 +3008,7 @@ pub const Checker = struct {
             .number => tymod.ID_NUMBER,
             .boolean => tymod.ID_BOOLEAN,
             .bigint => tymod.ID_BIGINT,
+            .symbol => tymod.ID_SYMBOL,
             .undefined_t => tymod.ID_UNDEFINED,
             .null_t => tymod.ID_NULL,
             .void_t => tymod.ID_VOID,
@@ -3027,7 +3029,7 @@ pub const Checker = struct {
         return self.narrowUnion(ty, kind, keep_only);
     }
 
-    const Narrowable = enum(u8) { none, null_t, undefined_t, void_t, string, number, boolean, bigint, function };
+    const Narrowable = enum(u8) { none, null_t, undefined_t, void_t, string, number, boolean, bigint, symbol, function };
 
     fn narrowKindFromLiteral(self: *Checker, lit: NodeIndex) Narrowable {
         var n = lit;
@@ -3107,6 +3109,7 @@ pub const Checker = struct {
             .number => id.eq(tymod.ID_NUMBER),
             .boolean => id.eq(tymod.ID_BOOLEAN),
             .bigint => id.eq(tymod.ID_BIGINT),
+            .symbol => id.eq(tymod.ID_SYMBOL),
             .function => k == .function_t,
             .none => false,
         };
@@ -3118,6 +3121,7 @@ pub const Checker = struct {
             .number => k == .number or k == .number_literal,
             .boolean => k == .boolean or k == .boolean_literal,
             .bigint => k == .bigint or k == .bigint_literal,
+            .symbol => k == .symbol,
             .undefined_t => k == .undefined_t or k == .void_t,
             .null_t => k == .null_t,
             .void_t => k == .void_t,
