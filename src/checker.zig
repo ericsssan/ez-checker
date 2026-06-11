@@ -13322,6 +13322,9 @@ pub const Checker = struct {
         // type beyond what we can statically represent.
         const data = self.ast_ref.nodeData(node);
         const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
+        // Contextual type from an enclosing `let x: T = {…}` annotation — used to
+        // PRESERVE a literal property value when T expects a literal (union).
+        const ctx_obj_ty = self.objectLiteralContextualType(node);
         var buf: [16]tymod.ObjectProp = undefined;
         // Tracks the accessor kind of each buf entry (bit0 = has getter, bit1 =
         // has setter; 0 = plain property/method).  Lets a get+set pair merge
@@ -13357,7 +13360,11 @@ pub const Checker = struct {
                     const val_rhs_tag = self.ast_ref.nodeTag(pd.rhs);
                     const has_type_assertion = val_rhs_tag == .ts_as_expr or val_rhs_tag == .ts_type_assertion;
                     const val_t = self.store.get(val_ty);
-                    const widened_ty = if (has_type_assertion) val_ty else switch (val_t.kind) {
+                    // A contextual type that expects this property as a literal
+                    // (`let x: { style: "currency" } = { style: "currency" }`)
+                    // preserves the literal instead of widening.
+                    const ctx_preserves = self.contextualPropExpectsLiteral(ctx_obj_ty, key_name, val_ty);
+                    const widened_ty = if (has_type_assertion or ctx_preserves) val_ty else switch (val_t.kind) {
                         .string_literal => tymod.ID_STRING,
                         .number_literal => tymod.ID_NUMBER,
                         .boolean_literal => tymod.ID_BOOLEAN,
@@ -15755,6 +15762,41 @@ pub const Checker = struct {
 
     /// The contextual type of an object literal that is the initializer of an
     /// annotated `let/const/var` declarator (`let p: Point = { … }` → Point).
+    /// True when contextual object type `ctx` declares `prop_name` with a
+    /// literal (or literal-union) type that `val_ty` (a literal) is assignable
+    /// to — so the object-literal property keeps its literal type, not widened.
+    fn contextualPropExpectsLiteral(self: *Checker, ctx: ?TypeId, prop_name: []const u8, val_ty: TypeId) bool {
+        const c = ctx orelse return false;
+        const vt = self.store.get(val_ty).kind;
+        if (vt != .string_literal and vt != .number_literal and vt != .boolean_literal) return false;
+        const ct = self.store.get(c);
+        if (ct.kind != .object_t) return false;
+        for (self.store.propsOf(ct.object_props)) |p| {
+            if (!std.mem.eql(u8, p.name, prop_name)) continue;
+            return self.typeExpectsLiteral(p.type_id, val_ty);
+        }
+        return false;
+    }
+
+    /// True when `target` is a literal type (or a union containing one) that
+    /// `val_ty` is assignable to — i.e. the context pins a literal.
+    fn typeExpectsLiteral(self: *Checker, target: TypeId, val_ty: TypeId) bool {
+        const t = self.store.get(target);
+        switch (t.kind) {
+            .string_literal, .number_literal, .boolean_literal =>
+                return tymod.isAssignableTo(&self.store, val_ty, target),
+            .union_t => {
+                for (self.store.idsOf(t.list_data)) |m| {
+                    const mk = self.store.get(m).kind;
+                    if ((mk == .string_literal or mk == .number_literal or mk == .boolean_literal) and
+                        tymod.isAssignableTo(&self.store, val_ty, m)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
+    }
+
     fn objectLiteralContextualType(self: *Checker, objlit: NodeIndex) ?TypeId {
         const parents = self.semantic.parent_indices;
         const oidx = objlit.toInt();
