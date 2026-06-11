@@ -7225,6 +7225,58 @@ pub const Checker = struct {
         }
     }
 
+    /// Widen the type of a parameter's default-value initializer the way tsc
+    /// types `(a = init)`: primitive literals → their base type, object
+    /// literals widened property-wise (recursively), unions member-wise.
+    /// Functions, arrays, `null`/`undefined`, and named types are preserved
+    /// as-is (tsc does NOT apply the top-level `null → any` var rule to
+    /// parameter defaults — `(z = null)` is `z?: null`).
+    fn widenForParamDefault(self: *Checker, raw: TypeId, depth: u8) TypeId {
+        if (depth > 8) return raw;
+        const t = self.store.get(raw);
+        // Non-strict: a `null` / `undefined` default widens to `any`
+        // (`(a = undefined)` → `a?: any`).  Strict mode preserves them
+        // (`(z = null)` → `z?: null`).
+        if (!self.checker_opts.strict_null_checks and (t.kind == .null_t or t.kind == .undefined_t)) {
+            return tymod.ID_ANY;
+        }
+        switch (t.kind) {
+            .string_literal => return tymod.ID_STRING,
+            .number_literal => return tymod.ID_NUMBER,
+            .bigint_literal => return tymod.ID_BIGINT,
+            .boolean_literal => return tymod.ID_BOOLEAN,
+            .object_t => {
+                if (t.alias_name.len > 0) return raw;
+                const props = self.store.propsOf(t.object_props);
+                if (props.len == 0 or props.len > 32) return raw;
+                var buf: [32]tymod.ObjectProp = undefined;
+                var changed = false;
+                for (props, 0..) |p, i| {
+                    const w = self.widenForParamDefault(p.type_id, depth + 1);
+                    if (!w.eq(p.type_id)) changed = true;
+                    buf[i] = p;
+                    buf[i].type_id = w;
+                }
+                if (!changed) return raw;
+                return self.store.objectOf(buf[0..props.len]) catch raw;
+            },
+            .union_t => {
+                const members = self.store.idsOf(t.list_data);
+                if (members.len == 0 or members.len > 32) return raw;
+                var buf: [32]TypeId = undefined;
+                var changed = false;
+                for (members, 0..) |m, i| {
+                    const w = self.widenForParamDefault(m, depth + 1);
+                    if (!w.eq(m)) changed = true;
+                    buf[i] = w;
+                }
+                if (!changed) return raw;
+                return self.store.unionOf(buf[0..members.len]) catch raw;
+            },
+            else => return raw,
+        }
+    }
+
     fn paramDeclaredType(self: *Checker, param: NodeIndex) TypeId {
         var node = param;
         // Peel assignment_pattern (default value) — the binding side
@@ -7261,7 +7313,11 @@ pub const Checker = struct {
             // patterns derive their type from the initializer instead — left
             // as `unknown` here (handled elsewhere / future work).
             if (default_val == .none) return self.impliedPatternType(node, 0);
-            return tymod.ID_UNKNOWN;
+            // Default-valued pattern (`{ z } = { z: 1 }`): tsc types the param
+            // from the widened initializer.  Object patterns match the widened
+            // object literal; array patterns currently widen to an array (not a
+            // tuple) — no worse than the previous `unknown`.
+            return self.widenForParamDefault(self.typeOf(default_val), 0);
         }
         if (ntag != .identifier) return tymod.ID_UNKNOWN;
         const bd = self.ast_ref.nodeData(node);
@@ -7270,17 +7326,11 @@ pub const Checker = struct {
             return self.resolveTypeNode(ty);
         }
         // No annotation. If there's a default value, infer its widened type —
-        // `(a = 3)` → number, `(a = "x")` → string, `(a = true)` → boolean.
-        // `null` / `undefined` defaults leave the param as `any` (non-strict).
+        // `(a = 3)` → number, `(a = "x")` → string, `(a = () => {})` →
+        // `() => void`, `(o = { x: 0 })` → `{ x: number; }`.  `null` /
+        // `undefined` defaults are preserved (tsc: `(z = null)` → `z?: null`).
         if (default_val != .none) {
-            const raw = self.typeOf(default_val);
-            return switch (self.store.get(raw).kind) {
-                .string_literal => tymod.ID_STRING,
-                .number_literal => tymod.ID_NUMBER,
-                .bigint_literal => tymod.ID_BIGINT,
-                .boolean_literal => tymod.ID_BOOLEAN,
-                else => tymod.ID_ANY,
-            };
+            return self.widenForParamDefault(self.typeOf(default_val), 0);
         }
         // Contextual parameter type from an expected callback signature
         // (`arr.map(x => …)` → `x` is the element type).
