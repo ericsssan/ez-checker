@@ -7931,6 +7931,35 @@ pub const Checker = struct {
     /// available — primitive vs primitive, literal vs base type, void
     /// vs void.  When undecidable we union the two branches so
     /// downstream rules don't pick a wrong arm.
+    /// Display for a generic conditional type that can't be decided:
+    /// `Check extends Extends ? True : False`, as an opaque type_ref.
+    fn conditionalTypeDisplay(self: *Checker, check_node: NodeIndex, extends_node: NodeIndex, true_node: NodeIndex, false_node: NodeIndex) ?TypeId {
+        return self.conditionalDisplayFromTypes(
+            self.resolveTypeNode(check_node),
+            self.resolveTypeNode(extends_node),
+            self.resolveTypeNode(true_node),
+            self.resolveTypeNode(false_node),
+        );
+    }
+
+    fn conditionalDisplayFromTypes(self: *Checker, check: TypeId, ext: TypeId, tru: TypeId, fal: TypeId) ?TypeId {
+        const ch = self.typeToString(check) catch return null;
+        defer self.gpa.free(ch);
+        const ex = self.typeToString(ext) catch return null;
+        defer self.gpa.free(ex);
+        const tr = self.typeToString(tru) catch return null;
+        defer self.gpa.free(tr);
+        const fa = self.typeToString(fal) catch return null;
+        defer self.gpa.free(fa);
+        const s = std.fmt.allocPrint(self.gpa, "{s} extends {s} ? {s} : {s}", .{ ch, ex, tr, fa }) catch return null;
+        const r = self.store.typeRef(s, &.{}) catch {
+            self.gpa.free(s);
+            return null;
+        };
+        self.string_pool.append(self.gpa, s) catch self.gpa.free(s);
+        return r;
+    }
+
     fn resolveConditionalType(self: *Checker, ty_node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(ty_node);
         const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
@@ -7947,7 +7976,9 @@ pub const Checker = struct {
         if (typeNodeReferencesUnresolved(self, check_node) or
             typeNodeReferencesUnresolved(self, extends_node))
         {
-            return tymod.ID_UNKNOWN;
+            // Can't decide the relation (generic check/extends) — tsc keeps the
+            // conditional symbolic, e.g. `any[] extends T ? any[] : never`.
+            return self.conditionalTypeDisplay(check_node, extends_node, true_node, false_node) orelse tymod.ID_UNKNOWN;
         }
         const check_ty = self.resolveTypeNode(check_node);
         const extends_ty = self.resolveTypeNode(extends_node);
@@ -8117,7 +8148,15 @@ pub const Checker = struct {
                 // Evaluating both branches would yield a `branch | never` union
                 // whose `any` branch makes the whole thing read as `any` — a
                 // false positive for the no-unsafe-* rules. Keep it unknown.
-                if (check_t.kind == .type_param) return tymod.ID_UNKNOWN;
+                if (check_t.kind == .type_param) {
+                    // Deferred conditional — display it symbolically with the
+                    // substituted parts (`T extends U ? X : Y`).
+                    const ex = self.resolveTypeNodeWithSubst(extends_node, keys, vals);
+                    const tn = self.resolveTypeNodeWithSubst(true_node, keys, vals);
+                    const fn_ = self.resolveTypeNodeWithSubst(false_node, keys, vals);
+                    if (self.conditionalDisplayFromTypes(check_ty, ex, tn, fn_)) |d| return d;
+                    return tymod.ID_UNKNOWN;
+                }
                 const a = blk: {
                     if (infer_count == 0) break :blk self.resolveTypeNodeWithSubst(true_node, keys, vals);
                     var mk: [8][]const u8 = undefined;
