@@ -77,6 +77,9 @@ const CompilerOpts = struct {
     strict_null_checks: bool = false,
     strict_set: bool = false, // @strict was written (either value)
     snc_set: bool = false, // @strictNullChecks was written (either value)
+    /// package.json `@filename` sections from the source case file (not present
+    /// in the .types baseline) — for bare-specifier `exports` resolution.
+    package_jsons: []const ez.PackageJsonFile = &.{},
     // @strictBindCallApply directive — tri-state: null = unset (corpus default
     // is ON, except under @strict:false).  Set explicitly to override.
     strict_bind_call_apply: ?bool = null,
@@ -306,7 +309,42 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
             opts.isolate_modules = isTrue(val);
         }
     }
+    opts.package_jsons = extractPackageJsons(arena, content) catch &.{};
     return opts;
+}
+
+/// Scan a multi-file test source for `// @filename: …package.json` sections and
+/// return each one's name + JSON body (the package.json isn't in the .types
+/// baseline, so it must come from the source case file).
+fn extractPackageJsons(arena: std.mem.Allocator, content: []const u8) ![]const ez.PackageJsonFile {
+    var out = std.ArrayList(ez.PackageJsonFile).empty;
+    var it = std.mem.splitScalar(u8, content, '\n');
+    var cur_name: ?[]const u8 = null;
+    var body = std.ArrayList(u8).empty;
+    const flush = struct {
+        fn f(a: std.mem.Allocator, o: *std.ArrayList(ez.PackageJsonFile), nm: ?[]const u8, b: *std.ArrayList(u8)) !void {
+            if (nm) |n| if (std.mem.endsWith(u8, n, "package.json") and b.items.len > 0) {
+                try o.append(a, .{ .name = n, .source = try a.dupe(u8, b.items) });
+            };
+            b.clearRetainingCapacity();
+        }
+    }.f;
+    while (it.next()) |raw| {
+        const line = std.mem.trimEnd(u8, raw, "\r");
+        const t = std.mem.trim(u8, line, " \t\r");
+        const marker = "// @filename:";
+        if (std.mem.startsWith(u8, t, marker)) {
+            try flush(arena, &out, cur_name, &body);
+            cur_name = std.mem.trim(u8, t[marker.len..], " \t\r");
+            continue;
+        }
+        if (cur_name != null and std.mem.endsWith(u8, cur_name.?, "package.json")) {
+            try body.appendSlice(arena, line);
+            try body.append(arena, '\n');
+        }
+    }
+    try flush(arena, &out, cur_name, &body);
+    return out.toOwnedSlice(arena);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1423,6 +1461,9 @@ fn evalSection(arena: std.mem.Allocator, sec: Section, lang: Language, opts: Com
     var copts = opts.toCheckerOpts();
     copts.available_modules = module_names;
     copts.module_files = sec.module_files;
+    // package.json comes from the source case file (CompilerOpts), since the
+    // .types baseline omits it.
+    copts.package_jsons = opts.package_jsons;
     return evalSectionInner(arena, sec, lang, copts, coll) catch SecResult{ .status = .errored };
 }
 

@@ -77,6 +77,9 @@ pub const CheckerOpts = struct {
     /// import to the matching module's declarations in-memory.  Empty when not
     /// a multi-file program (single-file callers need not set it).
     module_files: []const ModuleFile = &.{},
+    /// package.json files (filename + JSON source) for bare-specifier `exports`
+    /// resolution.  Empty when none were provided.
+    package_jsons: []const PackageJsonFile = &.{},
     target: Target = .es5,
     /// Module resolution strategy.  Affects import resolution rules —
     /// notably, node16/nodenext require explicit .js/.mjs/.cjs extensions
@@ -134,6 +137,14 @@ pub const ModuleFile = struct {
     name: []const u8,
     start: u32,
     end: u32,
+};
+
+/// A package.json file (filename + raw JSON source) passed alongside the
+/// concatenated module sections so the checker can resolve bare specifiers
+/// through `exports`.  package.json sections aren't part of the code source.
+pub const PackageJsonFile = struct {
+    name: []const u8,
+    source: []const u8,
 };
 
 /// Describes where an imported name came from.
@@ -14898,12 +14909,17 @@ pub const Checker = struct {
     /// can't be resolved cleanly (external/excluded specifier, or `export =`
     /// module).  Owned string lives in `string_pool`.
     fn namespaceImportBindingType(self: *Checker, ns_name: []const u8, spec: []const u8) ?TypeId {
-        if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
-        const mf = self.moduleFileForSpec(spec) orelse return null;
-        if (mf.end <= self.ast_ref.source.len) {
-            const sec_src = self.ast_ref.source[mf.start..mf.end];
-            if (std.mem.indexOf(u8, sec_src, "export =") != null or
-                std.mem.indexOf(u8, sec_src, "export=") != null) return null;
+        if (std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../")) {
+            const mf = self.moduleFileForSpec(spec) orelse return null;
+            if (mf.end <= self.ast_ref.source.len) {
+                const sec_src = self.ast_ref.source[mf.start..mf.end];
+                if (std.mem.indexOf(u8, sec_src, "export =") != null or
+                    std.mem.indexOf(u8, sec_src, "export=") != null) return null;
+            }
+        } else {
+            // Bare specifier (`package/sub`) — resolvable only when the package's
+            // package.json `exports` exposes the subpath.
+            if (!self.bareSpecResolvable(spec)) return null;
         }
         const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return null;
         const r = self.store.typeRef(tn, &.{}) catch {
@@ -14912,6 +14928,64 @@ pub const Checker = struct {
         };
         self.string_pool.append(self.gpa, tn) catch self.gpa.free(tn);
         return r;
+    }
+
+    /// True when a bare specifier `package/sub` resolves through the package's
+    /// package.json `exports`: the subpath key is present and maps (possibly via
+    /// `import`/`require`/`node`/`types`/`default` conditions) to a non-null
+    /// target.  Packages whose `exports` use subpath PATTERNS (`./*`) are treated
+    /// conservatively as unresolvable (pattern + exclusion resolution is TODO).
+    fn bareSpecResolvable(self: *Checker, spec: []const u8) bool {
+        // Split package name (handle `@scope/name`) from the subpath.
+        var pkg_end: usize = std.mem.indexOfScalar(u8, spec, '/') orelse spec.len;
+        if (spec.len > 0 and spec[0] == '@') {
+            if (pkg_end < spec.len) {
+                const rest = spec[pkg_end + 1 ..];
+                pkg_end = if (std.mem.indexOfScalar(u8, rest, '/')) |s| pkg_end + 1 + s else spec.len;
+            }
+        }
+        const pkg = spec[0..pkg_end];
+        const subpath = if (pkg_end < spec.len) spec[pkg_end + 1 ..] else "";
+        const pkg_src = self.packageJsonSource(pkg) orelse return false;
+        return self.exportsHasSubpath(pkg_src, subpath);
+    }
+
+    /// The source text of the package.json that declares `"name": "<pkg>"`
+    /// (root or under node_modules), or null.
+    fn packageJsonSource(self: *Checker, pkg: []const u8) ?[]const u8 {
+        var name_buf: [160]u8 = undefined;
+        if (pkg.len + 12 > name_buf.len) return null;
+        const needle = std.fmt.bufPrint(&name_buf, "\"name\": \"{s}\"", .{pkg}) catch return null;
+        for (self.checker_opts.package_jsons) |pj| {
+            if (std.mem.indexOf(u8, pj.source, needle) != null) return pj.source;
+        }
+        return null;
+    }
+
+    /// True when the `exports` object in `pkg_src` exposes `subpath` (a non-null
+    /// target).  Conservative: bails (false) when the exports use patterns.
+    fn exportsHasSubpath(self: *Checker, pkg_src: []const u8, subpath: []const u8) bool {
+        _ = self;
+        const ex_kw = std.mem.indexOf(u8, pkg_src, "\"exports\"") orelse return false;
+        const region = pkg_src[ex_kw..];
+        // Pattern-based exports need full pattern/exclusion resolution — skip.
+        if (std.mem.indexOfScalar(u8, region, '*') != null) return false;
+        // Build the subpath key: "." for the package root, else "./<subpath>".
+        var key_buf: [256]u8 = undefined;
+        const key = if (subpath.len == 0)
+            "\".\""
+        else blk: {
+            const k = std.fmt.bufPrint(&key_buf, "\"./{s}\"", .{subpath}) catch return false;
+            break :blk k;
+        };
+        const ki = std.mem.indexOf(u8, region, key) orelse return false;
+        // After the key + `:`, resolve only a plain string target.  A conditions
+        // object (`{ import: …, require: … }`) needs format-aware condition
+        // resolution (TODO) — bail conservatively so we don't emit `typeof` for a
+        // subpath that the importer's condition actually excludes.
+        var i = ki + key.len;
+        while (i < region.len and (region[i] == ' ' or region[i] == ':' or region[i] == '\t')) i += 1;
+        return i < region.len and region[i] == '"';
     }
 
     /// True when an import specifier refers to one of the sibling sections

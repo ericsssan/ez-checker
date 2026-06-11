@@ -13,6 +13,7 @@ pub const Checker = @import("checker.zig").Checker;
 pub const CheckerOpts = @import("checker.zig").CheckerOpts;
 pub const ModuleResolver = @import("checker.zig").ModuleResolver;
 pub const ModuleFile = @import("checker.zig").ModuleFile;
+pub const PackageJsonFile = @import("checker.zig").PackageJsonFile;
 pub const EnumKind = @import("checker.zig").EnumKind;
 pub const ImportEntry = @import("checker.zig").ImportEntry;
 
