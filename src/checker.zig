@@ -6940,6 +6940,9 @@ pub const Checker = struct {
                 else => tymod.ID_ANY,
             };
         }
+        // Contextual parameter type from an expected callback signature
+        // (`arr.map(x => …)` → `x` is the element type).
+        if (self.contextualParamType(param)) |ct| return ct;
         // Unannotated parameters default to `any` to match TypeScript's
         // behavior when noImplicitAny is off (the default). The original design
         // returned `unknown` to avoid spurious unsafe-* fires, but this causes
@@ -15873,6 +15876,56 @@ pub const Checker = struct {
             },
             else => return null,
         }
+    }
+
+    /// The contextual type of an unannotated parameter `param`: when its
+    /// enclosing arrow/function has an expected function type (e.g. a callback
+    /// argument of `arr.map(...)`), the parameter takes the matching slot's type.
+    fn contextualParamType(self: *Checker, param: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (param.toInt() < parents.len) parents[param.toInt()] else NONE;
+        var fn_node: NodeIndex = .none;
+        var ps: u32 = 0;
+        var pe: u32 = 0;
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            const d = self.ast_ref.nodeData(pn);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .arrow_fn, .async_arrow_fn => {
+                    const ad = self.ast_ref.extraData(ast.ArrowData, @intFromEnum(d.lhs));
+                    fn_node = pn; ps = ad.params_start; pe = ad.params_end;
+                    break;
+                },
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => {
+                    if (d.lhs == .none) return null;
+                    const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
+                    fn_node = pn; ps = fd.params; pe = fd.params_end;
+                    break;
+                },
+                else => {},
+            }
+        }
+        if (fn_node == .none) return null;
+        const ext = self.ast_ref.extra_data;
+        if (ps > pe or pe > ext.len) return null;
+        var pi: ?usize = null;
+        for (ext[ps..pe], 0..) |raw, i| {
+            if (raw == param.toInt()) { pi = i; break; }
+        }
+        const idx = pi orelse return null;
+        const exp = self.expectedTypeOf(fn_node) orelse return null;
+        const ft = self.store.get(exp);
+        if (ft.kind != .function_t) return null;
+        const sigs = self.store.signaturesOf(ft.signatures);
+        if (sigs.len == 0) return null;
+        const cparams = self.store.signatureParamsOf(sigs[0]);
+        if (idx >= cparams.len) return null;
+        const cty = cparams[idx];
+        // An uninstantiated type-param contextual type (`<T>(x: T) => …` not yet
+        // resolved) is shown as implicit `any` by tsc — don't surface the `T`.
+        if (self.store.get(cty).kind == .type_param) return null;
+        return self.nonNullExpected(cty);
     }
 
     /// An array/tuple element's type under a contextual element type: keep the
