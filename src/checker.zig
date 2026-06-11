@@ -6186,6 +6186,11 @@ pub const Checker = struct {
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
         if (tp_end > ext_len) return null;
         const tp_nodes = self.ast_ref.extra_data[tp_start..tp_end];
+        // Type-position mode so a constraint / default that references a sibling
+        // type parameter keeps the name (`<T extends Date, U extends T>`) instead
+        // of collapsing it to that parameter's own constraint (`U extends Date`).
+        self.type_pos_depth += 1;
+        defer self.type_pos_depth -= 1;
         var buf: std.ArrayList(u8) = .empty;
         buf.append(self.gpa, '<') catch { buf.deinit(self.gpa); return null; };
         var count: usize = 0;
