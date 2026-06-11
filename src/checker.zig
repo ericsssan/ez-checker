@@ -15531,6 +15531,14 @@ pub const Checker = struct {
         if (std.mem.eql(u8, t.name, "ArrayConstructor")) {
             if (self.arrayConstructorProperty(name)) |ty| return ty;
         }
+        // `Promise.resolve` as a VALUE (not called) — its lib overload set.
+        // (`Promise.resolve(x)` calls are typed earlier in inferCallReturn.)
+        if (std.mem.eql(u8, t.name, "PromiseConstructor") and std.mem.eql(u8, name, "resolve")) {
+            return self.store.typeRef(
+                "{ (): Promise<void>; <T>(value: T): Promise<Awaited<T>>; <T>(value: T | PromiseLike<T>): Promise<Awaited<T>>; }",
+                &.{},
+            ) catch tymod.ID_ANY;
+        }
         const struct_key: ?[]const u8 = if (std.mem.eql(u8, t.name, "Math"))
             "__Math_struct"
         else if (std.mem.eql(u8, t.name, "JSON"))
