@@ -381,6 +381,14 @@ pub const Checker = struct {
     /// `expectedTypeOf` of the arrow node). Lets a concise literal body preserve
     /// its literal when the context expects one (`const f: () => "a" = () => "a"`).
     contextual_arrow_return: ?TypeId = null,
+    /// Contextual parameter types active ONLY while inferring a function's own
+    /// return type from its body (keyed by param-identifier node index).  A body
+    /// reference to a contextually-typed but un-annotated parameter resolves
+    /// through here so return inference sees the real type (e.g.
+    /// `var f: (x: number) => number = x => x` returns `number`), without
+    /// globally re-typing param references elsewhere.  Populated and torn down
+    /// around the return-inference block in `buildSignatureRaw`.
+    param_ctx_types: std.AutoHashMapUnmanaged(u32, TypeId) = .empty,
     /// Set while resolving a member access through a union/intersection
     /// receiver — suppresses the string-index-signature fallback so a member
     /// served only by an index signature counts as "absent" (the union access
@@ -459,6 +467,7 @@ pub const Checker = struct {
         self.expando_fns.deinit(self.gpa);
         self.expando_objs.deinit(self.gpa);
         self.pattern_annotations.deinit(self.gpa);
+        self.param_ctx_types.deinit(self.gpa);
         {
             var jit = self.jsdoc_params.valueIterator();
             while (jit.next()) |lst| lst.deinit(self.gpa);
@@ -4611,6 +4620,15 @@ pub const Checker = struct {
                 if (self.isForInLoopBinding(binding)) return tymod.ID_STRING;
                 // For-of simple binding: `for (var x of arr)` — element type.
                 if (self.forOfBindingElementType(binding)) |t| return t;
+                // Contextual parameter type, but ONLY while inferring the
+                // enclosing function's own return type (see param_ctx_types).
+                // Scoping it this way lets `var f: (x: number) => number = x => x`
+                // infer the return as `number`, without globally re-typing param
+                // references (which ripples into narrowing / generic inference
+                // across unrelated code).
+                if (binding.toInt() < self.ast_ref.nodes.len) {
+                    if (self.param_ctx_types.get(binding.toInt())) |t| return t;
+                }
                 return tymod.ID_ANY;
             },
         }
@@ -6519,6 +6537,10 @@ pub const Checker = struct {
         var param_buf: [16]tymod.TypeId = undefined;
         var name_buf: [16][]const u8 = undefined;
         var opt_buf: [16]bool = undefined;
+        // Per-param simple-identifier binding node (NONE for patterns/rest),
+        // used to scope contextual param types into return inference below.
+        var ctx_node_buf: [16]u32 = undefined;
+        const CTX_NONE: u32 = @intFromEnum(NodeIndex.none);
         var count: usize = 0;
         var rest_idx: u16 = 0xFFFF;
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
@@ -6567,12 +6589,37 @@ pub const Checker = struct {
                 }
                 param_buf[count] = pty;
                 name_buf[count] = self.paramDisplayName(param);
+                ctx_node_buf[count] = if (!is_rest and self.ast_ref.nodeTag(pn) == .identifier)
+                    pn.toInt()
+                else
+                    CTX_NONE;
                 // A param is optional if it has a default value, or has an
                 // explicit `?` marker between the identifier and the annotation.
                 opt_buf[count] = is_default or self.paramHasOptionalMarker(pn);
                 count += 1;
             }
         }
+        // Bind contextually-typed, un-annotated params for the duration of
+        // return inference, so body references resolve to the param's real type
+        // (`x => x` under `(x: number) => number` returns `number`).  Scoped:
+        // removed by the defer once this signature's return type is computed,
+        // so it never affects param references elsewhere.
+        var ctx_added: [16]u32 = undefined;
+        var ctx_n: usize = 0;
+        if (body_for_inference != .none) {
+            for (0..count) |i| {
+                const nd = ctx_node_buf[i];
+                if (nd == CTX_NONE) continue;
+                if (param_buf[i].eq(tymod.ID_ANY) or param_buf[i].eq(tymod.ID_UNKNOWN)) continue;
+                if (self.param_ctx_types.contains(nd)) continue;
+                self.param_ctx_types.put(self.gpa, nd, param_buf[i]) catch continue;
+                ctx_added[ctx_n] = nd;
+                ctx_n += 1;
+            }
+        }
+        defer for (ctx_added[0..ctx_n]) |nd| {
+            _ = self.param_ctx_types.remove(nd);
+        };
         // Resolve return type.  Declared annotation wins; arrow with
         // expression body uses its body type directly; block-body
         // returns are inferred by walking direct `return <expr>;`
