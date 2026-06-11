@@ -68,6 +68,11 @@ pub const CheckerOpts = struct {
     /// resolved by bare-name lookup in the combined AST; others are external
     /// and stay `any`.
     available_modules: []const []const u8 = &.{},
+    /// Byte spans of the sibling modules in `available_modules` within the
+    /// concatenated multi-file source — lets the checker resolve a relative
+    /// import to the matching module's declarations in-memory.  Empty when not
+    /// a multi-file program (single-file callers need not set it).
+    module_files: []const ModuleFile = &.{},
     target: Target = .es5,
     /// Module resolution strategy.  Affects import resolution rules —
     /// notably, node16/nodenext require explicit .js/.mjs/.cjs extensions
@@ -114,6 +119,17 @@ pub const ModuleResolver = struct {
     ) ?TypeId {
         return self.resolve_fn(self.ctx, from_dir, module_spec, export_name, local_store, gpa);
     }
+};
+
+/// A sibling module's byte span within a concatenated multi-file program (the
+/// oracle joins `@filename` sections into one source).  Lets the checker locate
+/// a module's declarations to resolve `import … from "<spec>"` to real export
+/// types in-memory (no filesystem).  `name` is the section filename (e.g.
+/// `subfolder/index.ts`); `[start, end)` is its range in the combined source.
+pub const ModuleFile = struct {
+    name: []const u8,
+    start: u32,
+    end: u32,
 };
 
 /// Describes where an imported name came from.

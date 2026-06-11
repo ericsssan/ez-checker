@@ -1022,7 +1022,9 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
         // Concatenate: .dts sections first (ambient declarations), then others.
         var src_parts = std.ArrayList([]const u8).empty;
         var all_entries = std.ArrayList(Entry).empty;
+        var mod_files = std.ArrayList(ez.ModuleFile).empty;
         var line_offset: u32 = 0;
+        var byte_offset: u32 = 0; // start byte of the next section in combined_src
 
         // Pass 1: dts sections first.
         for (sections[start..end]) |sec| {
@@ -1035,7 +1037,13 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
                     .type_str = e.type_str,
                 });
             }
+            try mod_files.append(arena, .{
+                .name = sec.name,
+                .start = byte_offset,
+                .end = byte_offset + @as(u32, @intCast(sec.source.len)),
+            });
             try src_parts.append(arena, sec.source);
+            byte_offset += @as(u32, @intCast(sec.source.len)) + 1; // +1 for the "\n" join separator
             line_offset += countLines(sec.source);
         }
         // Pass 2: non-dts sections.
@@ -1049,7 +1057,13 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
                     .type_str = e.type_str,
                 });
             }
+            try mod_files.append(arena, .{
+                .name = sec.name,
+                .start = byte_offset,
+                .end = byte_offset + @as(u32, @intCast(sec.source.len)),
+            });
             try src_parts.append(arena, sec.source);
+            byte_offset += @as(u32, @intCast(sec.source.len)) + 1;
             line_offset += countLines(sec.source);
         }
 
@@ -1058,6 +1072,7 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
             .name = sections[start].name,
             .source = combined_src,
             .entries = try all_entries.toOwnedSlice(arena),
+            .module_files = try mod_files.toOwnedSlice(arena),
         };
         try groups.append(arena, .{
             .start = start,
@@ -1129,6 +1144,9 @@ const Section = struct {
     name: []const u8,
     source: []u8,
     entries: []Entry,
+    /// For a combined multi-file group: each constituent section's byte span in
+    /// `source` (for the checker's in-memory module resolver).  Empty otherwise.
+    module_files: []const ez.ModuleFile = &.{},
 };
 
 fn isDecoration(body: []const u8) bool {
@@ -1380,6 +1398,7 @@ fn lineOf(starts: []const u32, offset: u32) u32 {
 fn evalSection(arena: std.mem.Allocator, sec: Section, lang: Language, opts: CompilerOpts, coll: *Collector, module_names: []const []const u8) SecResult {
     var copts = opts.toCheckerOpts();
     copts.available_modules = module_names;
+    copts.module_files = sec.module_files;
     return evalSectionInner(arena, sec, lang, copts, coll) catch SecResult{ .status = .errored };
 }
 
