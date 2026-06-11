@@ -2562,8 +2562,9 @@ pub const Checker = struct {
             else => return ty,
         }
         const t = self.store.get(ty);
-        // Only a finite union narrows to a specific member; a wide primitive
-        // (`x: number`, `case 3:`) stays `number` in tsc.
+        // `boolean` is the finite domain `true | false`, so it narrows to the
+        // matching literal; other wide primitives (`number`, `case 3:`) don't.
+        if (ty.eq(tymod.ID_BOOLEAN) and lt.kind == .boolean_literal) return label_ty;
         if (t.kind != .union_t) return ty;
         var buf: [16]TypeId = undefined;
         var n: usize = 0;
@@ -2575,6 +2576,29 @@ pub const Checker = struct {
             }
         }
         if (n == 0) return ty;
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch ty;
+    }
+
+    /// Drop the union member equal to `lit_ty` (the `x !== <literal>` branch);
+    /// a bare `boolean` flips to the opposite literal.
+    fn dropLiteralMember(self: *Checker, ty: TypeId, lit_ty: TypeId) TypeId {
+        if (ty.eq(tymod.ID_BOOLEAN)) {
+            const lt = self.store.get(lit_ty);
+            if (lt.kind == .boolean_literal) return self.store.booleanLiteral(!lt.literal_value.boolean) catch ty;
+            return ty;
+        }
+        const t = self.store.get(ty);
+        if (t.kind != .union_t) return ty;
+        var buf: [16]TypeId = undefined;
+        var n: usize = 0;
+        for (self.store.idsOf(t.list_data)) |m| {
+            if (m.eq(lit_ty)) continue;
+            if (n >= buf.len) return ty;
+            buf[n] = m;
+            n += 1;
+        }
+        if (n == 0) return tymod.ID_NEVER;
         if (n == 1) return buf[0];
         return self.store.unionOf(buf[0..n]) catch ty;
     }
@@ -3003,7 +3027,19 @@ pub const Checker = struct {
         }
         _ = &sym_side;
         const removed = self.narrowKindFromLiteral(lit_side);
-        if (removed == .none) return ty;
+        if (removed == .none) {
+            // `x === 1` / `x === "a"` / `x === true`: keep the matching literal
+            // member in the equal branch; drop it in the not-equal branch.
+            const lit_ty = self.typeOf(lit_side);
+            switch (self.store.get(lit_ty).kind) {
+                .string_literal, .number_literal, .boolean_literal, .bigint_literal => {
+                    const keep_eq = (!is_neq) != negate;
+                    if (keep_eq) return self.narrowToCaseLiteral(ty, lit_side);
+                    return self.dropLiteralMember(ty, lit_ty);
+                },
+                else => return ty,
+            }
+        }
         // Loose equality: `x == null` / `x != null` (and `== undefined`) narrows
         // both null and undefined — TS treats `== null` as `=== null || === undefined`.
         if ((tag == .equal or tag == .not_equal) and
