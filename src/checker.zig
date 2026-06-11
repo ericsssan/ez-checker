@@ -9415,8 +9415,18 @@ pub const Checker = struct {
             const NONE: u32 = @intFromEnum(NodeIndex.none);
             var p = if (ty_node.toInt() < parents.len) parents[ty_node.toInt()] else NONE;
             var guard: u8 = 0;
+            // Track whether `this` sits inside a CALL SIGNATURE (param/return of a
+            // function/method/call/construct signature). tsc keeps interface
+            // `this` symbolic only there (`(iter: this) => …`, `(): this`); a bare
+            // property (`{ x: this }`) or index-signature value (`{ [k]: this }`)
+            // is an error-position that widens to `any`.
+            var in_sig = false;
             while (p != NONE and guard < 32) : (guard += 1) {
                 const pn: NodeIndex = @enumFromInt(p);
+                switch (self.ast_ref.nodeTag(pn)) {
+                    .ts_function_type, .ts_constructor_type => in_sig = true,
+                    else => {},
+                }
                 if (self.ast_ref.nodeTag(pn) == .class_decl) {
                     const pd = self.ast_ref.nodeData(pn);
                     if (pd.lhs != .none) {
@@ -9427,9 +9437,19 @@ pub const Checker = struct {
                     // Class found but instance type couldn't be built → `any`.
                     return tymod.ID_ANY;
                 }
+                // Inside an INTERFACE method (`(value: V, iter: this) => boolean`),
+                // tsc keeps `this` POLYMORPHIC — it renders `this`, not the
+                // structural type (was falling through to `any`). A plain function
+                // type's `this` (thisTypeErrors) has no class/interface ancestor
+                // and correctly stays `any`, so gate on the interface ancestor.
+                if (self.ast_ref.nodeTag(pn) == .ts_interface_decl)
+                    return if (in_sig and self.type_pos_depth > 0)
+                        self.store.typeRef("this", &.{}) catch tymod.ID_ANY
+                    else
+                        tymod.ID_ANY;
                 p = if (@intFromEnum(pn) < parents.len) parents[@intFromEnum(pn)] else NONE;
             }
-            // `this` outside class context → `any`.
+            // `this` outside class/interface context → `any`.
             return tymod.ID_ANY;
         }
         // Unknown name (not built-in, not declared anywhere in the file
