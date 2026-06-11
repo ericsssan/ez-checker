@@ -8685,14 +8685,17 @@ pub const Checker = struct {
         try self.global_value_types.put(self.gpa, "document", tymod.ID_ANY);
         try self.global_value_types.put(self.gpa, "self", tymod.ID_ANY);
 
-        // Error constructors — callable, return any so `new Error()` is accepted
-        // by prefer-promise-reject-errors without forcing us to model Error instances.
-        const error_fn = try h.fnTypeWithParams(&.{tymod.ID_STRING}, tymod.ID_ANY);
+        // Error constructors — the VALUE `Error` has type `ErrorConstructor`
+        // (tsc renders the constructor-interface name). `new Error()` resolves
+        // name-based via classOrLibInstance, independent of this value type.
         for ([_][]const u8{
             "Error", "TypeError", "RangeError", "SyntaxError",
             "ReferenceError", "URIError", "EvalError", "AggregateError",
         }) |ename| {
-            try self.global_value_types.put(self.gpa, ename, error_fn);
+            const ctor_name = try std.fmt.allocPrint(self.gpa, "{s}Constructor", .{ename});
+            self.string_pool.append(self.gpa, ctor_name) catch {};
+            const ctor_ty = try self.store.typeRef(ctor_name, &.{});
+            try self.global_value_types.put(self.gpa, ename, ctor_ty);
         }
 
         // Object — static namespace with commonly-needed methods.
