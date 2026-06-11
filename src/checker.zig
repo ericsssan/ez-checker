@@ -14101,7 +14101,12 @@ pub const Checker = struct {
                         }
                     } else {
                         const t = self.memberOnApparentType(class_ty, prop_name, obj_node);
-                        if (!tymod.isUnknown(&self.store, t)) return t;
+                        if (!tymod.isUnknown(&self.store, t) and !tymod.isAny(&self.store, t)) return t;
+                        // class_ty degraded to any/unknown — a re-entrant class
+                        // build returns a bare typeRef whose members don't
+                        // resolve (e.g. `this.x` while building the instance type
+                        // for `super.f`). Fall back to a direct class-body scan.
+                        if (self.thisClassDirectPropLookup(obj_node, prop_name)) |direct_ty| return direct_ty;
                     }
                 }
             }
