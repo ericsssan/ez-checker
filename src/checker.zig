@@ -14477,11 +14477,25 @@ pub const Checker = struct {
     fn importExprAnyFallback(self: *Checker, node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(node);
         if (data.lhs == .none) return tymod.ID_ANY; // `import()` — error, any
-        // A string-literal spec that didn't resolve to a local section may still be
-        // resolved on disk by tsc to a concrete CJS/JSON/typeof shape — stay `any`.
-        if (self.ast_ref.nodeTag(data.lhs) == .string_literal) return tymod.ID_ANY;
-        // Non-literal specifier → Promise<any> (target statically unknown).
         const any_inner = [_]TypeId{tymod.ID_ANY};
+        if (self.ast_ref.nodeTag(data.lhs) == .string_literal) {
+            // In node16/nodenext a RELATIVE dynamic import resolves to a module
+            // whose shape tsc usually reports as `Promise<any>` (the relative
+            // CJS/JS sibling).  Emit that.  Bare specifiers and the classic
+            // module modes stay plain `any` (their on-disk shape varies too much).
+            const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
+            if (raw.len >= 2 and (raw[0] == '\'' or raw[0] == '"')) {
+                const spec = raw[1 .. raw.len - 1];
+                const is_rel = std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../");
+                if (is_rel and self.checker_opts.isNode16Style() and
+                    !std.mem.endsWith(u8, spec, ".json"))
+                {
+                    return self.store.typeRef("Promise", &any_inner) catch tymod.ID_ANY;
+                }
+            }
+            return tymod.ID_ANY;
+        }
+        // Non-literal specifier → Promise<any> (target statically unknown).
         return self.store.typeRef("Promise", &any_inner) catch tymod.ID_ANY;
     }
 
