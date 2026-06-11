@@ -1461,11 +1461,22 @@ pub const Checker = struct {
             // built from `push`/element-assign contributions.  Only when the
             // declared type is the unrefined `any`/`unknown`/empty-array form,
             // so a real annotation (`let x: number[] = []`) is untouched.
-            if (self.checker_opts.no_implicit_any and (bkind == .@"var" or bkind == .let) and
+            // tsc evolves `let x = []` / `var x = []` arrays from their
+            // element writes regardless of noImplicitAny (the flag only governs
+            // the implicit-any error, not the inferred type), so this is not
+            // gated on no_implicit_any.
+            if ((bkind == .@"var" or bkind == .let) and
                 (base.eq(tymod.ID_ANY) or base.eq(tymod.ID_UNKNOWN) or self.isEmptyArrayType(base)))
             {
                 if (self.inferEvolvingArrayType(sym, node)) |arr| {
-                    return self.narrowAtUse(node, sym, arr);
+                    // Under noImplicitAny, trust the full refinement (the tuned
+                    // strict behaviour).  In non-strict mode, only trust an
+                    // all-`any` result (`any[]`) — a refined element union there
+                    // risks diverging from tsc's evolution, and `any[]` is the
+                    // common non-strict case (`const arr = []; arr[i] = …`).
+                    if (self.checker_opts.no_implicit_any or self.isAnyArrayType(arr)) {
+                        return self.narrowAtUse(node, sym, arr);
+                    }
                 }
             }
             if (!base.eq(tymod.ID_UNKNOWN)) {
@@ -3472,6 +3483,14 @@ pub const Checker = struct {
         const elems = self.store.idsOf(t.list_data);
         if (elems.len != 1) return false;
         return elems[0].eq(tymod.ID_NEVER) or elems[0].eq(tymod.ID_ANY);
+    }
+
+    /// `any[]` exactly (array whose sole element type is `any`).
+    fn isAnyArrayType(self: *Checker, ty: TypeId) bool {
+        const t = self.store.get(ty);
+        if (t.kind != .array_t) return false;
+        const elems = self.store.idsOf(t.list_data);
+        return elems.len == 1 and elems[0].eq(tymod.ID_ANY);
     }
 
     /// The initializer node of a var/let binding's declarator, or `.none`.
