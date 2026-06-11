@@ -47,6 +47,10 @@ pub const CheckerOpts = struct {
     /// In that legacy mode TypeScript types empty arrays as `undefined[]`
     /// rather than `never[]`.
     strict_explicitly_false: bool = false,
+    /// True when strictNullChecks was EXPLICITLY disabled (`@strict: false` or
+    /// `@strictNullChecks: false`).  Optional parameters keep `| undefined` by
+    /// default but collapse to `T` only under this explicit opt-out.
+    strict_null_checks_explicit_off: bool = false,
     /// True when `strictBindCallApply` is in effect (implied by `strict`, or
     /// set explicitly).  Under it, a function value's `apply`/`call`/`bind`
     /// resolve to the generic `CallableFunction`/`NewableFunction` overloads;
@@ -4198,10 +4202,11 @@ pub const Checker = struct {
                 self.type_pos_depth += 1;
                 var ty = self.resolveTypeNode(ty_node);
                 self.type_pos_depth -= 1;
-                // Optional parameter (`x?: T`) — parser marks the identifier
-                // by setting lhs to `.root`.  TypeScript always types optional
-                // params as `T | undefined` regardless of strictNullChecks.
-                if (bd.lhs == .root) {
+                // Optional parameter (`x?: T`) — parser marks the identifier by
+                // setting lhs to `.root`.  Typed `T | undefined` by default (even
+                // with no directive), collapsing to `T` only when strictNullChecks
+                // is EXPLICITLY disabled.
+                if (bd.lhs == .root and !self.checker_opts.strict_null_checks_explicit_off) {
                     const ids = [_]TypeId{ ty, tymod.ID_UNDEFINED };
                     ty = self.store.unionOf(&ids) catch ty;
                 }
@@ -15145,7 +15150,9 @@ pub const Checker = struct {
                     continue;
                 }
                 if (std.mem.eql(u8, p.name, prop_name)) {
-                    if (p.optional) {
+                    // An optional property access is `T | undefined` only under
+                    // strictNullChecks; without it the access type is just `T`.
+                    if (p.optional and self.checker_opts.strict_null_checks) {
                         return self.store.unionOf(&.{ p.type_id, tymod.ID_UNDEFINED }) catch p.type_id;
                     }
                     return p.type_id;

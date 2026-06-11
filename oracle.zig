@@ -75,6 +75,8 @@ fn langIdx(l: Language) usize {
 const CompilerOpts = struct {
     strict: bool = false,
     strict_null_checks: bool = false,
+    strict_set: bool = false, // @strict was written (either value)
+    snc_set: bool = false, // @strictNullChecks was written (either value)
     // @strictBindCallApply directive — tri-state: null = unset (corpus default
     // is ON, except under @strict:false).  Set explicitly to override.
     strict_bind_call_apply: ?bool = null,
@@ -107,6 +109,12 @@ const CompilerOpts = struct {
     fn toCheckerOpts(self: CompilerOpts) ez.CheckerOpts {
         return .{
             .strict_null_checks = self.strict or self.strict_null_checks,
+            // strictNullChecks was EXPLICITLY turned off (@strict:false or
+            // @strictNullChecks:false).  Optional parameters are `T | undefined`
+            // by default (even with no directive) but collapse to `T` only when
+            // strictNullChecks is explicitly disabled.
+            .strict_null_checks_explicit_off = self.strict_explicitly_false or
+                (self.snc_set and !self.strict_null_checks),
             .no_implicit_any = self.strict or self.no_implicit_any,
             // CallableFunction/NewableFunction overloads for apply/call/bind are
             // the corpus default; the loose base-Function signatures apply only
@@ -193,9 +201,13 @@ fn applyVariantOverrides(opts: *CompilerOpts, filename: []const u8) void {
         else if (std.mem.eql(u8, key, "target")) opts.target = parseTarget(val)
         else if (std.mem.eql(u8, key, "strict")) {
             opts.strict = isTrue(val);
+            opts.strict_set = true;
             if (!opts.strict) opts.strict_explicitly_false = true;
         }
-        else if (std.mem.eql(u8, key, "strictNullChecks")) opts.strict_null_checks = isTrue(val)
+        else if (std.mem.eql(u8, key, "strictNullChecks")) {
+            opts.strict_null_checks = isTrue(val);
+            opts.snc_set = true;
+        }
         else if (std.mem.eql(u8, key, "strictBindCallApply")) opts.strict_bind_call_apply = isTrue(val)
         else if (std.mem.eql(u8, key, "noImplicitAny")) opts.no_implicit_any = isTrue(val)
         else if (std.mem.eql(u8, key, "noUncheckedIndexedAccess")) opts.no_unchecked_indexed_access = isTrue(val)
