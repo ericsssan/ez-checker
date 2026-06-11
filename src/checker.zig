@@ -9746,6 +9746,11 @@ pub const Checker = struct {
     fn resolveTypeRef(self: *Checker, ty_node: NodeIndex) TypeId {
         const name_tok = self.ast_ref.nodeMainToken(ty_node);
         const name = self.ast_ref.tokenText(name_tok);
+        // `unique symbol` is parsed as a ts_type_reference whose name token is the
+        // `unique` keyword (the trailing `symbol` is consumed) — resolve it.
+        if (std.mem.eql(u8, name, "unique")) {
+            return self.store.typeRef("unique symbol", &.{}) catch tymod.ID_SYMBOL;
+        }
         // Literal types in type position end up as a ts_type_reference
         // whose name token is the literal source — recognize the
         // common shapes and map them to the corresponding TS keyword.
