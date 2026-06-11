@@ -1299,7 +1299,17 @@ fn normalizeType(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
 
 fn leftmostStart(a: *const Ast, node: NodeIndex) u32 {
     if (node == .none) return std.math.maxInt(u32);
-    const own = a.tokenStart(a.nodeMainToken(node));
+    const mtok = a.nodeMainToken(node);
+    // JSX elements anchor on the tag-name token (`div` in `<div />`), but tsc
+    // reports the expression text starting at the `<`.  Extend left to it so the
+    // node text matches the baseline (`<div />`, not `div />`).
+    switch (a.nodeTag(node)) {
+        .jsx_element, .jsx_self_closing => {
+            if (mtok > 0) return a.tokenStart(mtok - 1);
+        },
+        else => {},
+    }
+    const own = a.tokenStart(mtok);
     const recurse = switch (a.nodeTag(node)) {
         .add, .subtract, .multiply, .divide, .modulo, .exponentiate,
         .equal, .not_equal, .strict_equal, .strict_not_equal,
