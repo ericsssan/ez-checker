@@ -3,8 +3,8 @@
     .version = "0.1.1",
     .dependencies = .{
         .es_parser = .{
-            .url = "git+https://github.com/ericsssan/es-parser.git?ref=v0.2.9#f5971172d44e5b90f1efd5231f232ee3f5ad6404",
-            .hash = "es_parser-0.2.9-C15LK-bmFwBJmyMyOPA3BrXTEtN9mdpowBnocFPABSuJ",
+            .url = "git+https://github.com/ericsssan/es-parser.git?ref=v0.2.11#edf92d8d04bffe93548fe4df9133076cd3b9ac1b",
+            .hash = "es_parser-0.2.11-C15LKxfwFwB0fz1nYe1MVzNEB7i_30DcrM6a_pB-GOzd",
         },
         .zbc = .{
             .url = "git+https://github.com/ericsssan/zbc.git?ref=v0.1.3#65847aaae33d39f14dbf7faad05846c2eb58547d",

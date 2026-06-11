@@ -6406,47 +6406,12 @@ pub const Checker = struct {
         const is_async = self.ast_ref.nodeTag(arrow_node) == .async_arrow_fn;
         // Contextual return type (`const f: () => "a" = () => "a"`): preserve a
         // concise literal body when the context expects that literal.
-        // ArrowData has no type_params field. For generic arrows <T>(params) => body,
-        // the parser stores type param node indices in extra_data immediately before
-        // params_start. Only generic arrows have type params: non-async generic arrows
-        // start with '<' (less_than main_token); async generic arrows have 'async'
-        // as main_token and '<' as the very next token.  Recover the range first so
-        // it can be folded into the function type's identity at intern time.
-        const main_tok = self.ast_ref.nodeMainToken(arrow_node);
-        const main_tag = self.ast_ref.tokenTag(main_tok);
-        const tok_count: u32 = @intCast(self.ast_ref.tokens.len);
-        const is_generic_arrow = main_tag == .less_than or
-            (is_async and main_tag == .kw_async and
-             main_tok + 1 < tok_count and
-             self.ast_ref.tokenTag(main_tok + 1) == .less_than);
-        var tp_start: u32 = ad.params_start;
-        var tp_end: u32 = ad.params_start;
-        if (is_generic_arrow) {
-            const ext = self.ast_ref.extra_data;
-            const total_nodes: u32 = @intCast(self.ast_ref.nodes.len);
-            const isTp = struct {
-                fn f(c: *Checker, raw: u32, total: u32) bool {
-                    return raw < total and c.ast_ref.nodeTag(@enumFromInt(raw)) == .ts_type_parameter;
-                }
-            }.f;
-            // The type-parameter block sits before the params but isn't always
-            // adjacent: a param's own type (e.g. `(arg: T) => U`) inserts nodes
-            // into extra_data between the `<T, U>` block and the param list, so
-            // skip over those to reach the block's contiguous run.  (ArrowData
-            // records no type_params range — see es-parser limitation.)
-            while (tp_end > 0 and !isTp(self, ext[tp_end - 1], total_nodes)) tp_end -= 1;
-            tp_start = tp_end;
-            while (tp_start > 0 and isTp(self, ext[tp_start - 1], total_nodes)) tp_start -= 1;
-            // The contiguous run can also pick up an *enclosing* generic's type
-            // parameters when they sit adjacent in extra_data.  Those precede
-            // this arrow's `<`, so drop leading entries whose token is before
-            // the arrow's main token (`<`, or `async` for async arrows).
-            while (tp_start < tp_end and self.ast_ref.nodeMainToken(@enumFromInt(ext[tp_start])) < main_tok)
-                tp_start += 1;
-        }
+        // Generic arrow type parameters (`<T, U>(x) => …`) are recorded directly
+        // on ArrowData (es-parser ≥ v0.2.11); fold them into the function type's
+        // identity at intern time.
         const saved_ctx_ret = self.contextual_arrow_return;
         self.contextual_arrow_return = self.arrowContextualReturn(arrow_node);
-        const fn_ty = self.buildFunctionTypeG(ad.params_start, ad.params_end, ad.return_type, ad.body, is_async, false, tp_start, tp_end);
+        const fn_ty = self.buildFunctionTypeG(ad.params_start, ad.params_end, ad.return_type, ad.body, is_async, false, ad.type_params, ad.type_params_end);
         self.contextual_arrow_return = saved_ctx_ret;
         return fn_ty;
     }

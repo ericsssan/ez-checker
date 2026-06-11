@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.11]
+
+A bug-fix release: generic arrow functions no longer lose their type
+parameters.
+
+### Fixed
+
+- **`ArrowData` stores type parameters.** Generic arrow functions such as
+  `<T, U>(x) => ...` parsed their type-parameter list but never recorded it on
+  the node, leaving the `ts_type_parameter` nodes orphaned (no parent) and
+  recoverable only via a fragile backward-scan heuristic that broke on nested
+  generics like `(arg: T) => U`. `ArrowData` now carries
+  `type_params`/`type_params_end` (mirroring `FnData`), populated for both the
+  `<T>(...) =>` and `async <T>(...) =>` paths, and `parent_builder` links the
+  type-param subtree so the nodes are correctly parented.
+  ([#13](https://github.com/ericsssan/es-parser/issues/13))
+
+## [0.2.10]
+
+A bug-fix release: generic constructor types no longer lose their type
+parameters.
+
+### Fixed
+
+- **`parseConstructorType` preserves type parameters.** Generic constructor
+  types such as `new <T>(x: T) => T[]` parsed their type-parameter list but
+  discarded the result, leaving `FnData.type_params`/`type_params_end` at their
+  `0,0` default so consumers saw a non-generic constructor type. The
+  `parseTypeParameterList` result is now captured and stored on the
+  `ts_constructor_type` node, matching the function-type path.
+  ([#12](https://github.com/ericsssan/es-parser/issues/12))
+
 ## [0.2.9]
 
 A tooling release: zbc static analysis integrated into the default build step.
