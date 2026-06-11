@@ -16389,6 +16389,17 @@ pub const Checker = struct {
                 if (ann == .none or self.ast_ref.nodeTag(ann) != .ts_type_annotation) return null;
                 return self.nonNullExpected(self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs));
             },
+            // Class field with a type annotation initialized by this expression:
+            // `member: (s: T) => U = n => …` contextually types the initializer.
+            .property_def, .computed_property_def => {
+                const pd = self.ast_ref.nodeData(pn);
+                if (pd.rhs == .none) return null;
+                const prop = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(pd.rhs));
+                if (prop.value != node) return null;
+                if (prop.type_annotation == .none or
+                    self.ast_ref.nodeTag(prop.type_annotation) != .ts_type_annotation) return null;
+                return self.nonNullExpected(self.resolveTypeNode(self.ast_ref.nodeData(prop.type_annotation).lhs));
+            },
             .call_expr, .optional_call_expr, .new_expr => return self.callArgContextualType(pn, node),
             .return_stmt => return self.enclosingFnReturnType(pn),
             // (assignment-target contextual typing is omitted — typeOf(lhs) can
@@ -16563,6 +16574,13 @@ pub const Checker = struct {
             for (self.store.idsOf(t.list_data)) |m| {
                 if (self.objectPropExpectedType(m, key)) |pt| return pt;
             }
+        }
+        // Named interface / alias (`interface G { func(n: T): void }`): resolve
+        // the member via apparent-type lookup so an object literal contextually
+        // typed by `G` propagates `func`'s parameter types to its arrow value.
+        if (t.kind == .type_ref) {
+            const m = self.memberOnApparentType(obj_ty, key, .none);
+            if (!tymod.isUnknown(&self.store, m) and !tymod.isAny(&self.store, m)) return m;
         }
         return null;
     }
