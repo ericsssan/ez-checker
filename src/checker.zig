@@ -17585,17 +17585,21 @@ fn needsPropertyQuoting(name: []const u8) bool {
 /// < symbol < undefined < null < void < never < any < other.
 fn typePriorityForSort(store: *const tymod.TypeStore, id: tymod.TypeId) u8 {
     const t = store.get(id);
+    // tsc orders union members by type-creation id: the intrinsic primitives
+    // first (string < number < bigint < boolean < symbol, fixed at lib init),
+    // then object/named types, with `void`/`null`/`undefined`/`never` LAST
+    // (`X | undefined`, never `undefined | X`; `null | undefined`).
     return switch (t.kind) {
         .string, .string_literal => 0,
         .number, .number_literal => 1,
         .bigint, .bigint_literal => 2,
         .boolean, .boolean_literal => 3,
         .symbol => 4,
-        .undefined_t => 5,
-        .null_t => 6,
-        .void_t => 7,
-        .never => 8,
         else => 10,
+        .void_t => 13,
+        .null_t => 14,
+        .undefined_t => 15,
+        .never => 16,
     };
 }
 
