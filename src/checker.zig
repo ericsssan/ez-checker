@@ -8894,6 +8894,39 @@ pub const Checker = struct {
         return result;
     }
 
+    /// Canonical display for a generic mapped type that can't be evaluated:
+    /// `{ [readonly] [P in Constraint][?]: Value; }`, as an opaque type_ref.
+    fn mappedTypeDisplay(self: *Checker, key_param: NodeIndex, constraint_ty: TypeId, value_type: NodeIndex, mods: MappedTypeModifiers) ?TypeId {
+        const kp = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(key_param));
+        if (kp.len == 0) return null;
+        const c = self.typeToString(constraint_ty) catch return null;
+        defer self.gpa.free(c);
+        const v = self.typeToString(self.resolveTypeNode(value_type)) catch return null;
+        defer self.gpa.free(v);
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        buf.appendSlice(self.gpa, "{ ") catch return null;
+        if (mods.is_readonly) buf.appendSlice(self.gpa, "readonly ") catch return null;
+        if (mods.remove_readonly) buf.appendSlice(self.gpa, "-readonly ") catch return null;
+        buf.append(self.gpa, '[') catch return null;
+        buf.appendSlice(self.gpa, kp) catch return null;
+        buf.appendSlice(self.gpa, " in ") catch return null;
+        buf.appendSlice(self.gpa, c) catch return null;
+        buf.append(self.gpa, ']') catch return null;
+        if (mods.is_optional) buf.append(self.gpa, '?') catch return null;
+        if (mods.remove_optional) buf.appendSlice(self.gpa, "-?") catch return null;
+        buf.appendSlice(self.gpa, ": ") catch return null;
+        buf.appendSlice(self.gpa, v) catch return null;
+        buf.appendSlice(self.gpa, "; }") catch return null;
+        const owned = buf.toOwnedSlice(self.gpa) catch return null;
+        const r = self.store.typeRef(owned, &.{}) catch {
+            self.gpa.free(owned);
+            return null;
+        };
+        self.string_pool.append(self.gpa, owned) catch self.gpa.free(owned);
+        return r;
+    }
+
     fn resolveMappedType(self: *Checker, ty_node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(ty_node);
         const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
@@ -8919,6 +8952,18 @@ pub const Checker = struct {
 
         var keys_buf: [16][]const u8 = undefined;
         const key_count_opt = self.collectStringLiteralKeys(constraint, &keys_buf, 0);
+        // A constraint over a type parameter (`keyof T`, or a bare type-param `K`)
+        // can't be enumerated; tsc keeps the mapped-type syntax `{ [P in K]: V; }`.
+        if (key_count_opt == null and as_type == .none) {
+            const c_ty = self.resolveTypeNode(constraint);
+            const ck = self.store.get(c_ty);
+            const is_generic = ck.kind == .type_param or
+                (ck.kind == .type_ref and std.mem.startsWith(u8, ck.name, "keyof "));
+            if (is_generic) {
+                const key_param: NodeIndex = @enumFromInt(slice[0]);
+                if (self.mappedTypeDisplay(key_param, c_ty, value_type, mods)) |d| return d;
+            }
+        }
         if (key_count_opt == null) {
             // Open constraint (e.g. `Lowercase<string>`) — emit a single "[]" sentinel
             // so callers can detect that any string key maps to the value type.
@@ -17508,6 +17553,13 @@ pub const Checker = struct {
             .object_keyword => try buf.appendSlice(gpa, "object"),
             .error_t     => try buf.appendSlice(gpa, "error"),
             .type_ref => {
+                // An alias-tagged type_ref renders by its alias display (e.g. an
+                // expanded mapped-type body that's the body of `Boxified<T>` shows
+                // `Boxified<T>`, not the mapped syntax).
+                if (t.alias_name.len > 0) {
+                    try buf.appendSlice(gpa, t.alias_name);
+                    return;
+                }
                 try buf.appendSlice(gpa, t.name);
                 const args = self.store.idsOf(t.list_data);
                 if (args.len > 0) {
