@@ -177,6 +177,10 @@ pub const Type = struct {
     /// ts.Type.aliasSymbol. Part of interning identity (see hash/eql) so an
     /// alias-tagged type stays distinct from its bare structural form.
     alias_name: []const u8 = "",
+    /// The generic type arguments of the alias (`[string]` for `Box<string>`),
+    /// stored structurally so substitution (`Box<T>` → `Box<string>`) can update
+    /// them and re-render `alias_name`.  Empty for non-generic / untagged types.
+    alias_args: TypeIdList = .empty,
     /// When non-empty, this literal is an enum *member* of the named enum
     /// (`Fruit.Apple` → enum_name = "Fruit"). Surfaced to the facade so it
     /// can OR-in ts.TypeFlags.EnumLiteral and synthesize an EnumMember symbol
@@ -312,6 +316,10 @@ pub const InternContext = struct {
         }
         h.update(t.name);
         h.update(t.alias_name);
+        for (self.store.idsOf(t.alias_args)) |a| {
+            const av = a.toInt();
+            h.update(std.mem.asBytes(&av));
+        }
         h.update(t.enum_name);
         const ovl: u8 = @intFromBool(t.is_overload_set);
         h.update(std.mem.asBytes(&ovl));
@@ -371,6 +379,12 @@ pub const InternContext = struct {
         if (!literalEql(ta.literal_value, tb.literal_value)) return false;
         if (!std.mem.eql(u8, ta.name, tb.name)) return false;
         if (!std.mem.eql(u8, ta.alias_name, tb.alias_name)) return false;
+        {
+            const aa = self.store.idsOf(ta.alias_args);
+            const ba = self.store.idsOf(tb.alias_args);
+            if (aa.len != ba.len) return false;
+            for (aa, ba) |x, y| if (!x.eq(y)) return false;
+        }
         if (!std.mem.eql(u8, ta.enum_name, tb.enum_name)) return false;
         if (ta.is_overload_set != tb.is_overload_set) return false;
         const la = self.store.idsOf(ta.list_data);

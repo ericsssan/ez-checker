@@ -9779,6 +9779,21 @@ pub const Checker = struct {
         return self.store.add(copy) catch id;
     }
 
+    /// Like tagAliasName, but also records the alias's generic arguments
+    /// structurally (`Box<string>` → display "Box<string>", args [string]) so
+    /// substituteTypeId can re-render them when the alias is instantiated.
+    fn tagAliasArgs(self: *Checker, id: TypeId, display: []const u8, args: []const TypeId) TypeId {
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .object_t, .intersection_t, .union_t, .tuple_t, .type_ref, .function_t => {},
+            else => return id,
+        }
+        var copy = t.*;
+        copy.alias_name = display;
+        copy.alias_args = self.store.appendTypeIds(args) catch return self.tagAliasName(id, display);
+        return self.store.add(copy) catch id;
+    }
+
     /// Stamp a structurally-resolved utility type (`Record<string, number>`,
     /// `Partial<Foo>`, ...) with its display name, since tsc renders these
     /// by name rather than expanding them.
@@ -9796,7 +9811,7 @@ pub const Checker = struct {
         }
         buf.append(self.gpa, '>') catch return id;
         const display = self.gpa.dupe(u8, buf.items) catch return id;
-        return self.tagAliasName(id, display);
+        return self.tagAliasArgs(id, display, args);
     }
 
     fn resolveTypeRef(self: *Checker, ty_node: NodeIndex) TypeId {
@@ -10195,7 +10210,7 @@ pub const Checker = struct {
                             }
                             alias_buf.append(self.gpa, '>') catch {};
                             const alias_str = alias_buf.toOwnedSlice(self.gpa) catch name;
-                            return self.tagAliasName(result, alias_str);
+                            return self.tagAliasArgs(result, alias_str, use_args);
                         }
                     }
                     return self.tagAliasName(result, name);
@@ -15460,6 +15475,46 @@ pub const Checker = struct {
         self.resolve_depth += 1;
         defer self.resolve_depth -= 1;
         const t = self.store.get(id);
+        // Aliased generic type (`Box<T>`): substitute its structural body AND its
+        // recorded alias args, then re-render the display (`Box<T>` → `Box<string>`)
+        // so an instantiated alias keeps its name instead of expanding.
+        alias: {
+            const aargs = self.store.idsOf(t.alias_args);
+            if (aargs.len == 0 or aargs.len > 8) break :alias;
+            // Capture everything off `t` BEFORE any store mutation (substituteTypeId
+            // / store.add realloc the types array and dangle `t`).
+            const alias_name = t.alias_name; // slice into the (stable) string pool
+            var bare = t.*;
+            bare.alias_name = "";
+            bare.alias_args = .empty;
+            var orig_args: [8]TypeId = undefined;
+            @memcpy(orig_args[0..aargs.len], aargs);
+            var new_args_buf: [8]TypeId = undefined;
+            var changed = false;
+            for (orig_args[0..aargs.len], 0..) |a, i| {
+                new_args_buf[i] = self.substituteTypeId(a, keys, vals);
+                if (!new_args_buf[i].eq(a)) changed = true;
+            }
+            if (!changed) break :alias;
+            const new_args = new_args_buf[0..aargs.len];
+            const base = if (std.mem.indexOfScalar(u8, alias_name, '<')) |lt| alias_name[0..lt] else alias_name;
+            const bare_id = self.store.add(bare) catch break :alias;
+            const sub_body = self.substituteTypeId(bare_id, keys, vals);
+            var buf: std.ArrayList(u8) = .empty;
+            defer buf.deinit(self.gpa);
+            buf.appendSlice(self.gpa, base) catch break :alias;
+            buf.append(self.gpa, '<') catch break :alias;
+            for (new_args, 0..) |a, i| {
+                if (i > 0) buf.appendSlice(self.gpa, ", ") catch break :alias;
+                const s = self.typeToString(a) catch break :alias;
+                defer self.gpa.free(s);
+                buf.appendSlice(self.gpa, s) catch break :alias;
+            }
+            buf.append(self.gpa, '>') catch break :alias;
+            const display = self.gpa.dupe(u8, buf.items) catch break :alias;
+            self.string_pool.append(self.gpa, display) catch self.gpa.free(display);
+            return self.tagAliasArgs(sub_body, display, new_args);
+        }
         switch (t.kind) {
             // A bare type parameter (`T` resolved to its own param type, e.g. the
             // element of `Readonly<T>[]` after Readonly unwraps) — substitute by
