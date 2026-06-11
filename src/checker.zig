@@ -13037,11 +13037,27 @@ pub const Checker = struct {
         const p = parents[node.toInt()];
         if (p == @intFromEnum(NodeIndex.none)) return false;
         const pn: NodeIndex = @enumFromInt(p);
-        if (self.ast_ref.nodeTag(pn) != .declarator) return false;
-        const pn_data = self.ast_ref.nodeData(pn);
-        if (pn_data.rhs != node) return false;
-        if (pn_data.lhs == .none) return false;
-        return self.ast_ref.nodeTag(pn_data.lhs) == .array_pattern;
+        const ptag = self.ast_ref.nodeTag(pn);
+        if (ptag == .declarator) {
+            const pn_data = self.ast_ref.nodeData(pn);
+            if (pn_data.rhs != node) return false;
+            if (pn_data.lhs == .none) return false;
+            return self.ast_ref.nodeTag(pn_data.lhs) == .array_pattern;
+        }
+        // Default value of a binding-pattern element (`[a = ["x", "y"]]`) — tsc
+        // infers the default array literal as a tuple, like a destructuring RHS.
+        if (ptag == .assignment_pattern) {
+            const apd = self.ast_ref.nodeData(pn);
+            if (apd.rhs != node) return false;
+            if (pn.toInt() >= parents.len) return false;
+            const gp = parents[pn.toInt()];
+            if (gp == @intFromEnum(NodeIndex.none)) return false;
+            return switch (self.ast_ref.nodeTag(@enumFromInt(gp))) {
+                .array_pattern, .object_pattern, .property => true,
+                else => false,
+            };
+        }
+        return false;
     }
 
     /// Returns true when `node` (an array literal) is the direct operand of a

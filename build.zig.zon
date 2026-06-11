@@ -7,7 +7,8 @@
             .hash = "es_parser-0.2.9-C15LK-bmFwBJmyMyOPA3BrXTEtN9mdpowBnocFPABSuJ",
         },
         .zbc = .{
-            .path = "../zbc",
+            .url = "git+https://github.com/ericsssan/zbc.git?ref=v0.1.3#65847aaae33d39f14dbf7faad05846c2eb58547d",
+            .hash = "zbc-0.1.3-cIta9eVZNwARWP_oOLKlxMAU7Rl4ZyqRu_fhEXTB8gW7",
         },
     },
     .minimum_zig_version = "0.17.0-dev.607+456b2ec07",
