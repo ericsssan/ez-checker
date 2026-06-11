@@ -12539,9 +12539,60 @@ pub const Checker = struct {
         return self.store.unionOf(buf[0..n]) catch tymod.ID_UNKNOWN;
     }
 
+    /// `[a: number, b?: string, ...rest: T[]]` labeled-tuple display, opaque.
+    fn namedTupleDisplay(self: *Checker, elems: []const u32) ?TypeId {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        buf.append(self.gpa, '[') catch return null;
+        for (elems, 0..) |raw, i| {
+            if (i > 0) buf.appendSlice(self.gpa, ", ") catch return null;
+            const m: NodeIndex = @enumFromInt(raw);
+            switch (self.ast_ref.nodeTag(m)) {
+                .ts_named_tuple_member => {
+                    const md = self.ast_ref.nodeData(m);
+                    const label = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(m));
+                    buf.appendSlice(self.gpa, label) catch return null;
+                    if (md.rhs == .root) buf.append(self.gpa, '?') catch return null;
+                    buf.appendSlice(self.gpa, ": ") catch return null;
+                    const s = self.typeToString(self.resolveTypeNode(md.lhs)) catch return null;
+                    defer self.gpa.free(s);
+                    buf.appendSlice(self.gpa, s) catch return null;
+                },
+                .spread_element => {
+                    buf.appendSlice(self.gpa, "...") catch return null;
+                    const s = self.typeToString(self.resolveTypeNode(self.ast_ref.nodeData(m).lhs)) catch return null;
+                    defer self.gpa.free(s);
+                    buf.appendSlice(self.gpa, s) catch return null;
+                },
+                else => {
+                    const s = self.typeToString(self.resolveTypeNode(m)) catch return null;
+                    defer self.gpa.free(s);
+                    buf.appendSlice(self.gpa, s) catch return null;
+                },
+            }
+        }
+        buf.append(self.gpa, ']') catch return null;
+        const owned = buf.toOwnedSlice(self.gpa) catch return null;
+        const r = self.store.typeRef(owned, &.{}) catch {
+            self.gpa.free(owned);
+            return null;
+        };
+        self.string_pool.append(self.gpa, owned) catch self.gpa.free(owned);
+        return r;
+    }
+
     fn resolveTupleType(self: *Checker, ty_node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(ty_node);
         const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
+        // A labeled tuple (`[a: number, b: string]`) is display-only in TS but tsc
+        // renders the labels.  Our tuple_t can't carry element names, so emit the
+        // labeled form as an opaque type_ref.
+        for (slice) |raw| {
+            if (self.ast_ref.nodeTag(@enumFromInt(raw)) == .ts_named_tuple_member) {
+                if (self.namedTupleDisplay(slice)) |d| return d;
+                break;
+            }
+        }
         var buf: [16]TypeId = undefined;
         const n = @min(slice.len, buf.len);
         var i: usize = 0;
