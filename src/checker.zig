@@ -1746,6 +1746,13 @@ pub const Checker = struct {
         // Built-in global values (`console`, `Math`, `JSON`, ...) — fall
         // back to the curated lib shapes so member access / calls type
         // correctly without modelling the full lib.d.ts.
+        // A bare `globalThis` value reference is typed `typeof globalThis`.  Kept
+        // out of global_value_types (which would also re-type globals that flow
+        // through it) so only the literal identifier is affected; member access
+        // `globalThis.x` resolves on the opaque type_ref → any, as before.
+        if (std.mem.eql(u8, name, "globalThis")) {
+            return self.store.typeRef("typeof globalThis", &.{}) catch tymod.ID_ANY;
+        }
         if (self.global_value_types.get(name)) |t| {
             // Several globals appear as named constructor/singleton types in tsc's
             // oracle rather than their structural forms. Return typeRef lazily (not
