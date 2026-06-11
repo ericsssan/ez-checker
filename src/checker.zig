@@ -12894,6 +12894,30 @@ pub const Checker = struct {
             if (fd.return_type != .none) {
                 self.matchTypeParam(fd.return_type, ret_id, names, bindings);
             }
+            return;
+        }
+        // `{ prop: T }` matched against an object_t arg — bind each prop's type.
+        if (tag == .ts_type_literal) {
+            const at = self.store.get(arg_ty);
+            if (at.kind != .object_t) return;
+            const d = self.ast_ref.nodeData(n);
+            const slice = self.directRange(d.lhs, d.rhs) orelse return;
+            for (slice) |raw| {
+                const member: NodeIndex = @enumFromInt(raw);
+                if (self.ast_ref.nodeTag(member) != .ts_property_signature) continue;
+                const mdata = self.ast_ref.nodeData(member);
+                if (mdata.lhs == .none or mdata.rhs == .none) continue;
+                if (self.ast_ref.nodeTag(mdata.rhs) != .ts_type_annotation) continue;
+                const key = self.staticPropertyKey(mdata.lhs) orelse continue;
+                const pty_node = self.ast_ref.nodeData(mdata.rhs).lhs;
+                for (self.store.propsOf(at.object_props)) |p| {
+                    if (std.mem.eql(u8, p.name, key)) {
+                        self.matchTypeParam(pty_node, p.type_id, names, bindings);
+                        break;
+                    }
+                }
+            }
+            return;
         }
     }
 
