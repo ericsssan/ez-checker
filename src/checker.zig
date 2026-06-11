@@ -1459,7 +1459,9 @@ pub const Checker = struct {
             if (!base.eq(tymod.ID_UNKNOWN)) {
                 // Annotated const enum vars narrow reads to the initializer's
                 // member type (`const c: Choice = Choice.One` → c : Choice.One).
-                const flow = self.narrowConstEnumAtUse(sym, node, base) orelse base;
+                var flow = self.narrowConstEnumAtUse(sym, node, base) orelse base;
+                // Reaching-definitions flow narrowing (`x = 42; x` → number).
+                flow = self.flowNarrowByAssignments(sym, node, flow) orelse flow;
                 return self.narrowAtUse(node, sym, flow);
             }
             // Symbol resolves but has no declared type — distinguish between
@@ -3762,6 +3764,65 @@ pub const Checker = struct {
             if (self.ast_ref.nodeTag(node) != .declarator) return false;
         }
         return self.ast_ref.nodeData(node).rhs != .none;
+    }
+
+    /// Flow-narrow a UNION-typed variable to the members selected by the
+    /// assignments that reach `use_node` (`let x: string|number; x = 42; x` →
+    /// `number`). Uses the CFG reaching-definitions (so closures past the last
+    /// assignment behave like tsc). Returns null to keep the declared type.
+    fn flowNarrowByAssignments(self: *Checker, sym: symbol_mod.SymbolId, use_node: NodeIndex, base: TypeId) ?TypeId {
+        const bt = self.store.get(base);
+        if (bt.kind != .union_t) return null; // only finite unions narrow
+        if (!self.evolving_index_built) self.buildEvolvingIndex();
+        const symid = sym.toInt();
+        const list = self.evolving_assign_index.get(symid) orelse return null;
+        if (list.items.len == 0) return null;
+        if (self.evolving_in_progress.contains(symid)) return null;
+        if (self.isPlainAssignTarget(use_node)) return null;
+        const cpr = if (self.semantic.code_path_result) |*c| c else return null;
+
+        var reaches: [64]bool = undefined;
+        @memset(&reaches, false);
+        const m = @min(list.items.len, reaches.len);
+        const writes = list.items[0..m];
+        const use_ni = use_node.toInt();
+        const use_seg: u32 = if (use_ni < self.node_seg.len) self.node_seg[use_ni] else NONE_SEG;
+        if (use_seg == NONE_SEG) return null;
+        const use_pos = self.ast_ref.nodeSpan(use_node).start;
+        if (self.computeReachingWrites(cpr, writes, reaches[0..m], use_seg, use_pos, use_node)) return null;
+
+        self.evolving_in_progress.put(self.gpa, symid, {}) catch return null;
+        defer _ = self.evolving_in_progress.remove(symid);
+        // Type of each reaching PLAIN write; bail on any compound op.
+        var wtypes: [64]TypeId = undefined;
+        var wn: usize = 0;
+        for (writes, 0..) |w, i| {
+            if (!reaches[i]) continue;
+            if (w.op != .assign) return null;
+            const wt = self.evolvingWriteType(w);
+            if (tymod.isAny(&self.store, wt) or wt.eq(tymod.ID_UNKNOWN)) return null;
+            if (wn >= wtypes.len) return null;
+            wtypes[wn] = wt;
+            wn += 1;
+        }
+        if (wn == 0) return null;
+        // Keep the base members some reaching write is assignable to.
+        const members = self.store.idsOf(bt.list_data);
+        var keep_buf: [16]TypeId = undefined;
+        var kn: usize = 0;
+        for (members) |mem| {
+            for (wtypes[0..wn]) |wt| {
+                if (tymod.isAssignableTo(&self.store, wt, mem)) {
+                    if (kn >= keep_buf.len) return null;
+                    keep_buf[kn] = mem;
+                    kn += 1;
+                    break;
+                }
+            }
+        }
+        if (kn == 0 or kn == members.len) return null; // no narrowing
+        if (kn == 1) return keep_buf[0];
+        return self.store.unionOf(keep_buf[0..kn]) catch null;
     }
 
     fn inferEvolvingType(self: *Checker, sym: symbol_mod.SymbolId, use_node: NodeIndex) ?TypeId {
