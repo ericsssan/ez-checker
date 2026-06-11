@@ -607,7 +607,7 @@ pub const Checker = struct {
             // the default React-style factory, which is what tsc's baselines
             // record).  This makes JSX-returning functions type as
             // `() => JSX.Element` rather than `() => any`.
-            .jsx_element, .jsx_self_closing, .jsx_fragment => self.jsxElementType(),
+            .jsx_element, .jsx_self_closing, .jsx_fragment => self.jsxElementType(node),
             // A JSX element name (`<Foo .../>`) references a value — resolve it
             // like an identifier so the facade can read the component's props.
             .jsx_identifier => self.inferIdentifier(node),
@@ -1238,9 +1238,35 @@ pub const Checker = struct {
     /// Type of a JSX element/fragment expression — `JSX.Element` under a
     /// React-style jsx mode, otherwise `any` (preserve mode / no JSX namespace,
     /// where tsc leaves the element untyped).
-    fn jsxElementType(self: *Checker) TypeId {
+    fn jsxElementType(self: *Checker, node: NodeIndex) TypeId {
         if (!self.checker_opts.jsx_react_mode) return tymod.ID_ANY;
+        // A namespaced tag name (`<a:b />`) is not a valid intrinsic element or
+        // component — tsc types the element `any`, not `JSX.Element`.
+        if (self.jsxTagNameNode(node)) |name_node| {
+            if (self.ast_ref.nodeTag(name_node) == .jsx_namespaced_name) return tymod.ID_ANY;
+        }
         return self.store.typeRef("JSX.Element", &.{}) catch tymod.ID_ANY;
+    }
+
+    /// The tag-name node of a jsx_element / jsx_self_closing (null for fragments).
+    fn jsxTagNameNode(self: *Checker, node: NodeIndex) ?NodeIndex {
+        const data = self.ast_ref.nodeData(node);
+        if (data.lhs == .none) return null;
+        switch (self.ast_ref.nodeTag(node)) {
+            .jsx_self_closing => {
+                const od = self.ast_ref.extraData(ast.JsxOpeningData, @intFromEnum(data.lhs));
+                return od.name;
+            },
+            .jsx_element => {
+                const ed = self.ast_ref.extraData(ast.JsxElementData, @intFromEnum(data.lhs));
+                if (ed.opening == .none) return null;
+                const op_data = self.ast_ref.nodeData(ed.opening);
+                if (op_data.lhs == .none) return null;
+                const od = self.ast_ref.extraData(ast.JsxOpeningData, @intFromEnum(op_data.lhs));
+                return od.name;
+            },
+            else => return null,
+        }
     }
 
     /// Map a value-side TypeId to the string-literal type(s) that `typeof`

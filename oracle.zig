@@ -1304,7 +1304,9 @@ fn leftmostStart(a: *const Ast, node: NodeIndex) u32 {
     // reports the expression text starting at the `<`.  Extend left to it so the
     // node text matches the baseline (`<div />`, not `div />`).
     switch (a.nodeTag(node)) {
-        .jsx_element, .jsx_self_closing => {
+        // jsx_element/jsx_self_closing anchor on the tag-name token; jsx_fragment
+        // anchors on the first `>` of `<>`.  In both cases the `<` is one token left.
+        .jsx_element, .jsx_self_closing, .jsx_fragment => {
             if (mtok > 0) return a.tokenStart(mtok - 1);
         },
         else => {},
