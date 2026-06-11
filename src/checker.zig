@@ -9093,6 +9093,15 @@ pub const Checker = struct {
                 };
                 return try h.checker.store.functionType(sig);
             }
+            fn fnTypeNamed(h: @This(), params: []const TypeId, names: []const []const u8, ret: TypeId) !TypeId {
+                const pr = try h.checker.store.appendSignatureParamsFull(params, names, &.{});
+                const sig = tymod.Signature{
+                    .params_start = pr.start,
+                    .params_end = pr.end,
+                    .return_type = ret,
+                };
+                return try h.checker.store.functionType(sig);
+            }
             // (...data: any[]) => ret  — a single rest param named "data"
             fn fnTypeRestAnyArray(h: @This(), ret: TypeId) !TypeId {
                 const any_arr = try h.checker.store.arrayOf(tymod.ID_ANY);
@@ -9147,15 +9156,14 @@ pub const Checker = struct {
         try self.natively_bound_type_ids.put(self.gpa, console_ty, {});
 
         // Math — selection of common methods returning number.
-        // (number) => number — single-arg methods. Unnamed param so user-code
-        // enrichment can supply the actual param name via the intern mechanism.
-        const num_x_fn = try h.fnTypeWithParams(&.{tymod.ID_NUMBER}, tymod.ID_NUMBER);
-        // (number, number) => number — two-arg methods.
-        const num_xy_fn = try h.fnTypeWithParams(&.{ tymod.ID_NUMBER, tymod.ID_NUMBER }, tymod.ID_NUMBER);
-        // (...number[]) => number — variadic methods (min, max, hypot).
+        // (x: number) => number — single-arg methods (lib.es5 names them `x`).
+        const num_x_fn = try h.fnTypeNamed(&.{tymod.ID_NUMBER}, &.{"x"}, tymod.ID_NUMBER);
+        // (x: number, y: number) => number — two-arg methods (pow, imul).
+        const num_xy_fn = try h.fnTypeNamed(&.{ tymod.ID_NUMBER, tymod.ID_NUMBER }, &.{ "x", "y" }, tymod.ID_NUMBER);
+        // (...values: number[]) => number — variadic methods (min, max, hypot).
         const num_rest_fn = blk: {
             const num_arr = try self.store.arrayOf(tymod.ID_NUMBER);
-            const pr = try self.store.appendSignatureParams(&.{num_arr}, &.{});
+            const pr = try self.store.appendSignatureParamsFull(&.{num_arr}, &.{"values"}, &.{});
             const sig: tymod.Signature = .{ .params_start = pr.start, .params_end = pr.end, .rest_param_index = 0, .return_type = tymod.ID_NUMBER };
             break :blk try self.store.functionType(sig);
         };
@@ -9247,10 +9255,14 @@ pub const Checker = struct {
         // bigint, valid for restrict-plus-operands).
         try self.global_value_types.put(self.gpa, "BigInt", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_BIGINT));
         // parseInt / parseFloat / isNaN / isFinite — global functions.
-        try self.global_value_types.put(self.gpa, "parseInt", try h.fnTypeWithParams(&.{tymod.ID_STRING}, tymod.ID_NUMBER));
-        try self.global_value_types.put(self.gpa, "parseFloat", try h.fnTypeWithParams(&.{tymod.ID_STRING}, tymod.ID_NUMBER));
-        try self.global_value_types.put(self.gpa, "isNaN", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_BOOLEAN));
-        try self.global_value_types.put(self.gpa, "isFinite", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_BOOLEAN));
+        // parseInt(string: string, radix?: number): number
+        {
+            const pr = try self.store.appendSignatureParamsFull(&.{ tymod.ID_STRING, tymod.ID_NUMBER }, &.{ "string", "radix" }, &.{ false, true });
+            try self.global_value_types.put(self.gpa, "parseInt", try self.store.functionType(.{ .params_start = pr.start, .params_end = pr.end, .return_type = tymod.ID_NUMBER }));
+        }
+        try self.global_value_types.put(self.gpa, "parseFloat", try h.fnTypeNamed(&.{tymod.ID_STRING}, &.{"string"}, tymod.ID_NUMBER));
+        try self.global_value_types.put(self.gpa, "isNaN", try h.fnTypeNamed(&.{tymod.ID_NUMBER}, &.{"number"}, tymod.ID_BOOLEAN));
+        try self.global_value_types.put(self.gpa, "isFinite", try h.fnTypeNamed(&.{tymod.ID_NUMBER}, &.{"number"}, tymod.ID_BOOLEAN));
         // `void`-like literals exposed as values.
         try self.global_value_types.put(self.gpa, "undefined", tymod.ID_UNDEFINED);
         try self.global_value_types.put(self.gpa, "NaN", tymod.ID_NUMBER);
@@ -9374,7 +9386,7 @@ pub const Checker = struct {
 
         // Miscellaneous.
         try self.global_value_types.put(self.gpa, "structuredClone", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY));
-        try self.global_value_types.put(self.gpa, "eval",             try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_ANY));
+        try self.global_value_types.put(self.gpa, "eval",             try h.fnTypeNamed(&.{tymod.ID_STRING}, &.{"x"}, tymod.ID_ANY));
 
         // Temporal (lib.esnext): the namespace value renders `typeof Temporal`.
         try self.global_value_types.put(self.gpa, "Temporal", try self.store.typeRef("typeof Temporal", &.{}));
