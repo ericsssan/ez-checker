@@ -807,6 +807,10 @@ pub const Checker = struct {
             .optional_member_expr, .optional_computed_member_expr => self.inferMember(node),
 
             .await_expr => self.inferAwait(node),
+            // `new.target` — the constructor of the nearest enclosing non-arrow
+            // function/class (arrows inherit it): `typeof ClassName` in a class,
+            // or the enclosing function's own type.
+            .new_target => self.inferNewTarget(node),
             // yield's type is TNext of the enclosing Generator — defaults to any
             // when not explicitly typed.  Using any matches tsc's default behaviour.
             .yield_expr, .yield_delegate => tymod.ID_ANY,
@@ -16185,6 +16189,36 @@ pub const Checker = struct {
         return self.resolveTypeNode(self.ast_ref.nodeData(bd.rhs).lhs);
     }
 
+    /// `typeof ClassName` for the class enclosing `node` (a constructor /
+    /// method / class body), or null when not inside a named class.
+    fn enclosingClassTypeofType(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var q: u32 = node.toInt();
+        while (q < parents.len) {
+            const qt = self.ast_ref.nodeTag(@enumFromInt(q));
+            if (qt == .class_decl or qt == .class_expr) {
+                const cdata = self.ast_ref.nodeData(@enumFromInt(q));
+                if (cdata.lhs == .none) return null;
+                const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
+                if (cd.name == .none) return null;
+                const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+                if (name.len == 0) return null;
+                const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return null;
+                const r = self.store.typeRef(tn, &.{}) catch {
+                    self.gpa.free(tn);
+                    return null;
+                };
+                self.string_pool.append(self.gpa, tn) catch self.gpa.free(tn);
+                return r;
+            }
+            const qp = parents[q];
+            if (qp == NONE) return null;
+            q = qp;
+        }
+        return null;
+    }
+
     /// Walk parents from `node` to find the enclosing class instance type.
     /// Returns the structural (object_t) type for the class, or null if not
     /// inside a class method.  Used by memberOnApparentType for `typeRef("this")`.
@@ -16888,17 +16922,9 @@ pub const Checker = struct {
     /// we avoid here to keep the change minimal).  The key invariant is
     /// that the result is always a function_t, never bare `any`.
     fn inferNewTarget(self: *Checker, node: NodeIndex) TypeId {
-        // Build a reusable `() => any` sentinel for constructor and
-        // unknown-context fallbacks.
-        const any_fn = self.store.functionType(.{
-            .params_start = 0,
-            .params_end = 0,
-            .return_type = tymod.ID_ANY,
-        }) catch return tymod.ID_ANY;
-
         const parents = self.semantic.parent_indices;
         const nidx = node.toInt();
-        if (nidx >= parents.len) return any_fn;
+        if (nidx >= parents.len) return tymod.ID_ANY;
         var p = parents[nidx];
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         while (p != NONE) : (p = parents[p]) {
@@ -16907,37 +16933,33 @@ pub const Checker = struct {
             switch (tag) {
                 // Arrow functions are transparent for new.target — keep walking.
                 .arrow_fn, .async_arrow_fn => {},
-                // A no-body constructor_def: tsc returns `typeof ClassName`
-                // which requires class-side type building we avoid here.
-                // Return ID_ANY (coverage gap) rather than a wrong function type.
-                .constructor_def => return tymod.ID_ANY,
-                // Regular function declarations and expressions: return the
-                // function's own type so `new.target` is at least a function_t.
-                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
-                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => {
-                    return self.functionTypeFromFnDecl(pn);
-                },
-                // Method / getter / setter in a class body.
-                // For a regular method, new.target is `() => any`.
-                // For a constructor method (key = "constructor"), tsc returns
-                // `typeof ClassName` — leave as ID_ANY to avoid a wrong type.
+                // In a constructor, `new.target` is `typeof ClassName`.
+                .constructor_def => return self.enclosingClassTypeofType(pn) orelse tymod.ID_ANY,
+                // Regular function / method / accessor: `new.target` is that
+                // function's own type, but building it recurses through return
+                // inference (the body may reference new.target).  Leave as a
+                // coverage gap (`any`) rather than risk a wrong function type —
+                // except a CONSTRUCTOR method, which is `typeof ClassName`.
                 .method_def, .computed_method_def => {
                     const md = self.ast_ref.nodeData(pn);
                     if (md.lhs != .none) {
                         const kt = self.ast_ref.nodeTag(md.lhs);
                         if (kt == .identifier or kt == .property_ident) {
                             const kname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.lhs));
-                            if (std.mem.eql(u8, kname, "constructor")) return tymod.ID_ANY;
+                            if (std.mem.eql(u8, kname, "constructor"))
+                                return self.enclosingClassTypeofType(pn) orelse tymod.ID_ANY;
                         }
                     }
-                    return any_fn;
+                    return tymod.ID_ANY;
                 },
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
                 .getter_def, .setter_def,
-                .computed_getter_def, .computed_setter_def => return any_fn,
+                .computed_getter_def, .computed_setter_def => return tymod.ID_ANY,
                 else => {},
             }
         }
-        return any_fn;
+        return tymod.ID_ANY;
     }
 
     /// Returns the nearest enclosing non-arrow function node, or .none.
