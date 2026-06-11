@@ -13100,16 +13100,28 @@ pub const Checker = struct {
             const et = self.store.get(exp);
             if (et.kind != .tuple_t) break :tuple_blk;
             const exp_elems = self.store.idsOf(et.list_data);
-            // Don't reshape when the tuple has rest/optional elements of a
-            // different arity — keep it simple and exact.
-            if (exp_elems.len != slice.len) break :tuple_blk;
+            // A trailing rest element (`[number, ...string[]]`) matches any arity
+            // ≥ the fixed prefix; otherwise the arity must be exact.
+            var fixed: usize = exp_elems.len;
+            var rest_el: TypeId = tymod.ID_ANY;
+            var has_rest = false;
+            if (exp_elems.len > 0 and self.store.get(exp_elems[exp_elems.len - 1]).kind == .rest_t) {
+                has_rest = true;
+                fixed = exp_elems.len - 1;
+                rest_el = self.peelRestElem(exp_elems[exp_elems.len - 1]);
+            }
+            if (has_rest) {
+                if (slice.len < fixed) break :tuple_blk;
+            } else if (exp_elems.len != slice.len) {
+                break :tuple_blk;
+            }
             var tup_buf: [32]TypeId = undefined;
             var i: usize = 0;
             while (i < slice.len) : (i += 1) {
                 const en: NodeIndex = @enumFromInt(slice[i]);
                 if (en == .none or self.ast_ref.nodeTag(en) == .spread_element) break :tuple_blk;
-                const vty = self.typeOf(en);
-                tup_buf[i] = self.contextualElementType(vty, self.peelRestElem(exp_elems[i]));
+                const exp_el = if (i < fixed) self.peelRestElem(exp_elems[i]) else rest_el;
+                tup_buf[i] = self.contextualElementType(self.typeOf(en), exp_el);
             }
             const list = self.store.appendTypeIds(tup_buf[0..slice.len]) catch break :tuple_blk;
             return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch break :tuple_blk;
