@@ -3772,7 +3772,15 @@ pub const Checker = struct {
     /// assignment behave like tsc). Returns null to keep the declared type.
     fn flowNarrowByAssignments(self: *Checker, sym: symbol_mod.SymbolId, use_node: NodeIndex, base: TypeId) ?TypeId {
         const bt = self.store.get(base);
-        if (bt.kind != .union_t) return null; // only finite unions narrow
+        // Narrow finite domains: a union, or `boolean` (= `true | false`).
+        var member_buf: [2]TypeId = undefined;
+        const members: []const TypeId = if (bt.kind == .union_t)
+            self.store.idsOf(bt.list_data)
+        else if (base.eq(tymod.ID_BOOLEAN)) blk: {
+            member_buf[0] = self.store.booleanLiteral(true) catch return null;
+            member_buf[1] = self.store.booleanLiteral(false) catch return null;
+            break :blk member_buf[0..2];
+        } else return null;
         if (!self.evolving_index_built) self.buildEvolvingIndex();
         const symid = sym.toInt();
         const list = self.evolving_assign_index.get(symid) orelse return null;
@@ -3807,7 +3815,6 @@ pub const Checker = struct {
         }
         if (wn == 0) return null;
         // Keep the base members some reaching write is assignable to.
-        const members = self.store.idsOf(bt.list_data);
         var keep_buf: [16]TypeId = undefined;
         var kn: usize = 0;
         for (members) |mem| {
