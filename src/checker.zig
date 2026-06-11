@@ -15533,11 +15533,17 @@ pub const Checker = struct {
         }
         // `Promise.resolve` as a VALUE (not called) — its lib overload set.
         // (`Promise.resolve(x)` calls are typed earlier in inferCallReturn.)
-        if (std.mem.eql(u8, t.name, "PromiseConstructor") and std.mem.eql(u8, name, "resolve")) {
-            return self.store.typeRef(
-                "{ (): Promise<void>; <T>(value: T): Promise<Awaited<T>>; <T>(value: T | PromiseLike<T>): Promise<Awaited<T>>; }",
-                &.{},
-            ) catch tymod.ID_ANY;
+        if (std.mem.eql(u8, t.name, "PromiseConstructor")) {
+            const sig: ?[]const u8 =
+                if (std.mem.eql(u8, name, "resolve"))
+                    "{ (): Promise<void>; <T>(value: T): Promise<Awaited<T>>; <T>(value: T | PromiseLike<T>): Promise<Awaited<T>>; }"
+                else if (std.mem.eql(u8, name, "reject"))
+                    "<T = never>(reason?: any) => Promise<T>"
+                else if (std.mem.eql(u8, name, "all"))
+                    "{ <T>(values: Iterable<T | PromiseLike<T>>): Promise<Awaited<T>[]>; <T extends readonly unknown[] | []>(values: T): Promise<{ -readonly [P in keyof T]: Awaited<T[P]>; }>; }"
+                else
+                    null;
+            if (sig) |s| return self.store.typeRef(s, &.{}) catch tymod.ID_ANY;
         }
         const struct_key: ?[]const u8 = if (std.mem.eql(u8, t.name, "Math"))
             "__Math_struct"
