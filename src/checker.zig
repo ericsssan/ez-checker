@@ -15854,8 +15854,22 @@ pub const Checker = struct {
             .return_stmt => return self.enclosingFnReturnType(pn),
             // (assignment-target contextual typing is omitted — typeOf(lhs) can
             //  recurse into expando/circular receivers and poison the node cache.)
-            .grouping_expr, .ts_as_expr, .ts_satisfies_expr, .conditional =>
-                return self.expectedTypeOfD(pn, depth + 1),
+            .grouping_expr, .conditional => return self.expectedTypeOfD(pn, depth + 1),
+            // `expr as T` / `expr satisfies T` — the operand's expected type is T
+            // (skip `as const`, which isn't a regular type context).
+            .ts_as_expr => {
+                const ad = self.ast_ref.nodeData(pn);
+                if (ad.lhs != node or ad.rhs == .none) return null;
+                if (self.ast_ref.nodeTag(ad.rhs) == .ts_type_reference and
+                    std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ad.rhs)), "const"))
+                    return null;
+                return self.nonNullExpected(self.resolveTypeNode(ad.rhs));
+            },
+            .ts_satisfies_expr => {
+                const sd = self.ast_ref.nodeData(pn);
+                if (sd.lhs != node or sd.rhs == .none) return null;
+                return self.nonNullExpected(self.resolveTypeNode(sd.rhs));
+            },
             .property => {
                 const pdata = self.ast_ref.nodeData(pn);
                 if (pdata.rhs != node) return null;
