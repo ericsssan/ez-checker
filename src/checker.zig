@@ -15548,6 +15548,8 @@ pub const Checker = struct {
                     "<T = never>(reason?: any) => Promise<T>"
                 else if (std.mem.eql(u8, name, "all"))
                     "{ <T>(values: Iterable<T | PromiseLike<T>>): Promise<Awaited<T>[]>; <T extends readonly unknown[] | []>(values: T): Promise<{ -readonly [P in keyof T]: Awaited<T[P]>; }>; }"
+                else if (std.mem.eql(u8, name, "try"))
+                    "<T, U extends unknown[]>(callbackFn: (...args: U) => T | PromiseLike<T>, ...args: U) => Promise<Awaited<T>>"
                 else
                     null;
             if (sig) |s| return self.store.typeRef(s, &.{}) catch tymod.ID_ANY;
