@@ -342,6 +342,12 @@ pub const InternContext = struct {
                 const v: u8 = @intFromBool(opt);
                 h.update(std.mem.asBytes(&v));
             }
+            // Parameter names are display-only (they don't affect assignability),
+            // but tsc renders each function type with its own param names, so they
+            // must be part of interning identity — otherwise two structurally
+            // identical signatures dedup and the first writer's names leak onto
+            // the other (`(s) => …` showing `n` from a contextual `(n) => …`).
+            for (self.store.signatureParamNamesOf(s)) |pn| h.update(pn);
             const rv = s.return_type.toInt();
             h.update(std.mem.asBytes(&rv));
             const flags = [_]u8{
@@ -403,6 +409,12 @@ pub const InternContext = struct {
             const yoa = self.store.signatureParamOptionalsOf(y);
             if (xoa.len != yoa.len) return false;
             for (xoa, yoa) |m, nn| if (m != nn) return false;
+            // Param names are part of identity (see hash) so each function type
+            // keeps its own displayed parameter names.
+            const xna = self.store.signatureParamNamesOf(x);
+            const yna = self.store.signatureParamNamesOf(y);
+            if (xna.len != yna.len) return false;
+            for (xna, yna) |m, nn| if (!std.mem.eql(u8, m, nn)) return false;
         }
         return true;
     }
