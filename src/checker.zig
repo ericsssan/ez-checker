@@ -14171,8 +14171,13 @@ pub const Checker = struct {
                         const st = self.buildClassStaticType(cls_decl, inner_name);
                         if (!st.eq(tymod.ID_UNKNOWN)) {
                             const t = self.memberOnApparentType(st, prop_name, obj_node);
-                            if (!tymod.isUnknown(&self.store, t)) return t;
+                            // Skip `any`/unknown — a re-entrant static build (e.g.
+                            // `this.c` inside a `static f = () => …` arrow) yields a
+                            // bare typeRef whose member lookup degrades to `any`;
+                            // the direct scan below recovers the real type.
+                            if (!tymod.isUnknown(&self.store, t) and !tymod.isAny(&self.store, t)) return t;
                         }
+                        if (self.classStaticDirectPropLookup(cls_decl, prop_name)) |dt| return dt;
                         // Function.prototype apply/call/bind on the class
                         // constructor value — NewableFunction overloads.
                         if (self.functionBindCallApplyType(prop_name, true)) |ty| return ty;
@@ -15577,6 +15582,49 @@ pub const Checker = struct {
             if (pd.type_annotation == .none) return null;
             const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
             return self.resolveTypeNode(ty_node);
+        }
+        return null;
+    }
+
+    /// Directly look up a STATIC property's type on a class body, without
+    /// rebuilding the whole static type (cycle-safe: used when
+    /// `buildClassStaticType` re-enters via a `static f = () => this.x` arrow).
+    fn classStaticDirectPropLookup(self: *Checker, class_decl: NodeIndex, prop_name: []const u8) ?TypeId {
+        // Private (`#x`) members have dedicated handling — don't shadow it.
+        if (prop_name.len > 0 and prop_name[0] == '#') return null;
+        const cdata_node = self.ast_ref.nodeData(class_decl);
+        if (cdata_node.lhs == .none) return null;
+        const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata_node.lhs));
+        if (cd.body == .none) return null;
+        const body_data = self.ast_ref.nodeData(cd.body);
+        const slice = self.directRange(body_data.lhs, body_data.rhs) orelse return null;
+        for (slice) |raw| {
+            const m: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(m) != .property_def) continue;
+            if (!self.classMemberIsStatic(m)) continue;
+            const mdata = self.ast_ref.nodeData(m);
+            if (mdata.lhs == .none) continue;
+            const ktag = self.ast_ref.nodeTag(mdata.lhs);
+            if (ktag != .identifier and ktag != .property_ident) continue;
+            const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+            if (!std.mem.eql(u8, key, prop_name)) continue;
+            const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(mdata.rhs));
+            if (pd.type_annotation != .none and
+                self.ast_ref.nodeTag(pd.type_annotation) == .ts_type_annotation)
+            {
+                return self.resolveTypeNode(self.ast_ref.nodeData(pd.type_annotation).lhs);
+            }
+            if (pd.value != .none) {
+                const raw_ty = self.typeOf(pd.value);
+                return switch (self.store.get(raw_ty).kind) {
+                    .string_literal => tymod.ID_STRING,
+                    .number_literal => tymod.ID_NUMBER,
+                    .boolean_literal => tymod.ID_BOOLEAN,
+                    .bigint_literal => tymod.ID_BIGINT,
+                    else => raw_ty,
+                };
+            }
+            return null;
         }
         return null;
     }
