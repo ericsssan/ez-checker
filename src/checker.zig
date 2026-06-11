@@ -1339,6 +1339,21 @@ pub const Checker = struct {
     }
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
+        // The local binding of `import * as X from "<spec>"`: the declaration
+        // site has no reference symbol, but tsc types it `typeof X`.  Resolved
+        // via the in-memory cross-file resolver (gated to a known relative
+        // sibling section that isn't an `export =` module).
+        ns_decl: {
+            const parents = self.semantic.parent_indices;
+            const ni = node.toInt();
+            if (ni >= parents.len) break :ns_decl;
+            const p = parents[ni];
+            if (p == @intFromEnum(NodeIndex.none)) break :ns_decl;
+            if (self.ast_ref.nodeTag(@enumFromInt(p)) != .import_namespace_specifier) break :ns_decl;
+            const ns_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+            const spec = self.namespace_import_map.get(ns_name) orelse break :ns_decl;
+            if (self.namespaceImportBindingType(ns_name, spec)) |t| return t;
+        }
         if (self.symbolForIdentRef(node)) |sym| {
             // Namespace or class identifier in value position → `typeof Name`.
             // Guard: skip type-annotation positions (where tsc says `any`).
@@ -14348,6 +14363,46 @@ pub const Checker = struct {
             }
         }
         return null;
+    }
+
+    /// The `ModuleFile` (byte span) of the sibling section that `spec` resolves
+    /// to, or null.  Matches on the basename with extension stripped.
+    fn moduleFileForSpec(self: *Checker, spec: []const u8) ?ModuleFile {
+        if (self.checker_opts.module_files.len == 0) return null;
+        if (self.checker_opts.isNode16Style() and node16UnresolvableSpec(spec)) return null;
+        var base = spec;
+        if (std.mem.lastIndexOfScalar(u8, base, '/')) |sl| base = base[sl + 1 ..];
+        if (base.len == 0) return null;
+        const base_noext = if (std.mem.lastIndexOfScalar(u8, base, '.')) |d| base[0..d] else base;
+        for (self.checker_opts.module_files) |mf| {
+            var mn = mf.name;
+            if (std.mem.lastIndexOfScalar(u8, mn, '/')) |sl| mn = mn[sl + 1 ..];
+            if (std.mem.lastIndexOfScalar(u8, mn, '.')) |d| mn = mn[0..d];
+            if (std.mem.endsWith(u8, mn, ".d")) mn = mn[0 .. mn.len - 2];
+            if (std.mem.eql(u8, mn, base) or std.mem.eql(u8, mn, base_noext)) return mf;
+        }
+        return null;
+    }
+
+    /// The display type of the local binding of `import * as X from "<spec>"` —
+    /// `typeof X` for a normal relative ESM module section, or null when it
+    /// can't be resolved cleanly (external/excluded specifier, or `export =`
+    /// module).  Owned string lives in `string_pool`.
+    fn namespaceImportBindingType(self: *Checker, ns_name: []const u8, spec: []const u8) ?TypeId {
+        if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
+        const mf = self.moduleFileForSpec(spec) orelse return null;
+        if (mf.end <= self.ast_ref.source.len) {
+            const sec_src = self.ast_ref.source[mf.start..mf.end];
+            if (std.mem.indexOf(u8, sec_src, "export =") != null or
+                std.mem.indexOf(u8, sec_src, "export=") != null) return null;
+        }
+        const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return null;
+        const r = self.store.typeRef(tn, &.{}) catch {
+            self.gpa.free(tn);
+            return null;
+        };
+        self.string_pool.append(self.gpa, tn) catch self.gpa.free(tn);
+        return r;
     }
 
     /// True when an import specifier refers to one of the sibling sections
