@@ -16190,9 +16190,17 @@ pub const Checker = struct {
 
     fn objectPropExpectedType(self: *Checker, obj_ty: TypeId, key: []const u8) ?TypeId {
         const t = self.store.get(obj_ty);
-        if (t.kind != .object_t) return null;
-        for (self.store.propsOf(t.object_props)) |p| {
-            if (std.mem.eql(u8, p.name, key)) return p.type_id;
+        if (t.kind == .object_t) {
+            for (self.store.propsOf(t.object_props)) |p| {
+                if (std.mem.eql(u8, p.name, key)) return p.type_id;
+            }
+            return null;
+        }
+        // `{ a: T } & { … }` — find the property in any intersection member.
+        if (t.kind == .intersection_t) {
+            for (self.store.idsOf(t.list_data)) |m| {
+                if (self.objectPropExpectedType(m, key)) |pt| return pt;
+            }
         }
         return null;
     }
