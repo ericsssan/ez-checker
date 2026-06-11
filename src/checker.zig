@@ -811,6 +811,8 @@ pub const Checker = struct {
             // function/class (arrows inherit it): `typeof ClassName` in a class,
             // or the enclosing function's own type.
             .new_target => self.inferNewTarget(node),
+            // `import("./spec")` dynamic-import expression.
+            .import_expr => self.inferImportExpr(node),
             // yield's type is TNext of the enclosing Generator — defaults to any
             // when not explicitly typed.  Using any matches tsc's default behaviour.
             .yield_expr, .yield_delegate => tymod.ID_ANY,
@@ -14388,6 +14390,57 @@ pub const Checker = struct {
         return null;
     }
 
+    /// A dynamic-import expression `import("<spec>")`.  When the specifier is a
+    /// string literal resolving to a known sibling module section (and that
+    /// section is a normal ESM module, not `export =`/CJS or a JSON file), tsc
+    /// types it `Promise<typeof import("<spec>")>`.  All other forms (non-literal
+    /// specifier, unresolvable module, CJS/JSON interop) keep the `any` fallback —
+    /// those render with module-shape-dependent types we can't reconstruct here.
+    fn inferImportExpr(self: *Checker, node: NodeIndex) TypeId {
+        const inner = self.importExprAwaitedType(node) orelse return tymod.ID_ANY;
+        // Opaque `Promise<…>` type_ref: renders correctly and exposes no members,
+        // so `import(…).then(…)` stays a gap rather than diverging from tsc's lib
+        // Promise signature.  `await import(…)` is special-cased in inferAwait.
+        const t = self.store.get(inner);
+        const pn = std.fmt.allocPrint(self.gpa, "Promise<{s}>", .{t.name}) catch return tymod.ID_ANY;
+        const r = self.store.typeRef(pn, &.{}) catch {
+            self.gpa.free(pn);
+            return tymod.ID_ANY;
+        };
+        self.string_pool.append(self.gpa, pn) catch self.gpa.free(pn);
+        return r;
+    }
+
+    /// The awaited (unwrapped) type of a dynamic-import expression `import("spec")`:
+    /// `typeof import("spec")` when the specifier is a string literal resolving to a
+    /// known sibling ESM section.  Returns null for any form tsc types as `any`
+    /// (non-literal spec, unresolvable module, JSON, CJS/`export =`, or a relative
+    /// node16/nodenext specifier whose CJS-ness depends on package.json `type`).
+    fn importExprAwaitedType(self: *Checker, node: NodeIndex) ?TypeId {
+        const data = self.ast_ref.nodeData(node);
+        if (data.lhs == .none) return null;
+        if (self.ast_ref.nodeTag(data.lhs) != .string_literal) return null;
+        const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
+        if (raw.len < 2 or !(raw[0] == '\'' or raw[0] == '"')) return null;
+        const spec = raw[1 .. raw.len - 1];
+        if (std.mem.endsWith(u8, spec, ".json")) return null;
+        const is_relative = std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../");
+        if (is_relative and self.checker_opts.isNode16Style()) return null;
+        const mf = self.moduleFileForSpec(spec) orelse return null;
+        if (mf.end <= self.ast_ref.source.len) {
+            const sec_src = self.ast_ref.source[mf.start..mf.end];
+            if (std.mem.indexOf(u8, sec_src, "export =") != null or
+                std.mem.indexOf(u8, sec_src, "export=") != null) return null;
+        }
+        const inner_name = std.fmt.allocPrint(self.gpa, "typeof import(\"{s}\")", .{spec}) catch return null;
+        const inner = self.store.typeRef(inner_name, &.{}) catch {
+            self.gpa.free(inner_name);
+            return null;
+        };
+        self.string_pool.append(self.gpa, inner_name) catch self.gpa.free(inner_name);
+        return inner;
+    }
+
     /// The display type of the local binding of `import * as X from "<spec>"` —
     /// `typeof X` for a normal relative ESM module section, or null when it
     /// can't be resolved cleanly (external/excluded specifier, or `export =`
@@ -16994,6 +17047,17 @@ pub const Checker = struct {
             !self.awaitInAsyncContext(node))
         {
             return tymod.ID_ANY;
+        }
+        // `await import("spec")` → `typeof import("spec")`.  The import expression's
+        // own type is an opaque `Promise<…>` type_ref that resolveAwaited can't peel,
+        // so unwrap it here from the awaited-type helper.
+        if (operand != .none) {
+            var inner_op = operand;
+            if (self.ast_ref.nodeTag(inner_op) == .grouping_expr)
+                inner_op = self.ast_ref.nodeData(inner_op).lhs;
+            if (inner_op != .none and self.ast_ref.nodeTag(inner_op) == .import_expr) {
+                if (self.importExprAwaitedType(inner_op)) |awaited| return awaited;
+            }
         }
         // await unwraps Promise<T> → T, recursing through unions (await of
         // `Promise<A> | Promise<B>` → `A | B`) and nested promises.
