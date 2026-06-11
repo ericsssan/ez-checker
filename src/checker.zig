@@ -14205,7 +14205,10 @@ pub const Checker = struct {
         return switch (obj.kind) {
             .string, .string_literal, .number, .number_literal,
             .boolean, .boolean_literal, .null_t, .undefined_t,
-            .void_t, .never, .bigint, .bigint_literal, .symbol => tymod.ID_UNKNOWN,
+            .void_t, .bigint, .bigint_literal, .symbol => tymod.ID_UNKNOWN,
+            // Property access on `never` (e.g. an exhausted else branch) is an
+            // error tsc recovers to `any`.
+            .never => tymod.ID_ANY,
             else => tymod.ID_ANY,
         };
     }
