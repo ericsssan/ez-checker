@@ -7824,6 +7824,49 @@ pub const Checker = struct {
     /// unions: each interpolation can expand to multiple variants
     /// when its type is a union of string literals; the result is the
     /// cross-product of all such variants.
+    /// `` `foo${string}` `` template-literal-type syntax display (when an
+    /// interpolation can't be enumerated), as an opaque type_ref.
+    fn templateLiteralTypeDisplay(self: *Checker, ty_node: NodeIndex) ?TypeId {
+        const data = self.ast_ref.nodeData(ty_node);
+        const slice = self.directRange(data.lhs, data.rhs) orelse return null;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        buf.append(self.gpa, '`') catch return null;
+        for (slice) |raw| {
+            const part: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(part) == .template_element) {
+                const tok = self.ast_ref.nodeMainToken(part);
+                const start = self.ast_ref.tokenStart(tok);
+                const len = self.ast_ref.tokens.items(.len)[tok];
+                const src = self.ast_ref.source;
+                if (start + len > src.len) return null;
+                var span_start = start;
+                var span_end: u32 = start + len;
+                if (span_start < span_end and (src[span_start] == '`' or src[span_start] == '}')) span_start += 1;
+                if (span_end >= span_start + 2 and src[span_end - 1] == '{' and src[span_end - 2] == '$') {
+                    span_end -= 2;
+                } else if (span_end > span_start and src[span_end - 1] == '`') {
+                    span_end -= 1;
+                }
+                buf.appendSlice(self.gpa, src[span_start..span_end]) catch return null;
+            } else {
+                const s = self.typeToString(self.resolveTypeNode(part)) catch return null;
+                defer self.gpa.free(s);
+                buf.appendSlice(self.gpa, "${") catch return null;
+                buf.appendSlice(self.gpa, s) catch return null;
+                buf.append(self.gpa, '}') catch return null;
+            }
+        }
+        buf.append(self.gpa, '`') catch return null;
+        const owned = buf.toOwnedSlice(self.gpa) catch return null;
+        const r = self.store.typeRef(owned, &.{}) catch {
+            self.gpa.free(owned);
+            return null;
+        };
+        self.string_pool.append(self.gpa, owned) catch self.gpa.free(owned);
+        return r;
+    }
+
     fn resolveTemplateLiteralType(self: *Checker, ty_node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(ty_node);
         const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_STRING;
@@ -7859,7 +7902,10 @@ pub const Checker = struct {
             const id = self.resolveTypeNode(part);
             var options_buf: [16][]const u8 = undefined;
             const opt_count = self.gatherStringLiteralOptions(id, &options_buf) catch return tymod.ID_STRING;
-            if (opt_count == 0) return tymod.ID_STRING;
+            // A non-finite interpolation (`${string}`, `${number}`, a type param)
+            // can't be enumerated — tsc keeps the template-literal-type syntax
+            // (`` `foo${string}` ``) rather than widening to `string`.
+            if (opt_count == 0) return self.templateLiteralTypeDisplay(ty_node) orelse tymod.ID_STRING;
             const prev_len = variants.items.len;
             // Cross product: each existing variant × each option.
             for (0..opt_count - 1) |_| {
