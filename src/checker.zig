@@ -2948,6 +2948,13 @@ pub const Checker = struct {
         var buf: [16]TypeId = undefined;
         var n: usize = 0;
         for (self.store.idsOf(t.list_data)) |m| {
+            // A `boolean` union member narrows to its truthy/falsy literal.
+            if (m.eq(tymod.ID_BOOLEAN)) {
+                if (n >= buf.len) return ty;
+                buf[n] = self.store.booleanLiteral(!negate) catch m;
+                n += 1;
+                continue;
+            }
             const is_falsy_literal = m.eq(tymod.ID_NULL) or
                 m.eq(tymod.ID_UNDEFINED) or m.eq(tymod.ID_VOID);
             const keep = if (negate) is_falsy_literal else !is_falsy_literal;
