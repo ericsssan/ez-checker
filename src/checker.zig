@@ -2510,10 +2510,33 @@ pub const Checker = struct {
                         ty = self.applyNarrowing(data.lhs, sym, ty, true);
                     }
                 },
+                .switch_case => {
+                    ty = self.narrowBySwitchCase(pn, sym, ty);
+                },
                 else => {},
             }
             prev = p;
             p = self.semantic.parent_indices[p];
+        }
+        return ty;
+    }
+
+    /// Narrow `sym` for a use inside `switch (typeof sym) { case 'kind': … }`.
+    /// `case_node` is the enclosing switch_case; its parent switch_stmt holds the
+    /// discriminant. Only the `typeof`-discriminant form is handled here.
+    fn narrowBySwitchCase(self: *Checker, case_node: NodeIndex, sym: symbol_mod.SymbolId, ty: TypeId) TypeId {
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const ci = case_node.toInt();
+        if (ci >= self.semantic.parent_indices.len) return ty;
+        const swp = self.semantic.parent_indices[ci];
+        if (swp == NONE) return ty;
+        const sw: NodeIndex = @enumFromInt(swp);
+        if (self.ast_ref.nodeTag(sw) != .switch_stmt) return ty;
+        const disc = self.ast_ref.nodeData(sw).lhs;
+        const label = self.ast_ref.nodeData(case_node).lhs;
+        if (disc == .none or label == .none) return ty;
+        if (self.tryTypeofNarrow(disc, label, sym, false, false)) |spec| {
+            return self.intersectNarrow(ty, spec.kind, spec.keep_only);
         }
         return ty;
     }
@@ -5862,7 +5885,11 @@ pub const Checker = struct {
             if (self.resolveDeclaredType(t.name)) |resolved| {
                 if (!resolved.eq(id)) return self.keyofOf(resolved);
             }
+            // Unresolved reference (a type parameter like `T`): tsc keeps
+            // `keyof T` symbolic rather than collapsing it to `string`.
+            if (t.name.len > 0) return self.symbolicKeyof(t.name);
         }
+        if (t.kind == .type_param and t.name.len > 0) return self.symbolicKeyof(t.name);
         // Array: keyof T[] includes number-coercible string indices +
         // 'length' / 'push' / 'pop' / etc.  TS technically returns a
         // huge union here; conservative: return number (the rule's
@@ -5871,6 +5898,13 @@ pub const Checker = struct {
             return tymod.ID_NUMBER;
         }
         return tymod.ID_STRING;
+    }
+
+    /// A display-only `keyof <name>` type for an unresolved type-parameter
+    /// operand (rendered verbatim via the type_ref name).
+    fn symbolicKeyof(self: *Checker, name: []const u8) TypeId {
+        const kn = std.fmt.allocPrint(self.gpa, "keyof {s}", .{name}) catch return tymod.ID_STRING;
+        return self.store.typeRef(kn, &.{}) catch tymod.ID_STRING;
     }
 
     /// `typeof x` in type position — resolve to the value-side type of
