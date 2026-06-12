@@ -9417,6 +9417,16 @@ pub const Checker = struct {
                 // `T[P]` / `T[keyof U]` over a generic object — can't evaluate;
                 // tsc keeps it symbolic as `T[Index]`.
                 return self.indexedAccessDisplay(obj_ty, data.rhs);
+            } else if (ot.kind == .type_ref and ot.name.len > 0 and
+                self.argIsInScopeTypeParam(data.rhs))
+            {
+                // `Named[K]` over a named object with a symbolic (type-parameter)
+                // index — `M1[K]`, `PartMappings[K]`.  tsc keeps it symbolic as
+                // `Named[Index]` (evaluable string-literal keys took the branch
+                // above).  When `K` is later bound to a concrete key the access is
+                // re-resolved through substitution, so leaving it symbolic here is
+                // correct for the generic-signature display.
+                return self.indexedAccessDisplay(obj_ty, data.rhs);
             }
             return tymod.ID_UNKNOWN;
         };
