@@ -3182,7 +3182,7 @@ pub const Checker = struct {
                         ty = self.applyNarrowing(data.lhs, sym, ty, true);
                     }
                 },
-                .switch_case => {
+                .switch_case, .switch_default => {
                     ty = self.narrowBySwitchCase(pn, sym, ty, node);
                 },
                 else => {},
@@ -3205,20 +3205,26 @@ pub const Checker = struct {
         const sw: NodeIndex = @enumFromInt(swp);
         if (self.ast_ref.nodeTag(sw) != .switch_stmt) return ty;
         const disc = self.ast_ref.nodeData(sw).lhs;
+        if (disc == .none) return ty;
         const label = self.ast_ref.nodeData(case_node).lhs;
-        if (disc == .none or label == .none) return ty;
         // `switch (true) { case <boolean-expr>: }` — the discriminant `true`
         // equals the matched case expression, so each case body narrows `sym`
         // exactly as `if (<case-expr>)` would (typeof / instanceof / predicate /
-        // truthy / `in` — all routed through applyNarrowing).
+        // truthy / `in` — all routed through applyNarrowing).  The `default`
+        // clause (label `.none`) narrows by the negation of every case
+        // condition (it runs only when nothing matched).
         if (self.ast_ref.nodeTag(disc) == .boolean_literal and
             std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(disc)), "true"))
         {
+            if (self.ast_ref.nodeTag(case_node) == .switch_default)
+                return self.narrowBySwitchTrueDefault(sw, case_node, sym, ty);
+            if (label == .none) return ty;
             // Only the case BODY is narrowed — a read inside the case
             // condition itself (`x` in `case isA(x):`) sees the un-narrowed type.
             if (self.descendsFrom(use_node, label)) return ty;
-            return self.applyNarrowing(label, sym, ty, false);
+            return self.narrowBySwitchTrueCase(sw, case_node, label, sym, ty);
         }
+        if (label == .none) return ty;
         // `switch (typeof x) { case 'kind': }`
         if (self.tryTypeofNarrow(disc, label, sym, false, false)) |spec| {
             return self.intersectNarrow(ty, spec.kind, spec.keep_only);
@@ -3232,6 +3238,102 @@ pub const Checker = struct {
             return self.narrowToCaseLiteral(ty, label);
         }
         return ty;
+    }
+
+    /// `switch (true)` case-body narrowing for clause `case_node`.  Beyond the
+    /// clause's own condition, an immediately-preceding run of EMPTY-body case
+    /// clauses (`case A: case B: body`) also reaches this body via fallthrough,
+    /// so the result is the UNION of each stacked condition's narrowing
+    /// (`input` becomes `A | B`).  Falls back to the single-condition narrowing
+    /// when the clause list can't be resolved.
+    fn narrowBySwitchTrueCase(self: *Checker, sw: NodeIndex, case_node: NodeIndex, label: NodeIndex, sym: symbol_mod.SymbolId, ty: TypeId) TypeId {
+        const single = self.applyNarrowing(label, sym, ty, false);
+        const clauses = self.safeSubRange(self.ast_ref.nodeData(sw).rhs) orelse return single;
+        const extra = self.ast_ref.extra_data;
+        if (clauses.end > extra.len) return single;
+        const cl = extra[clauses.start..clauses.end];
+        const ci: u32 = @intFromEnum(case_node);
+        var k: usize = cl.len;
+        for (cl, 0..) |c, i| {
+            if (c == ci) {
+                k = i;
+                break;
+            }
+        }
+        if (k == cl.len) return single;
+        // Walk back over immediately-preceding empty-body case clauses.
+        var first = k;
+        while (first > 0) {
+            const prev: NodeIndex = @enumFromInt(cl[first - 1]);
+            if (self.ast_ref.nodeTag(prev) != .switch_case) break;
+            const pb = self.safeSubRange(self.ast_ref.nodeData(prev).rhs);
+            const empty = pb == null or pb.?.start == pb.?.end;
+            if (!empty) break;
+            first -= 1;
+        }
+        if (first == k) return single; // no stacked predecessors
+        var buf: [16]TypeId = undefined;
+        var n: usize = 0;
+        var i = first;
+        while (i <= k and n < buf.len) : (i += 1) {
+            const clause: NodeIndex = @enumFromInt(cl[i]);
+            const lab = self.ast_ref.nodeData(clause).lhs;
+            if (lab == .none) continue;
+            buf[n] = self.applyNarrowing(lab, sym, ty, false);
+            n += 1;
+        }
+        if (n == 0) return single;
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch single;
+    }
+
+    /// `switch (true) { … default: }` narrowing: the default body runs only when
+    /// no case matched, so narrow `sym` by the NEGATION of every case condition
+    /// (`default` after `A`/`B`/`C` cases ⊢ not-A ∧ not-B ∧ not-C → `D | E`).
+    /// Bails when the default is a fallthrough target (the preceding clause does
+    /// not terminate), since then it is also reachable with a case condition true.
+    fn narrowBySwitchTrueDefault(self: *Checker, sw: NodeIndex, default_node: NodeIndex, sym: symbol_mod.SymbolId, ty: TypeId) TypeId {
+        const clauses = self.safeSubRange(self.ast_ref.nodeData(sw).rhs) orelse return ty;
+        const extra = self.ast_ref.extra_data;
+        if (clauses.end > extra.len) return ty;
+        const cl = extra[clauses.start..clauses.end];
+        const di: u32 = @intFromEnum(default_node);
+        var k: usize = cl.len;
+        for (cl, 0..) |c, i| {
+            if (c == di) {
+                k = i;
+                break;
+            }
+        }
+        if (k == cl.len) return ty;
+        // Reached by fallthrough if a preceding clause doesn't terminate.
+        if (k > 0) {
+            const prev: NodeIndex = @enumFromInt(cl[k - 1]);
+            if (!self.clauseTerminates(prev)) return ty;
+        }
+        var t = ty;
+        for (cl) |c| {
+            const clause: NodeIndex = @enumFromInt(c);
+            if (self.ast_ref.nodeTag(clause) != .switch_case) continue;
+            const lab = self.ast_ref.nodeData(clause).lhs;
+            if (lab == .none) continue;
+            t = self.applyNarrowing(lab, sym, t, true);
+        }
+        return t;
+    }
+
+    /// Whether a switch clause's body unconditionally terminates (its last
+    /// statement is break / return / throw / continue), so the next clause is
+    /// not a fallthrough target.  An empty body falls through.
+    fn clauseTerminates(self: *Checker, clause: NodeIndex) bool {
+        const body = self.safeSubRange(self.ast_ref.nodeData(clause).rhs) orelse return false;
+        const extra = self.ast_ref.extra_data;
+        if (body.start == body.end or body.end == 0 or body.end > extra.len) return false;
+        const last: NodeIndex = @enumFromInt(extra[body.end - 1]);
+        return switch (self.ast_ref.nodeTag(last)) {
+            .break_stmt, .return_stmt, .throw_stmt, .continue_stmt => true,
+            else => false,
+        };
     }
 
     /// Keep the union member(s) of `ty` that the `switch` case label selects.
