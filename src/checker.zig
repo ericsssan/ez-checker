@@ -1998,6 +1998,13 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "globalThis")) {
             return self.store.typeRef("typeof globalThis", &.{}) catch tymod.ID_ANY;
         }
+        // The global `fetch` VALUE renders as the lib's full signature (we only
+        // reach this global fallback when `fetch` isn't a user binding, so a
+        // shadowing jQuery-style `fetch` is unaffected).  The CALL return is
+        // built in inferCallReturn.
+        if (std.mem.eql(u8, name, "fetch") and self.global_value_types.contains("fetch")) {
+            return self.store.typeRef("(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>", &.{}) catch tymod.ID_ANY;
+        }
         if (self.global_value_types.get(name)) |t| {
             // Several globals appear as named constructor/singleton types in tsc's
             // oracle rather than their structural forms. Return typeRef lazily (not
@@ -10101,8 +10108,9 @@ pub const Checker = struct {
         try self.global_value_types.put(self.gpa, "requestAnimationFrame", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_NUMBER));
         try self.global_value_types.put(self.gpa, "cancelAnimationFrame",  try h.fnTypeWithParams(&.{tymod.ID_NUMBER}, tymod.ID_VOID));
 
-        // Fetch API — returns any (Promise<Response> approximated as any for now).
-        try self.global_value_types.put(self.gpa, "fetch", try h.fnTypeWithParams(&.{tymod.ID_ANY, tymod.ID_ANY}, tymod.ID_ANY));
+        // Fetch API — `fetch(…)` → `Promise<Response>`, built lazily in
+        // inferCallReturn (setup-time typeRefs hit the intern-rehash hazard).
+        try self.global_value_types.put(self.gpa, "fetch", try h.fnTypeWithParams(&.{ tymod.ID_ANY, tymod.ID_ANY }, tymod.ID_ANY));
 
         // URI encoding / decoding.
         try self.global_value_types.put(self.gpa, "encodeURIComponent", try h.fnTypeWithParams(&.{tymod.ID_ANY}, tymod.ID_STRING));
@@ -13755,6 +13763,13 @@ pub const Checker = struct {
             {
                 return self.store.typeRef(cname, &.{}) catch tymod.ID_UNKNOWN;
             }
+            // `fetch(…)` → `Promise<Response>` (lib global, when not shadowed by a
+            // user binding).  Built lazily here — setup-time typeRefs hit the
+            // intern-rehash hazard.  `await fetch(…)` unwraps to `Response`.
+            if (std.mem.eql(u8, cname, "fetch") and self.symbolForIdentRef(callee) == null) {
+                const resp = self.store.typeRef("Response", &.{}) catch return tymod.ID_ANY;
+                return self.store.typeRef("Promise", &.{resp}) catch tymod.ID_ANY;
+            }
         }
         // `Object.create(...)` is typed `any` by the lib — surface that so
         // no-unsafe-return / -assignment flag returning or assigning it.
@@ -16995,6 +17010,20 @@ pub const Checker = struct {
         if (std.mem.eql(u8, t.name, "Document")) {
             if (std.mem.eql(u8, name, "body")) {
                 return self.store.typeRef("HTMLElement", &.{}) catch null;
+            }
+        }
+        // `Response` body-consumer methods — each returns a `Promise<…>` (so
+        // `await res.json()` unwraps to the body type).  Extends the fetch chain
+        // (`fetch(…)` → `Promise<Response>`).
+        if (std.mem.eql(u8, t.name, "Response")) {
+            const body: ?TypeId = if (std.mem.eql(u8, name, "json")) tymod.ID_ANY else if (std.mem.eql(u8, name, "text")) tymod.ID_STRING else if (std.mem.eql(u8, name, "blob")) (self.store.typeRef("Blob", &.{}) catch return null) else if (std.mem.eql(u8, name, "arrayBuffer")) (self.store.typeRef("ArrayBuffer", &.{}) catch return null) else if (std.mem.eql(u8, name, "formData")) (self.store.typeRef("FormData", &.{}) catch return null) else null;
+            if (body) |b| {
+                const pr = self.store.typeRef("Promise", &.{b}) catch return null;
+                return self.makeNamedFn(&.{}, &.{}, &.{}, pr);
+            }
+            if (std.mem.eql(u8, name, "clone")) {
+                const r = self.store.typeRef("Response", &.{}) catch return null;
+                return self.makeNamedFn(&.{}, &.{}, &.{}, r);
             }
         }
         // NumberConstructor statics (the value `Number` types as NumberConstructor).
