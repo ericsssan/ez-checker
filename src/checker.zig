@@ -3527,6 +3527,9 @@ pub const Checker = struct {
                 return self.narrowEquality(t, sym, ty, neg);
             },
             .instanceof_expr => return self.narrowInstanceof(t, sym, ty, neg),
+            // `'prop' in obj` — narrow a union receiver to the members that have
+            // (truthy branch) / lack (negated branch) the named property.
+            .in_expr => return self.narrowByIn(t, sym, ty, neg),
             // Truthy guard `if (x) {...}` — inside the truthy branch
             // remove null / undefined / 0 / "" / false.  Inside falsy
             // branch keep only those.
@@ -3629,6 +3632,66 @@ pub const Checker = struct {
         }
         // Truthy branch: replace with class_t.
         return class_t;
+    }
+
+    /// `'prop' in obj` narrowing: keep the union members of `ty` that have the
+    /// named property (truthy branch) or lack it (negated branch).  Only fires
+    /// for a union receiver bound to `sym` and a string-literal key.
+    fn narrowByIn(self: *Checker, test_node: NodeIndex, sym: symbol_mod.SymbolId, ty: TypeId, negate: bool) TypeId {
+        const data = self.ast_ref.nodeData(test_node);
+        if (data.lhs == .none or data.rhs == .none) return ty;
+        // `key in obj` — `obj` (rhs) must be the variable being narrowed.
+        if (!self.identifierBindsToSym(data.rhs, sym)) return ty;
+        if (self.ast_ref.nodeTag(data.lhs) != .string_literal) return ty;
+        const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
+        if (raw.len < 2) return ty;
+        const key = raw[1 .. raw.len - 1];
+        const t = self.store.get(ty);
+        if (t.kind != .union_t) return ty;
+        const members = self.store.idsOf(t.list_data);
+        var buf: [16]TypeId = undefined;
+        var n: usize = 0;
+        for (members) |m| {
+            const has = self.typeHasOwnProperty(m, key);
+            const keep = if (negate) !has else has;
+            if (keep) {
+                if (n >= buf.len) return ty;
+                buf[n] = m;
+                n += 1;
+            }
+        }
+        if (n == 0 or n == members.len) return ty; // no narrowing
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch ty;
+    }
+
+    /// Whether `ty` (an object type, or a type_ref resolving to one) declares a
+    /// property named `key`.  Used by `in`-narrowing; conservative — returns
+    /// false for types it can't resolve to a concrete object shape.
+    fn typeHasOwnProperty(self: *Checker, ty: TypeId, key: []const u8) bool {
+        const t = self.store.get(ty);
+        switch (t.kind) {
+            .object_t => {
+                for (self.store.propsOf(t.object_props)) |p| {
+                    if (std.mem.eql(u8, p.name, key)) return true;
+                }
+                return false;
+            },
+            .type_ref => {
+                const ref_name = t.name;
+                if (self.resolveDeclaredType(ref_name)) |resolved| {
+                    if (!resolved.eq(ty)) return self.typeHasOwnProperty(resolved, key);
+                }
+                return false;
+            },
+            .intersection_t => {
+                for (self.store.idsOf(t.list_data)) |m| {
+                    if (self.typeHasOwnProperty(m, key)) return true;
+                }
+                return false;
+            },
+            else => return false,
+        }
     }
 
     /// Truthy guard: remove null / undefined from a union.  Keep
