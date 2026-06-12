@@ -236,15 +236,22 @@ fn isIdentChar(c: u8) bool {
         (c >= '0' and c <= '9') or c == '_' or c == '$';
 }
 
-/// True when the line containing byte `at` begins (after indentation) with the
-/// `export` keyword — used to confirm a `class X`/`enum X` match is a top-level
-/// export rather than a nested or local declaration.
-fn lineHasExportBefore(src: []const u8, at: usize) bool {
+/// True when the line containing byte `at` begins (after indentation) with a
+/// top-level declaration keyword introducing a `class X`/`enum X`/`namespace X`
+/// — confirming the match is a real declaration rather than a use.  Accepts both
+/// `export enum X` and a bare `enum X` later exported via `export { X }` (an
+/// imported name is necessarily exported, so export-syntax need not be on the
+/// decl line itself).  `const` covers `const enum X`.
+fn lineStartsTopLevelDecl(src: []const u8, at: usize) bool {
     var ls = at;
     while (ls > 0 and src[ls - 1] != '\n') ls -= 1;
     var i = ls;
     while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
-    return std.mem.startsWith(u8, src[i..], "export ");
+    const rest = src[i..];
+    inline for (.{ "export ", "declare ", "const ", "abstract ", "enum ", "class ", "namespace " }) |kw| {
+        if (std.mem.startsWith(u8, rest, kw)) return true;
+    }
+    return false;
 }
 
 /// Resolve a RELATIVE module specifier (`./x`, `../y/z`) written in `from_path`
@@ -15268,6 +15275,17 @@ pub const Checker = struct {
             const obj_node = data.lhs;
             if (self.ast_ref.nodeTag(obj_node) == .identifier) {
                 const obj_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(obj_node));
+                // Cross-file enum: the imported binding is `any` here (its value
+                // type is a coverage gap), but `<Enum>.<member>` still displays
+                // the qualified member name.  Mirror the local-enum path with the
+                // syntactic ref (handled centrally in memberOnApparentType).
+                if ((self.ast_ref.nodeTag(node) == .member_expr or
+                    self.ast_ref.nodeTag(node) == .optional_member_expr) and
+                    data.rhs != .none and self.importedEnumDisplayName(obj_name) != null)
+                {
+                    const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.rhs));
+                    if (prop.len > 0) return self.memberOnApparentType(tymod.ID_ANY, prop, obj_node);
+                }
                 // Check if this is an enum and try to look up the member
                 if (self.enum_kinds.get(obj_name) != null) {
                     const tag = self.ast_ref.nodeTag(node);
@@ -15540,13 +15558,40 @@ pub const Checker = struct {
             while (std.mem.indexOfPos(u8, src, idx, needle)) |at| {
                 const after = at + needle.len;
                 const boundary = after >= src.len or !isIdentChar(src[after]);
-                // Exclude `export const enum <exp>`: tsc renders const enums by the
-                // enum name, not `typeof`.
-                const is_const_enum = std.mem.eql(u8, kw, "enum ") and
-                    at >= 6 and std.mem.endsWith(u8, src[0..at], "const ");
-                if (boundary and !is_const_enum and lineHasExportBefore(src, at)) return local_name;
+                // Both plain and `const enum` value-bind to `typeof <name>` when
+                // imported (e.g. `import { SymbolFlags }` → `typeof SymbolFlags`);
+                // the bare-name positions where const enums render differently are
+                // already filtered by identifierInBareNamePosition at the call site.
+                if (boundary and lineStartsTopLevelDecl(src, at)) return local_name;
                 idx = at + needle.len;
             }
+        }
+        return null;
+    }
+
+    /// When the local binding `local_name` is a named import of an enum (plain
+    /// OR `const enum`), returns the name tsc qualifies member access with — i.e.
+    /// `<name>.<member>`.  Member access on a cross-file enum is purely syntactic
+    /// (the qualified member name), so no value resolution is needed.  Returns
+    /// null for non-enum imports / default imports.
+    fn importedEnumDisplayName(self: *Checker, local_name: []const u8) ?[]const u8 {
+        const entry = self.import_map.get(local_name) orelse return null;
+        const spec = entry.module_specifier;
+        if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
+        const exp = entry.exported_name;
+        if (std.mem.eql(u8, exp, "default")) return null;
+        const src = self.resolvedModuleSpecSource(spec) orelse return null;
+        var buf: [192]u8 = undefined;
+        const needle = std.fmt.bufPrint(&buf, "enum {s}", .{exp}) catch return null;
+        var idx: usize = 0;
+        while (std.mem.indexOfPos(u8, src, idx, needle)) |at| {
+            const after = at + needle.len;
+            const boundary = after >= src.len or !isIdentChar(src[after]);
+            // Qualify with the local binding name — a value `import { E as F }`
+            // displays member access as `F.x` (the alias).  (Rare `import type`
+            // aliases that tsc qualifies by the declared name are left as-is.)
+            if (boundary and lineStartsTopLevelDecl(src, at)) return local_name;
+            idx = at + needle.len;
         }
         return null;
     }
@@ -15983,6 +16028,25 @@ pub const Checker = struct {
     }
 
     fn memberOnApparentType(self: *Checker, obj_ty: TypeId, prop_name: []const u8, obj_node: NodeIndex) TypeId {
+        // Cross-file enum member access (`SymbolFlags.Type` where SymbolFlags is
+        // an imported enum): tsc displays the qualified member name regardless of
+        // the underlying value, so this is purely syntactic — emit the opaque
+        // `<EnumName>.<member>` ref.  Member presence isn't validated (a bad
+        // member is rare and would otherwise be `any`).
+        if (prop_name.len > 0 and obj_node != .none and
+            self.ast_ref.nodeTag(obj_node) == .identifier)
+        {
+            const on = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(obj_node));
+            if (self.importedEnumDisplayName(on)) |ename| {
+                const qn = std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ ename, prop_name }) catch return tymod.ID_ANY;
+                const r = self.store.typeRef(qn, &.{}) catch {
+                    self.gpa.free(qn);
+                    return tymod.ID_ANY;
+                };
+                self.string_pool.append(self.gpa, qn) catch self.gpa.free(qn);
+                return r;
+            }
+        }
         const obj = self.store.get(obj_ty);
         // Remember if input obj_ty is unknown/error so we return `any`
         // instead of `unknown` at the end, following the "unknown source → any"
