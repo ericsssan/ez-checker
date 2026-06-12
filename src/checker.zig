@@ -14342,7 +14342,7 @@ pub const Checker = struct {
                         inst_callee = par;
                 }
             }
-            if (self.newExprInstanceType(inst_callee)) |ty| return ty;
+            if (self.newExprInstanceType(inst_callee, node)) |ty| return ty;
             // `new f()` on a PLAIN function (only call signatures, no construct
             // signature) — tsc types the result `any` (the function's instance
             // type), NOT the call return type.  A value with a construct
@@ -15052,7 +15052,7 @@ pub const Checker = struct {
     /// / grouping wrappers to get the underlying class identifier and
     /// its type args, then resolve to the corresponding type-ref or
     /// declared object_t.
-    fn newExprInstanceType(self: *Checker, callee: NodeIndex) ?TypeId {
+    fn newExprInstanceType(self: *Checker, callee: NodeIndex, call_node: NodeIndex) ?TypeId {
         var c = callee;
         // Peel grouping_expr and new_expr (when the parser shape is
         // `call_expr(new_expr(...))` for `new X<T>()` calls).
@@ -15100,7 +15100,7 @@ pub const Checker = struct {
             return null;
         }
         if (self.ast_ref.nodeTag(c) != .identifier) return null;
-        var args_buf: [4]TypeId = undefined;
+        var args_buf: [8]TypeId = undefined;
         const args_count = blk: {
             if (type_args_end <= type_args_start) break :blk 0;
             const slice = self.ast_ref.extra_data[type_args_start..type_args_end];
@@ -15112,7 +15112,133 @@ pub const Checker = struct {
             }
             break :blk n;
         };
+        // No explicit type args on `new C(...)`: if C is a generic user class,
+        // infer its type arguments from the constructor arguments (the same
+        // unify-against-param-annotation machinery as a generic call).  This
+        // makes the instance render as `C<string, number>` and lets member
+        // access substitute the class type params (via applyDeclTypeArgs).
+        if (args_count == 0 and call_node != .none) {
+            if (self.classDeclForCalleeIdent(c)) |decl| {
+                const inferred = self.inferClassTypeArgs(decl, call_node, &args_buf);
+                if (inferred > 0) return self.classOrLibInstance(c, args_buf[0..inferred]);
+            }
+        }
         return self.classOrLibInstance(c, args_buf[0..args_count]);
+    }
+
+    /// The constructor member of a class body (a `method_def` keyed
+    /// "constructor", or a `constructor_def` overload/declare), or `.none`.
+    /// Prefers the implemented `method_def` (it carries the real params).
+    fn findConstructorMember(self: *Checker, members: []const u32) NodeIndex {
+        var fallback: NodeIndex = .none;
+        for (members) |raw| {
+            const m: NodeIndex = @enumFromInt(raw);
+            const mtag = self.ast_ref.nodeTag(m);
+            if (mtag == .method_def) {
+                const mdata = self.ast_ref.nodeData(m);
+                if (mdata.lhs == .none or mdata.rhs == .none) continue;
+                const ktag = self.ast_ref.nodeTag(mdata.lhs);
+                if (ktag != .identifier and ktag != .property_ident) continue;
+                if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs)), "constructor")) continue;
+                return m;
+            } else if (mtag == .constructor_def) {
+                if (self.ast_ref.nodeData(m).rhs != .none and fallback == .none) fallback = m;
+            }
+        }
+        return fallback;
+    }
+
+    /// Resolve a `new C(...)` callee identifier to its in-scope `class_decl`,
+    /// SCOPE-CORRECTLY via the reference's symbol (NOT the flat
+    /// `type_decl_nodes` map, which collides across same-named classes in
+    /// different scopes — e.g. `NonGeneric.C` vs `Generic.C`).  Returns null
+    /// when the callee isn't a simple in-file class reference.
+    fn classDeclForCalleeIdent(self: *Checker, ident: NodeIndex) ?NodeIndex {
+        if (self.ast_ref.nodeTag(ident) != .identifier) return null;
+        const sym = self.symbolForIdentRef(ident) orelse return null;
+        const decl_name = self.semantic.symbols.getDeclNode(sym);
+        if (decl_name == .none) return null;
+        const parents = self.semantic.parent_indices;
+        if (decl_name.toInt() >= parents.len) return null;
+        const pidx = parents[decl_name.toInt()];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const p: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(p) != .class_decl) return null;
+        return p;
+    }
+
+    /// Infer a generic class's type arguments at a `new C(...)` call that has
+    /// NO explicit type args, by unifying the constructor's parameter
+    /// annotations against the argument types.  Fills `out` (unbound params →
+    /// `unknown`) and returns the type-param count, or 0 when the class isn't
+    /// generic or nothing could be inferred (so the caller keeps bare `C`).
+    fn inferClassTypeArgs(self: *Checker, class_decl: NodeIndex, call_node: NodeIndex, out: *[8]TypeId) usize {
+        const cdata = self.ast_ref.nodeData(class_decl);
+        if (cdata.lhs == .none) return 0;
+        const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
+        const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+        if (cd.type_params_end <= cd.type_params or cd.type_params_end > ext_len) return 0;
+        var names: [8][]const u8 = undefined;
+        var tp_count: usize = 0;
+        for (self.ast_ref.extra_data[cd.type_params..cd.type_params_end]) |raw| {
+            if (tp_count >= names.len) break;
+            const tp_node: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(tp_node) != .ts_type_parameter) continue;
+            names[tp_count] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
+            tp_count += 1;
+        }
+        if (tp_count == 0) return 0;
+        for (0..tp_count) |b| out[b] = TypeId.none;
+        if (cd.body == .none) return 0;
+        const body_data = self.ast_ref.nodeData(cd.body);
+        const members = self.directRange(body_data.lhs, body_data.rhs) orelse return 0;
+        const ctor = self.findConstructorMember(members);
+        if (ctor == .none) return 0;
+        const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(self.ast_ref.nodeData(ctor).rhs));
+        if (md.params_start >= md.params_end or md.params_end > ext_len) return 0;
+        const params = self.ast_ref.extra_data[md.params_start..md.params_end];
+        // Trailing rest parameter (peel default / parameter-property).
+        var rest_pi: usize = std.math.maxInt(usize);
+        if (params.len > 0) {
+            var pn: NodeIndex = @enumFromInt(params[params.len - 1]);
+            if (self.ast_ref.nodeTag(pn) == .assignment_pattern) pn = self.ast_ref.nodeData(pn).lhs;
+            if (self.ast_ref.nodeTag(pn) == .ts_parameter_property) pn = self.ast_ref.nodeData(pn).lhs;
+            if (self.ast_ref.nodeTag(pn) == .rest_element) rest_pi = params.len - 1;
+        }
+        const arg_nodes = self.callArguments(call_node);
+        for (arg_nodes, 0..) |arg_raw, ai| {
+            const pidx = if (ai < params.len) ai else rest_pi;
+            if (pidx == std.math.maxInt(usize) or pidx >= params.len) continue;
+            const param: NodeIndex = @enumFromInt(params[pidx]);
+            const param_ty_node = self.paramAnnotationNode(param) orelse continue;
+            const arg_ty = self.typeOf(@enumFromInt(arg_raw));
+            const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
+            self.matchTypeParam(match_node, arg_ty, names[0..tp_count], out[0..tp_count]);
+        }
+        var any_bound = false;
+        for (out[0..tp_count]) |b| {
+            if (!b.eq(TypeId.none)) { any_bound = true; break; }
+        }
+        if (!any_bound) return 0;
+        for (out[0..tp_count]) |*b| {
+            if (b.eq(TypeId.none)) {
+                // Unbound type param → `unknown` (tsc's default for a param
+                // it couldn't infer from the constructor arguments).
+                b.* = tymod.ID_UNKNOWN;
+            } else {
+                // Widen a bound primitive literal to its base type: a `new`
+                // call is an inference site, so `new C(1, '')` infers
+                // `C<number, string>`, not `C<1, "">`.
+                b.* = switch (self.store.get(b.*).kind) {
+                    .string_literal => tymod.ID_STRING,
+                    .number_literal => tymod.ID_NUMBER,
+                    .boolean_literal => tymod.ID_BOOLEAN,
+                    .bigint_literal => tymod.ID_BIGINT,
+                    else => b.*,
+                };
+            }
+        }
+        return tp_count;
     }
 
     /// True when the callee looks constructible — a ts_instantiation_expr
