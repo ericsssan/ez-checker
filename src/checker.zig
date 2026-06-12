@@ -15179,52 +15179,58 @@ pub const Checker = struct {
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
         if (cd.type_params_end <= cd.type_params or cd.type_params_end > ext_len) return 0;
         var names: [8][]const u8 = undefined;
+        var tp_nodes: [8]NodeIndex = undefined;
         var tp_count: usize = 0;
         for (self.ast_ref.extra_data[cd.type_params..cd.type_params_end]) |raw| {
             if (tp_count >= names.len) break;
             const tp_node: NodeIndex = @enumFromInt(raw);
             if (self.ast_ref.nodeTag(tp_node) != .ts_type_parameter) continue;
             names[tp_count] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
+            tp_nodes[tp_count] = tp_node;
             tp_count += 1;
         }
         if (tp_count == 0) return 0;
         for (0..tp_count) |b| out[b] = TypeId.none;
-        if (cd.body == .none) return 0;
-        const body_data = self.ast_ref.nodeData(cd.body);
-        const members = self.directRange(body_data.lhs, body_data.rhs) orelse return 0;
-        const ctor = self.findConstructorMember(members);
-        if (ctor == .none) return 0;
-        const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(self.ast_ref.nodeData(ctor).rhs));
-        if (md.params_start >= md.params_end or md.params_end > ext_len) return 0;
-        const params = self.ast_ref.extra_data[md.params_start..md.params_end];
-        // Trailing rest parameter (peel default / parameter-property).
-        var rest_pi: usize = std.math.maxInt(usize);
-        if (params.len > 0) {
-            var pn: NodeIndex = @enumFromInt(params[params.len - 1]);
-            if (self.ast_ref.nodeTag(pn) == .assignment_pattern) pn = self.ast_ref.nodeData(pn).lhs;
-            if (self.ast_ref.nodeTag(pn) == .ts_parameter_property) pn = self.ast_ref.nodeData(pn).lhs;
-            if (self.ast_ref.nodeTag(pn) == .rest_element) rest_pi = params.len - 1;
+        // Match the constructor's parameter annotations against the call args,
+        // when the class declares its own constructor.  A class with no
+        // constructor (inherited or implicit) binds nothing — its instance
+        // still renders `C<unknown, …>` (a generic class is NEVER bare).
+        if (cd.body != .none) {
+            if (self.directRange(self.ast_ref.nodeData(cd.body).lhs, self.ast_ref.nodeData(cd.body).rhs)) |members| {
+                const ctor = self.findConstructorMember(members);
+                if (ctor != .none) {
+                    const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(self.ast_ref.nodeData(ctor).rhs));
+                    if (md.params_end > md.params_start and md.params_end <= ext_len) {
+                        const params = self.ast_ref.extra_data[md.params_start..md.params_end];
+                        // Trailing rest parameter (peel default / parameter-property).
+                        var rest_pi: usize = std.math.maxInt(usize);
+                        {
+                            var pn: NodeIndex = @enumFromInt(params[params.len - 1]);
+                            if (self.ast_ref.nodeTag(pn) == .assignment_pattern) pn = self.ast_ref.nodeData(pn).lhs;
+                            if (self.ast_ref.nodeTag(pn) == .ts_parameter_property) pn = self.ast_ref.nodeData(pn).lhs;
+                            if (self.ast_ref.nodeTag(pn) == .rest_element) rest_pi = params.len - 1;
+                        }
+                        const arg_nodes = self.callArguments(call_node);
+                        for (arg_nodes, 0..) |arg_raw, ai| {
+                            const pidx = if (ai < params.len) ai else rest_pi;
+                            if (pidx == std.math.maxInt(usize) or pidx >= params.len) continue;
+                            const param: NodeIndex = @enumFromInt(params[pidx]);
+                            const param_ty_node = self.paramAnnotationNode(param) orelse continue;
+                            const arg_ty = self.typeOf(@enumFromInt(arg_raw));
+                            const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
+                            self.matchTypeParam(match_node, arg_ty, names[0..tp_count], out[0..tp_count]);
+                        }
+                    }
+                }
+            }
         }
-        const arg_nodes = self.callArguments(call_node);
-        for (arg_nodes, 0..) |arg_raw, ai| {
-            const pidx = if (ai < params.len) ai else rest_pi;
-            if (pidx == std.math.maxInt(usize) or pidx >= params.len) continue;
-            const param: NodeIndex = @enumFromInt(params[pidx]);
-            const param_ty_node = self.paramAnnotationNode(param) orelse continue;
-            const arg_ty = self.typeOf(@enumFromInt(arg_raw));
-            const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
-            self.matchTypeParam(match_node, arg_ty, names[0..tp_count], out[0..tp_count]);
-        }
-        var any_bound = false;
-        for (out[0..tp_count]) |b| {
-            if (!b.eq(TypeId.none)) { any_bound = true; break; }
-        }
-        if (!any_bound) return 0;
-        for (out[0..tp_count]) |*b| {
+        for (out[0..tp_count], 0..) |*b, i| {
             if (b.eq(TypeId.none)) {
-                // Unbound type param → `unknown` (tsc's default for a param
-                // it couldn't infer from the constructor arguments).
-                b.* = tymod.ID_UNKNOWN;
+                // Unbound type param: use its declared default (`<T = number>`)
+                // when present, else `unknown` (tsc's fallback for a param it
+                // couldn't infer from the constructor arguments).
+                const def = self.ast_ref.nodeData(tp_nodes[i]).rhs;
+                b.* = if (def != .none) self.resolveTypeNode(def) else tymod.ID_UNKNOWN;
             } else {
                 // Widen a bound primitive literal to its base type: a `new`
                 // call is an inference site, so `new C(1, '')` infers
