@@ -14730,6 +14730,45 @@ pub const Checker = struct {
                         n += 1;
                     }
                 },
+                .computed_property => {
+                    // `{ [x]: v }` with a late-bound (`unique symbol`) key — tsc
+                    // renders the member as `[x]: T`.  Gated to a plain-identifier
+                    // key (a `Symbol.iterator`-style member key needs its full
+                    // qualified source, handled elsewhere) and a non-function
+                    // value (method/contextual-param typing diverges).  Any other
+                    // computed key widens to an index signature tsc models
+                    // differently, so bail.
+                    const pd = self.ast_ref.nodeData(p);
+                    if (pd.lhs == .none or pd.rhs == .none) return tymod.ID_UNKNOWN;
+                    if (self.ast_ref.nodeTag(pd.lhs) != .identifier) return tymod.ID_UNKNOWN;
+                    const key_ty = self.typeOf(pd.lhs);
+                    const kt = self.store.get(key_ty);
+                    if (!(kt.kind == .type_ref and std.mem.eql(u8, kt.name, "unique symbol")))
+                        return tymod.ID_UNKNOWN;
+                    const val_ty = self.typeOf(pd.rhs);
+                    const val_t = self.store.get(val_ty);
+                    if (val_t.kind == .function_t) return tymod.ID_UNKNOWN;
+                    const key_disp = self.computedKeyName(pd.lhs) orelse return tymod.ID_UNKNOWN;
+                    const widened_ty = switch (val_t.kind) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        else => val_ty,
+                    };
+                    // Dedup: a later computed key with the same display wins.
+                    var dup = false;
+                    for (buf[0..n]) |*bp| {
+                        if (std.mem.eql(u8, bp.name, key_disp)) {
+                            bp.type_id = widened_ty;
+                            dup = true;
+                            break;
+                        }
+                    }
+                    if (!dup) {
+                        buf[n] = .{ .name = key_disp, .type_id = widened_ty };
+                        n += 1;
+                    }
+                },
                 .spread_element => {
                     // Spreading any value (any/object/unknown/complex) makes the whole object `any`.
                     return tymod.ID_ANY;
@@ -14739,6 +14778,21 @@ pub const Checker = struct {
             }
         }
         return self.store.objectOf(buf[0..n]) catch tymod.ID_UNKNOWN;
+    }
+
+    /// Display name for a late-bound computed key: the bracketed source text of
+    /// the key expression (`[x]`, `[N.s]`, `[Symbol.iterator]`).  Owned string
+    /// lives in `string_pool`.
+    fn computedKeyName(self: *Checker, key: NodeIndex) ?[]const u8 {
+        const span = self.ast_ref.nodeSpan(key);
+        const src = self.ast_ref.source;
+        if (span.start >= span.end or span.end > src.len) return null;
+        const disp = std.fmt.allocPrint(self.gpa, "[{s}]", .{src[span.start..span.end]}) catch return null;
+        self.string_pool.append(self.gpa, disp) catch {
+            self.gpa.free(disp);
+            return null;
+        };
+        return disp;
     }
 
     /// Property-key string for an object-literal member, including numeric
@@ -18557,6 +18611,8 @@ pub const Checker = struct {
 /// else (hyphens, dots, spaces, leading digits, etc.) needs double-quotes.
 fn needsPropertyQuoting(name: []const u8) bool {
     if (name.len == 0) return true;
+    // Late-bound computed key (`[x]`, `[Symbol.iterator]`) — rendered verbatim.
+    if (name[0] == '[' and name[name.len - 1] == ']') return false;
     // tsc renders a property key unquoted iff it is a CANONICAL numeric-literal
     // name: `(+name).toString() === name`. So "0"/"100"/"1.5" are unquoted, but
     // "1.0", "1.", "007", "0.0" (non-canonical) stay quoted. We only consider the
