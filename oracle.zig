@@ -600,7 +600,10 @@ pub fn run(opts: Options) !Result {
                     stats.sections_large += unit.section_count;
                     continue;
                 }
-                const uctx: ?*ModuleCtx = if (unit.is_module) mctx else null;
+                // Both isolated modules and the shared (script) unit get the
+                // resolver: scripts can carry dynamic imports (`import('./x')`)
+                // that must resolve to sibling module sections.
+                const uctx: ?*ModuleCtx = mctx;
                 const r = evalSectionFull(fa, unit.sec, lang, comp_opts, &coll, names_buf[0..names_n], uctx, unit.file_path);
                 accumulateResultN(&stats, r, lang, comp_opts, unit.section_count);
             }
