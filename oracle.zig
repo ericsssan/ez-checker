@@ -1031,13 +1031,17 @@ fn sectionIsModule(sec: Section) bool {
     if (Language.fromExtension(sec.name) == .dts) return false;
     const src = sec.source;
     var i: usize = 0;
+    var depth: i32 = 0; // brace nesting — only top-level (0) import/export marks a module
     while (i < src.len) {
         while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
         const line_start = i;
         var j = i;
         while (j < src.len and src[j] != '\n') j += 1;
         const line = src[line_start..j];
-        if (std.mem.startsWith(u8, line, "import ") or
+        // A nested `export`/`import` (e.g. `export class` inside `namespace X {}`)
+        // is a namespace member, not a top-level module marker.  Only count it at
+        // brace depth 0.
+        if (depth == 0 and (std.mem.startsWith(u8, line, "import ") or
             std.mem.startsWith(u8, line, "import(") or
             std.mem.startsWith(u8, line, "import\"") or
             std.mem.startsWith(u8, line, "import'") or
@@ -1045,9 +1049,12 @@ fn sectionIsModule(sec: Section) bool {
             std.mem.startsWith(u8, line, "export{") or
             std.mem.startsWith(u8, line, "export*") or
             std.mem.startsWith(u8, line, "export=") or
-            std.mem.startsWith(u8, line, "export default"))
+            std.mem.startsWith(u8, line, "export default")))
         {
             return true;
+        }
+        for (line) |c| {
+            if (c == '{') depth += 1 else if (c == '}') depth -= 1;
         }
         i = j + 1;
     }
