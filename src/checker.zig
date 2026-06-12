@@ -231,6 +231,22 @@ fn dirOfPath(path: []const u8) []const u8 {
     return "";
 }
 
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_' or c == '$';
+}
+
+/// True when the line containing byte `at` begins (after indentation) with the
+/// `export` keyword — used to confirm a `class X`/`enum X` match is a top-level
+/// export rather than a nested or local declaration.
+fn lineHasExportBefore(src: []const u8, at: usize) bool {
+    var ls = at;
+    while (ls > 0 and src[ls - 1] != '\n') ls -= 1;
+    var i = ls;
+    while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
+    return std.mem.startsWith(u8, src[i..], "export ");
+}
+
 /// Resolve a RELATIVE module specifier (`./x`, `../y/z`) written in `from_path`
 /// to one of `module_files`, applying Node-style extension and `/index`
 /// resolution.  Returns the matched ModuleFile, or null.  Bare specifiers are
@@ -1535,6 +1551,14 @@ pub const Checker = struct {
                     {
                         return tymod.ID_ANY;
                     }
+                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
+                    return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                }
+                // A named/default import of a type-entity (enum / class / namespace)
+                // used as a value → `typeof <localname>`.  tsc displays the LOCAL
+                // binding name.  Member access on it stays a coverage gap (the
+                // members aren't resolved cross-file), never a wrong concrete.
+                if (self.importedNameIsTypeofEntity(ns_name)) {
                     const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
                     return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
                 }
@@ -15480,6 +15504,40 @@ pub const Checker = struct {
     /// `typeof X` for a normal relative ESM module section, or null when it
     /// can't be resolved cleanly (external/excluded specifier, or `export =`
     /// module).  Owned string lives in `string_pool`.
+    /// True when the local binding `local_name` is a named/default import whose
+    /// target module declares the exported name as a type-entity (enum / class /
+    /// namespace / `export default class`) — i.e. tsc types a value-position use
+    /// `typeof <local_name>`.  Resolved textually from the target source (no
+    /// member resolution); mirrors the `export =` source scan used elsewhere.
+    fn importedNameIsTypeofEntity(self: *Checker, local_name: []const u8) bool {
+        const entry = self.import_map.get(local_name) orelse return false;
+        const spec = entry.module_specifier;
+        if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return false;
+        const src = self.resolvedModuleSpecSource(spec) orelse return false;
+        const exp = entry.exported_name;
+        if (std.mem.eql(u8, exp, "default")) {
+            return std.mem.indexOf(u8, src, "export default class ") != null or
+                std.mem.indexOf(u8, src, "export default abstract class ") != null;
+        }
+        // Look for `export {enum,class,namespace} <exp>` (with declare/abstract/const
+        // modifiers between `export` and the keyword tolerated by scanning for the
+        // keyword+name pair anywhere a top-level export introduces it).
+        var buf: [192]u8 = undefined;
+        inline for (.{ "enum ", "class ", "namespace " }) |kw| {
+            const needle = std.fmt.bufPrint(&buf, "{s}{s}", .{ kw, exp }) catch return false;
+            var idx: usize = 0;
+            while (std.mem.indexOfPos(u8, src, idx, needle)) |at| {
+                // Require a word boundary after the name (so `class Foo` doesn't
+                // match `class FooBar`) and an `export` earlier on the line.
+                const after = at + needle.len;
+                const boundary = after >= src.len or !isIdentChar(src[after]);
+                if (boundary and lineHasExportBefore(src, at)) return true;
+                idx = at + needle.len;
+            }
+        }
+        return false;
+    }
+
     fn namespaceImportBindingType(self: *Checker, ns_name: []const u8, spec: []const u8) ?TypeId {
         // node16/nodenext requires an explicit extension on relative imports; an
         // extensionless/directory specifier is unresolvable → tsc types it `any`.
