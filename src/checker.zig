@@ -1046,6 +1046,32 @@ pub const Checker = struct {
                 );
                 break :blk mresult;
             },
+            // A computed object-literal property (`[Symbol.iterator]: 0`): the
+            // oracle anchors the member's type at the `[…]` key span, and tsc
+            // types it as the property VALUE (literals widened, matching the
+            // mutable-object-literal property type).  Method members are
+            // `.computed_method_def` (handled above).
+            .computed_property => blk: {
+                const d = self.ast_ref.nodeData(node);
+                if (d.rhs == .none) break :blk tymod.ID_ANY;
+                const vty = self.typeOf(d.rhs);
+                // `as const` object or an explicitly-asserted value keeps the
+                // literal type (no widening), matching tsc.
+                const rtag = self.ast_ref.nodeTag(d.rhs);
+                if (rtag == .ts_as_expr or rtag == .ts_type_assertion or
+                    self.computedPropInConstAssertion(node)) break :blk vty;
+                break :blk switch (self.store.get(vty).kind) {
+                    .string_literal => tymod.ID_STRING,
+                    .number_literal => tymod.ID_NUMBER,
+                    .boolean_literal => tymod.ID_BOOLEAN,
+                    .bigint_literal => tymod.ID_BIGINT,
+                    // A function value needs contextual typing (from the object's
+                    // contextual type) that we don't apply here; emitting the
+                    // under-inferred signature diverges, so leave it a gap.
+                    .function_t => tymod.ID_UNKNOWN,
+                    else => vty,
+                };
+            },
             .class_decl => tymod.ID_ANY,
             .class_expr => tymod.ID_UNKNOWN,
             // Spread element `...expr` in call args/array literals:
@@ -15308,6 +15334,24 @@ pub const Checker = struct {
     /// Display name for a late-bound computed key: the bracketed source text of
     /// the key expression (`[x]`, `[N.s]`, `[Symbol.iterator]`).  Owned string
     /// lives in `string_pool`.
+    /// True when a computed object-literal property `node` sits inside an object
+    /// literal wrapped in `as const` (`{ [k]: 0 } as const`) — its value keeps
+    /// the literal type rather than widening.
+    fn computedPropInConstAssertion(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const ni = node.toInt();
+        if (ni >= parents.len) return false;
+        const p = parents[ni]; // object_literal
+        if (p == NONE or p >= parents.len) return false;
+        const gp = parents[p]; // ts_as_expr?
+        if (gp == NONE or gp >= self.ast_ref.nodes.len) return false;
+        if (self.ast_ref.nodeTag(@enumFromInt(gp)) != .ts_as_expr) return false;
+        const as_data = self.ast_ref.nodeData(@enumFromInt(gp));
+        if (as_data.rhs == .none or self.ast_ref.nodeTag(as_data.rhs) != .ts_type_reference) return false;
+        return std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(as_data.rhs)), "const");
+    }
+
     fn computedKeyName(self: *Checker, key: NodeIndex) ?[]const u8 {
         const span = self.exprSourceSpan(key);
         const src = self.ast_ref.source;
@@ -16073,6 +16117,16 @@ pub const Checker = struct {
                 if (name.len > 0) {
                     for (self.store.propsOf(snap_props)) |p| {
                         if (std.mem.eql(u8, p.name, name)) return p.type_id;
+                    }
+                }
+            }
+            // Symbol-keyed access (`obj[Symbol.iterator]`): the member is stored
+            // under its computed display name `[Symbol.iterator]`.  Match when the
+            // key's type is `unique symbol` (a real symbol key, not a string).
+            if (kt.kind == .type_ref and std.mem.eql(u8, kt.name, "unique symbol")) {
+                if (self.computedKeyName(key_node)) |disp| {
+                    for (self.store.propsOf(snap_props)) |p| {
+                        if (std.mem.eql(u8, p.name, disp)) return p.type_id;
                     }
                 }
             }
