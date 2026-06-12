@@ -1554,7 +1554,7 @@ const ModuleCtx = struct {
     in_progress: std.StringHashMapUnmanaged(void) = .empty,
 
     fn moduleResolver(self: *ModuleCtx) ez.ModuleResolver {
-        return .{ .ctx = self, .resolve_fn = resolveExportType };
+        return .{ .ctx = self, .resolve_fn = resolveExportType, .module_source_fn = resolveModuleSrc };
     }
 
     fn sectionByName(self: *ModuleCtx, name: []const u8) ?*const Section {
@@ -1593,6 +1593,15 @@ const ModuleCtx = struct {
         return cm;
     }
 };
+
+fn resolveModuleSrc(ctx_ptr: *anyopaque, from_dir: []const u8, spec: []const u8) ?[]const u8 {
+    const self: *ModuleCtx = @ptrCast(@alignCast(ctx_ptr));
+    var fp_buf: [1024]u8 = undefined;
+    const from_path = std.fmt.bufPrint(&fp_buf, "{s}/_", .{from_dir}) catch return null;
+    const mf = ez.resolveRelativeSpec(from_path, spec, self.module_files) orelse return null;
+    const sec = self.sectionByName(mf.name) orelse return null;
+    return sec.source;
+}
 
 fn resolveExportType(
     ctx_ptr: *anyopaque,

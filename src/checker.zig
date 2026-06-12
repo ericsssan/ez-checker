@@ -115,6 +115,16 @@ pub const ModuleResolver = struct {
         local_store: *TypeStore,
         gpa: std.mem.Allocator,
     ) ?TypeId,
+    /// Returns the raw source of the module `spec` resolves to (relative to
+    /// `from_dir`), or null when unresolvable.  Lets the checker run the same
+    /// `export =` / module-shape checks it does in concatenation mode without
+    /// the combined-source byte ranges (which don't exist under per-module
+    /// isolation).
+    module_source_fn: *const fn (
+        ctx: *anyopaque,
+        from_dir: []const u8,
+        module_spec: []const u8,
+    ) ?[]const u8,
 
     pub fn resolveExportedType(
         self: ModuleResolver,
@@ -125,6 +135,10 @@ pub const ModuleResolver = struct {
         gpa: std.mem.Allocator,
     ) ?TypeId {
         return self.resolve_fn(self.ctx, from_dir, module_spec, export_name, local_store, gpa);
+    }
+
+    pub fn moduleSource(self: ModuleResolver, from_dir: []const u8, module_spec: []const u8) ?[]const u8 {
+        return self.module_source_fn(self.ctx, from_dir, module_spec);
     }
 };
 
@@ -15353,6 +15367,19 @@ pub const Checker = struct {
 
     /// The `ModuleFile` (byte span) of the sibling section that `spec` resolves
     /// to, or null.  Matches on the basename with extension stripped.
+    /// Source of the module that `spec` resolves to relative to this file, or
+    /// null when unresolvable.  Under per-module isolation this goes through the
+    /// module resolver (which holds every section's real source); otherwise it
+    /// reads the concatenated combined-source byte range via moduleFileForSpec.
+    fn resolvedModuleSpecSource(self: *Checker, spec: []const u8) ?[]const u8 {
+        if (self.module_resolver) |resolver| {
+            return resolver.moduleSource(dirOfPath(self.file_path), spec);
+        }
+        const mf = self.moduleFileForSpec(spec) orelse return null;
+        if (mf.end > self.ast_ref.source.len or mf.end <= mf.start) return null;
+        return self.ast_ref.source[mf.start..mf.end];
+    }
+
     fn moduleFileForSpec(self: *Checker, spec: []const u8) ?ModuleFile {
         if (self.checker_opts.module_files.len == 0) return null;
         if (self.checker_opts.isNode16Style() and node16UnresolvableSpec(spec)) return null;
@@ -15437,12 +15464,9 @@ pub const Checker = struct {
         if (std.mem.endsWith(u8, spec, ".json")) return null;
         const is_relative = std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../");
         if (is_relative and self.checker_opts.isNode16Style()) return null;
-        const mf = self.moduleFileForSpec(spec) orelse return null;
-        if (mf.end <= self.ast_ref.source.len) {
-            const sec_src = self.ast_ref.source[mf.start..mf.end];
-            if (std.mem.indexOf(u8, sec_src, "export =") != null or
-                std.mem.indexOf(u8, sec_src, "export=") != null) return null;
-        }
+        const sec_src = self.resolvedModuleSpecSource(spec) orelse return null;
+        if (std.mem.indexOf(u8, sec_src, "export =") != null or
+            std.mem.indexOf(u8, sec_src, "export=") != null) return null;
         const inner_name = std.fmt.allocPrint(self.gpa, "typeof import(\"{s}\")", .{spec}) catch return null;
         const inner = self.store.typeRef(inner_name, &.{}) catch {
             self.gpa.free(inner_name);
@@ -15457,13 +15481,13 @@ pub const Checker = struct {
     /// can't be resolved cleanly (external/excluded specifier, or `export =`
     /// module).  Owned string lives in `string_pool`.
     fn namespaceImportBindingType(self: *Checker, ns_name: []const u8, spec: []const u8) ?TypeId {
+        // node16/nodenext requires an explicit extension on relative imports; an
+        // extensionless/directory specifier is unresolvable → tsc types it `any`.
+        if (self.checker_opts.isNode16Style() and node16UnresolvableSpec(spec)) return null;
         if (std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../")) {
-            const mf = self.moduleFileForSpec(spec) orelse return null;
-            if (mf.end <= self.ast_ref.source.len) {
-                const sec_src = self.ast_ref.source[mf.start..mf.end];
-                if (std.mem.indexOf(u8, sec_src, "export =") != null or
-                    std.mem.indexOf(u8, sec_src, "export=") != null) return null;
-            }
+            const sec_src = self.resolvedModuleSpecSource(spec) orelse return null;
+            if (std.mem.indexOf(u8, sec_src, "export =") != null or
+                std.mem.indexOf(u8, sec_src, "export=") != null) return null;
         } else {
             // Bare specifier (`package/sub`) — resolvable only when the package's
             // package.json `exports` exposes the subpath.
