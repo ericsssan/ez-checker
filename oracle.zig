@@ -1033,18 +1033,20 @@ const EvalUnit = struct {
 /// `.d.ts` and plain script files stay in the shared global program.
 fn sectionIsModule(sec: Section) bool {
     if (Language.fromExtension(sec.name) == .dts) return false;
-    const src = sec.source;
+    return hasTopLevelImportExport(sec.source);
+}
+
+/// True when `src` has a top-level (brace depth 0) `import`/`export` — a nested
+/// `export class` inside `namespace X {}` is a member, not a module marker.
+fn hasTopLevelImportExport(src: []const u8) bool {
     var i: usize = 0;
-    var depth: i32 = 0; // brace nesting — only top-level (0) import/export marks a module
+    var depth: i32 = 0;
     while (i < src.len) {
         while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
         const line_start = i;
         var j = i;
         while (j < src.len and src[j] != '\n') j += 1;
         const line = src[line_start..j];
-        // A nested `export`/`import` (e.g. `export class` inside `namespace X {}`)
-        // is a namespace member, not a top-level module marker.  Only count it at
-        // brace depth 0.
         if (depth == 0 and (std.mem.startsWith(u8, line, "import ") or
             std.mem.startsWith(u8, line, "import(") or
             std.mem.startsWith(u8, line, "import\"") or
@@ -1063,6 +1065,15 @@ fn sectionIsModule(sec: Section) bool {
         i = j + 1;
     }
     return false;
+}
+
+/// True for an ambient global `.d.ts` — a declaration file with NO top-level
+/// import/export, so its declarations are global to the whole compilation
+/// (visible across language groups).  A `.d.ts` WITH a top-level export is an
+/// external module, not a global ambient, and is excluded.
+fn dtsIsAmbientGlobal(sec: Section) bool {
+    if (Language.fromExtension(sec.name) != .dts) return false;
+    return !hasTopLevelImportExport(sec.source);
 }
 
 // A multi-section group needs whole-program (concatenated) evaluation when any
@@ -1118,6 +1129,17 @@ fn countLines(s: []const u8) u32 {
 fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]SectionGroup {
     var groups = std.ArrayList(SectionGroup).empty;
 
+    // Ambient global `.d.ts` sections are visible to EVERY other section in the
+    // compilation, even across language groups (e.g. a `react.d.ts` declaring
+    // `namespace JSX` is in scope for a sibling `.tsx`).  Collect them once and
+    // prepend as source-only context to every unit (deduped against the unit's
+    // own sections).
+    var ambient = std.ArrayList(usize).empty;
+    for (sections, 0..) |sec, si| {
+        if (dtsIsAmbientGlobal(sec)) try ambient.append(arena, si);
+    }
+    const ambient_dts = ambient.items;
+
     var i: usize = 0;
     while (i < sections.len) {
         // Find a run of sections that share a compatible language group.
@@ -1162,7 +1184,7 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
             }
             const u = try arena.alloc(EvalUnit, 1);
             u[0] = .{
-                .sec = try buildUnitSection(arena, sections, all_idx.items, null),
+                .sec = try buildUnitSection(arena, sections, ambient_dts, all_idx.items, null),
                 .section_count = end - start,
             };
             try groups.append(arena, .{ .start = start, .end = end, .lang = combined_lang, .units = u });
@@ -1185,14 +1207,14 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
 
         var units = std.ArrayList(EvalUnit).empty;
         if (shared.items.len > 0) {
-            const sec = try buildUnitSection(arena, sections, shared.items, null);
+            const sec = try buildUnitSection(arena, sections, ambient_dts, shared.items, null);
             try units.append(arena, .{ .sec = sec, .section_count = shared.items.len });
         }
         for (modules.items) |mi| {
             var parts = std.ArrayList(usize).empty;
             for (shared.items) |s| try parts.append(arena, s);
             try parts.append(arena, mi);
-            const sec = try buildUnitSection(arena, sections, parts.items, mi);
+            const sec = try buildUnitSection(arena, sections, ambient_dts, parts.items, mi);
             try units.append(arena, .{
                 .sec = sec,
                 .section_count = 1,
@@ -1201,7 +1223,7 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
             });
         }
         if (units.items.len == 0) {
-            const sec = try buildUnitSection(arena, sections, shared.items, null);
+            const sec = try buildUnitSection(arena, sections, ambient_dts, shared.items, null);
             try units.append(arena, .{ .sec = sec, .section_count = end - start });
         }
         try groups.append(arena, .{
@@ -1220,9 +1242,15 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
 /// restricts scored entries to that single section index (an isolated module
 /// unit must not re-score its shared prelude).  module_files cover every
 /// included section for in-source module resolution.
+///
+/// `context` indices are emitted as SOURCE-ONLY prelude (never scored) and are
+/// skipped when they already appear in `indices` — used to make ambient `.d.ts`
+/// globals visible across LANGUAGE groups (a `.d.ts` declaring `namespace JSX`
+/// is global to a sibling `.tsx`, but the two live in different oracle groups).
 fn buildUnitSection(
     arena: std.mem.Allocator,
     sections: []const Section,
+    context: []const usize,
     indices: []const usize,
     entries_only: ?usize,
 ) !Section {
@@ -1231,6 +1259,20 @@ fn buildUnitSection(
     var mod_files = std.ArrayList(ez.ModuleFile).empty;
     var line_offset: u32 = 0;
     var byte_offset: u32 = 0;
+    // Ambient context prelude — source only, no scored entries; skip any index
+    // already present in `indices` (which carries its own source + entries).
+    for (context) |si| {
+        if (std.mem.indexOfScalar(usize, indices, si) != null) continue;
+        const sec = sections[si];
+        try mod_files.append(arena, .{
+            .name = sec.name,
+            .start = byte_offset,
+            .end = byte_offset + @as(u32, @intCast(sec.source.len)),
+        });
+        try src_parts.append(arena, sec.source);
+        byte_offset += @as(u32, @intCast(sec.source.len)) + 1;
+        line_offset += countLines(sec.source);
+    }
     for (indices) |si| {
         const sec = sections[si];
         const include = if (entries_only) |only| (si == only) else true;
