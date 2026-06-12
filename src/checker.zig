@@ -15619,6 +15619,11 @@ pub const Checker = struct {
             // in the enum object or the imported module respectively.
             if (std.mem.startsWith(u8, ref_name, "typeof ")) {
                 const inner_name = ref_name["typeof ".len..];
+                // `globalThis.X` — resolve X as a global value (`globalThis.isNaN`
+                // is the same `(number: number) => boolean` as the bare `isNaN`).
+                if (std.mem.eql(u8, inner_name, "globalThis")) {
+                    if (self.global_value_types.get(prop_name)) |gt| return gt;
+                }
                 // Expando function property: `function foo(){} foo.x = 1` —
                 // `foo.x` (and the property key `x`) has the widened assigned
                 // value type.  Handled here so both read accesses and write
