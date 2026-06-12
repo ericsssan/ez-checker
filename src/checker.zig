@@ -5006,6 +5006,20 @@ pub const Checker = struct {
     /// reading the annotation attached to the identifier (parser stores
     /// the ts_type_annotation node in identifier.data.rhs), or by walking
     /// up to the declarator and falling back to the initializer.
+    /// True when `node` is the parameter of a `catch (param: T)` clause —
+    /// i.e. its parent is a `catch_clause` and it is that clause's lhs (param)
+    /// slot.  Used to apply TypeScript's "only any/unknown" catch-annotation rule.
+    fn bindingIsCatchParam(self: *Checker, node: NodeIndex) bool {
+        const idx = node.toInt();
+        const parents = self.semantic.parent_indices;
+        if (idx >= parents.len) return false;
+        const pidx = parents[idx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return false;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (self.ast_ref.nodeTag(parent) != .catch_clause) return false;
+        return self.ast_ref.nodeData(parent).lhs == node;
+    }
+
     pub fn declaredTypeAtBinding(self: *Checker, binding: NodeIndex) TypeId {
         if (binding == .none) return tymod.ID_ANY;
         // Enum binding: the symbol's decl node is the ts_enum_decl itself
@@ -5056,6 +5070,15 @@ pub const Checker = struct {
                 self.type_pos_depth += 1;
                 var ty = self.resolveTypeNode(ty_node);
                 self.type_pos_depth -= 1;
+                // Catch-clause parameter: TypeScript permits ONLY `any` /
+                // `unknown` here; any other annotation is a type error and the
+                // variable falls back to the catch default (`any` — or
+                // `unknown` under useUnknownInCatchVariables, not modeled).
+                // Honor a valid annotation; ignore the rest, matching tsc.
+                if (self.bindingIsCatchParam(node)) {
+                    if (ty != tymod.ID_ANY and ty != tymod.ID_UNKNOWN) return tymod.ID_ANY;
+                    return ty;
+                }
                 // Optional parameter (`x?: T`) — parser marks the identifier by
                 // setting lhs to `.root`.  Typed `T | undefined` by default (even
                 // with no directive), collapsing to `T` only when strictNullChecks
