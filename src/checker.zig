@@ -2388,21 +2388,24 @@ pub const Checker = struct {
         }
     }
 
-    /// True when `decl` (a ts_enum_decl) is a `const enum` — scan the modifier
-    /// keywords preceding its main token for `const`.
-    fn enumIsConst(self: *Checker, decl: NodeIndex) bool {
+    /// Scans the modifier keywords preceding a ts_enum_decl's main token,
+    /// reporting whether `const` and/or `declare` are present.
+    fn enumModifiers(self: *Checker, decl: NodeIndex) struct { is_const: bool, is_declare: bool } {
         const tok = self.ast_ref.nodeMainToken(decl);
         const tags = self.ast_ref.tokens.items(.tag);
+        var is_const = false;
+        var is_declare = false;
         var i: u32 = tok;
         while (i > 0) {
             i -= 1;
             switch (tags[i]) {
-                .kw_const => return true,
-                .kw_enum, .kw_declare, .kw_export => {},
-                else => return false,
+                .kw_const => is_const = true,
+                .kw_declare => is_declare = true,
+                .kw_enum, .kw_export => {},
+                else => break,
             }
         }
-        return false;
+        return .{ .is_const = is_const, .is_declare = is_declare };
     }
 
     fn buildEnumObjectType(self: *Checker, enum_name: []const u8) ?TypeId {
@@ -2422,7 +2425,13 @@ pub const Checker = struct {
         //  * regular enum: only a direct reference (`enum E { C, D = C }`) shares
         //    a member's nominal type (`E.D : E.C`); a mere value coincidence does
         //    NOT alias.  Keyed by the referenced member name.
-        const is_const_enum = self.enumIsConst(decl);
+        // tsc value-aliases enum members that share a value to the FIRST such
+        // member's name — for non-ambient enums (both `const enum` and regular
+        // `enum`, whose constant members form literal types canonicalized by
+        // value).  An ambient `declare enum` keeps members nominal (distinct),
+        // aliasing only via a direct member reference.
+        const enum_mods = self.enumModifiers(decl);
+        const value_alias = enum_mods.is_const or !enum_mods.is_declare;
         const SeenVal = struct { is_num: bool, num: f64, str: []const u8, name: []const u8 };
         var seen_vals: [256]SeenVal = undefined;
         var seen_n: usize = 0;
@@ -2475,7 +2484,7 @@ pub const Checker = struct {
                 ev_n += 1;
             }
             var canonical_name = member_name;
-            if (is_const_enum) {
+            if (value_alias) {
                 // Value-based: first member with this value wins.  Prefer the
                 // constant-folded numeric value (covers `D = A | B`); fall back
                 // to the literal type for string members.
