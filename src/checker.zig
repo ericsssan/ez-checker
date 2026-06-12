@@ -13170,6 +13170,11 @@ pub const Checker = struct {
                 return self.store.typeRef("unique symbol", &.{}) catch tymod.ID_SYMBOL;
             return tymod.ID_SYMBOL;
         }
+        // `Object.defineProperty(o, …)` / `defineProperties` / `setPrototypeOf`
+        // are typed `<T>(o: T, …) => T` by the lib, so the call returns the
+        // first argument's type.  ez's generic path leaves the bare `T`, so
+        // substitute it with the receiver's actual type.
+        if (self.objectIdentityStaticReturn(node, callee)) |ty| return ty;
         // `Error(...)` / `TypeError(...)` / … called WITHOUT `new` returns an
         // instance of the same type (the lib gives the Error constructors a
         // call signature equal to their construct signature).  Only fires when
@@ -13318,6 +13323,28 @@ pub const Checker = struct {
             }
         }
         return false;
+    }
+
+    /// `Object.defineProperty(o, …)` / `Object.defineProperties(o, …)` /
+    /// `Object.setPrototypeOf(o, …)` return the first argument's type (the lib
+    /// signature is `<T>(o: T, …) => T`).  Returns the receiver's type, or null
+    /// to defer to the generic path (which would leak the bare `T`).
+    fn objectIdentityStaticReturn(self: *Checker, node: NodeIndex, callee: NodeIndex) ?TypeId {
+        var n = callee;
+        while (self.ast_ref.nodeTag(n) == .grouping_expr) n = self.ast_ref.nodeData(n).lhs;
+        const tag = self.ast_ref.nodeTag(n);
+        if (tag != .member_expr and tag != .optional_member_expr) return null;
+        const d = self.ast_ref.nodeData(n);
+        if (d.lhs == .none or d.rhs == .none) return null;
+        if (self.ast_ref.nodeTag(d.lhs) != .identifier) return null;
+        if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs)), "Object")) return null;
+        if (self.symbolForIdentRef(d.lhs) != null) return null; // user-shadowed Object
+        const method = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.rhs));
+        if (!eqAny(method, &.{ "defineProperty", "defineProperties", "setPrototypeOf" })) return null;
+        const args = self.safeSubRange(self.ast_ref.nodeData(node).rhs) orelse return null;
+        if (args.start >= args.end or args.end > self.ast_ref.extra_data.len) return null;
+        const arg0: NodeIndex = @enumFromInt(self.ast_ref.extra_data[args.start]);
+        return self.typeOf(arg0);
     }
 
     fn calleeIsObjectCreate(self: *Checker, callee: NodeIndex) bool {
