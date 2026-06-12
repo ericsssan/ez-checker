@@ -4304,6 +4304,19 @@ pub const Checker = struct {
                 if (data.rhs != .none) {
                     const raw = self.typeOf(data.rhs);
                     const t = self.store.get(raw);
+                    // `unique symbol` only survives on a fresh `Symbol()` /
+                    // `Symbol.for()` call (or an explicit annotation, handled
+                    // above).  A binding initialized from a unique-symbol
+                    // REFERENCE (`const a = constCall;`, `const b = N.s;`)
+                    // widens to `symbol`, matching tsc.
+                    if (t.kind == .type_ref and std.mem.eql(u8, t.name, "unique symbol")) {
+                        const itag = self.ast_ref.nodeTag(data.rhs);
+                        if (itag == .identifier or itag == .member_expr or
+                            itag == .computed_member_expr or itag == .optional_member_expr)
+                        {
+                            return tymod.ID_SYMBOL;
+                        }
+                    }
                     // Array/tuple literals are always widened to T[] — TypeScript
                     // widens `['c', 'd']` to `string[]` for both let and const
                     // (only `as const` produces a readonly tuple literal type).
