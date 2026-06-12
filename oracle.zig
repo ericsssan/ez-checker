@@ -1054,6 +1054,20 @@ fn sectionIsModule(sec: Section) bool {
     return false;
 }
 
+// A multi-section group needs whole-program (concatenated) evaluation when any
+// section carries a quoted `declare module "<spec>" { … }` — either a cross-file
+// augmentation merging into a sibling/ambient module, or an ambient external
+// module definition (`declare module "C"`) that importers resolve.  Per-module
+// isolation evaluates each section in its own scope and can't reproduce either.
+fn groupNeedsConcat(sections: []const Section, start: usize, end: usize) bool {
+    if (end - start < 2) return false;
+    for (sections[start..end]) |sec| {
+        if (std.mem.indexOf(u8, sec.source, "declare module \"") != null or
+            std.mem.indexOf(u8, sec.source, "declare module '") != null) return true;
+    }
+    return false;
+}
+
 // Classify language for grouping: .dts is compatible with .ts (ambient decls).
 fn groupLang(lang: Language) u8 {
     return switch (lang) {
@@ -1124,6 +1138,26 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
             i = end;
             continue;
         };
+
+        // Hybrid: a group containing a cross-file module augmentation
+        // (`declare module "<spec>" { … }`) relies on every section sharing one
+        // scope so the augmentation merges into its target — per-module
+        // isolation can't reconstruct that merge.  Keep such groups whole
+        // (the legacy single-program behaviour); isolate everything else.
+        if (groupNeedsConcat(sections, start, end)) {
+            var all_idx = std.ArrayList(usize).empty;
+            for (start..end) |si| {
+                if (Language.fromExtension(sections[si].name) != null) try all_idx.append(arena, si);
+            }
+            const u = try arena.alloc(EvalUnit, 1);
+            u[0] = .{
+                .sec = try buildUnitSection(arena, sections, all_idx.items, null),
+                .section_count = end - start,
+            };
+            try groups.append(arena, .{ .start = start, .end = end, .lang = combined_lang, .units = u });
+            i = end;
+            continue;
+        }
 
         // Partition: ambient `.d.ts` + plain script files share one global
         // program (`shared`, dts first); each module file is isolated.
