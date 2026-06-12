@@ -1555,12 +1555,14 @@ pub const Checker = struct {
                     return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
                 }
                 // A named/default import of a type-entity (enum / class / namespace)
-                // used as a value → `typeof <localname>`.  tsc displays the LOCAL
-                // binding name.  Member access on it stays a coverage gap (the
-                // members aren't resolved cross-file), never a wrong concrete.
-                if (self.importedNameIsTypeofEntity(ns_name)) {
-                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
-                    return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                // used as a plain value → `typeof <name>`.  Skip heritage / export
+                // positions (bare name there) and member access stays a coverage
+                // gap (members aren't resolved cross-file), never a wrong concrete.
+                if (!self.identifierInBareNamePosition(node)) {
+                    if (self.importedTypeEntityDisplayName(ns_name)) |disp| {
+                        const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp}) catch return tymod.ID_ANY;
+                        return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                    }
                 }
             }
             if ((bkind == .namespace_decl or bkind == .class_decl or bkind == .enum_decl) and
@@ -15504,36 +15506,71 @@ pub const Checker = struct {
     /// `typeof X` for a normal relative ESM module section, or null when it
     /// can't be resolved cleanly (external/excluded specifier, or `export =`
     /// module).  Owned string lives in `string_pool`.
-    /// True when the local binding `local_name` is a named/default import whose
-    /// target module declares the exported name as a type-entity (enum / class /
-    /// namespace / `export default class`) — i.e. tsc types a value-position use
-    /// `typeof <local_name>`.  Resolved textually from the target source (no
-    /// member resolution); mirrors the `export =` source scan used elsewhere.
-    fn importedNameIsTypeofEntity(self: *Checker, local_name: []const u8) bool {
-        const entry = self.import_map.get(local_name) orelse return false;
+    /// When the local binding `local_name` is a named/default import whose target
+    /// module declares the exported name as a non-const type-entity (enum / class
+    /// / namespace / `export default class`), returns the name tsc displays for a
+    /// value-position use as `typeof <name>`.  For a default class import that is
+    /// the ORIGINAL declared class name (`export default class Foo` → `Foo`), not
+    /// the local binding; for named imports it is the local binding.  Returns null
+    /// otherwise.  Resolved textually (no member resolution); `const enum` is
+    /// excluded (tsc renders those by the enum name, not `typeof`).
+    fn importedTypeEntityDisplayName(self: *Checker, local_name: []const u8) ?[]const u8 {
+        const entry = self.import_map.get(local_name) orelse return null;
         const spec = entry.module_specifier;
-        if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return false;
-        const src = self.resolvedModuleSpecSource(spec) orelse return false;
+        if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
+        const src = self.resolvedModuleSpecSource(spec) orelse return null;
         const exp = entry.exported_name;
         if (std.mem.eql(u8, exp, "default")) {
-            return std.mem.indexOf(u8, src, "export default class ") != null or
-                std.mem.indexOf(u8, src, "export default abstract class ") != null;
+            // `export default [abstract] class <Name>` → tsc displays the original
+            // class name.  Plain `export default <ident>` (a re-export) is skipped.
+            const at = std.mem.indexOf(u8, src, "export default class ") orelse
+                std.mem.indexOf(u8, src, "export default abstract class ") orelse return null;
+            var i = at + "export default ".len;
+            if (std.mem.startsWith(u8, src[i..], "abstract ")) i += "abstract ".len;
+            i += "class ".len;
+            const ns = i;
+            while (i < src.len and isIdentChar(src[i])) i += 1;
+            if (i > ns) return src[ns..i];
+            return null;
         }
-        // Look for `export {enum,class,namespace} <exp>` (with declare/abstract/const
-        // modifiers between `export` and the keyword tolerated by scanning for the
-        // keyword+name pair anywhere a top-level export introduces it).
         var buf: [192]u8 = undefined;
         inline for (.{ "enum ", "class ", "namespace " }) |kw| {
-            const needle = std.fmt.bufPrint(&buf, "{s}{s}", .{ kw, exp }) catch return false;
+            const needle = std.fmt.bufPrint(&buf, "{s}{s}", .{ kw, exp }) catch return null;
             var idx: usize = 0;
             while (std.mem.indexOfPos(u8, src, idx, needle)) |at| {
-                // Require a word boundary after the name (so `class Foo` doesn't
-                // match `class FooBar`) and an `export` earlier on the line.
                 const after = at + needle.len;
                 const boundary = after >= src.len or !isIdentChar(src[after]);
-                if (boundary and lineHasExportBefore(src, at)) return true;
+                // Exclude `export const enum <exp>`: tsc renders const enums by the
+                // enum name, not `typeof`.
+                const is_const_enum = std.mem.eql(u8, kw, "enum ") and
+                    at >= 6 and std.mem.endsWith(u8, src[0..at], "const ");
+                if (boundary and !is_const_enum and lineHasExportBefore(src, at)) return local_name;
                 idx = at + needle.len;
             }
+        }
+        return null;
+    }
+
+    /// True when `node` sits in a position where a class/enum/namespace reference
+    /// is displayed by its BARE name (no `typeof`): a class `extends` clause
+    /// (parent `class_decl`), or an export specifier / `export default <X>`.
+    /// The local-symbol path handles these for in-file decls; the imported-entity
+    /// lever must mirror it by NOT emitting `typeof` here.
+    fn identifierInBareNamePosition(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var guard: u8 = 0;
+        while (p != NONE and p < parents.len and p < self.ast_ref.nodes.len and guard < 6) : (guard += 1) {
+            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
+                .member_expr, .optional_member_expr, .identifier, .grouping_expr => {},
+                .class_decl, .ts_interface_decl,
+                .export_named, .export_specifier, .export_named_from,
+                .export_default_expr, .export_default_class, .export_default_fn,
+                => return true,
+                else => return false,
+            }
+            p = parents[p];
         }
         return false;
     }
