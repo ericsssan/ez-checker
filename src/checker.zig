@@ -168,6 +168,86 @@ fn node16UnresolvableSpec(spec: []const u8) bool {
     return true;
 }
 
+/// Strip a recognized TS/JS module extension from a file name, returning the
+/// extensionless path.  `.d.ts`-style declaration suffixes are handled first.
+fn stripModuleExt(name: []const u8) []const u8 {
+    const dts = [_][]const u8{ ".d.ts", ".d.tsx", ".d.mts", ".d.cts" };
+    for (dts) |e| if (std.mem.endsWith(u8, name, e)) return name[0 .. name.len - e.len];
+    const exts = [_][]const u8{ ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js", ".mjs", ".cjs", ".json" };
+    for (exts) |e| if (std.mem.endsWith(u8, name, e)) return name[0 .. name.len - e.len];
+    return name;
+}
+
+/// Normalize a slash-separated path, resolving `.` and `..` segments, into
+/// `buf`.  Returns the normalized slice, or null if it escapes above the root
+/// or overflows.  No leading slash is produced (paths are program-root-relative).
+fn normalizePath(buf: []u8, path: []const u8) ?[]const u8 {
+    var segs: [128][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            if (n == 0) return null; // escapes program root
+            n -= 1;
+            continue;
+        }
+        if (n >= segs.len) return null;
+        segs[n] = seg;
+        n += 1;
+    }
+    var len: usize = 0;
+    for (segs[0..n], 0..) |s, i| {
+        if (i > 0) {
+            if (len >= buf.len) return null;
+            buf[len] = '/';
+            len += 1;
+        }
+        if (len + s.len > buf.len) return null;
+        @memcpy(buf[len..][0..s.len], s);
+        len += s.len;
+    }
+    return buf[0..len];
+}
+
+/// Directory portion of a path (everything before the last `/`), or "" when the
+/// path has no directory component.
+fn dirOfPath(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |sl| return path[0..sl];
+    return "";
+}
+
+/// Resolve a RELATIVE module specifier (`./x`, `../y/z`) written in `from_path`
+/// to one of `module_files`, applying Node-style extension and `/index`
+/// resolution.  Returns the matched ModuleFile, or null.  Bare specifiers are
+/// handled separately (package.json `exports`).  This is the path-correct
+/// successor to the basename-matching `moduleFileForSpec`; it takes an explicit
+/// importer path, which the per-module (isolated) evaluation provides.
+fn resolveRelativeSpec(from_path: []const u8, spec: []const u8, module_files: []const ModuleFile) ?ModuleFile {
+    if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
+    var join_buf: [1024]u8 = undefined;
+    const dir = dirOfPath(from_path);
+    const joined = std.fmt.bufPrint(&join_buf, "{s}/{s}", .{ dir, stripModuleExt(spec) }) catch return null;
+    var norm_buf: [1024]u8 = undefined;
+    const target = normalizePath(&norm_buf, joined) orelse return null;
+
+    // Exact file match: module_file path (sans extension) equals the target.
+    for (module_files) |mf| {
+        var mfn_buf: [1024]u8 = undefined;
+        const mfn = normalizePath(&mfn_buf, stripModuleExt(mf.name)) orelse continue;
+        if (std.mem.eql(u8, mfn, target)) return mf;
+    }
+    // Directory import: `./dir` → `./dir/index.{ts,…}`.
+    var idx_buf: [1024]u8 = undefined;
+    const target_index = std.fmt.bufPrint(&idx_buf, "{s}/index", .{target}) catch return null;
+    for (module_files) |mf| {
+        var mfn_buf: [1024]u8 = undefined;
+        const mfn = normalizePath(&mfn_buf, stripModuleExt(mf.name)) orelse continue;
+        if (std.mem.eql(u8, mfn, target_index)) return mf;
+    }
+    return null;
+}
+
 const ExpandoProp = struct { name: []const u8, value: NodeIndex };
 const JsdocParam = struct { name: []const u8, type_str: []const u8 };
 
@@ -19005,6 +19085,38 @@ fn firstNodeOfTag(ast_result: *const Ast, tag: ast.Node.Tag) ?NodeIndex {
         if (ast_result.nodeTag(ni) == tag) return ni;
     }
     return null;
+}
+
+test "resolveRelativeSpec: node-style path resolution" {
+    const mfs = [_]ModuleFile{
+        .{ .name = "index.ts", .start = 0, .end = 1 },
+        .{ .name = "sub/mod.ts", .start = 1, .end = 2 },
+        .{ .name = "sub/dir/index.ts", .start = 2, .end = 3 },
+        .{ .name = "other.d.ts", .start = 3, .end = 4 },
+    };
+    const expectName = struct {
+        fn f(r: ?ModuleFile, want: []const u8) !void {
+            try std.testing.expect(r != null);
+            try std.testing.expectEqualStrings(want, r.?.name);
+        }
+    }.f;
+
+    // Sibling, no extension, from a nested file.
+    try expectName(resolveRelativeSpec("sub/a.ts", "./mod", &mfs), "sub/mod.ts");
+    // Sibling with explicit extension in the spec.
+    try expectName(resolveRelativeSpec("sub/a.ts", "./mod.js", &mfs), "sub/mod.ts");
+    // Parent traversal back to the root index.
+    try expectName(resolveRelativeSpec("sub/a.ts", "../index", &mfs), "index.ts");
+    // Directory import → /index.
+    try expectName(resolveRelativeSpec("index.ts", "./sub/dir", &mfs), "sub/dir/index.ts");
+    // `.d.ts` declaration file.
+    try expectName(resolveRelativeSpec("index.ts", "./other", &mfs), "other.d.ts");
+    // Non-relative (bare) specifier — not handled here.
+    try std.testing.expect(resolveRelativeSpec("index.ts", "lodash", &mfs) == null);
+    // Unresolvable sibling.
+    try std.testing.expect(resolveRelativeSpec("index.ts", "./nope", &mfs) == null);
+    // Escapes the program root.
+    try std.testing.expect(resolveRelativeSpec("index.ts", "../../x", &mfs) == null);
 }
 
 test "Checker: number literal type" {
