@@ -14315,6 +14315,22 @@ pub const Checker = struct {
                 }
             }
             if (self.newExprInstanceType(inst_callee)) |ty| return ty;
+            // `new f()` on a PLAIN function (only call signatures, no construct
+            // signature) — tsc types the result `any` (the function's instance
+            // type), NOT the call return type.  A value with a construct
+            // signature falls through to use that signature.
+            const cty = self.typeOf(callee);
+            const ct = self.store.get(cty);
+            if (ct.kind == .function_t) {
+                var has_construct = false;
+                for (self.store.signaturesOf(ct.signatures)) |s| {
+                    if (s.is_construct) {
+                        has_construct = true;
+                        break;
+                    }
+                }
+                if (!has_construct) return tymod.ID_ANY;
+            }
         }
         const callee_ty = self.typeOf(callee);
         if (tymod.isAny(&self.store, callee_ty)) return tymod.ID_ANY;
