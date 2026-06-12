@@ -6244,6 +6244,21 @@ pub const Checker = struct {
         if (inner == .none) return tymod.ID_UNKNOWN;
         while (self.ast_ref.nodeTag(inner) == .grouping_expr) inner = self.ast_ref.nodeData(inner).lhs;
         const inner_tag = self.ast_ref.nodeTag(inner);
+        // `typeof globalThis.X` — a qualified type query.  The inner is a
+        // ts_type_reference whose lhs is the member access `globalThis.X`;
+        // resolve X as a global value.
+        if (inner_tag == .ts_type_reference) {
+            const q = self.ast_ref.nodeData(inner).lhs;
+            if (q != .none and self.ast_ref.nodeTag(q) == .member_expr) {
+                const qd = self.ast_ref.nodeData(q);
+                if (qd.lhs != .none and qd.rhs != .none and
+                    std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.lhs)), "globalThis"))
+                {
+                    const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.rhs));
+                    if (self.global_value_types.get(prop)) |t| return t;
+                }
+            }
+        }
         // In type position, `typeof A` has lhs = ts_type_reference (not .identifier).
         // Accept either form — both carry the name in the main_token.
         if (inner_tag != .identifier and inner_tag != .ts_type_reference) return tymod.ID_UNKNOWN;
