@@ -121,6 +121,13 @@ pub const ObjectProp = struct {
     /// rendering a quoted key, so the renderer emits `'…'` instead of `"…"`.
     /// Only meaningful when the key actually needs quoting.
     key_single_quoted: bool = false,
+    /// Divergent get/set accessor: `type_id` holds the getter (READ) type — the
+    /// type tsc displays on plain references — while `write_type_id` holds the
+    /// setter (WRITE) parameter type used at simple-assignment targets
+    /// (`obj.p = v`). Only meaningful when `has_write_type` is set; otherwise the
+    /// read and write types coincide (plain field or same-typed accessor).
+    has_write_type: bool = false,
+    write_type_id: TypeId = ID_ANY,
 };
 
 pub const Signature = struct {
@@ -403,6 +410,8 @@ pub const InternContext = struct {
             if (!std.mem.eql(u8, x.index_key_name, y.index_key_name)) return false;
             if (x.index_key_is_number != y.index_key_is_number) return false;
             if (x.key_single_quoted != y.key_single_quoted) return false;
+            if (x.has_write_type != y.has_write_type) return false;
+            if (x.has_write_type and !x.write_type_id.eq(y.write_type_id)) return false;
         }
         const sa = self.store.signaturesOf(ta.signatures);
         const sb = self.store.signaturesOf(tb.signatures);
