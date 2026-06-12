@@ -17564,6 +17564,15 @@ pub const Checker = struct {
                 if (sd.lhs != node or sd.rhs == .none) return null;
                 return self.nonNullExpected(self.resolveTypeNode(sd.rhs));
             },
+            // Prefix type assertion `<T>expr` — type in lhs, operand in rhs.
+            .ts_type_assertion => {
+                const td = self.ast_ref.nodeData(pn);
+                if (td.rhs != node or td.lhs == .none) return null;
+                if (self.ast_ref.nodeTag(td.lhs) == .ts_type_reference and
+                    std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(td.lhs)), "const"))
+                    return null;
+                return self.nonNullExpected(self.resolveTypeNode(td.lhs));
+            },
             .property => {
                 const pdata = self.ast_ref.nodeData(pn);
                 if (pdata.rhs != node) return null;
