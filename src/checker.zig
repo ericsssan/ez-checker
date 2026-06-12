@@ -306,6 +306,11 @@ pub const Checker = struct {
     /// to `error_t` — TSe's "intrinsic error type" condition.
     known_type_names: std.StringHashMapUnmanaged(void),
 
+    /// Lazy cache: whether an `Element` type is declared inside a `JSX`
+    /// namespace in this program (→ a JSX element expression is `JSX.Element`
+    /// even under `jsx: preserve`).  Computed once by `jsxElementDeclared`.
+    jsx_element_declared_cache: ?bool = null,
+
     /// Maps type names to their AST declaration node so `resolveTypeRef`
     /// can build the structural type on demand.  Filled at init time
     /// for interfaces and classes — type aliases use the same mechanism
@@ -1476,11 +1481,60 @@ pub const Checker = struct {
         return std.mem.eql(u8, prop, "exports");
     }
 
+    /// Whether the program declares an `Element` type inside a `JSX` namespace
+    /// (`declare namespace JSX { interface Element {} }`).  When present, a JSX
+    /// element expression is `JSX.Element` regardless of the jsx EMIT mode
+    /// (`preserve` only affects output).  A `JSX` namespace WITHOUT an `Element`
+    /// member (e.g. only `IntrinsicElements`) leaves elements `any`.
+    fn jsxElementDeclared(self: *Checker) bool {
+        if (self.jsx_element_declared_cache) |v| return v;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const parents = self.semantic.parent_indices;
+        var result = false;
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 0;
+        outer: while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            const data = self.ast_ref.nodeData(ni);
+            const nm: []const u8 = switch (self.ast_ref.nodeTag(ni)) {
+                .ts_interface_decl => self.ast_ref.tokenText(self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(data.lhs)).name),
+                .ts_type_alias_decl => self.ast_ref.tokenText(self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(data.lhs)).name),
+                else => continue,
+            };
+            if (!std.mem.eql(u8, nm, "Element")) continue;
+            // Walk parents for an enclosing namespace/module named "JSX".
+            var p = if (i < parents.len) parents[i] else NONE;
+            var guard: u8 = 0;
+            while (p != NONE and p < self.ast_ref.nodes.len and guard < 12) : (guard += 1) {
+                const pn: NodeIndex = @enumFromInt(p);
+                const ptag = self.ast_ref.nodeTag(pn);
+                if (ptag == .ts_namespace_decl or ptag == .ts_module_decl) {
+                    const pd = self.ast_ref.nodeData(pn);
+                    if (pd.lhs != .none and
+                        std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs)), "JSX"))
+                    {
+                        result = true;
+                        break :outer;
+                    }
+                }
+                p = if (p < parents.len) parents[p] else NONE;
+            }
+        }
+        self.jsx_element_declared_cache = result;
+        return result;
+    }
+
     /// Type of a JSX element/fragment expression — `JSX.Element` under a
     /// React-style jsx mode, otherwise `any` (preserve mode / no JSX namespace,
     /// where tsc leaves the element untyped).
     fn jsxElementType(self: *Checker, node: NodeIndex) TypeId {
-        if (!self.checker_opts.jsx_react_mode) return tymod.ID_ANY;
+        // A JSX element is `JSX.Element` when that type is in scope: either a
+        // React-style jsx mode (the React import supplies the JSX namespace) OR
+        // an in-file `declare namespace JSX`.  `jsx: preserve` only affects
+        // EMIT, not type-checking, so a declared JSX namespace still yields
+        // `JSX.Element`; with neither, tsc leaves the element `any`.
+        if (!self.checker_opts.jsx_react_mode and !self.jsxElementDeclared())
+            return tymod.ID_ANY;
         // A namespaced tag name (`<a:b />`) is not a valid intrinsic element or
         // component — tsc types the element `any`, not `JSX.Element`.
         if (self.jsxTagNameNode(node)) |name_node| {

@@ -270,8 +270,12 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
     while (it.next()) |raw| {
         const line = std.mem.trim(u8, raw, " \r");
         if (line.len == 0) continue;
-        if (!std.mem.startsWith(u8, line, "// @")) break; // stop at first non-directive
-        const rest = line["// @".len..];
+        // TypeScript's test harness accepts both `// @opt` and `//@opt`
+        // (optional space after the `//`).  Require a leading `//` then `@`.
+        if (!std.mem.startsWith(u8, line, "//")) break; // stop at first non-directive
+        const after_slashes = std.mem.trim(u8, line[2..], " ");
+        if (after_slashes.len == 0 or after_slashes[0] != '@') break;
+        const rest = after_slashes[1..];
         const colon = std.mem.indexOfScalar(u8, rest, ':') orelse continue;
         const key = std.mem.trim(u8, rest[0..colon], " ");
         const val = std.mem.trim(u8, rest[colon + 1 ..], " ");
