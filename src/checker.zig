@@ -474,6 +474,11 @@ pub const Checker = struct {
     /// Same pattern as merged_iface_extra but for namespace blocks.
     merged_ns_extra: std.ArrayListUnmanaged(struct { name: []const u8, node: NodeIndex }) = .empty,
 
+    /// Earlier `enum E {…}` declaration nodes when a later same-named block
+    /// overwrote the primary in type_decl_nodes — two-block enum merging.
+    /// Ordered by appearance (so source order = extras… then primary).
+    merged_enum_extra: std.ArrayListUnmanaged(struct { name: []const u8, node: NodeIndex }) = .empty,
+
     /// Maps generic function TypeId → rendered type-parameter prefix string
     /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
     /// method type is built; looked up by typeToStringInner to emit the correct
@@ -653,6 +658,7 @@ pub const Checker = struct {
         }
         self.merged_iface_extra.deinit(self.gpa);
         self.merged_ns_extra.deinit(self.gpa);
+        self.merged_enum_extra.deinit(self.gpa);
         {
             var it = self.fn_type_params.valueIterator();
             while (it.next()) |v| self.gpa.free(v.*);
@@ -2668,13 +2674,62 @@ pub const Checker = struct {
         return .{ .is_const = is_const, .is_declare = is_declare };
     }
 
+    /// A stable identifier for `node`'s enclosing lexical container (the block /
+    /// namespace body / program it's a statement of), skipping `export …`
+    /// wrappers.  Two declarations with the same container key are in the same
+    /// scope.  Used to gate scope-aware enum merging.
+    fn declContainerKey(self: *Checker, node: NodeIndex) u32 {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var guard: u8 = 0;
+        while (p != NONE and p < self.ast_ref.nodes.len and guard < 6) : (guard += 1) {
+            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
+                .export_named, .export_default_class, .export_default_fn, .export_default_expr => {
+                    p = if (p < parents.len) parents[p] else NONE;
+                },
+                else => return p,
+            }
+        }
+        return p;
+    }
+
     fn buildEnumObjectType(self: *Checker, enum_name: []const u8) ?TypeId {
         const decl = self.type_decl_nodes.get(enum_name) orelse return null;
         if (self.ast_ref.nodeTag(decl) != .ts_enum_decl) return null;
         const data = self.ast_ref.nodeData(decl);
         if (data.lhs == .none) return null;
         const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
-        if (ed.members_start >= ed.members_end or ed.members_end > self.ast_ref.extra_data.len) return null;
+        // Two-block enum merge: combine member nodes across all same-named enum
+        // decls in source order (earlier `merged_enum_extra` blocks first, then
+        // the primary `decl`).  Single-block enums get just the primary's range.
+        var member_raws = std.ArrayListUnmanaged(u32).empty;
+        defer member_raws.deinit(self.gpa);
+        // `block_at[i] == true` marks the first member of a new enum BLOCK — tsc
+        // resets numeric auto-increment at each declaration (value-aliasing across
+        // blocks is preserved; only the running index restarts).
+        var block_at = std.ArrayListUnmanaged(bool).empty;
+        defer block_at.deinit(self.gpa);
+        for (self.merged_enum_extra.items) |entry| {
+            if (!std.mem.eql(u8, entry.name, enum_name)) continue;
+            const xd = self.ast_ref.nodeData(entry.node);
+            if (xd.lhs == .none) continue;
+            const xe = self.ast_ref.extraData(ast.EnumData, @intFromEnum(xd.lhs));
+            if (xe.members_start < xe.members_end and xe.members_end <= self.ast_ref.extra_data.len) {
+                for (self.ast_ref.extra_data[xe.members_start..xe.members_end], 0..) |raw, j| {
+                    member_raws.append(self.gpa, raw) catch return null;
+                    block_at.append(self.gpa, j == 0) catch return null;
+                }
+            }
+        }
+        if (ed.members_start < ed.members_end and ed.members_end <= self.ast_ref.extra_data.len) {
+            for (self.ast_ref.extra_data[ed.members_start..ed.members_end], 0..) |raw, j| {
+                member_raws.append(self.gpa, raw) catch return null;
+                block_at.append(self.gpa, j == 0) catch return null;
+            }
+        }
+        const members = member_raws.items;
+        if (members.len == 0) return null;
         var props_list = std.ArrayListUnmanaged(tymod.ObjectProp).empty;
         defer props_list.deinit(self.gpa);
         var auto_idx: f64 = 0;
@@ -2705,7 +2760,12 @@ pub const Checker = struct {
         var ev_vals: [256]f64 = undefined;
         var ev_n: usize = 0;
         var running_auto: f64 = 0;
-        for (self.ast_ref.extra_data[ed.members_start..ed.members_end]) |raw| {
+        for (members, 0..) |raw, mi| {
+            // A new enum block restarts numeric auto-increment.
+            if (mi > 0 and block_at.items[mi]) {
+                auto_idx = 0;
+                running_auto = 0;
+            }
             const m: NodeIndex = @enumFromInt(raw);
             if (self.ast_ref.nodeTag(m) != .ts_enum_member) continue;
             const md = self.ast_ref.nodeData(m);
@@ -10254,7 +10314,17 @@ pub const Checker = struct {
                     const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
                     const enum_name = self.ast_ref.tokenText(ed.name);
                     try self.known_type_names.put(self.gpa, enum_name, {});
-                    try self.type_decl_nodes.put(self.gpa, enum_name, ni);
+                    // Two-block enum merge: if an earlier `enum <name>` decl is
+                    // already registered IN THE SAME LEXICAL SCOPE, keep it so
+                    // buildEnumObjectType can combine members (source order =
+                    // extras… then primary).  Scope-aware: same-named enums in
+                    // DIFFERENT namespaces (`A.B.C.E` vs `A1.B.C.E`) must NOT
+                    // merge — they're distinct types.
+                    const egop = try self.type_decl_nodes.getOrPut(self.gpa, enum_name);
+                    if (egop.found_existing and self.ast_ref.nodeTag(egop.value_ptr.*) == .ts_enum_decl and
+                        self.declContainerKey(ni) == self.declContainerKey(egop.value_ptr.*))
+                        try self.merged_enum_extra.append(self.gpa, .{ .name = enum_name, .node = egop.value_ptr.* });
+                    egop.value_ptr.* = ni;
                     // Determine the ESTABLISHED member kind: the kind of
                     // the FIRST member with a concrete value (string or
                     // number).  This is the rule's "established" kind:
