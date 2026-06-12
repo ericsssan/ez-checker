@@ -2287,6 +2287,107 @@ pub const Checker = struct {
     /// Build an object_t for an enum's value-side shape — each enum
     /// member becomes a property whose type is the literal value (or
     /// the broad number/string when we can't statically resolve).
+    /// Parse a numeric-literal token (hex/octal/binary/decimal, underscores
+    /// allowed) to its f64 value, or null on failure.
+    fn parseJsNumber(raw: []const u8) ?f64 {
+        var cleaned: [256]u8 = undefined;
+        var n: usize = 0;
+        for (raw) |ch| {
+            if (ch == '_') continue;
+            if (n >= cleaned.len) return null;
+            cleaned[n] = ch;
+            n += 1;
+        }
+        const t = cleaned[0..n];
+        if (t.len >= 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'X')) {
+            const v = std.fmt.parseInt(u64, t[2..], 16) catch return null;
+            return @floatFromInt(v);
+        }
+        if (t.len >= 2 and t[0] == '0' and (t[1] == 'o' or t[1] == 'O')) {
+            const v = std.fmt.parseInt(u64, t[2..], 8) catch return null;
+            return @floatFromInt(v);
+        }
+        if (t.len >= 2 and t[0] == '0' and (t[1] == 'b' or t[1] == 'B')) {
+            const v = std.fmt.parseInt(u64, t[2..], 2) catch return null;
+            return @floatFromInt(v);
+        }
+        return std.fmt.parseFloat(f64, t) catch null;
+    }
+
+    /// JS `ToInt32` (truncate to a 32-bit signed integer), for evaluating
+    /// bitwise enum initializers.
+    fn toInt32(x: f64) i32 {
+        if (!std.math.isFinite(x)) return 0;
+        const two32: f64 = 4294967296.0;
+        var m = @mod(@trunc(x), two32);
+        if (m < 0) m += two32;
+        const u: u32 = @intFromFloat(m);
+        return @bitCast(u);
+    }
+
+    /// Constant-fold a const-enum member initializer to its numeric value,
+    /// resolving prior-member references through (`names`, `vals`).  Returns
+    /// null for anything not statically evaluable (string members, calls, etc.).
+    fn evalEnumConst(
+        self: *Checker,
+        node: NodeIndex,
+        names: []const []const u8,
+        vals: []const f64,
+        count: usize,
+        depth: u8,
+    ) ?f64 {
+        if (depth > 40 or node == .none) return null;
+        const tag = self.ast_ref.nodeTag(node);
+        const d = self.ast_ref.nodeData(node);
+        switch (tag) {
+            .number_literal => {
+                const txt = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+                return parseJsNumber(txt);
+            },
+            .identifier => {
+                const nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+                var i: usize = count;
+                while (i > 0) {
+                    i -= 1;
+                    if (std.mem.eql(u8, names[i], nm)) return vals[i];
+                }
+                return null;
+            },
+            .grouping_expr => return self.evalEnumConst(d.lhs, names, vals, count, depth + 1),
+            .unary_minus => {
+                const a = self.evalEnumConst(d.lhs, names, vals, count, depth + 1) orelse return null;
+                return -a;
+            },
+            .unary_plus => return self.evalEnumConst(d.lhs, names, vals, count, depth + 1),
+            .bitwise_not => {
+                const a = self.evalEnumConst(d.lhs, names, vals, count, depth + 1) orelse return null;
+                return @floatFromInt(~toInt32(a));
+            },
+            .add, .subtract, .multiply, .divide, .modulo, .exponentiate,
+            .bitwise_or, .bitwise_and, .bitwise_xor,
+            .shift_left, .shift_right, .unsigned_shift_right => {
+                const a = self.evalEnumConst(d.lhs, names, vals, count, depth + 1) orelse return null;
+                const b = self.evalEnumConst(d.rhs, names, vals, count, depth + 1) orelse return null;
+                return switch (tag) {
+                    .add => a + b,
+                    .subtract => a - b,
+                    .multiply => a * b,
+                    .divide => a / b,
+                    .modulo => @rem(a, b),
+                    .exponentiate => std.math.pow(f64, a, b),
+                    .bitwise_or => @floatFromInt(toInt32(a) | toInt32(b)),
+                    .bitwise_and => @floatFromInt(toInt32(a) & toInt32(b)),
+                    .bitwise_xor => @floatFromInt(toInt32(a) ^ toInt32(b)),
+                    .shift_left => @floatFromInt(toInt32(a) << @intCast(@as(u32, @bitCast(toInt32(b))) & 31)),
+                    .shift_right => @floatFromInt(toInt32(a) >> @intCast(@as(u32, @bitCast(toInt32(b))) & 31)),
+                    .unsigned_shift_right => @floatFromInt(@as(u32, @bitCast(toInt32(a))) >> @intCast(@as(u32, @bitCast(toInt32(b))) & 31)),
+                    else => unreachable,
+                };
+            },
+            else => return null,
+        }
+    }
+
     /// True when `decl` (a ts_enum_decl) is a `const enum` — scan the modifier
     /// keywords preceding its main token for `const`.
     fn enumIsConst(self: *Checker, decl: NodeIndex) bool {
@@ -2328,6 +2429,13 @@ pub const Checker = struct {
         const NameAlias = struct { name: []const u8, canonical: []const u8 };
         var aliases: [256]NameAlias = undefined;
         var alias_n: usize = 0;
+        // Constant-folded numeric value of each member (for const-enum value
+        // collision over computed initializers like `D = A | B`).  NaN = not
+        // statically evaluable.
+        var ev_names: [256][]const u8 = undefined;
+        var ev_vals: [256]f64 = undefined;
+        var ev_n: usize = 0;
+        var running_auto: f64 = 0;
         for (self.ast_ref.extra_data[ed.members_start..ed.members_end]) |raw| {
             const m: NodeIndex = @enumFromInt(raw);
             if (self.ast_ref.nodeTag(m) != .ts_enum_member) continue;
@@ -2351,15 +2459,36 @@ pub const Checker = struct {
                 auto_idx += 1;
                 break :blk lit;
             };
+            // Constant-fold this member's numeric value (for const-enum value
+            // collision), threading prior members for references.
+            var ev_val: ?f64 = null;
+            if (md.rhs != .none) {
+                ev_val = self.evalEnumConst(md.rhs, ev_names[0..ev_n], ev_vals[0..ev_n], ev_n, 0);
+                if (ev_val) |v| running_auto = v + 1;
+            } else {
+                ev_val = running_auto;
+                running_auto += 1;
+            }
+            if (ev_n < ev_vals.len) {
+                ev_names[ev_n] = member_name;
+                ev_vals[ev_n] = ev_val orelse std.math.nan(f64);
+                ev_n += 1;
+            }
             var canonical_name = member_name;
             if (is_const_enum) {
-                // Value-based: first member with this literal value wins.
+                // Value-based: first member with this value wins.  Prefer the
+                // constant-folded numeric value (covers `D = A | B`); fall back
+                // to the literal type for string members.
                 const vt = self.store.get(value_ty);
                 var is_num = false;
                 var key_num: f64 = 0;
                 var key_str: []const u8 = "";
                 var have_key = false;
-                switch (vt.kind) {
+                if (ev_val) |v| {
+                    is_num = true;
+                    key_num = v;
+                    have_key = true;
+                } else switch (vt.kind) {
                     .number_literal => {
                         is_num = true;
                         key_num = vt.literal_value.number;
