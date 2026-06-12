@@ -17582,6 +17582,20 @@ pub const Checker = struct {
                 const idx = self.arrayElementIndex(pn, node) orelse return null;
                 return self.arrayElementExpectedType(arr_expected, idx);
             },
+            // Method/accessor shorthand member of an object literal
+            // (`{ f(m) {} }`) — the member is a direct child of the literal, so
+            // resolve its key against the object's expected type.
+            .object_literal => {
+                const key_node: NodeIndex = switch (self.ast_ref.nodeTag(node)) {
+                    .method_def, .computed_method_def, .getter_def, .setter_def =>
+                        self.ast_ref.nodeData(node).lhs,
+                    else => return null,
+                };
+                if (key_node == .none) return null;
+                const key_name = self.staticPropertyKey(key_node) orelse return null;
+                const obj_expected = self.expectedTypeOfD(pn, depth + 1) orelse return null;
+                return self.objectPropExpectedType(obj_expected, key_name);
+            },
             else => return null,
         }
     }
@@ -17609,6 +17623,15 @@ pub const Checker = struct {
                     if (d.lhs == .none) return null;
                     const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
                     fn_node = pn; ps = fd.params; pe = fd.params_end;
+                    break;
+                },
+                // Object-literal method shorthand (`{ f(m) {} }`) — params live
+                // in MethodData (rhs); the method node carries the contextual
+                // type via expectedTypeOf's object-literal-member case.
+                .method_def, .computed_method_def => {
+                    if (d.rhs == .none) return null;
+                    const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(d.rhs));
+                    fn_node = pn; ps = md.params_start; pe = md.params_end;
                     break;
                 },
                 else => {},
