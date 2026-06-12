@@ -3183,7 +3183,7 @@ pub const Checker = struct {
                     }
                 },
                 .switch_case => {
-                    ty = self.narrowBySwitchCase(pn, sym, ty);
+                    ty = self.narrowBySwitchCase(pn, sym, ty, node);
                 },
                 else => {},
             }
@@ -3196,7 +3196,7 @@ pub const Checker = struct {
     /// Narrow `sym` for a use inside `switch (typeof sym) { case 'kind': … }`.
     /// `case_node` is the enclosing switch_case; its parent switch_stmt holds the
     /// discriminant. Only the `typeof`-discriminant form is handled here.
-    fn narrowBySwitchCase(self: *Checker, case_node: NodeIndex, sym: symbol_mod.SymbolId, ty: TypeId) TypeId {
+    fn narrowBySwitchCase(self: *Checker, case_node: NodeIndex, sym: symbol_mod.SymbolId, ty: TypeId, use_node: NodeIndex) TypeId {
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         const ci = case_node.toInt();
         if (ci >= self.semantic.parent_indices.len) return ty;
@@ -3207,6 +3207,18 @@ pub const Checker = struct {
         const disc = self.ast_ref.nodeData(sw).lhs;
         const label = self.ast_ref.nodeData(case_node).lhs;
         if (disc == .none or label == .none) return ty;
+        // `switch (true) { case <boolean-expr>: }` — the discriminant `true`
+        // equals the matched case expression, so each case body narrows `sym`
+        // exactly as `if (<case-expr>)` would (typeof / instanceof / predicate /
+        // truthy / `in` — all routed through applyNarrowing).
+        if (self.ast_ref.nodeTag(disc) == .boolean_literal and
+            std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(disc)), "true"))
+        {
+            // Only the case BODY is narrowed — a read inside the case
+            // condition itself (`x` in `case isA(x):`) sees the un-narrowed type.
+            if (self.descendsFrom(use_node, label)) return ty;
+            return self.applyNarrowing(label, sym, ty, false);
+        }
         // `switch (typeof x) { case 'kind': }`
         if (self.tryTypeofNarrow(disc, label, sym, false, false)) |spec| {
             return self.intersectNarrow(ty, spec.kind, spec.keep_only);
