@@ -639,11 +639,15 @@ pub const Checker = struct {
     /// Returns a TypeId in THIS checker's `store`; the caller clones it into the
     /// importing store via `TypeStore.cloneTypeInto`.
     pub fn exportedTypeOf(self: *Checker, name: []const u8) ?TypeId {
-        if (self.resolveDeclaredType(name)) |t| {
-            if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ERROR)) return t;
-        }
+        // A NAMED type export (interface / class / type-alias / enum) is
+        // displayed by tsc under its own name when imported (`let a: Foo` →
+        // `Foo`, not Foo's structure), which the importer already renders via a
+        // bare type_ref — so resolving it here adds nothing and expanding the
+        // structure would diverge.  Only VALUE exports (const/function/…), whose
+        // structural type the importer can't otherwise see, are resolved.
+        if (self.type_decl_nodes.get(name) != null) return null;
         if (self.typeOfNameByAstSearch(name)) |t| {
-            if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ERROR)) return t;
+            if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ERROR) and !t.eq(tymod.ID_ANY)) return t;
         }
         return null;
     }

@@ -572,12 +572,6 @@ pub fn run(opts: Options) !Result {
             }
 
             const lang = grp.lang;
-            const combined = grp.combined;
-            if (combined.source.len > MAX_SECTION_SRC) {
-                const count = grp.end - grp.start;
-                stats.sections_large += count;
-                continue;
-            }
             var names_buf: [64][]const u8 = undefined;
             var names_n: usize = 0;
             for (sections[grp.start..grp.end]) |s2| {
@@ -585,10 +579,31 @@ pub fn run(opts: Options) !Result {
                 names_buf[names_n] = s2.name;
                 names_n += 1;
             }
-            const r = evalSection(fa, combined, lang, comp_opts, &coll, names_buf[0..names_n]);
-            // Count sections_eval once per section in the group.
-            const section_count = grp.end - grp.start;
-            accumulateResultN(&stats, r, lang, comp_opts, section_count);
+            // Cross-module resolver context for this group's isolated modules.
+            // Module files (names only — for relative spec resolution) cover the
+            // whole group's sections.
+            var grp_mfs = std.ArrayList(ez.ModuleFile).empty;
+            for (sections[grp.start..grp.end]) |s2| {
+                grp_mfs.append(fa, .{ .name = s2.name, .start = 0, .end = 0 }) catch {};
+            }
+            const mctx = fa.create(ModuleCtx) catch null;
+            if (mctx) |mc| mc.* = .{
+                .arena = fa,
+                .sections = sections[grp.start..grp.end],
+                .module_files = grp_mfs.items,
+                .package_jsons = comp_opts.toCheckerOpts().package_jsons,
+                .base_opts = comp_opts.toCheckerOpts(),
+            };
+
+            for (grp.units) |unit| {
+                if (unit.sec.source.len > MAX_SECTION_SRC) {
+                    stats.sections_large += unit.section_count;
+                    continue;
+                }
+                const uctx: ?*ModuleCtx = if (unit.is_module) mctx else null;
+                const r = evalSectionFull(fa, unit.sec, lang, comp_opts, &coll, names_buf[0..names_n], uctx, unit.file_path);
+                accumulateResultN(&stats, r, lang, comp_opts, unit.section_count);
+            }
         }
     }
 
@@ -992,8 +1007,49 @@ const SectionGroup = struct {
     start: usize,  // index into sections slice (inclusive)
     end: usize,    // index into sections slice (exclusive)
     lang: Language,
-    combined: Section,
+    units: []EvalUnit,
 };
+
+const EvalUnit = struct {
+    sec: Section,
+    section_count: usize,
+    /// Importer path for the (isolated) module unit — empty for the shared
+    /// ambient+script unit.  Drives relative module resolution.
+    file_path: []const u8 = "",
+    /// True for an isolated module unit (gets the cross-module resolver).
+    is_module: bool = false,
+};
+
+/// True when a section is a MODULE — a non-`.d.ts` file with a top-level
+/// `import`/`export`.  Such a file has its own module scope in tsc (declarations
+/// don't leak globally), so the oracle evaluates it in isolation.  Ambient
+/// `.d.ts` and plain script files stay in the shared global program.
+fn sectionIsModule(sec: Section) bool {
+    if (Language.fromExtension(sec.name) == .dts) return false;
+    const src = sec.source;
+    var i: usize = 0;
+    while (i < src.len) {
+        while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
+        const line_start = i;
+        var j = i;
+        while (j < src.len and src[j] != '\n') j += 1;
+        const line = src[line_start..j];
+        if (std.mem.startsWith(u8, line, "import ") or
+            std.mem.startsWith(u8, line, "import(") or
+            std.mem.startsWith(u8, line, "import\"") or
+            std.mem.startsWith(u8, line, "import'") or
+            std.mem.startsWith(u8, line, "export ") or
+            std.mem.startsWith(u8, line, "export{") or
+            std.mem.startsWith(u8, line, "export*") or
+            std.mem.startsWith(u8, line, "export=") or
+            std.mem.startsWith(u8, line, "export default"))
+        {
+            return true;
+        }
+        i = j + 1;
+    }
+    return false;
+}
 
 // Classify language for grouping: .dts is compatible with .ts (ambient decls).
 fn groupLang(lang: Language) u8 {
@@ -1058,81 +1114,98 @@ fn groupSections(arena: std.mem.Allocator, sections: []const Section) ![]Section
                     i = si + 1;
                     continue;
                 };
-                try groups.append(arena, .{
-                    .start = si,
-                    .end = si + 1,
-                    .lang = sl,
-                    .combined = sec,
-                });
+                const u = try arena.alloc(EvalUnit, 1);
+                u[0] = .{ .sec = sec, .section_count = 1 };
+                try groups.append(arena, .{ .start = si, .end = si + 1, .lang = sl, .units = u });
             }
             i = end;
             continue;
         };
 
-        // Concatenate: .dts sections first (ambient declarations), then others.
-        var src_parts = std.ArrayList([]const u8).empty;
-        var all_entries = std.ArrayList(Entry).empty;
-        var mod_files = std.ArrayList(ez.ModuleFile).empty;
-        var line_offset: u32 = 0;
-        var byte_offset: u32 = 0; // start byte of the next section in combined_src
-
-        // Pass 1: dts sections first.
-        for (sections[start..end]) |sec| {
-            const sl = Language.fromExtension(sec.name) orelse continue;
-            if (sl != .dts) continue;
-            for (sec.entries) |e| {
-                try all_entries.append(arena, .{
-                    .line = e.line + line_offset,
-                    .expr = e.expr,
-                    .type_str = e.type_str,
-                });
-            }
-            try mod_files.append(arena, .{
-                .name = sec.name,
-                .start = byte_offset,
-                .end = byte_offset + @as(u32, @intCast(sec.source.len)),
-            });
-            try src_parts.append(arena, sec.source);
-            byte_offset += @as(u32, @intCast(sec.source.len)) + 1; // +1 for the "\n" join separator
-            line_offset += countLines(sec.source);
+        // Partition: ambient `.d.ts` + plain script files share one global
+        // program (`shared`, dts first); each module file is isolated.
+        var shared = std.ArrayList(usize).empty; // section indices, dts-first
+        var modules = std.ArrayList(usize).empty;
+        for (start..end) |si| {
+            if (Language.fromExtension(sections[si].name) == .dts) try shared.append(arena, si);
         }
-        // Pass 2: non-dts sections.
-        for (sections[start..end]) |sec| {
-            const sl = Language.fromExtension(sec.name) orelse continue;
-            if (sl == .dts) continue;
-            for (sec.entries) |e| {
-                try all_entries.append(arena, .{
-                    .line = e.line + line_offset,
-                    .expr = e.expr,
-                    .type_str = e.type_str,
-                });
-            }
-            try mod_files.append(arena, .{
-                .name = sec.name,
-                .start = byte_offset,
-                .end = byte_offset + @as(u32, @intCast(sec.source.len)),
-            });
-            try src_parts.append(arena, sec.source);
-            byte_offset += @as(u32, @intCast(sec.source.len)) + 1;
-            line_offset += countLines(sec.source);
+        for (start..end) |si| {
+            const l = Language.fromExtension(sections[si].name) orelse continue;
+            if (l == .dts) continue;
+            if (sectionIsModule(sections[si])) try modules.append(arena, si) else try shared.append(arena, si);
         }
 
-        const combined_src = try std.mem.join(arena, "\n", src_parts.items);
-        const combined = Section{
-            .name = sections[start].name,
-            .source = combined_src,
-            .entries = try all_entries.toOwnedSlice(arena),
-            .module_files = try mod_files.toOwnedSlice(arena),
-        };
+        var units = std.ArrayList(EvalUnit).empty;
+        if (shared.items.len > 0) {
+            const sec = try buildUnitSection(arena, sections, shared.items, null);
+            try units.append(arena, .{ .sec = sec, .section_count = shared.items.len });
+        }
+        for (modules.items) |mi| {
+            var parts = std.ArrayList(usize).empty;
+            for (shared.items) |s| try parts.append(arena, s);
+            try parts.append(arena, mi);
+            const sec = try buildUnitSection(arena, sections, parts.items, mi);
+            try units.append(arena, .{
+                .sec = sec,
+                .section_count = 1,
+                .file_path = sections[mi].name,
+                .is_module = true,
+            });
+        }
+        if (units.items.len == 0) {
+            const sec = try buildUnitSection(arena, sections, shared.items, null);
+            try units.append(arena, .{ .sec = sec, .section_count = end - start });
+        }
         try groups.append(arena, .{
             .start = start,
             .end = end,
             .lang = combined_lang,
-            .combined = combined,
+            .units = try units.toOwnedSlice(arena),
         });
         i = end;
     }
     return groups.toOwnedSlice(arena);
+}
+
+/// Concatenate the given section indices (in order) into one program source,
+/// "\n"-joined, line-remapping entries.  `entries_only` (when non-null)
+/// restricts scored entries to that single section index (an isolated module
+/// unit must not re-score its shared prelude).  module_files cover every
+/// included section for in-source module resolution.
+fn buildUnitSection(
+    arena: std.mem.Allocator,
+    sections: []const Section,
+    indices: []const usize,
+    entries_only: ?usize,
+) !Section {
+    var src_parts = std.ArrayList([]const u8).empty;
+    var all_entries = std.ArrayList(Entry).empty;
+    var mod_files = std.ArrayList(ez.ModuleFile).empty;
+    var line_offset: u32 = 0;
+    var byte_offset: u32 = 0;
+    for (indices) |si| {
+        const sec = sections[si];
+        const include = if (entries_only) |only| (si == only) else true;
+        if (include) {
+            for (sec.entries) |e| {
+                try all_entries.append(arena, .{ .line = e.line + line_offset, .expr = e.expr, .type_str = e.type_str });
+            }
+        }
+        try mod_files.append(arena, .{
+            .name = sec.name,
+            .start = byte_offset,
+            .end = byte_offset + @as(u32, @intCast(sec.source.len)),
+        });
+        try src_parts.append(arena, sec.source);
+        byte_offset += @as(u32, @intCast(sec.source.len)) + 1;
+        line_offset += countLines(sec.source);
+    }
+    return Section{
+        .name = if (indices.len > 0) sections[indices[0]].name else "",
+        .source = try std.mem.join(arena, "\n", src_parts.items),
+        .entries = try all_entries.toOwnedSlice(arena),
+        .module_files = try mod_files.toOwnedSlice(arena),
+    };
 }
 
 fn topPatterns(ra: std.mem.Allocator, map: *std.StringHashMap(*Pattern)) ![]Pattern {
