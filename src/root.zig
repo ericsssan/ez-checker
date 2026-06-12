@@ -16,6 +16,7 @@ pub const ModuleFile = @import("checker.zig").ModuleFile;
 pub const PackageJsonFile = @import("checker.zig").PackageJsonFile;
 pub const EnumKind = @import("checker.zig").EnumKind;
 pub const ImportEntry = @import("checker.zig").ImportEntry;
+pub const resolveRelativeSpec = @import("checker.zig").resolveRelativeSpec;
 
 test {
     _ = types;

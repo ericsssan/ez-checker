@@ -1457,17 +1457,115 @@ fn lineOf(starts: []const u32, offset: u32) u32 {
     return @intCast(lo - 1);
 }
 
+// ── Cross-module resolver (#27) ──────────────────────────────────────────────
+// Implements `ez.ModuleResolver` over a test's section sources: an isolated
+// module's `import { X } from "./other"` resolves to `other`'s real exported
+// type by parsing+checking the target section once (cached, cycle-guarded) and
+// cloning the export's type into the importing module's store.  No-op in
+// concatenation mode (imported names are already in scope, so the checker never
+// calls the resolver).
+
+const CheckedModule = struct {
+    ast: Ast,
+    sem: parser.semantic.SemanticResult,
+    checker: Checker,
+};
+
+const ModuleCtx = struct {
+    arena: std.mem.Allocator,
+    sections: []const Section,
+    module_files: []const ez.ModuleFile,
+    package_jsons: []const ez.PackageJsonFile,
+    base_opts: ez.CheckerOpts,
+    cache: std.StringHashMapUnmanaged(?*CheckedModule) = .empty,
+    in_progress: std.StringHashMapUnmanaged(void) = .empty,
+
+    fn moduleResolver(self: *ModuleCtx) ez.ModuleResolver {
+        return .{ .ctx = self, .resolve_fn = resolveExportType };
+    }
+
+    fn sectionByName(self: *ModuleCtx, name: []const u8) ?*const Section {
+        for (self.sections) |*s| if (std.mem.eql(u8, s.name, name)) return s;
+        return null;
+    }
+
+    fn getOrCheck(self: *ModuleCtx, sec: *const Section) ?*CheckedModule {
+        if (self.cache.get(sec.name)) |entry| return entry;
+        if (self.in_progress.contains(sec.name)) return null; // import cycle
+        self.in_progress.put(self.arena, sec.name, {}) catch return null;
+        const cm = self.checkSection(sec);
+        _ = self.in_progress.remove(sec.name);
+        self.cache.put(self.arena, sec.name, cm) catch {};
+        return cm;
+    }
+
+    fn checkSection(self: *ModuleCtx, sec: *const Section) ?*CheckedModule {
+        const lang = Language.fromExtension(sec.name) orelse return null;
+        if (sec.source.len > MAX_SECTION_SRC) return null;
+        const cm = self.arena.create(CheckedModule) catch return null;
+        var lex = parser.Lexer.tokenizeWithLanguage(self.arena, sec.source, lang) catch return null;
+        cm.ast = parser.Parser.parseWithLanguage(self.arena, sec.source, lex.tokens.slice(), lang, true) catch return null;
+        cm.sem = parser.semantic.SemanticAnalyzer.analyzeWithOptions(
+            self.arena,
+            &cm.ast,
+            .{ .is_module = true, .build_parents = true },
+        ) catch return null;
+        var opts = self.base_opts;
+        opts.is_js_file = (lang == .js or lang == .jsx);
+        opts.module_files = self.module_files;
+        opts.package_jsons = self.package_jsons;
+        cm.checker = Checker.init(self.arena, &cm.ast, &cm.sem, opts) catch return null;
+        cm.checker.file_path = sec.name;
+        cm.checker.module_resolver = self.moduleResolver();
+        return cm;
+    }
+};
+
+fn resolveExportType(
+    ctx_ptr: *anyopaque,
+    from_dir: []const u8,
+    spec: []const u8,
+    export_name: []const u8,
+    local_store: *ez.types.TypeStore,
+    gpa: std.mem.Allocator,
+) ?ez.types.TypeId {
+    _ = gpa;
+    const self: *ModuleCtx = @ptrCast(@alignCast(ctx_ptr));
+    // Synthesize an importer path whose dirname is `from_dir`, so the relative
+    // resolver computes the target relative to the importing module.
+    var fp_buf: [1024]u8 = undefined;
+    const from_path = std.fmt.bufPrint(&fp_buf, "{s}/_", .{from_dir}) catch return null;
+    const mf = ez.resolveRelativeSpec(from_path, spec, self.module_files) orelse return null;
+    const sec = self.sectionByName(mf.name) orelse return null;
+    const cm = self.getOrCheck(sec) orelse return null;
+    const ty = cm.checker.exportedTypeOf(export_name) orelse return null;
+    return local_store.cloneTypeInto(&cm.checker.store, ty, 0) catch null;
+}
+
 fn evalSection(arena: std.mem.Allocator, sec: Section, lang: Language, opts: CompilerOpts, coll: *Collector, module_names: []const []const u8) SecResult {
+    return evalSectionFull(arena, sec, lang, opts, coll, module_names, null, "");
+}
+
+fn evalSectionFull(
+    arena: std.mem.Allocator,
+    sec: Section,
+    lang: Language,
+    opts: CompilerOpts,
+    coll: *Collector,
+    module_names: []const []const u8,
+    module_ctx: ?*ModuleCtx,
+    file_path: []const u8,
+) SecResult {
     var copts = opts.toCheckerOpts();
     copts.available_modules = module_names;
     copts.module_files = sec.module_files;
     // package.json comes from the source case file (CompilerOpts), since the
     // .types baseline omits it.
     copts.package_jsons = opts.package_jsons;
-    return evalSectionInner(arena, sec, lang, copts, coll) catch SecResult{ .status = .errored };
+    return evalSectionInner(arena, sec, lang, copts, coll, module_ctx, file_path) catch SecResult{ .status = .errored };
 }
 
-fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, checker_opts: ez.CheckerOpts, coll: *Collector) !SecResult {
+fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, checker_opts: ez.CheckerOpts, coll: *Collector, module_ctx: ?*ModuleCtx, file_path: []const u8) !SecResult {
     var res = SecResult{ .status = .ok };
     if (sec.entries.len == 0) return res;
     const source = sec.source;
@@ -1482,6 +1580,10 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
     var opts_for_lang = checker_opts;
     opts_for_lang.is_js_file = (lang == .js or lang == .jsx);
     var checker = try Checker.init(arena, &ast_result, &sem, opts_for_lang);
+    if (module_ctx) |mc| {
+        checker.module_resolver = mc.moduleResolver();
+        checker.file_path = file_path;
+    }
 
     const starts = try lineStarts(arena, source);
 

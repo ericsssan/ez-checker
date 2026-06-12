@@ -223,7 +223,7 @@ fn dirOfPath(path: []const u8) []const u8 {
 /// handled separately (package.json `exports`).  This is the path-correct
 /// successor to the basename-matching `moduleFileForSpec`; it takes an explicit
 /// importer path, which the per-module (isolated) evaluation provides.
-fn resolveRelativeSpec(from_path: []const u8, spec: []const u8, module_files: []const ModuleFile) ?ModuleFile {
+pub fn resolveRelativeSpec(from_path: []const u8, spec: []const u8, module_files: []const ModuleFile) ?ModuleFile {
     if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
     var join_buf: [1024]u8 = undefined;
     const dir = dirOfPath(from_path);
@@ -631,6 +631,22 @@ pub const Checker = struct {
     }
 
     // ── Public queries (LintContext-facing) ───────────────
+
+    /// The type of a top-level export named `name`, for cross-module resolution
+    /// (the `ModuleResolver` resolves an importing module's `import { name }`
+    /// against this checker's exports).  Tries the type side first (interface /
+    /// class / type-alias / enum) then the value side (const / function / …).
+    /// Returns a TypeId in THIS checker's `store`; the caller clones it into the
+    /// importing store via `TypeStore.cloneTypeInto`.
+    pub fn exportedTypeOf(self: *Checker, name: []const u8) ?TypeId {
+        if (self.resolveDeclaredType(name)) |t| {
+            if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ERROR)) return t;
+        }
+        if (self.typeOfNameByAstSearch(name)) |t| {
+            if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ERROR)) return t;
+        }
+        return null;
+    }
 
     pub fn typeOf(self: *Checker, node: NodeIndex) TypeId {
         if (node == .none) return tymod.ID_ANY;
