@@ -1606,6 +1606,31 @@ pub const Checker = struct {
     }
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
+        // The own name of a NAMED function expression (`function named() {…}`):
+        // at its declaration site tsc types it as the function's type (the name
+        // is in scope inside the body for self-reference).  No reference symbol
+        // exists for it, so resolve the enclosing fn_expr directly.
+        fn_name: {
+            const parents = self.semantic.parent_indices;
+            const ni = node.toInt();
+            if (ni >= parents.len) break :fn_name;
+            const p = parents[ni];
+            if (p == @intFromEnum(NodeIndex.none) or p >= self.ast_ref.nodes.len) break :fn_name;
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => {
+                    // JS files attach expando/constructor semantics to named
+                    // function expressions (tsc often shows `typeof Named`), so
+                    // restrict this to TS where the plain function type is right.
+                    if (self.checker_opts.is_js_file) break :fn_name;
+                    const fd_d = self.ast_ref.nodeData(pn);
+                    if (fd_d.lhs == .none) break :fn_name;
+                    const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(fd_d.lhs));
+                    if (fd.name == node) return self.typeOf(pn);
+                },
+                else => {},
+            }
+        }
         // The local binding of `import * as X from "<spec>"`: the declaration
         // site has no reference symbol, but tsc types it `typeof X`.  Resolved
         // via the in-memory cross-file resolver (gated to a known relative
