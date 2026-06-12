@@ -6288,11 +6288,42 @@ pub const Checker = struct {
         const p = parents[ni];
         if (p == NONE) return false;
         const parent: NodeIndex = @enumFromInt(p);
+        // `static readonly x = Symbol()` class field — tsc gives it a fresh
+        // `unique symbol` (the only non-`const` position that does; instance
+        // `readonly` and `static` alone widen to `symbol`).
+        if (self.ast_ref.nodeTag(parent) == .property_def) {
+            const pd = self.ast_ref.nodeData(parent);
+            if (pd.lhs == .none or pd.rhs == .none) return false;
+            const prop_data = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(pd.rhs));
+            if (prop_data.value != node) return false;
+            return self.propertyIsStaticReadonly(pd.lhs);
+        }
         if (self.ast_ref.nodeTag(parent) != .declarator) return false;
         if (self.ast_ref.nodeData(parent).rhs != node) return false;
         const pp = if (parent.toInt() < parents.len) parents[parent.toInt()] else NONE;
         if (pp == NONE) return false;
         return self.ast_ref.nodeTag(@enumFromInt(pp)) == .const_decl;
+    }
+
+    /// True when the class member whose key is `name_node` carries BOTH the
+    /// `static` and `readonly` modifiers (scanning the keyword tokens that
+    /// precede the key).
+    fn propertyIsStaticReadonly(self: *Checker, name_node: NodeIndex) bool {
+        const name_tok = self.ast_ref.nodeMainToken(name_node);
+        const token_tags = self.ast_ref.tokens.items(.tag);
+        var has_static = false;
+        var has_readonly = false;
+        var i: u32 = name_tok;
+        while (i > 0) {
+            i -= 1;
+            switch (token_tags[i]) {
+                .kw_static => has_static = true,
+                .kw_readonly => has_readonly = true,
+                .kw_abstract, .kw_declare, .kw_override => {},
+                else => break,
+            }
+        }
+        return has_static and has_readonly;
     }
 
     pub fn constInitIsSymbolCall(self: *Checker, name: []const u8) bool {
