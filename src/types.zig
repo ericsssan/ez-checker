@@ -661,6 +661,92 @@ pub const TypeStore = struct {
         return try self.add(.{ .kind = .function_t, .signatures = sigs });
     }
 
+    /// Deep-copy a type from another store (`src`) into this one, remapping all
+    /// nested TypeIds and duplicating name/literal strings into this store's
+    /// allocator.  Used for cross-module type resolution: an imported export's
+    /// type, computed in its own module's store, is cloned into the importing
+    /// module's store so it can be interned and rendered there.
+    ///
+    /// The well-known singletons (ids < SINGLETON_COUNT) are shared across all
+    /// stores, so they map to themselves.  `depth` caps pathological recursion
+    /// (a cyclic type resolves to `unknown` at the cap).  Generic type-parameter
+    /// PREFIX strings (`<T>`) live in a checker-side side table keyed by TypeId,
+    /// not on the Type, so they are NOT carried by this clone — the structural
+    /// form (params/return/props) is preserved, which is what cross-module
+    /// rendering needs.
+    pub fn cloneTypeInto(self: *TypeStore, src: *const TypeStore, src_id: TypeId, depth: u8) error{OutOfMemory}!TypeId {
+        if (src_id.toInt() < SINGLETON_COUNT) return src_id;
+        if (depth > 40) return ID_UNKNOWN;
+        const t = src.get(src_id);
+
+        var nt = Type{ .kind = t.kind, .is_overload_set = t.is_overload_set };
+        nt.literal_value = switch (t.literal_value) {
+            .string => |s| .{ .string = try self.gpa.dupe(u8, s) },
+            .bigint => |s| .{ .bigint = try self.gpa.dupe(u8, s) },
+            else => t.literal_value,
+        };
+        if (t.name.len > 0) nt.name = try self.gpa.dupe(u8, t.name);
+        if (t.alias_name.len > 0) nt.alias_name = try self.gpa.dupe(u8, t.alias_name);
+        if (t.enum_name.len > 0) nt.enum_name = try self.gpa.dupe(u8, t.enum_name);
+
+        // Nested TypeId lists (union/intersection/tuple/function/array element).
+        nt.list_data = try self.cloneIdList(src, t.list_data, depth);
+        nt.alias_args = try self.cloneIdList(src, t.alias_args, depth);
+
+        // Object properties.
+        if (t.object_props.len() > 0) {
+            const props = src.propsOf(t.object_props);
+            var buf = try self.gpa.alloc(ObjectProp, props.len);
+            defer self.gpa.free(buf);
+            for (props, 0..) |p, i| {
+                buf[i] = p;
+                buf[i].type_id = try self.cloneTypeInto(src, p.type_id, depth + 1);
+                if (p.name.len > 0) buf[i].name = try self.gpa.dupe(u8, p.name);
+                if (p.index_key_name.len > 0) buf[i].index_key_name = try self.gpa.dupe(u8, p.index_key_name);
+            }
+            nt.object_props = try self.appendObjectProps(buf);
+        }
+
+        // Signatures.
+        if (t.signatures.len() > 0) {
+            const sigs = src.signaturesOf(t.signatures);
+            var sbuf = try self.gpa.alloc(Signature, sigs.len);
+            defer self.gpa.free(sbuf);
+            for (sigs, 0..) |s, i| {
+                const sparams = src.signatureParamsOf(s);
+                const snames = src.signatureParamNamesOf(s);
+                const sopts = src.signatureParamOptionalsOf(s);
+                var pbuf = try self.gpa.alloc(TypeId, sparams.len);
+                defer self.gpa.free(pbuf);
+                var nbuf = try self.gpa.alloc([]const u8, sparams.len);
+                defer self.gpa.free(nbuf);
+                for (sparams, 0..) |pid, k| {
+                    pbuf[k] = try self.cloneTypeInto(src, pid, depth + 1);
+                    nbuf[k] = if (k < snames.len and snames[k].len > 0) try self.gpa.dupe(u8, snames[k]) else "";
+                }
+                const pr = try self.appendSignatureParamsFull(pbuf, nbuf, sopts);
+                sbuf[i] = s;
+                sbuf[i].params_start = pr.start;
+                sbuf[i].params_end = pr.end;
+                sbuf[i].return_type = try self.cloneTypeInto(src, s.return_type, depth + 1);
+                if (s.predicate_param_index != 0xFFFF and s.predicate_target != .none)
+                    sbuf[i].predicate_target = try self.cloneTypeInto(src, s.predicate_target, depth + 1);
+            }
+            nt.signatures = try self.appendSignatures(sbuf);
+        }
+
+        return try self.add(nt);
+    }
+
+    fn cloneIdList(self: *TypeStore, src: *const TypeStore, list: TypeIdList, depth: u8) error{OutOfMemory}!TypeIdList {
+        if (list.len() == 0) return .empty;
+        const ids = src.idsOf(list);
+        var buf = try self.gpa.alloc(TypeId, ids.len);
+        defer self.gpa.free(buf);
+        for (ids, 0..) |id, i| buf[i] = try self.cloneTypeInto(src, id, depth + 1);
+        return try self.appendTypeIds(buf);
+    }
+
     // ── Convenience constructors ──────────────────────────
 
     pub fn stringLiteral(self: *TypeStore, value: []const u8) !TypeId {
@@ -1249,6 +1335,48 @@ test "TypeStore singletons" {
     try std.testing.expect(isAny(&store, ID_ANY));
     try std.testing.expect(!isAny(&store, ID_NUMBER));
     try std.testing.expect(!containsAny(&store, ID_STRING));
+}
+
+test "cloneTypeInto deep-copies across stores" {
+    // TypeStores are arena-backed in production (names/literals duped into the
+    // arena are freed with it), so model that here.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var a = try TypeStore.init(al);
+    var b = try TypeStore.init(al);
+
+    // In store A: a named object `{ x: number; tag: "go" }` plus an array of it.
+    const lit = try a.stringLiteral("go");
+    const props = [_]ObjectProp{
+        .{ .name = "x", .type_id = ID_NUMBER },
+        .{ .name = "tag", .type_id = lit },
+    };
+    const obj = try a.add(.{ .kind = .object_t, .object_props = try a.appendObjectProps(&props), .name = "Foo" });
+    const arr = try a.arrayOf(obj);
+
+    // Clone the array into store B.
+    const cloned = try b.cloneTypeInto(&a, arr, 0);
+
+    // Structure survives: array → object "Foo" with x:number and tag:"go".
+    const ct = b.get(cloned);
+    try std.testing.expectEqual(TypeKind.array_t, ct.kind);
+    const elem_ids = b.idsOf(ct.list_data);
+    try std.testing.expectEqual(@as(usize, 1), elem_ids.len);
+    const co = b.get(elem_ids[0]);
+    try std.testing.expectEqual(TypeKind.object_t, co.kind);
+    try std.testing.expectEqualStrings("Foo", co.name);
+    const cprops = b.propsOf(co.object_props);
+    try std.testing.expectEqual(@as(usize, 2), cprops.len);
+    try std.testing.expectEqualStrings("x", cprops[0].name);
+    try std.testing.expect(cprops[0].type_id.eq(ID_NUMBER));
+    try std.testing.expectEqualStrings("tag", cprops[1].name);
+    const tagv = b.get(cprops[1].type_id);
+    try std.testing.expectEqual(TypeKind.string_literal, tagv.kind);
+    try std.testing.expectEqualStrings("go", tagv.literal_value.string);
+
+    // The clone is independent: store A can be mutated/freed without affecting B.
+    // (names were duped into B's allocator.)
 }
 
 test "TypeStore union flattens and collapses any" {

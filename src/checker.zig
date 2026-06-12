@@ -115,6 +115,16 @@ pub const ModuleResolver = struct {
         local_store: *TypeStore,
         gpa: std.mem.Allocator,
     ) ?TypeId,
+    /// Returns the raw source of the module `spec` resolves to (relative to
+    /// `from_dir`), or null when unresolvable.  Lets the checker run the same
+    /// `export =` / module-shape checks it does in concatenation mode without
+    /// the combined-source byte ranges (which don't exist under per-module
+    /// isolation).
+    module_source_fn: *const fn (
+        ctx: *anyopaque,
+        from_dir: []const u8,
+        module_spec: []const u8,
+    ) ?[]const u8,
 
     pub fn resolveExportedType(
         self: ModuleResolver,
@@ -125,6 +135,10 @@ pub const ModuleResolver = struct {
         gpa: std.mem.Allocator,
     ) ?TypeId {
         return self.resolve_fn(self.ctx, from_dir, module_spec, export_name, local_store, gpa);
+    }
+
+    pub fn moduleSource(self: ModuleResolver, from_dir: []const u8, module_spec: []const u8) ?[]const u8 {
+        return self.module_source_fn(self.ctx, from_dir, module_spec);
     }
 };
 
@@ -166,6 +180,102 @@ fn node16UnresolvableSpec(spec: []const u8) bool {
         if (std.mem.endsWith(u8, spec, ext)) return false;
     }
     return true;
+}
+
+/// Strip a recognized TS/JS module extension from a file name, returning the
+/// extensionless path.  `.d.ts`-style declaration suffixes are handled first.
+fn stripModuleExt(name: []const u8) []const u8 {
+    const dts = [_][]const u8{ ".d.ts", ".d.tsx", ".d.mts", ".d.cts" };
+    for (dts) |e| if (std.mem.endsWith(u8, name, e)) return name[0 .. name.len - e.len];
+    const exts = [_][]const u8{ ".tsx", ".ts", ".mts", ".cts", ".jsx", ".js", ".mjs", ".cjs", ".json" };
+    for (exts) |e| if (std.mem.endsWith(u8, name, e)) return name[0 .. name.len - e.len];
+    return name;
+}
+
+/// Normalize a slash-separated path, resolving `.` and `..` segments, into
+/// `buf`.  Returns the normalized slice, or null if it escapes above the root
+/// or overflows.  No leading slash is produced (paths are program-root-relative).
+fn normalizePath(buf: []u8, path: []const u8) ?[]const u8 {
+    var segs: [128][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0 or std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            if (n == 0) return null; // escapes program root
+            n -= 1;
+            continue;
+        }
+        if (n >= segs.len) return null;
+        segs[n] = seg;
+        n += 1;
+    }
+    var len: usize = 0;
+    for (segs[0..n], 0..) |s, i| {
+        if (i > 0) {
+            if (len >= buf.len) return null;
+            buf[len] = '/';
+            len += 1;
+        }
+        if (len + s.len > buf.len) return null;
+        @memcpy(buf[len..][0..s.len], s);
+        len += s.len;
+    }
+    return buf[0..len];
+}
+
+/// Directory portion of a path (everything before the last `/`), or "" when the
+/// path has no directory component.
+fn dirOfPath(path: []const u8) []const u8 {
+    if (std.mem.lastIndexOfScalar(u8, path, '/')) |sl| return path[0..sl];
+    return "";
+}
+
+fn isIdentChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_' or c == '$';
+}
+
+/// True when the line containing byte `at` begins (after indentation) with the
+/// `export` keyword — used to confirm a `class X`/`enum X` match is a top-level
+/// export rather than a nested or local declaration.
+fn lineHasExportBefore(src: []const u8, at: usize) bool {
+    var ls = at;
+    while (ls > 0 and src[ls - 1] != '\n') ls -= 1;
+    var i = ls;
+    while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
+    return std.mem.startsWith(u8, src[i..], "export ");
+}
+
+/// Resolve a RELATIVE module specifier (`./x`, `../y/z`) written in `from_path`
+/// to one of `module_files`, applying Node-style extension and `/index`
+/// resolution.  Returns the matched ModuleFile, or null.  Bare specifiers are
+/// handled separately (package.json `exports`).  This is the path-correct
+/// successor to the basename-matching `moduleFileForSpec`; it takes an explicit
+/// importer path, which the per-module (isolated) evaluation provides.
+pub fn resolveRelativeSpec(from_path: []const u8, spec: []const u8, module_files: []const ModuleFile) ?ModuleFile {
+    if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
+    var join_buf: [1024]u8 = undefined;
+    const dir = dirOfPath(from_path);
+    const joined = std.fmt.bufPrint(&join_buf, "{s}/{s}", .{ dir, stripModuleExt(spec) }) catch return null;
+    var norm_buf: [1024]u8 = undefined;
+    const target = normalizePath(&norm_buf, joined) orelse return null;
+
+    // Exact file match: module_file path (sans extension) equals the target.
+    for (module_files) |mf| {
+        var mfn_buf: [1024]u8 = undefined;
+        const mfn = normalizePath(&mfn_buf, stripModuleExt(mf.name)) orelse continue;
+        if (std.mem.eql(u8, mfn, target)) return mf;
+    }
+    // Directory import: `./dir` → `./dir/index.{ts,…}`.
+    var idx_buf: [1024]u8 = undefined;
+    const target_index = std.fmt.bufPrint(&idx_buf, "{s}/index", .{target}) catch return null;
+    for (module_files) |mf| {
+        var mfn_buf: [1024]u8 = undefined;
+        const mfn = normalizePath(&mfn_buf, stripModuleExt(mf.name)) orelse continue;
+        if (std.mem.eql(u8, mfn, target_index)) return mf;
+    }
+    return null;
 }
 
 const ExpandoProp = struct { name: []const u8, value: NodeIndex };
@@ -551,6 +661,26 @@ pub const Checker = struct {
     }
 
     // ── Public queries (LintContext-facing) ───────────────
+
+    /// The type of a top-level export named `name`, for cross-module resolution
+    /// (the `ModuleResolver` resolves an importing module's `import { name }`
+    /// against this checker's exports).  Tries the type side first (interface /
+    /// class / type-alias / enum) then the value side (const / function / …).
+    /// Returns a TypeId in THIS checker's `store`; the caller clones it into the
+    /// importing store via `TypeStore.cloneTypeInto`.
+    pub fn exportedTypeOf(self: *Checker, name: []const u8) ?TypeId {
+        // A NAMED type export (interface / class / type-alias / enum) is
+        // displayed by tsc under its own name when imported (`let a: Foo` →
+        // `Foo`, not Foo's structure), which the importer already renders via a
+        // bare type_ref — so resolving it here adds nothing and expanding the
+        // structure would diverge.  Only VALUE exports (const/function/…), whose
+        // structural type the importer can't otherwise see, are resolved.
+        if (self.type_decl_nodes.get(name) != null) return null;
+        if (self.typeOfNameByAstSearch(name)) |t| {
+            if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ERROR) and !t.eq(tymod.ID_ANY)) return t;
+        }
+        return null;
+    }
 
     pub fn typeOf(self: *Checker, node: NodeIndex) TypeId {
         if (node == .none) return tymod.ID_ANY;
@@ -1423,6 +1553,16 @@ pub const Checker = struct {
                     }
                     const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
                     return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                }
+                // A named/default import of a type-entity (enum / class / namespace)
+                // used as a plain value → `typeof <name>`.  Skip heritage / export
+                // positions (bare name there) and member access stays a coverage
+                // gap (members aren't resolved cross-file), never a wrong concrete.
+                if (!self.identifierInBareNamePosition(node)) {
+                    if (self.importedTypeEntityDisplayName(ns_name)) |disp| {
+                        const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp}) catch return tymod.ID_ANY;
+                        return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+                    }
                 }
             }
             if ((bkind == .namespace_decl or bkind == .class_decl or bkind == .enum_decl) and
@@ -15253,6 +15393,19 @@ pub const Checker = struct {
 
     /// The `ModuleFile` (byte span) of the sibling section that `spec` resolves
     /// to, or null.  Matches on the basename with extension stripped.
+    /// Source of the module that `spec` resolves to relative to this file, or
+    /// null when unresolvable.  Under per-module isolation this goes through the
+    /// module resolver (which holds every section's real source); otherwise it
+    /// reads the concatenated combined-source byte range via moduleFileForSpec.
+    fn resolvedModuleSpecSource(self: *Checker, spec: []const u8) ?[]const u8 {
+        if (self.module_resolver) |resolver| {
+            return resolver.moduleSource(dirOfPath(self.file_path), spec);
+        }
+        const mf = self.moduleFileForSpec(spec) orelse return null;
+        if (mf.end > self.ast_ref.source.len or mf.end <= mf.start) return null;
+        return self.ast_ref.source[mf.start..mf.end];
+    }
+
     fn moduleFileForSpec(self: *Checker, spec: []const u8) ?ModuleFile {
         if (self.checker_opts.module_files.len == 0) return null;
         if (self.checker_opts.isNode16Style() and node16UnresolvableSpec(spec)) return null;
@@ -15337,12 +15490,9 @@ pub const Checker = struct {
         if (std.mem.endsWith(u8, spec, ".json")) return null;
         const is_relative = std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../");
         if (is_relative and self.checker_opts.isNode16Style()) return null;
-        const mf = self.moduleFileForSpec(spec) orelse return null;
-        if (mf.end <= self.ast_ref.source.len) {
-            const sec_src = self.ast_ref.source[mf.start..mf.end];
-            if (std.mem.indexOf(u8, sec_src, "export =") != null or
-                std.mem.indexOf(u8, sec_src, "export=") != null) return null;
-        }
+        const sec_src = self.resolvedModuleSpecSource(spec) orelse return null;
+        if (std.mem.indexOf(u8, sec_src, "export =") != null or
+            std.mem.indexOf(u8, sec_src, "export=") != null) return null;
         const inner_name = std.fmt.allocPrint(self.gpa, "typeof import(\"{s}\")", .{spec}) catch return null;
         const inner = self.store.typeRef(inner_name, &.{}) catch {
             self.gpa.free(inner_name);
@@ -15356,14 +15506,83 @@ pub const Checker = struct {
     /// `typeof X` for a normal relative ESM module section, or null when it
     /// can't be resolved cleanly (external/excluded specifier, or `export =`
     /// module).  Owned string lives in `string_pool`.
-    fn namespaceImportBindingType(self: *Checker, ns_name: []const u8, spec: []const u8) ?TypeId {
-        if (std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../")) {
-            const mf = self.moduleFileForSpec(spec) orelse return null;
-            if (mf.end <= self.ast_ref.source.len) {
-                const sec_src = self.ast_ref.source[mf.start..mf.end];
-                if (std.mem.indexOf(u8, sec_src, "export =") != null or
-                    std.mem.indexOf(u8, sec_src, "export=") != null) return null;
+    /// When the local binding `local_name` is a named/default import whose target
+    /// module declares the exported name as a non-const type-entity (enum / class
+    /// / namespace / `export default class`), returns the name tsc displays for a
+    /// value-position use as `typeof <name>`.  For a default class import that is
+    /// the ORIGINAL declared class name (`export default class Foo` → `Foo`), not
+    /// the local binding; for named imports it is the local binding.  Returns null
+    /// otherwise.  Resolved textually (no member resolution); `const enum` is
+    /// excluded (tsc renders those by the enum name, not `typeof`).
+    fn importedTypeEntityDisplayName(self: *Checker, local_name: []const u8) ?[]const u8 {
+        const entry = self.import_map.get(local_name) orelse return null;
+        const spec = entry.module_specifier;
+        if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
+        const src = self.resolvedModuleSpecSource(spec) orelse return null;
+        const exp = entry.exported_name;
+        if (std.mem.eql(u8, exp, "default")) {
+            // `export default [abstract] class <Name>` → tsc displays the original
+            // class name.  Plain `export default <ident>` (a re-export) is skipped.
+            const at = std.mem.indexOf(u8, src, "export default class ") orelse
+                std.mem.indexOf(u8, src, "export default abstract class ") orelse return null;
+            var i = at + "export default ".len;
+            if (std.mem.startsWith(u8, src[i..], "abstract ")) i += "abstract ".len;
+            i += "class ".len;
+            const ns = i;
+            while (i < src.len and isIdentChar(src[i])) i += 1;
+            if (i > ns) return src[ns..i];
+            return null;
+        }
+        var buf: [192]u8 = undefined;
+        inline for (.{ "enum ", "class ", "namespace " }) |kw| {
+            const needle = std.fmt.bufPrint(&buf, "{s}{s}", .{ kw, exp }) catch return null;
+            var idx: usize = 0;
+            while (std.mem.indexOfPos(u8, src, idx, needle)) |at| {
+                const after = at + needle.len;
+                const boundary = after >= src.len or !isIdentChar(src[after]);
+                // Exclude `export const enum <exp>`: tsc renders const enums by the
+                // enum name, not `typeof`.
+                const is_const_enum = std.mem.eql(u8, kw, "enum ") and
+                    at >= 6 and std.mem.endsWith(u8, src[0..at], "const ");
+                if (boundary and !is_const_enum and lineHasExportBefore(src, at)) return local_name;
+                idx = at + needle.len;
             }
+        }
+        return null;
+    }
+
+    /// True when `node` sits in a position where a class/enum/namespace reference
+    /// is displayed by its BARE name (no `typeof`): a class `extends` clause
+    /// (parent `class_decl`), or an export specifier / `export default <X>`.
+    /// The local-symbol path handles these for in-file decls; the imported-entity
+    /// lever must mirror it by NOT emitting `typeof` here.
+    fn identifierInBareNamePosition(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var guard: u8 = 0;
+        while (p != NONE and p < parents.len and p < self.ast_ref.nodes.len and guard < 6) : (guard += 1) {
+            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
+                .member_expr, .optional_member_expr, .identifier, .grouping_expr => {},
+                .class_decl, .ts_interface_decl,
+                .export_named, .export_specifier, .export_named_from,
+                .export_default_expr, .export_default_class, .export_default_fn,
+                => return true,
+                else => return false,
+            }
+            p = parents[p];
+        }
+        return false;
+    }
+
+    fn namespaceImportBindingType(self: *Checker, ns_name: []const u8, spec: []const u8) ?TypeId {
+        // node16/nodenext requires an explicit extension on relative imports; an
+        // extensionless/directory specifier is unresolvable → tsc types it `any`.
+        if (self.checker_opts.isNode16Style() and node16UnresolvableSpec(spec)) return null;
+        if (std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../")) {
+            const sec_src = self.resolvedModuleSpecSource(spec) orelse return null;
+            if (std.mem.indexOf(u8, sec_src, "export =") != null or
+                std.mem.indexOf(u8, sec_src, "export=") != null) return null;
         } else {
             // Bare specifier (`package/sub`) — resolvable only when the package's
             // package.json `exports` exposes the subpath.
@@ -19005,6 +19224,38 @@ fn firstNodeOfTag(ast_result: *const Ast, tag: ast.Node.Tag) ?NodeIndex {
         if (ast_result.nodeTag(ni) == tag) return ni;
     }
     return null;
+}
+
+test "resolveRelativeSpec: node-style path resolution" {
+    const mfs = [_]ModuleFile{
+        .{ .name = "index.ts", .start = 0, .end = 1 },
+        .{ .name = "sub/mod.ts", .start = 1, .end = 2 },
+        .{ .name = "sub/dir/index.ts", .start = 2, .end = 3 },
+        .{ .name = "other.d.ts", .start = 3, .end = 4 },
+    };
+    const expectName = struct {
+        fn f(r: ?ModuleFile, want: []const u8) !void {
+            try std.testing.expect(r != null);
+            try std.testing.expectEqualStrings(want, r.?.name);
+        }
+    }.f;
+
+    // Sibling, no extension, from a nested file.
+    try expectName(resolveRelativeSpec("sub/a.ts", "./mod", &mfs), "sub/mod.ts");
+    // Sibling with explicit extension in the spec.
+    try expectName(resolveRelativeSpec("sub/a.ts", "./mod.js", &mfs), "sub/mod.ts");
+    // Parent traversal back to the root index.
+    try expectName(resolveRelativeSpec("sub/a.ts", "../index", &mfs), "index.ts");
+    // Directory import → /index.
+    try expectName(resolveRelativeSpec("index.ts", "./sub/dir", &mfs), "sub/dir/index.ts");
+    // `.d.ts` declaration file.
+    try expectName(resolveRelativeSpec("index.ts", "./other", &mfs), "other.d.ts");
+    // Non-relative (bare) specifier — not handled here.
+    try std.testing.expect(resolveRelativeSpec("index.ts", "lodash", &mfs) == null);
+    // Unresolvable sibling.
+    try std.testing.expect(resolveRelativeSpec("index.ts", "./nope", &mfs) == null);
+    // Escapes the program root.
+    try std.testing.expect(resolveRelativeSpec("index.ts", "../../x", &mfs) == null);
 }
 
 test "Checker: number literal type" {
