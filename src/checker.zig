@@ -16057,6 +16057,14 @@ pub const Checker = struct {
                     return self.store.typeRef("unique symbol", &.{}) catch null;
                 }
             }
+            // Symbol.keyFor(sym) — registry reverse lookup.  (Symbol.for is
+            // intentionally NOT modeled: its `symbol` return makes `const s =
+            // Symbol.for(...)` correct but cascades into the separate
+            // unique-symbol and symbol-coercion gaps, a net regression.)
+            if (std.mem.eql(u8, name, "keyFor")) {
+                const ret = self.store.unionOf(&.{ tymod.ID_STRING, tymod.ID_UNDEFINED }) catch return null;
+                return self.makeNamedFn(&.{tymod.ID_SYMBOL}, &.{"sym"}, &.{false}, ret);
+            }
             return null;
         }
         // `XConstructor.prototype` → the instance type `X` (e.g. `Date.prototype`
@@ -16076,6 +16084,65 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, "body")) {
                 return self.store.typeRef("HTMLElement", &.{}) catch null;
             }
+        }
+        // NumberConstructor statics (the value `Number` types as NumberConstructor).
+        if (std.mem.eql(u8, t.name, "NumberConstructor")) {
+            if (eqAny(name, &.{ "NaN", "MAX_SAFE_INTEGER", "MIN_SAFE_INTEGER", "MAX_VALUE", "MIN_VALUE", "EPSILON", "POSITIVE_INFINITY", "NEGATIVE_INFINITY" })) {
+                return tymod.ID_NUMBER;
+            }
+            if (eqAny(name, &.{ "isInteger", "isFinite", "isNaN", "isSafeInteger" })) {
+                return self.makeNamedFn(&.{tymod.ID_UNKNOWN}, &.{"number"}, &.{false}, tymod.ID_BOOLEAN);
+            }
+        }
+        // StringConstructor statics: `String.fromCharCode` / `fromCodePoint`.
+        if (std.mem.eql(u8, t.name, "StringConstructor")) {
+            const param_name: ?[]const u8 =
+                if (std.mem.eql(u8, name, "fromCharCode")) "codes" else if (std.mem.eql(u8, name, "fromCodePoint")) "codePoints" else null;
+            if (param_name) |pn| {
+                const num_arr = self.store.arrayOf(tymod.ID_NUMBER) catch return null;
+                const pr = self.store.appendSignatureParamsFull(&.{num_arr}, &.{pn}, &.{false}) catch return null;
+                const sig: tymod.Signature = .{
+                    .params_start = pr.start,
+                    .params_end = pr.end,
+                    .return_type = tymod.ID_STRING,
+                    .rest_param_index = 0,
+                };
+                return self.store.functionType(sig) catch null;
+            }
+        }
+        // Reflect statics (lib.es2015.reflect) — the non-generic members with
+        // stable displays.  `set`/`defineProperty`/`get`/`apply`/`construct`
+        // are omitted (generic overload sets or `any` returns tsc prints
+        // differently).
+        if (std.mem.eql(u8, t.name, "Reflect")) {
+            const pkey = self.store.typeRef("PropertyKey", &.{}) catch return null;
+            if (eqAny(name, &.{ "isExtensible", "preventExtensions" })) {
+                return self.makeNamedFn(&.{tymod.ID_OBJECT_KW}, &.{"target"}, &.{false}, tymod.ID_BOOLEAN);
+            }
+            if (std.mem.eql(u8, name, "getPrototypeOf")) {
+                const ret = self.store.unionOf(&.{ tymod.ID_OBJECT_KW, tymod.ID_NULL }) catch return null;
+                return self.makeNamedFn(&.{tymod.ID_OBJECT_KW}, &.{"target"}, &.{false}, ret);
+            }
+            if (eqAny(name, &.{ "has", "deleteProperty" })) {
+                return self.makeNamedFn(&.{ tymod.ID_OBJECT_KW, pkey }, &.{ "target", "propertyKey" }, &.{ false, false }, tymod.ID_BOOLEAN);
+            }
+            if (std.mem.eql(u8, name, "setPrototypeOf")) {
+                const proto = self.store.unionOf(&.{ tymod.ID_OBJECT_KW, tymod.ID_NULL }) catch return null;
+                return self.makeNamedFn(&.{ tymod.ID_OBJECT_KW, proto }, &.{ "target", "proto" }, &.{ false, false }, tymod.ID_BOOLEAN);
+            }
+            if (std.mem.eql(u8, name, "ownKeys")) {
+                const ks = self.store.unionOf(&.{ tymod.ID_STRING, tymod.ID_SYMBOL }) catch return null;
+                const ret = self.store.arrayOf(ks) catch return null;
+                return self.makeNamedFn(&.{tymod.ID_OBJECT_KW}, &.{"target"}, &.{false}, ret);
+            }
+        }
+        // DateConstructor statics (the value `Date` types as DateConstructor).
+        if (std.mem.eql(u8, t.name, "DateConstructor")) {
+            if (std.mem.eql(u8, name, "now")) return self.makeNullaryFn(tymod.ID_NUMBER);
+            if (std.mem.eql(u8, name, "parse")) {
+                return self.makeNamedFn(&.{tymod.ID_STRING}, &.{"s"}, &.{false}, tymod.ID_NUMBER);
+            }
+            if (std.mem.eql(u8, name, "prototype")) return self.store.typeRef("Date", &.{}) catch null;
         }
         // Date.prototype essentials.
         if (std.mem.eql(u8, t.name, "Date")) {
