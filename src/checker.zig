@@ -11971,7 +11971,12 @@ pub const Checker = struct {
             for (arg_types, 0..) |arg_ty, ai| {
                 const param_ty = params[ai];
                 if (tymod.isAny(&self.store, param_ty)) continue;
-                if (tymod.isAny(&self.store, arg_ty) or tymod.isUnknown(&self.store, arg_ty)) continue;
+                // Overload selection uses the SUBTYPE relation: `any` is only a
+                // subtype of `any`, so an `any` argument does NOT match a
+                // non-`any` param (the param-`any` case is handled above) — skip
+                // this overload so resolution falls to the `(x: any)` overload.
+                if (tymod.isAny(&self.store, arg_ty)) continue :outer;
+                if (tymod.isUnknown(&self.store, arg_ty)) continue;
                 if (self.structuralAssignable(arg_ty, param_ty, 0) == .no) continue :outer;
             }
             return si;
