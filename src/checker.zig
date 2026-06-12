@@ -15276,6 +15276,24 @@ pub const Checker = struct {
     /// Compute the type of `obj[key]` access.  For arrays/tuples returns
     /// the element type; for objects with a static string key, returns
     /// that property's type; otherwise unknown.
+    /// The property name a computed key denotes when it's a string literal
+    /// (`obj["k"]`) or resolves to a single string-literal type (`const k =
+    /// "fn"; obj[k]`).  Null otherwise.
+    fn stringLiteralKeyName(self: *Checker, key_node: NodeIndex) ?[]const u8 {
+        if (key_node == .none) return null;
+        if (self.ast_ref.nodeTag(key_node) == .string_literal) {
+            return self.staticPropertyKey(key_node);
+        }
+        const kt = self.store.get(self.typeOf(key_node));
+        if (kt.kind == .string_literal) {
+            return switch (kt.literal_value) {
+                .string => |s| if (s.len > 0) s else null,
+                else => null,
+            };
+        }
+        return null;
+    }
+
     fn inferComputedMember(self: *Checker, obj_ty: TypeId, key_node: NodeIndex, obj_node: NodeIndex) TypeId {
         const input_was_unknown = obj_ty.eq(tymod.ID_UNKNOWN) or obj_ty.eq(tymod.ID_ERROR);
         if (key_node == .none) return if (input_was_unknown) tymod.ID_ANY else tymod.ID_UNKNOWN;
@@ -15413,6 +15431,13 @@ pub const Checker = struct {
         // Type reference (Promise / Array / etc.): resolve to the
         // underlying structural shape, then retry.
         if (obj2.kind == .type_ref) {
+            // String-literal key `obj["k"]` is the same as the named access
+            // `obj.k` — route through memberOnApparentType, which resolves
+            // enum members on `typeof E`, lib type_refs, declared classes, etc.
+            if (self.stringLiteralKeyName(key_node)) |kn| {
+                const t = self.memberOnApparentType(obj_ty, kn, obj_node);
+                if (!tymod.isUnknown(&self.store, t) and !tymod.isAny(&self.store, t)) return t;
+            }
             const ref_name2 = obj2.name;  // snapshot before resolveDeclaredType may grow store
             if (self.resolveDeclaredType(ref_name2)) |resolved| {
                 if (!resolved.eq(obj_ty)) {
