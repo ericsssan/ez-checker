@@ -2255,7 +2255,9 @@ pub const Checker = struct {
                 // The property token of a simple `=` assignment target carries the
                 // setter (write) type for a divergent accessor (see inferMember).
                 if (self.nodeIsSimpleAssignTarget(parent)) {
-                    if (self.memberWriteType(lookup_ty, prop_name)) |wt|
+                    const rtag = self.ast_ref.nodeTag(pdata.lhs);
+                    const ro_any = rtag != .this_expr and rtag != .super_expr;
+                    if (self.memberWriteType(lookup_ty, prop_name, pdata.lhs, ro_any)) |wt|
                         return self.maybeAddOptionalUndefined(wt, obj_ty, in_chain);
                 }
                 const inner = self.memberOnApparentType(lookup_ty, prop_name, pdata.lhs);
@@ -7733,6 +7735,45 @@ pub const Checker = struct {
         return null;
     }
 
+    /// True when the class enclosing `accessor` declares a same-name,
+    /// same-staticness SET accessor — even an unannotated one. Distinguishes a
+    /// writable get/set pair from a read-only getter-only accessor (the latter's
+    /// `pairedSetterParamType` is also null, but for a different reason).
+    fn classHasSetter(self: *Checker, accessor: NodeIndex, prop_name: []const u8, want_static: bool) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const midx = accessor.toInt();
+        if (midx >= parents.len) return false;
+        var p_idx = parents[midx];
+        if (p_idx == NONE) return false;
+        const possible_body: NodeIndex = @enumFromInt(p_idx);
+        if (self.ast_ref.nodeTag(possible_body) == .class_body) {
+            p_idx = parents[p_idx];
+            if (p_idx == NONE) return false;
+        }
+        const class_node: NodeIndex = @enumFromInt(p_idx);
+        const ctag = self.ast_ref.nodeTag(class_node);
+        if (ctag != .class_decl and ctag != .class_expr) return false;
+        const cdata = self.ast_ref.nodeData(class_node);
+        if (cdata.lhs == .none) return false;
+        const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
+        if (cd.body == .none) return false;
+        const body_data = self.ast_ref.nodeData(cd.body);
+        const slice = self.directRange(body_data.lhs, body_data.rhs) orelse return false;
+        for (slice) |raw| {
+            const m: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(m) != .setter_def) continue;
+            if (self.classMemberIsStatic(m) != want_static) continue;
+            const mdata = self.ast_ref.nodeData(m);
+            if (mdata.lhs == .none) continue;
+            const ktag = self.ast_ref.nodeTag(mdata.lhs);
+            if (ktag != .identifier and ktag != .property_ident) continue;
+            const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+            if (std.mem.eql(u8, key, prop_name)) return true;
+        }
+        return false;
+    }
+
     /// Return the identifier name of a function parameter binding.
     fn paramName(self: *Checker, param: NodeIndex) []const u8 {
         var n = param;
@@ -12737,7 +12778,8 @@ pub const Checker = struct {
                     ty = self.resolveTypeNode(ty_node);
                 }
                 const optional = propertyHasOptionalMarker(self, data.lhs);
-                return .{ .name = name, .type_id = ty, .optional = optional };
+                const is_readonly = propertyHasReadonlyModifier(self, data.lhs);
+                return .{ .name = name, .type_id = ty, .optional = optional, .readonly = is_readonly };
             },
             .ts_method_signature => {
                 const sig_data = self.ast_ref.extraData(ast.InterfaceSigData, @intFromEnum(data.lhs));
@@ -13258,8 +13300,14 @@ pub const Checker = struct {
                         const sigs = self.store.signaturesOf(ft.signatures);
                         if (sigs.len > 0) read_ty = sigs[0].return_type;
                     }
-                    const write_ty = self.pairedSetterParamType(member, name) orelse read_ty;
-                    return self.accessorProp(name, read_ty, write_ty);
+                    const paired_set = self.pairedSetterParamType(member, name);
+                    const write_ty = paired_set orelse read_ty;
+                    var p = self.accessorProp(name, read_ty, write_ty);
+                    // No paired setter → read-only accessor: assigning to it is an
+                    // error and tsc types the assignment target `any`.
+                    if (paired_set == null and !self.classHasSetter(member, name, want_static))
+                        p.is_getter_only = true;
+                    return p;
                 }
                 if (tag == .setter_def) {
                     var write_ty: ?TypeId = null;
@@ -15779,7 +15827,9 @@ pub const Checker = struct {
         // Simple `=` assignment target: a divergent get/set accessor exposes its
         // setter (write) type here, not the getter type used for reads.
         if (self.nodeIsSimpleAssignTarget(node)) {
-            if (self.memberWriteType(lookup_ty, prop_name)) |wt|
+            const rtag = self.ast_ref.nodeTag(data.lhs);
+            const ro_any = rtag != .this_expr and rtag != .super_expr;
+            if (self.memberWriteType(lookup_ty, prop_name, data.lhs, ro_any)) |wt|
                 return self.maybeAddOptionalUndefined(wt, obj_ty, in_chain);
         }
         const inner = self.memberOnApparentType(lookup_ty, prop_name, data.lhs);
@@ -16462,12 +16512,18 @@ pub const Checker = struct {
     /// `obj_ty` is not a divergent accessor (the normal read path then applies).
     /// For a union receiver the write type is the union of each member's write
     /// type, fired only when at least one member actually diverges.
-    fn memberWriteType(self: *Checker, obj_ty: TypeId, prop_name: []const u8) ?TypeId {
+    fn memberWriteType(self: *Checker, obj_ty: TypeId, prop_name: []const u8, obj_node: NodeIndex, readonly_to_any: bool) ?TypeId {
         const obj = self.store.get(obj_ty);
         switch (obj.kind) {
             .object_t => {
                 for (self.store.propsOf(obj.object_props)) |p| {
                     if (!std.mem.eql(u8, p.name, prop_name)) continue;
+                    // Read-only accessor: writing is an error, target is `any`.
+                    if (p.is_getter_only) return tymod.ID_ANY;
+                    // A `readonly` field written via a non-`this` receiver is an
+                    // error too (the `this`-in-constructor exception only applies
+                    // to a plain `this` receiver, which the caller excludes).
+                    if (readonly_to_any and p.readonly) return tymod.ID_ANY;
                     return if (p.has_write_type) p.write_type_id else null;
                 }
                 return null;
@@ -16480,7 +16536,7 @@ pub const Checker = struct {
                     if (n >= buf.len) return null;
                     const mk = self.store.get(m).kind;
                     if (mk == .null_t or mk == .undefined_t or mk == .void_t) continue;
-                    if (self.memberWriteType(m, prop_name)) |wt| {
+                    if (self.memberWriteType(m, prop_name, obj_node, readonly_to_any)) |wt| {
                         any_divergent = true;
                         buf[n] = wt;
                     } else {
@@ -16499,10 +16555,19 @@ pub const Checker = struct {
                 // Snapshot the name: resolveDeclaredType may grow the type store
                 // and invalidate the `obj` pointer.
                 const ref_name = obj.name;
+                // Polymorphic `this` receiver (`this.p = v` inside a method):
+                // resolve to the enclosing class instance type.
+                if (std.mem.eql(u8, ref_name, "this")) {
+                    if (self.thisEnclosingClassType(obj_node)) |class_ty| {
+                        if (!class_ty.eq(tymod.ID_UNKNOWN) and !class_ty.eq(obj_ty))
+                            return self.memberWriteType(class_ty, prop_name, obj_node, readonly_to_any);
+                    }
+                    return null;
+                }
                 if (self.resolveDeclaredType(ref_name)) |resolved| {
                     if (!resolved.eq(obj_ty)) {
                         const subst = self.applyDeclTypeArgs(obj_ty, ref_name, resolved);
-                        return self.memberWriteType(subst, prop_name);
+                        return self.memberWriteType(subst, prop_name, obj_node, readonly_to_any);
                     }
                 }
                 return null;

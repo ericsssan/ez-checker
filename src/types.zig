@@ -128,6 +128,9 @@ pub const ObjectProp = struct {
     /// read and write types coincide (plain field or same-typed accessor).
     has_write_type: bool = false,
     write_type_id: TypeId = ID_ANY,
+    /// A get accessor with no paired set accessor: the property is read-only, so
+    /// assigning to it is an error and tsc types the assignment target `any`.
+    is_getter_only: bool = false,
 };
 
 pub const Signature = struct {
@@ -412,6 +415,7 @@ pub const InternContext = struct {
             if (x.key_single_quoted != y.key_single_quoted) return false;
             if (x.has_write_type != y.has_write_type) return false;
             if (x.has_write_type and !x.write_type_id.eq(y.write_type_id)) return false;
+            if (x.is_getter_only != y.is_getter_only) return false;
         }
         const sa = self.store.signaturesOf(ta.signatures);
         const sb = self.store.signaturesOf(tb.signatures);
