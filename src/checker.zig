@@ -675,15 +675,68 @@ pub const Checker = struct {
     /// class / type-alias / enum) then the value side (const / function / …).
     /// Returns a TypeId in THIS checker's `store`; the caller clones it into the
     /// importing store via `TypeStore.cloneTypeInto`.
+    /// The name of this module's default-exported TYPE declaration
+    /// (`export default interface/class/enum <Name>`), or null.  `export default
+    /// interface/enum` parse as `export_default_expr` wrapping the decl; classes
+    /// as `export_default_class`.
+    fn defaultExportTypeName(self: *Checker) ?[]const u8 {
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 0;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            const tag = self.ast_ref.nodeTag(ni);
+            if (tag != .export_default_class and tag != .export_default_expr) continue;
+            const inner = self.ast_ref.nodeData(ni).lhs;
+            if (inner == .none) continue;
+            switch (self.ast_ref.nodeTag(inner)) {
+                .class_decl => {
+                    const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(self.ast_ref.nodeData(inner).lhs));
+                    if (cd.name != .none) return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+                },
+                .ts_interface_decl => {
+                    const id = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(self.ast_ref.nodeData(inner).lhs));
+                    return self.ast_ref.tokenText(id.name);
+                },
+                .ts_enum_decl => {
+                    const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(self.ast_ref.nodeData(inner).lhs));
+                    return self.ast_ref.tokenText(ed.name);
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
     pub fn exportedTypeOf(self: *Checker, name: []const u8) ?TypeId {
-        // A NAMED type export (interface / class / type-alias / enum) is
-        // displayed by tsc under its own name when imported (`let a: Foo` →
-        // `Foo`, not Foo's structure), which the importer already renders via a
-        // bare type_ref — so resolving it here adds nothing and expanding the
-        // structure would diverge.  Only VALUE exports (const/function/…), whose
-        // structural type the importer can't otherwise see, are resolved.
-        if (self.type_decl_nodes.get(name) != null) return null;
-        if (self.typeOfNameByAstSearch(name)) |t| {
+        // `default` import → resolve to the default-exported declaration's name.
+        const real = if (std.mem.eql(u8, name, "default"))
+            (self.defaultExportTypeName() orelse name)
+        else
+            name;
+        // A NAMED interface/class export: return its STRUCTURAL type so the
+        // importer can resolve cross-file member access (`a.value`) and heritage
+        // (`class C extends ImportedBase`).  The importer still DISPLAYS the type
+        // by name — resolveTypeRef intercepts imported names to a bare type_ref —
+        // so the structure only ever feeds member/inheritance lookup, never the
+        // rendered annotation.  Enums and type-aliases stay name-only (returning
+        // their structure would diverge from tsc's named display).
+        if (self.type_decl_nodes.get(real)) |decl| {
+            const dtag = self.ast_ref.nodeTag(decl);
+            if (dtag == .ts_interface_decl or dtag == .class_decl) {
+                if (self.resolveDeclaredType(real)) |t| {
+                    if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ERROR) and !t.eq(tymod.ID_ANY)) {
+                        // Tag the structure with its name so EVERY importer display
+                        // path renders the name (matching tsc's named display) while
+                        // member access still reads the object_props.  Without this
+                        // the raw structure leaks into displays the resolveTypeRef
+                        // intercept doesn't cover (return types, re-exports, …).
+                        return self.tagAliasName(t, real);
+                    }
+                }
+            }
+            return null;
+        }
+        if (self.typeOfNameByAstSearch(real)) |t| {
             if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ERROR) and !t.eq(tymod.ID_ANY)) return t;
         }
         return null;
@@ -10635,6 +10688,21 @@ pub const Checker = struct {
                 return self.store.typeRef(name, args) catch tymod.ID_ANY;
             }
         }
+        // An IMPORTED type name used as a SIMPLE (non-qualified) type reference
+        // renders by its local name — `var a: A` → `A`.  The resolved structure
+        // is alias-tagged (self-displays as the name) so this intercept is only a
+        // fast path; it is intentionally skipped for qualified `X.A` forms (e.g.
+        // `typeof X.A`), which the namespace-member path renders verbatim.
+        if (self.import_map.get(name) != null) {
+            const ty_data2 = self.ast_ref.nodeData(ty_node);
+            const is_qualified = ty_data2.lhs != .none and
+                self.ast_ref.nodeTag(ty_data2.lhs) == .member_expr;
+            if (!is_qualified) {
+                var ia_buf: [8]TypeId = undefined;
+                const iargs = self.collectTypeArgs(ty_node, &ia_buf);
+                return self.store.typeRef(name, iargs) catch tymod.ID_ANY;
+            }
+        }
         // Qualified type `A.B` whose last component `B` is NOT a declared
         // type anywhere (e.g. `TypeScript.AST` where AST lives in another file
         // referenced via ///<reference>) → preserve the verbatim qualified name
@@ -11818,13 +11886,24 @@ pub const Checker = struct {
         const resolver = self.module_resolver orelse return null;
         const entry = self.import_map.get(name) orelse return null;
         const from_dir = std.fs.path.dirname(self.file_path) orelse ".";
-        return resolver.resolveExportedType(
+        const t = resolver.resolveExportedType(
             from_dir,
             entry.module_specifier,
             entry.exported_name,
             &self.store,
             self.gpa,
-        );
+        ) orelse return null;
+        // A resolved interface/class structure displays under the LOCAL binding
+        // name (`import { Foo as Bar }` → `Bar`), not the exporter's declared
+        // name.  Re-tag the cloned structure so every display path renders the
+        // local name; member access reads the structure's props regardless.
+        const rt = self.store.get(t);
+        if (rt.kind == .object_t and rt.alias_name.len > 0 and
+            !std.mem.eql(u8, rt.alias_name, name))
+        {
+            return self.tagAliasName(t, name);
+        }
+        return t;
     }
 
     /// type (e.g. an import or type alias to a non-structural type).
