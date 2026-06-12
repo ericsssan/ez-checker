@@ -2287,6 +2287,23 @@ pub const Checker = struct {
     /// Build an object_t for an enum's value-side shape — each enum
     /// member becomes a property whose type is the literal value (or
     /// the broad number/string when we can't statically resolve).
+    /// True when `decl` (a ts_enum_decl) is a `const enum` — scan the modifier
+    /// keywords preceding its main token for `const`.
+    fn enumIsConst(self: *Checker, decl: NodeIndex) bool {
+        const tok = self.ast_ref.nodeMainToken(decl);
+        const tags = self.ast_ref.tokens.items(.tag);
+        var i: u32 = tok;
+        while (i > 0) {
+            i -= 1;
+            switch (tags[i]) {
+                .kw_const => return true,
+                .kw_enum, .kw_declare, .kw_export => {},
+                else => return false,
+            }
+        }
+        return false;
+    }
+
     fn buildEnumObjectType(self: *Checker, enum_name: []const u8) ?TypeId {
         const decl = self.type_decl_nodes.get(enum_name) orelse return null;
         if (self.ast_ref.nodeTag(decl) != .ts_enum_decl) return null;
@@ -2297,6 +2314,20 @@ pub const Checker = struct {
         var props_list = std.ArrayListUnmanaged(tymod.ObjectProp).empty;
         defer props_list.deinit(self.gpa);
         var auto_idx: f64 = 0;
+        // Canonical display name for collapsed members.  Two different rules:
+        //  * CONST enum: members are inlined to their value, so tsc displays the
+        //    FIRST member declared with a given value (`const enum { A=-1, C=-1. }`
+        //    → both `Foo.A`).  Keyed by literal value.
+        //  * regular enum: only a direct reference (`enum E { C, D = C }`) shares
+        //    a member's nominal type (`E.D : E.C`); a mere value coincidence does
+        //    NOT alias.  Keyed by the referenced member name.
+        const is_const_enum = self.enumIsConst(decl);
+        const SeenVal = struct { is_num: bool, num: f64, str: []const u8, name: []const u8 };
+        var seen_vals: [256]SeenVal = undefined;
+        var seen_n: usize = 0;
+        const NameAlias = struct { name: []const u8, canonical: []const u8 };
+        var aliases: [256]NameAlias = undefined;
+        var alias_n: usize = 0;
         for (self.ast_ref.extra_data[ed.members_start..ed.members_end]) |raw| {
             const m: NodeIndex = @enumFromInt(raw);
             if (self.ast_ref.nodeTag(m) != .ts_enum_member) continue;
@@ -2320,16 +2351,69 @@ pub const Checker = struct {
                 auto_idx += 1;
                 break :blk lit;
             };
+            var canonical_name = member_name;
+            if (is_const_enum) {
+                // Value-based: first member with this literal value wins.
+                const vt = self.store.get(value_ty);
+                var is_num = false;
+                var key_num: f64 = 0;
+                var key_str: []const u8 = "";
+                var have_key = false;
+                switch (vt.kind) {
+                    .number_literal => {
+                        is_num = true;
+                        key_num = vt.literal_value.number;
+                        have_key = true;
+                    },
+                    .string_literal => {
+                        key_str = vt.literal_value.string;
+                        have_key = true;
+                    },
+                    else => {},
+                }
+                if (have_key) {
+                    var found = false;
+                    for (seen_vals[0..seen_n]) |s| {
+                        if (s.is_num != is_num) continue;
+                        if ((is_num and s.num == key_num) or (!is_num and std.mem.eql(u8, s.str, key_str))) {
+                            canonical_name = s.name;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found and seen_n < seen_vals.len) {
+                        seen_vals[seen_n] = .{ .is_num = is_num, .num = key_num, .str = key_str, .name = member_name };
+                        seen_n += 1;
+                    }
+                }
+            } else {
+                // Reference-based: a direct `D = C` inherits C's canonical name.
+                if (md.rhs != .none and self.ast_ref.nodeTag(md.rhs) == .identifier) {
+                    const ref_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
+                    for (aliases[0..alias_n]) |al| {
+                        if (std.mem.eql(u8, al.name, ref_name)) {
+                            canonical_name = al.canonical;
+                            break;
+                        }
+                    }
+                }
+                if (alias_n < aliases.len) {
+                    aliases[alias_n] = .{ .name = member_name, .canonical = canonical_name };
+                    alias_n += 1;
+                }
+            }
             // Tag string/number-literal members as enum members so the facade
             // surfaces ts.TypeFlags.EnumLiteral + an EnumMember symbol
             // (no-unsafe-enum-comparison). Broad number/string members (no
-            // statically-known value) stay untagged.
+            // statically-known value) stay untagged.  The DISPLAY uses the
+            // canonical (first) name for the value; the PROP name stays the
+            // real member name so `E.D` lookup still resolves.
             const member_ty: TypeId = switch (self.store.get(value_ty).kind) {
-                .number_literal, .string_literal => self.store.enumMemberLiteral(value_ty, enum_name, member_name) catch value_ty,
+                .number_literal, .string_literal => self.store.enumMemberLiteral(value_ty, enum_name, canonical_name) catch value_ty,
                 // Computed initializers (`A = computed(0)`) still produce an
                 // opaque member type displaying `E.A` — tsc does not widen
                 // computed enum members to number.
-                .number, .string => self.store.enumMemberLiteral(value_ty, enum_name, member_name) catch value_ty,
+                .number, .string => self.store.enumMemberLiteral(value_ty, enum_name, canonical_name) catch value_ty,
                 else => value_ty,
             };
             props_list.append(self.gpa, .{ .name = member_name, .type_id = member_ty }) catch return null;
