@@ -311,6 +311,12 @@ pub const Checker = struct {
     /// even under `jsx: preserve`).  Computed once by `jsxElementDeclared`.
     jsx_element_declared_cache: ?bool = null,
 
+    /// Lazy cache: whether the react JSX factory (`React`) is an `any`-typed
+    /// stub (`declare const React: any`).  Then `React.createElement(...)` is
+    /// `any`, so JSX elements are `any` despite react mode.  Set by
+    /// `jsxFactoryIsAnyStub`.
+    jsx_factory_any_cache: ?bool = null,
+
     /// Maps type names to their AST declaration node so `resolveTypeRef`
     /// can build the structural type on demand.  Filled at init time
     /// for interfaces and classes — type aliases use the same mechanism
@@ -1524,16 +1530,58 @@ pub const Checker = struct {
         return result;
     }
 
+    /// Whether the react JSX factory `React` is an `any`-typed stub
+    /// (`declare const React: any`, or untyped under non-strict).  tsc derives a
+    /// JSX element's type from the factory's return type, so an `any` factory
+    /// makes the element `any` rather than `JSX.Element`.
+    fn jsxFactoryIsAnyStub(self: *Checker) bool {
+        if (self.jsx_factory_any_cache) |v| return v;
+        var result = false;
+        const parents = self.semantic.parent_indices;
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 0;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .identifier) continue;
+            if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni)), "React")) continue;
+            // Must be a declarator BINDING (`(const|var) React …`), not a use.
+            if (i >= parents.len) continue;
+            const pi = parents[i];
+            if (pi == @intFromEnum(NodeIndex.none)) continue;
+            const parent: NodeIndex = @enumFromInt(pi);
+            if (self.ast_ref.nodeTag(parent) != .declarator) continue;
+            if (self.ast_ref.nodeData(parent).lhs != ni) continue;
+            // Annotation lives on the identifier's rhs; `any` annotation OR no
+            // annotation (implicit any under non-strict) → stub factory.
+            const id_rhs = self.ast_ref.nodeData(ni).rhs;
+            if (id_rhs == .none) {
+                result = true;
+                break;
+            }
+            if (self.ast_ref.nodeTag(id_rhs) == .ts_type_annotation) {
+                const ty = self.resolveTypeNode(self.ast_ref.nodeData(id_rhs).lhs);
+                if (tymod.isAny(&self.store, ty)) {
+                    result = true;
+                    break;
+                }
+            }
+        }
+        self.jsx_factory_any_cache = result;
+        return result;
+    }
+
     /// Type of a JSX element/fragment expression — `JSX.Element` under a
     /// React-style jsx mode, otherwise `any` (preserve mode / no JSX namespace,
     /// where tsc leaves the element untyped).
     fn jsxElementType(self: *Checker, node: NodeIndex) TypeId {
-        // A JSX element is `JSX.Element` when that type is in scope: either a
-        // React-style jsx mode (the React import supplies the JSX namespace) OR
-        // an in-file `declare namespace JSX`.  `jsx: preserve` only affects
-        // EMIT, not type-checking, so a declared JSX namespace still yields
-        // `JSX.Element`; with neither, tsc leaves the element `any`.
-        if (!self.checker_opts.jsx_react_mode and !self.jsxElementDeclared())
+        // A JSX element is `JSX.Element` when that type is in scope: an in-file
+        // `declare namespace JSX { interface Element }` (authoritative, even
+        // under `jsx: preserve` — that only affects EMIT) OR a React-style mode
+        // whose factory is properly typed.  A react-mode factory stubbed as
+        // `declare const React: any` yields `any` (its createElement returns
+        // any); with neither, tsc leaves the element `any`.
+        if (!self.jsxElementDeclared() and
+            (!self.checker_opts.jsx_react_mode or self.jsxFactoryIsAnyStub()))
             return tymod.ID_ANY;
         // A namespaced tag name (`<a:b />`) is not a valid intrinsic element or
         // component — tsc types the element `any`, not `JSX.Element`.
