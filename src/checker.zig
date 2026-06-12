@@ -6679,6 +6679,30 @@ pub const Checker = struct {
                     const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.rhs));
                     if (self.global_value_types.get(prop)) |t| return t;
                 }
+                // `typeof <ns>.Member` where `<ns>` is a DIRECT namespace import
+                // (`import * as types`): tsc keeps the query verbatim as
+                // `typeof types.Member` (the namespace type doesn't structurally
+                // expose its members under a type query).  Render it syntactically
+                // rather than resolving the member to its (cross-file) structure.
+                // Restricted to a two-level chain (`ns.Member`): a deeper chain
+                // (`ns.C.staticField`) resolves to the member's value type.
+                if (qd.rhs != .none and self.ast_ref.nodeTag(qd.lhs) == .identifier and
+                    self.namespace_import_map.get(self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.lhs))) != null)
+                {
+                    const root_tok = self.ast_ref.nodeMainToken(qd.lhs);
+                    const rhs_tok = self.ast_ref.nodeMainToken(qd.rhs);
+                    const s = self.ast_ref.tokenStart(root_tok);
+                    const e = self.ast_ref.tokenStart(rhs_tok) + self.ast_ref.tokens.items(.len)[rhs_tok];
+                    if (s < e and e <= self.ast_ref.source.len) {
+                        const disp = std.fmt.allocPrint(self.gpa, "typeof {s}", .{self.ast_ref.source[s..e]}) catch return tymod.ID_ANY;
+                        const r = self.store.typeRef(disp, &.{}) catch {
+                            self.gpa.free(disp);
+                            return tymod.ID_ANY;
+                        };
+                        self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
+                        return r;
+                    }
+                }
             }
         }
         // In type position, `typeof A` has lhs = ts_type_reference (not .identifier).
