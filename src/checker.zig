@@ -16617,6 +16617,29 @@ pub const Checker = struct {
             const sl = self.store.appendSignatures(&sigs) catch return null;
             return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch null;
         }
+        // Statics whose value tsc prints as a fixed (generic) overload set.
+        // Emit the canonical display as an opaque type_ref: this corrects the
+        // method-VALUE node (previously a bogus `(any) => any`).  The cases
+        // where tsc renames the type param (`T_1`, nested generic scope) or
+        // degrades to `any` (no lib) stay as-is — already wrong, so no new
+        // divergence.  Calls through these refs resolve to `any` (unmodeled),
+        // the same coverage-gap as before.
+        {
+            const sig: ?[]const u8 =
+                if (std.mem.eql(u8, name, "values"))
+                    "{ <T>(o: { [s: string]: T; } | ArrayLike<T>): T[]; (o: {}): any[]; }"
+                else if (std.mem.eql(u8, name, "entries"))
+                    "{ <T>(o: { [s: string]: T; } | ArrayLike<T>): [string, T][]; (o: {}): [string, any][]; }"
+                else if (std.mem.eql(u8, name, "fromEntries"))
+                    "{ <T = any>(entries: Iterable<readonly [PropertyKey, T]>): { [k: string]: T; }; (entries: Iterable<readonly any[]>): any; }"
+                else if (std.mem.eql(u8, name, "assign"))
+                    "{ <T extends {}, U>(target: T, source: U): T & U; <T extends {}, U, V>(target: T, source1: U, source2: V): T & U & V; <T extends {}, U, V, W>(target: T, source1: U, source2: V, source3: W): T & U & V & W; (target: object, ...sources: any[]): any; }"
+                else if (std.mem.eql(u8, name, "freeze"))
+                    "{ <T extends Function>(f: T): T; <T extends { [idx: string]: U | null | undefined | object; }, U extends string | bigint | number | boolean | symbol>(o: T): Readonly<T>; <T>(o: T): Readonly<T>; }"
+                else
+                    null;
+            if (sig) |s| return self.store.typeRef(s, &.{}) catch null;
+        }
         if (std.mem.eql(u8, name, "keys")) {
             // { (o: object): string[]; (o: {}): string[]; }
             const empty_obj = self.store.add(.{ .kind = .object_t }) catch return null;
@@ -16635,6 +16658,16 @@ pub const Checker = struct {
 
     /// lib.es5 ArrayConstructor statics with tsc-fidelity signatures.
     fn arrayConstructorProperty(self: *Checker, name: []const u8) ?TypeId {
+        // Method values tsc prints as fixed overload sets (opaque display; the
+        // call result stays a coverage-gap, as before).  `from` has a 2-overload
+        // (no-Iterable, older lib) and `any` (no lib) variant that stay wrong,
+        // but the 4-overload form is the common case.
+        if (std.mem.eql(u8, name, "from")) {
+            return self.store.typeRef("{ <T>(arrayLike: ArrayLike<T>): T[]; <T, U>(arrayLike: ArrayLike<T>, mapfn: (v: T, k: number) => U, thisArg?: any): U[]; <T>(iterable: Iterable<T> | ArrayLike<T>): T[]; <T, U>(iterable: Iterable<T> | ArrayLike<T>, mapfn: (v: T, k: number) => U, thisArg?: any): U[]; }", &.{}) catch null;
+        }
+        if (std.mem.eql(u8, name, "of")) {
+            return self.store.typeRef("<T>(...items: T[]) => T[]", &.{}) catch null;
+        }
         if (std.mem.eql(u8, name, "isArray")) {
             // (arg: any) => arg is any[]
             const any_arr = self.store.arrayOf(tymod.ID_ANY) catch return null;
