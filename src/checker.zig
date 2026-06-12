@@ -14740,7 +14740,10 @@ pub const Checker = struct {
                     // differently, so bail.
                     const pd = self.ast_ref.nodeData(p);
                     if (pd.lhs == .none or pd.rhs == .none) return tymod.ID_UNKNOWN;
-                    if (self.ast_ref.nodeTag(pd.lhs) != .identifier) return tymod.ID_UNKNOWN;
+                    // Key must be a plain identifier or a member access
+                    // (`Symbol.iterator`, `N.s`) — anything else bails.
+                    const key_tag = self.ast_ref.nodeTag(pd.lhs);
+                    if (key_tag != .identifier and key_tag != .member_expr) return tymod.ID_UNKNOWN;
                     const key_ty = self.typeOf(pd.lhs);
                     const kt = self.store.get(key_ty);
                     if (!(kt.kind == .type_ref and std.mem.eql(u8, kt.name, "unique symbol")))
@@ -14780,11 +14783,34 @@ pub const Checker = struct {
         return self.store.objectOf(buf[0..n]) catch tymod.ID_UNKNOWN;
     }
 
+    /// Source byte range covering a (possibly member) expression.  A
+    /// member_expr's own `nodeSpan` covers only its property token, so combine
+    /// the leftmost object's start with the property's end (`Symbol.iterator`,
+    /// `N.s`) — otherwise just the node's own span.
+    fn exprSourceSpan(self: *Checker, node: NodeIndex) struct { start: u32, end: u32 } {
+        const span = self.ast_ref.nodeSpan(node);
+        var start = span.start;
+        var end = span.end;
+        const tag = self.ast_ref.nodeTag(node);
+        if (tag == .member_expr or tag == .optional_member_expr) {
+            const d = self.ast_ref.nodeData(node);
+            if (d.lhs != .none) {
+                const ls = self.exprSourceSpan(d.lhs);
+                if (ls.start < start) start = ls.start;
+            }
+            if (d.rhs != .none) {
+                const rs = self.ast_ref.nodeSpan(d.rhs);
+                if (rs.end > end) end = rs.end;
+            }
+        }
+        return .{ .start = start, .end = end };
+    }
+
     /// Display name for a late-bound computed key: the bracketed source text of
     /// the key expression (`[x]`, `[N.s]`, `[Symbol.iterator]`).  Owned string
     /// lives in `string_pool`.
     fn computedKeyName(self: *Checker, key: NodeIndex) ?[]const u8 {
-        const span = self.ast_ref.nodeSpan(key);
+        const span = self.exprSourceSpan(key);
         const src = self.ast_ref.source;
         if (span.start >= span.end or span.end > src.len) return null;
         const disp = std.fmt.allocPrint(self.gpa, "[{s}]", .{src[span.start..span.end]}) catch return null;
