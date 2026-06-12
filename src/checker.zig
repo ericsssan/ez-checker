@@ -2179,6 +2179,8 @@ pub const Checker = struct {
             .member_expr, .optional_member_expr => {
                 if (pdata.rhs != node) return tymod.ID_ANY;
                 if (pdata.lhs == .none) return tymod.ID_ANY;
+                // Property token of `typeof ns.Member` renders verbatim too.
+                if (self.typeofNsQualifiedRef(parent)) |t| return t;
                 const obj_ty = self.typeOf(pdata.lhs);
                 const tok = self.ast_ref.nodeMainToken(node);
                 const prop_name = self.ast_ref.tokenText(tok);
@@ -15359,6 +15361,45 @@ pub const Checker = struct {
         return null;
     }
 
+    /// When `member_node` (a member_expr `ns.X`) is the operand of a `typeof`
+    /// type query and `ns` is a namespace import, returns the verbatim `typeof
+    /// ns.X` ref tsc renders — the same syntactic form resolveTypeofType emits
+    /// for the whole query, applied to the separately-scored inner member node
+    /// (and its property token).  2-level only (root must be a direct namespace
+    /// identifier), matching the resolveTypeofType lever.
+    fn typeofNsQualifiedRef(self: *Checker, member_node: NodeIndex) ?TypeId {
+        const data = self.ast_ref.nodeData(member_node);
+        if (data.lhs == .none or data.rhs == .none) return null;
+        if (self.ast_ref.nodeTag(data.lhs) != .identifier) return null;
+        const root_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
+        if (self.namespace_import_map.get(root_name) == null) return null;
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (member_node.toInt() < parents.len) parents[member_node.toInt()] else NONE;
+        var guard: u8 = 0;
+        const in_typeof = while (p != NONE and p < parents.len and p < self.ast_ref.nodes.len and guard < 4) : (guard += 1) {
+            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
+                .ts_typeof_type => break true,
+                .ts_type_reference, .member_expr, .grouping_expr => {},
+                else => break false,
+            }
+            p = parents[p];
+        } else false;
+        if (!in_typeof) return null;
+        const root_tok = self.ast_ref.nodeMainToken(data.lhs);
+        const rhs_tok = self.ast_ref.nodeMainToken(data.rhs);
+        const s = self.ast_ref.tokenStart(root_tok);
+        const e = self.ast_ref.tokenStart(rhs_tok) + self.ast_ref.tokens.items(.len)[rhs_tok];
+        if (s >= e or e > self.ast_ref.source.len) return null;
+        const disp = std.fmt.allocPrint(self.gpa, "typeof {s}", .{self.ast_ref.source[s..e]}) catch return null;
+        const r = self.store.typeRef(disp, &.{}) catch {
+            self.gpa.free(disp);
+            return null;
+        };
+        self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
+        return r;
+    }
+
     fn inferMember(self: *Checker, node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(node);
         // CommonJS: `module.exports` is the module's export object — tsc
@@ -15370,6 +15411,9 @@ pub const Checker = struct {
         {
             return self.store.typeRef("typeof module.exports", &.{}) catch tymod.ID_ANY;
         }
+        // `typeof ns.Member` — the inner member node of a namespace type query
+        // renders verbatim (see resolveTypeofType for the whole-query lever).
+        if (self.typeofNsQualifiedRef(node)) |t| return t;
         const obj_ty = self.typeOf(data.lhs);
         // Special case: enum member access (e.g. `SyntaxKind.Block`).
         // Enum values are typed as `any`, but we still want to look up
