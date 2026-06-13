@@ -14848,12 +14848,28 @@ pub const Checker = struct {
             if (self.ast_ref.nodeTag(pn) == .ts_parameter_property) pn = self.ast_ref.nodeData(pn).lhs;
             if (self.ast_ref.nodeTag(pn) == .rest_element) rest_pi = params.len - 1;
         }
+        // The call's contextual (expected) type, if any — used both to DEFER
+        // context-sensitive callback args below and for the backward pass.
+        const call_expected = self.expectedTypeOf(call);
         const arg_nodes = self.callArguments(call);
+        // PASS 1 — non-context-sensitive args (and the param-INDEPENDENT
+        // annotated return of context-sensitive callbacks).  A context-
+        // sensitive function literal (un-annotated arrow/fn-expr) has
+        // implicit-`any` params that would pollute the binding via any-wins, so
+        // its params are excluded from inference here (TypeScript fixes type
+        // params from the other arguments first).
         for (arg_nodes, 0..) |arg_raw, ai| {
             const pidx = if (ai < params.len) ai else rest_pi;
             if (pidx == std.math.maxInt(usize) or pidx >= params.len) continue;
             const param: NodeIndex = @enumFromInt(params[pidx]);
             const param_ty_node = self.paramAnnotationNode(param) orelse continue;
+            if (self.argIsContextSensitiveFn(@enumFromInt(arg_raw))) {
+                // Contribute only the arrow's annotated (param-independent)
+                // return; the rest is deferred to the backward / pass-2 steps.
+                if (self.arrowAnnotatedReturnType(@enumFromInt(arg_raw)) != null)
+                    self.matchContextSensitiveReturn(@enumFromInt(arg_raw), param_ty_node, names[0..tp_count], bindings[0..tp_count]);
+                continue;
+            }
             const arg_ty = self.typeOf(@enumFromInt(arg_raw));
             // For the rest param each trailing arg matches the rest ELEMENT.
             const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
@@ -14872,17 +14888,117 @@ pub const Checker = struct {
         for (bindings[0..tp_count]) |b| {
             if (b.eq(TypeId.none)) { any_unbound = true; break; }
         }
-        if (any_unbound and fd.return_type != .none) {
+        if (any_unbound and call_expected != null and fd.return_type != .none) {
             var ret_node = fd.return_type;
             if (self.ast_ref.nodeTag(ret_node) == .ts_type_annotation)
                 ret_node = self.ast_ref.nodeData(ret_node).lhs;
             if (ret_node != .none) {
-                if (self.expectedTypeOf(call)) |exp| {
-                    self.matchTypeParam(ret_node, exp, names[0..tp_count], bindings[0..tp_count]);
-                }
+                self.matchTypeParam(ret_node, call_expected.?, names[0..tp_count], bindings[0..tp_count]);
+            }
+        }
+        // PASS 2 — still-NOTHING bound (no other arg, no expected type fixed a
+        // param): forward-match the fully context-sensitive arrows.  Their
+        // implicit-`any` params bind the type params to `any`, which matches
+        // tsc's result for such an under-determined call (`f(x => x)` → `any`).
+        // Guarded on all-unbound so it can never OVERRIDE a binding established
+        // by pass 1 / backward (regardless of argument order).
+        var nothing_bound = true;
+        for (bindings[0..tp_count]) |b| {
+            if (!b.eq(TypeId.none)) { nothing_bound = false; break; }
+        }
+        if (nothing_bound) {
+            for (arg_nodes, 0..) |arg_raw, ai| {
+                const pidx = if (ai < params.len) ai else rest_pi;
+                if (pidx == std.math.maxInt(usize) or pidx >= params.len) continue;
+                if (!self.argIsContextSensitiveFn(@enumFromInt(arg_raw))) continue;
+                if (self.arrowAnnotatedReturnType(@enumFromInt(arg_raw)) != null) continue;
+                const param: NodeIndex = @enumFromInt(params[pidx]);
+                const param_ty_node = self.paramAnnotationNode(param) orelse continue;
+                const arg_ty = self.typeOf(@enumFromInt(arg_raw));
+                const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
+                self.matchTypeParam(match_node, arg_ty, names[0..tp_count], bindings[0..tp_count]);
             }
         }
         return tp_count;
+    }
+
+    /// Contribute ONLY the return of a context-sensitive callback arg to
+    /// inference: when the callback parameter is a function type `(…) => R` and
+    /// the arrow has an explicit (param-independent) return annotation, unify
+    /// `R` against that return type — never the callback's params (their
+    /// implicit `any` would pollute the binding).  `test<T>(cb: (arg: T) => T)`
+    /// called `test((arg): number => 1)` → bind T=number from the return.
+    fn matchContextSensitiveReturn(
+        self: *Checker,
+        arg: NodeIndex,
+        param_ty_node: NodeIndex,
+        names: []const []const u8,
+        bindings: []TypeId,
+    ) void {
+        var pn = param_ty_node;
+        while (self.ast_ref.nodeTag(pn) == .ts_parenthesized_type) pn = self.ast_ref.nodeData(pn).lhs;
+        if (self.ast_ref.nodeTag(pn) != .ts_function_type) return;
+        const pd = self.ast_ref.nodeData(pn);
+        if (pd.lhs == .none) return;
+        const pfd = self.ast_ref.extraData(ast.FnData, @intFromEnum(pd.lhs));
+        // A ts_function_type's return node lives in `body` (the parser reuses
+        // the field for type position); fall back to return_type.
+        const cb_ret_node = if (pfd.body != .none) pfd.body else pfd.return_type;
+        if (cb_ret_node == .none) return;
+        const arrow_ret = self.arrowAnnotatedReturnType(arg) orelse return;
+        self.matchTypeParam(cb_ret_node, arrow_ret, names, bindings);
+    }
+
+    /// The resolved return type of an arrow/function expression when it has an
+    /// EXPLICIT return annotation (`(x): R => …`), else null.  Param-
+    /// independent, so safe to use for inference from a context-sensitive arg.
+    fn arrowAnnotatedReturnType(self: *Checker, arg: NodeIndex) ?TypeId {
+        const d = self.ast_ref.nodeData(arg);
+        if (d.lhs == .none) return null;
+        var rt: NodeIndex = .none;
+        switch (self.ast_ref.nodeTag(arg)) {
+            .arrow_fn, .async_arrow_fn => rt = self.ast_ref.extraData(ast.ArrowData, @intFromEnum(d.lhs)).return_type,
+            .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr =>
+                rt = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs)).return_type,
+            else => return null,
+        }
+        if (rt == .none) return null;
+        if (self.ast_ref.nodeTag(rt) == .ts_type_annotation) rt = self.ast_ref.nodeData(rt).lhs;
+        if (rt == .none) return null;
+        self.type_pos_depth += 1;
+        defer self.type_pos_depth -= 1;
+        return self.resolveTypeNode(rt);
+    }
+
+    /// True when `arg` is a context-sensitive function literal — an
+    /// arrow/function expression with at least one UN-annotated parameter,
+    /// whose param types are therefore implicit `any` until contextually typed.
+    fn argIsContextSensitiveFn(self: *Checker, arg: NodeIndex) bool {
+        var ps: u32 = 0;
+        var pe: u32 = 0;
+        switch (self.ast_ref.nodeTag(arg)) {
+            .arrow_fn, .async_arrow_fn => {
+                const d = self.ast_ref.nodeData(arg);
+                if (d.lhs == .none) return false;
+                const ad = self.ast_ref.extraData(ast.ArrowData, @intFromEnum(d.lhs));
+                ps = ad.params_start;
+                pe = ad.params_end;
+            },
+            .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => {
+                const d = self.ast_ref.nodeData(arg);
+                if (d.lhs == .none) return false;
+                const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
+                ps = fd.params;
+                pe = fd.params_end;
+            },
+            else => return false,
+        }
+        if (ps >= pe or pe > self.ast_ref.extra_data.len) return false;
+        for (self.ast_ref.extra_data[ps..pe]) |raw| {
+            const p: NodeIndex = @enumFromInt(raw);
+            if (self.paramAnnotationNode(p) == null) return true;
+        }
+        return false;
     }
 
     /// The node a rest parameter's trailing args should match against: the
@@ -15123,14 +15239,17 @@ pub const Checker = struct {
         if (tag == .ts_function_type or tag == .ts_constructor_type) {
             const at = self.store.get(arg_ty);
             if (at.kind != .function_t) return;
-            const sig_ids = self.store.idsOf(at.list_data);
-            if (sig_ids.len == 0) return;
-            const ret_id = sig_ids[sig_ids.len - 1];
+            // A function_t stores its params/return in its SIGNATURE (via
+            // signatureParamsOf / sig.return_type), NOT in list_data — reading
+            // list_data found nothing and silently skipped the match.
+            const sigs = self.store.signaturesOf(at.signatures);
+            if (sigs.len == 0) return;
+            const param_type_ids = self.store.signatureParamsOf(sigs[0]);
+            const ret_id = sigs[0].return_type;
             const fn_data = self.ast_ref.nodeData(n);
             if (fn_data.lhs == .none) return;
             const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(fn_data.lhs));
             // Match parameter type annotations against param types in the arg function_t.
-            const param_type_ids = sig_ids[0..sig_ids.len - 1];
             if (fd.params_end > fd.params and fd.params_end <= self.ast_ref.extra_data.len) {
                 const params = self.ast_ref.extra_data[fd.params..fd.params_end];
                 for (params, 0..) |raw, pi| {
