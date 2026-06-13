@@ -14498,8 +14498,51 @@ pub const Checker = struct {
         // `T && T` is `NonNullable<T>`, not `false | NonNullable<T>`.
         const narrowed_b = self.tryNarrowExprByCondition(data.lhs, data.rhs, b) orelse b;
         if (self.store.get(a).kind == .type_param) return narrowed_b;
-        const false_literal = self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN;
-        return self.store.unionOf(&.{ false_literal, narrowed_b }) catch tymod.ID_ANY;
+        // Use the LHS's canonical falsy representative as the short-circuit branch:
+        // `number && b` → `0 | b`; `string && b` → `"" | b`; `boolean && b` → `false | b`.
+        // For unions, collect falsy-capable members. Falls back to `false` when no
+        // better representative exists (matches prior behaviour for boolean/unknown LHS).
+        const falsy_a = self.falsyRepresentative(a);
+        return self.store.unionOf(&.{ falsy_a, narrowed_b }) catch tymod.ID_ANY;
+    }
+
+    /// Returns the canonical falsy-literal representative of `ty` for use in
+    /// `&&` result types.  For primitive types: `0` for number, `""` for string,
+    /// `false` for boolean.  For unions: collect the falsy representatives of
+    /// each member and union them.  Falls back to `false` for types we don't
+    /// model further (objects, etc., which are always truthy in practice but
+    /// TypeScript still short-circuits through).
+    fn falsyRepresentative(self: *Checker, ty: TypeId) TypeId {
+        const t = self.store.get(ty);
+        switch (t.kind) {
+            .number   => return self.store.numberLiteral(0) catch tymod.ID_NUMBER,
+            .string   => return self.store.stringLiteral("") catch tymod.ID_STRING,
+            .boolean  => return self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN,
+            .null_t, .undefined_t => return ty,
+            .number_literal => {
+                const is_zero = t.literal_value == .number and t.literal_value.number == 0;
+                return if (is_zero) ty else self.store.booleanLiteral(false) catch ty;
+            },
+            .string_literal => {
+                const is_empty = t.literal_value == .string and t.literal_value.string.len == 0;
+                return if (is_empty) ty else self.store.booleanLiteral(false) catch ty;
+            },
+            .boolean_literal => return ty,
+            .union_t => {
+                var buf: [16]TypeId = undefined;
+                var n: usize = 0;
+                for (self.store.idsOf(t.list_data)) |m| {
+                    const fp = self.falsyRepresentative(m);
+                    const already = for (buf[0..n]) |b| { if (b.eq(fp)) break true; } else false;
+                    if (!already and n < buf.len) { buf[n] = fp; n += 1; }
+                }
+                if (n == 1) return buf[0];
+                if (n > 1) return self.store.unionOf(buf[0..n]) catch
+                    self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN;
+                return self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN;
+            },
+            else => return self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN,
+        }
     }
 
     /// Try to narrow an expression's type based on a condition in a logical AND.
