@@ -563,6 +563,18 @@ pub const Checker = struct {
     /// enclosing call's inferred type arguments (contextualCallbackParamType →
     /// inferGenericParamType → collectCallBindings), so the chain can't loop.
     cb_instantiate_depth: u8 = 0,
+
+    /// Active inference context: a flat stack of provisional type-parameter
+    /// bindings (name → TypeId) established while a generic call fixes its type
+    /// params from non-context-sensitive arguments.  Consulted when typing a
+    /// context-sensitive callback's parameters so they resolve to the
+    /// provisional binding (`wrap(s => s.length)` — `s` sees the fixed
+    /// `T=string`) rather than a bare type param.  Frames are pushed/popped
+    /// around `collectCallBindings`' pass 2.
+    infer_ctx_names: std.ArrayListUnmanaged([]const u8) = .empty,
+    infer_ctx_vals: std.ArrayListUnmanaged(TypeId) = .empty,
+    /// Recursion guard for `collectCallBindings`' provisional-binding pass 2.
+    infer_pass2_depth: u8 = 0,
     /// Set while resolving a member access through a union/intersection
     /// receiver — suppresses the string-index-signature fallback so a member
     /// served only by an index signature counts as "absent" (the union access
@@ -642,6 +654,8 @@ pub const Checker = struct {
         self.expando_objs.deinit(self.gpa);
         self.pattern_annotations.deinit(self.gpa);
         self.param_ctx_types.deinit(self.gpa);
+        self.infer_ctx_names.deinit(self.gpa);
+        self.infer_ctx_vals.deinit(self.gpa);
         {
             var jit = self.jsdoc_params.valueIterator();
             while (jit.next()) |lst| lst.deinit(self.gpa);
@@ -6964,6 +6978,13 @@ pub const Checker = struct {
                 }
             }
         }
+        // Resolve any type param through the ACTIVE inference context first —
+        // when this callback is being re-typed in `collectCallBindings`' pass 2
+        // the enclosing call's param-side type params are provisionally bound
+        // (`s` sees the fixed `T=string`).  Cheap no-op when no context is
+        // active, so standalone queries fall through to the instantiation below.
+        result = self.substituteThroughInferCtx(result);
+        if (!self.typeMentionsTypeParam(result)) return result;
         // The param type still mentions a type parameter (`(x: T) => …` where T
         // is the callee's own type param, e.g. `wrap(s => …)` with
         // `wrap<T,U>(cb: Mapper<T,U>)`).  Instantiate the WHOLE callback
@@ -14924,7 +14945,60 @@ pub const Checker = struct {
                 self.matchTypeParam(ret_node, call_expected.?, names[0..tp_count], bindings[0..tp_count]);
             }
         }
-        // PASS 2 — still-NOTHING bound (no other arg, no expected type fixed a
+        // PASS 2a (provisional-context fixed-point) — SOME type params are now
+        // fixed (param side: pass 1 / backward) but others remain unbound
+        // (typically the RETURN side, `U` in `cb: Mapper<T,U>`).  Push the fixed
+        // bindings as a provisional inference context and RE-TYPE each deferred
+        // context-sensitive arrow: its params now resolve to the fixed type
+        // params (`s` → the fixed `T=string`), so the body (`s.length`) yields a
+        // concrete type, and unifying the arrow against the callback param binds
+        // the return-side type params (`U=number`).  This is the fixed-point
+        // step that lets `wrap(s => s.length)` resolve to `Mapper<string,number>`.
+        {
+            var some_bound = false;
+            var some_unbound = false;
+            for (bindings[0..tp_count]) |b| {
+                if (b.eq(TypeId.none)) some_unbound = true else some_bound = true;
+            }
+            if (some_bound and some_unbound and self.infer_pass2_depth < 3) {
+                const frame_start = self.infer_ctx_names.items.len;
+                // Snapshot the already-fixed bindings: pass 2 may ONLY fill the
+                // still-unbound params, never override a fixed one (a
+                // re-entrant arrow re-typed as `(…: any) => any` would otherwise
+                // pollute the fixed param-side back to `any` via any-wins).
+                var pre: [8]TypeId = undefined;
+                for (0..tp_count) |i| {
+                    pre[i] = bindings[i];
+                    if (!bindings[i].eq(TypeId.none)) {
+                        self.infer_ctx_names.append(self.gpa, names[i]) catch break;
+                        self.infer_ctx_vals.append(self.gpa, bindings[i]) catch {
+                            _ = self.infer_ctx_names.pop();
+                            break;
+                        };
+                    }
+                }
+                self.infer_pass2_depth += 1;
+                for (arg_nodes, 0..) |arg_raw, ai| {
+                    const pidx = if (ai < params.len) ai else rest_pi;
+                    if (pidx == std.math.maxInt(usize) or pidx >= params.len) continue;
+                    if (!self.argIsContextSensitiveFn(@enumFromInt(arg_raw))) continue;
+                    if (self.arrowAnnotatedReturnType(@enumFromInt(arg_raw)) != null) continue;
+                    const param: NodeIndex = @enumFromInt(params[pidx]);
+                    const param_ty_node = self.paramAnnotationNode(param) orelse continue;
+                    const arg_ty = self.typeOf(@enumFromInt(arg_raw));
+                    const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
+                    self.matchTypeParam(match_node, arg_ty, names[0..tp_count], bindings[0..tp_count]);
+                }
+                self.infer_pass2_depth -= 1;
+                // Restore the pre-fixed bindings (undo any pollution of them).
+                for (0..tp_count) |i| {
+                    if (!pre[i].eq(TypeId.none)) bindings[i] = pre[i];
+                }
+                self.infer_ctx_names.shrinkRetainingCapacity(frame_start);
+                self.infer_ctx_vals.shrinkRetainingCapacity(frame_start);
+            }
+        }
+        // PASS 2b — still-NOTHING bound (no other arg, no expected type fixed a
         // param): forward-match the fully context-sensitive arrows.  Their
         // implicit-`any` params bind the type params to `any`, which matches
         // tsc's result for such an under-determined call (`f(x => x)` → `any`).
@@ -14996,6 +15070,14 @@ pub const Checker = struct {
         self.type_pos_depth += 1;
         defer self.type_pos_depth -= 1;
         return self.resolveTypeNode(rt);
+    }
+
+    /// Substitute any type parameter in `ty` that the ACTIVE inference context
+    /// binds (provisional pass-2 bindings).  No-op when no context is active.
+    fn substituteThroughInferCtx(self: *Checker, ty: TypeId) TypeId {
+        if (self.infer_ctx_names.items.len == 0) return ty;
+        if (!self.typeMentionsTypeParam(ty)) return ty;
+        return self.substituteTypeId(ty, self.infer_ctx_names.items, self.infer_ctx_vals.items);
     }
 
     /// True when `arg` is a context-sensitive function literal — an
