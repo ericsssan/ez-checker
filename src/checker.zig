@@ -20064,7 +20064,15 @@ pub const Checker = struct {
             if (rt != .none and self.ast_ref.nodeTag(rt) == .ts_type_annotation) {
                 return self.nonNullExpected(self.resolveTypeNode(self.ast_ref.nodeData(rt).lhs));
             }
-            return null; // reached the enclosing function; no return annotation
+            // No explicit return annotation — try the contextual return type of the
+            // enclosing function itself (e.g. `foo(outer => { return inner => {} })`
+            // where outer's expected type gives inner's param types).
+            const ctx_fn = self.expectedTypeOf(pn) orelse return null;
+            const ct = self.store.get(ctx_fn);
+            if (ct.kind != .function_t) return null;
+            const sigs = self.store.signaturesOf(ct.signatures);
+            if (sigs.len == 0) return null;
+            return self.nonNullExpected(sigs[0].return_type);
         }
         return null;
     }
