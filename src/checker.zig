@@ -1293,7 +1293,7 @@ pub const Checker = struct {
     }
 
     fn literalString(self: *Checker, node: NodeIndex) TypeId {
-        if (self.stringLiteralIsPropertyKey(node)) return tymod.ID_STRING;
+        if (self.literalAsObjectLiteralPropertyKeyType(node)) |ty| return ty;
         const tok = self.ast_ref.nodeMainToken(node);
         const raw = self.ast_ref.tokenText(tok);
         if (raw.len < 2) return tymod.ID_STRING;
@@ -1310,25 +1310,42 @@ pub const Checker = struct {
         return self.store.stringLiteral(decoded) catch tymod.ID_STRING;
     }
 
-    fn stringLiteralIsPropertyKey(self: *Checker, node: NodeIndex) bool {
+    /// When a string or number literal is used as a property key in an object literal
+    /// (e.g. `'a'` in `{ 'a': 0 }` or `0` in `{ 0: "x" }`), TypeScript returns the
+    /// widened type of the property VALUE, not the literal type of the key.
+    /// Returns null if the node is not an object-literal property key.
+    fn literalAsObjectLiteralPropertyKeyType(self: *Checker, node: NodeIndex) ?TypeId {
         const parents = self.semantic.parent_indices;
         const nidx = node.toInt();
-        if (nidx >= parents.len) return false;
+        if (nidx >= parents.len) return null;
         const pidx = parents[nidx];
-        if (pidx == @intFromEnum(NodeIndex.none)) return false;
-        if (pidx >= self.ast_ref.nodes.len) return false;
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        if (pidx >= self.ast_ref.nodes.len) return null;
         const parent: NodeIndex = @enumFromInt(pidx);
-        if (self.ast_ref.nodeTag(parent) != .property) return false;
-        if (self.ast_ref.nodeData(parent).lhs != node) return false;
-        if (pidx >= parents.len) return false;
+        if (self.ast_ref.nodeTag(parent) != .property) return null;
+        const pdata = self.ast_ref.nodeData(parent);
+        if (pdata.lhs != node) return null;
+        if (pdata.rhs == .none) return null;
+        if (pidx >= parents.len) return null;
         const gp_idx = parents[pidx];
-        if (gp_idx == @intFromEnum(NodeIndex.none)) return false;
-        if (gp_idx >= self.ast_ref.nodes.len) return false;
+        if (gp_idx == @intFromEnum(NodeIndex.none)) return null;
+        if (gp_idx >= self.ast_ref.nodes.len) return null;
         const grandparent: NodeIndex = @enumFromInt(gp_idx);
-        return self.ast_ref.nodeTag(grandparent) == .object_literal;
+        if (self.ast_ref.nodeTag(grandparent) != .object_literal) return null;
+        // Return widened value type (same widening as identifierAsObjectLiteralPropertyKey).
+        const val_ty = self.typeOf(pdata.rhs);
+        const t = self.store.get(val_ty);
+        return switch (t.kind) {
+            .string_literal => tymod.ID_STRING,
+            .number_literal => tymod.ID_NUMBER,
+            .boolean_literal => tymod.ID_BOOLEAN,
+            .bigint_literal => tymod.ID_BIGINT,
+            else => val_ty,
+        };
     }
 
     fn literalNumber(self: *Checker, node: NodeIndex) TypeId {
+        if (self.literalAsObjectLiteralPropertyKeyType(node)) |ty| return ty;
         const tok = self.ast_ref.nodeMainToken(node);
         const raw = self.ast_ref.tokenText(tok);
 
