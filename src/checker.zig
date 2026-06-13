@@ -2676,12 +2676,14 @@ pub const Checker = struct {
         if (t.kind == .string_literal or t.kind == .number_literal or t.kind == .boolean_literal) {
             const obj_node: NodeIndex = @enumFromInt(gp_pidx);
             const obj_ni = gp_pidx;
-            const callee_cached = blk: {
+            const should_check_ctx = blk: {
                 if (obj_ni >= parents.len) break :blk false;
                 const cp = parents[obj_ni];
                 if (cp == @intFromEnum(NodeIndex.none) or cp >= self.ast_ref.nodes.len) break :blk false;
                 const cn: NodeIndex = @enumFromInt(cp);
                 const ctag = self.ast_ref.nodeTag(cn);
+                // (no extra cases)
+                // Call/new expression: only if callee type is already cached (bottom-up ordering).
                 if (ctag != .call_expr and ctag != .optional_call_expr and ctag != .new_expr) break :blk false;
                 const cd = self.ast_ref.nodeData(cn);
                 if (cd.lhs == .none) break :blk false;
@@ -2690,7 +2692,7 @@ pub const Checker = struct {
                 const cached = self.node_types[callee_ni];
                 break :blk !cached.eq(TypeId.none) and !cached.eq(tymod.ID_UNKNOWN);
             };
-            if (callee_cached) {
+            if (should_check_ctx) {
                 if (self.expectedTypeOf(obj_node)) |ctx| {
                     const key_tok = self.ast_ref.nodeMainToken(node);
                     const key_name = self.ast_ref.tokenText(key_tok);
@@ -20480,8 +20482,15 @@ pub const Checker = struct {
             },
             .call_expr, .optional_call_expr, .new_expr => return self.callArgContextualType(pn, node),
             .return_stmt => return self.enclosingFnReturnType(pn),
-            // (assignment-target contextual typing is omitted — typeOf(lhs) can
-            //  recurse into expando/circular receivers and poison the node cache.)
+            // Assignment: `x = rhs` — use the type of the LHS as the expected type
+            // for the RHS. Restricted to identifier LHS to avoid recursing into
+            // member-access chains that could poison the node cache.
+            .assign => {
+                const ad = self.ast_ref.nodeData(pn);
+                if (ad.rhs != node or ad.lhs == .none) return null;
+                if (self.ast_ref.nodeTag(ad.lhs) != .identifier) return null;
+                return self.typeOf(ad.lhs);
+            },
             .grouping_expr, .conditional => return self.expectedTypeOfD(pn, depth + 1),
             // `expr as T` / `expr satisfies T` — the operand's expected type is T
             // (skip `as const`, which isn't a regular type context).
