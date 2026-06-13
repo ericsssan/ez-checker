@@ -20387,10 +20387,19 @@ pub const Checker = struct {
         const vt = self.store.get(val_ty).kind;
         if (vt != .string_literal and vt != .number_literal and vt != .boolean_literal) return false;
         const ct = self.store.get(c);
-        if (ct.kind != .object_t) return false;
-        for (self.store.propsOf(ct.object_props)) |p| {
-            if (!std.mem.eql(u8, p.name, prop_name)) continue;
-            return self.typeExpectsLiteral(p.type_id, val_ty);
+        if (ct.kind == .object_t) {
+            for (self.store.propsOf(ct.object_props)) |p| {
+                if (!std.mem.eql(u8, p.name, prop_name)) continue;
+                return self.typeExpectsLiteral(p.type_id, val_ty);
+            }
+            return false;
+        }
+        // When the expected type is a union (e.g. `X | Y`), preserve the literal
+        // if ANY member expects it — e.g. passing `{type:'y'}` to `(bar: X | Y) => void`.
+        if (ct.kind == .union_t) {
+            for (self.store.idsOf(ct.list_data)) |m| {
+                if (self.contextualPropExpectsLiteral(m, prop_name, val_ty)) return true;
+            }
         }
         return false;
     }
