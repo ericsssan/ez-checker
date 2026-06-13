@@ -20424,6 +20424,9 @@ pub const Checker = struct {
         switch (t.kind) {
             .string_literal, .number_literal, .boolean_literal =>
                 return tymod.isAssignableTo(&self.store, val_ty, target),
+            // `boolean` is semantically `true | false` — preserve boolean literals
+            // when the contextual property type is the base boolean type.
+            .boolean => return self.store.get(val_ty).kind == .boolean_literal,
             .union_t => {
                 for (self.store.idsOf(t.list_data)) |m| {
                     const mk = self.store.get(m).kind;

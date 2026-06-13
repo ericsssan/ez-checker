@@ -47,3 +47,211 @@ test "computed enum members" {
         std.debug.print("node {d} '{s}' = {s}\n", .{ n, text, tystr });
     }
 }
+
+test "SKIP contextual literal preservation in call arg" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\interface X { type: 'x'; value: string; }
+        \\interface Y { type: 'y'; value: 'none' | 'done'; }
+        \\function foo(bar: X | Y) { }
+        \\foo({ type: 'y', value: 'done' });
+    ;
+    var lex = try @import("es_parser").Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try @import("es_parser").Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try @import("es_parser").semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    var checker = try @import("ez_checker").Checker.init(gpa, &ast, &sem, .{});
+    defer checker.deinit();
+
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: @import("es_parser").ast.NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        if (tag != .identifier and tag != .string_literal) continue;
+        const span = ast.nodeSpan(ni);
+        if (span.end > src.len or span.end <= span.start) continue;
+        const text = src[span.start..span.end];
+        if (!std.mem.eql(u8, text, "type") and !std.mem.eql(u8, text, "value") and
+            !std.mem.eql(u8, text, "'y'") and !std.mem.eql(u8, text, "'done'")) continue;
+        const ty = checker.typeOf(ni);
+        const tystr = try checker.typeToString(ty);
+        defer gpa.free(tystr);
+        std.debug.print("node {d} '{s}' (tag={s}) = {s}\n", .{ n, text, @tagName(tag), tystr });
+    }
+}
+
+test "SKIP contextual literal - full oracle sweep" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\interface X { type: 'x'; value: string; }
+        \\interface Y { type: 'y'; value: 'none' | 'done'; }
+        \\function foo(bar: X | Y) { }
+        \\foo({ type: 'y', value: 'done' });
+    ;
+    var lex = try @import("es_parser").Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try @import("es_parser").Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try @import("es_parser").semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    var checker = try @import("ez_checker").Checker.init(gpa, &ast, &sem, .{});
+    defer checker.deinit();
+
+    // Simulate oracle: sweep ALL nodes first (this caches callees etc)
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: @import("es_parser").ast.NodeIndex = @enumFromInt(n);
+        _ = checker.typeOf(ni);
+    }
+
+    // Now check specific nodes
+    n = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: @import("es_parser").ast.NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        if (tag != .identifier) continue;
+        const span = ast.nodeSpan(ni);
+        if (span.end > src.len or span.end <= span.start) continue;
+        const text = src[span.start..span.end];
+        if (!std.mem.eql(u8, text, "type") and !std.mem.eql(u8, text, "value")) continue;
+        // Only property key identifiers (check parent is .property)
+        const parents = sem.parent_indices;
+        if (ni.toInt() >= parents.len) continue;
+        const pidx = parents[ni.toInt()];
+        if (pidx == @intFromEnum(@import("es_parser").ast.NodeIndex.none)) continue;
+        const par: @import("es_parser").ast.NodeIndex = @enumFromInt(pidx);
+        if (ast.nodeTag(par) != .property) continue;
+        const pdata = ast.nodeData(par);
+        if (pdata.lhs != ni) continue;
+        const ty = checker.typeOf(ni);
+        const tystr = try checker.typeToString(ty);
+        defer gpa.free(tystr);
+        std.debug.print("(full sweep) node {d} '{s}' = {s}\n", .{ n, text, tystr });
+    }
+}
+
+test "SKIP contextual literal - node ordering" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\interface X { type: 'x'; value: string; }
+        \\interface Y { type: 'y'; value: 'none' | 'done'; }
+        \\function foo(bar: X | Y) { }
+        \\foo({ type: 'y', value: 'done' });
+    ;
+    var lex = try @import("es_parser").Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try @import("es_parser").Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try @import("es_parser").semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+
+    // Print all nodes near the call expression to understand ordering
+    var n: u32 = 30;
+    while (n < ast.nodes.len and n <= 55) : (n += 1) {
+        const ni: @import("es_parser").ast.NodeIndex = @enumFromInt(n);
+        const span = ast.nodeSpan(ni);
+        if (span.end <= span.start or span.end > src.len) {
+            std.debug.print("node {d}: tag={s} (no span)\n", .{ n, @tagName(ast.nodeTag(ni)) });
+            continue;
+        }
+        const text = src[span.start..@min(span.end, span.start + 40)];
+        // strip newlines
+        var buf: [80]u8 = undefined;
+        var w: usize = 0;
+        for (text) |ch| {
+            if (ch != '\n' and ch != '\r' and w < buf.len - 1) { buf[w] = ch; w += 1; }
+        }
+        std.debug.print("node {d}: tag={s} text='{s}'\n", .{ n, @tagName(ast.nodeTag(ni)), buf[0..w] });
+    }
+}
+
+test "SKIP contextual literal - full node listing" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\interface X { type: 'x'; value: string; }
+        \\interface Y { type: 'y'; value: 'none' | 'done'; }
+        \\function foo(bar: X | Y) { }
+        \\foo({ type: 'y', value: 'done' });
+    ;
+    var lex = try @import("es_parser").Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try @import("es_parser").Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try @import("es_parser").semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+
+    std.debug.print("total nodes: {d}\n", .{ast.nodes.len});
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: @import("es_parser").ast.NodeIndex = @enumFromInt(n);
+        const span = ast.nodeSpan(ni);
+        var text_buf: [30]u8 = undefined;
+        var text_len: usize = 0;
+        if (span.end > span.start and span.end <= src.len) {
+            for (src[span.start..@min(span.end, span.start+30)]) |ch| {
+                if (ch != '\n' and ch != '\r' and text_len < text_buf.len-1) { text_buf[text_len] = ch; text_len += 1; }
+            }
+        }
+        // parent
+        const pidx = if (ni.toInt() < sem.parent_indices.len) sem.parent_indices[ni.toInt()] else 0xFFFFFFFF;
+        std.debug.print("node {d}: tag={s} parent={d} text='{s}'\n", .{ n, @tagName(ast.nodeTag(ni)), pidx, text_buf[0..text_len] });
+    }
+}
+
+test "SKIP contextual literal - trace node 35" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\interface X { type: 'x'; value: string; }
+        \\interface Y { type: 'y'; value: 'none' | 'done'; }
+        \\function foo(bar: X | Y) { }
+        \\foo({ type: 'y', value: 'done' });
+    ;
+    var lex = try @import("es_parser").Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try @import("es_parser").Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try @import("es_parser").semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    var checker = try @import("ez_checker").Checker.init(gpa, &ast, &sem, .{});
+    defer checker.deinit();
+
+    // Type nodes 0..34 first (simulating oracle sweep up to but not including 35)
+    var n: u32 = 1;
+    while (n <= 34) : (n += 1) {
+        const ni: @import("es_parser").ast.NodeIndex = @enumFromInt(n);
+        _ = checker.typeOf(ni);
+    }
+
+    // Check what's cached at callee node 34
+    const callee_cached = checker.node_types[34];
+    std.debug.print("node 34 (callee foo) cached type id: {d}\n", .{callee_cached.toInt()});
+
+    // Now type the property key
+    const ni35: @import("es_parser").ast.NodeIndex = @enumFromInt(35);
+    const ty35 = checker.typeOf(ni35);
+    const s35 = try checker.typeToString(ty35);
+    defer gpa.free(s35);
+    std.debug.print("node 35 'type' = {s}\n", .{s35});
+}
