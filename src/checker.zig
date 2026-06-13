@@ -20407,6 +20407,13 @@ pub const Checker = struct {
                 if (self.contextualPropExpectsLiteral(m, prop_name, val_ty)) return true;
             }
         }
+        // Named interface / type alias: resolve the apparent type's member.
+        // This handles `X | Y` union members that are type_ref("X") or type_ref("Y").
+        if (ct.kind == .type_ref) {
+            if (self.objectPropExpectedType(c, prop_name)) |prop_ty| {
+                return self.typeExpectsLiteral(prop_ty, val_ty);
+            }
+        }
         return false;
     }
 
