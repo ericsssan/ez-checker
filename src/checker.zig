@@ -7603,7 +7603,14 @@ pub const Checker = struct {
             const tp: NodeIndex = @enumFromInt(raw);
             if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) continue;
             if (count > 0) buf.appendSlice(self.gpa, ", ") catch { buf.deinit(self.gpa); return null; };
-            const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+            const main_tok = self.ast_ref.nodeMainToken(tp);
+            // The parser discards the `const` modifier token but it's preserved
+            // in the token stream one position before the name.  Check for it so
+            // we can render `<const T>` (TS 5.0 const type parameters).
+            if (main_tok > 0 and self.ast_ref.tokenTag(main_tok - 1) == .kw_const) {
+                buf.appendSlice(self.gpa, "const ") catch { buf.deinit(self.gpa); return null; };
+            }
+            const name = self.ast_ref.tokenText(main_tok);
             buf.appendSlice(self.gpa, name) catch { buf.deinit(self.gpa); return null; };
             const tp_data = self.ast_ref.nodeData(tp);
             if (tp_data.lhs != .none) {
@@ -11457,7 +11464,7 @@ pub const Checker = struct {
     fn tagAliasArgs(self: *Checker, id: TypeId, display: []const u8, args: []const TypeId) TypeId {
         const t = self.store.get(id);
         switch (t.kind) {
-            .object_t, .intersection_t, .union_t, .tuple_t, .type_ref, .function_t => {},
+            .object_t, .intersection_t, .union_t, .tuple_t, .type_ref, .function_t, .type_param => {},
             else => return id,
         }
         var copy = t.*;
@@ -14485,14 +14492,34 @@ pub const Checker = struct {
         if (tymod.isAny(&self.store, a)) return a;
         if (self.alwaysFalsy(a)) return a;
         if (self.alwaysTruthy(a)) return b;
-        // For `a && b`, narrow b by the condition a and return false | narrowed_b
+        // For `a && b`, narrow b by the condition a.
+        // When LHS is a type parameter, TypeScript does not propagate a falsy
+        // constituent — `T && number` is `number`, not `false | number`, and
+        // `T && T` is `NonNullable<T>`, not `false | NonNullable<T>`.
         const narrowed_b = self.tryNarrowExprByCondition(data.lhs, data.rhs, b) orelse b;
+        if (self.store.get(a).kind == .type_param) return narrowed_b;
         const false_literal = self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN;
         return self.store.unionOf(&.{ false_literal, narrowed_b }) catch tymod.ID_ANY;
     }
 
     /// Try to narrow an expression's type based on a condition in a logical AND.
     fn tryNarrowExprByCondition(self: *Checker, cond_node: NodeIndex, expr_node: NodeIndex, expr_type: TypeId) ?TypeId {
+        // `t && t` — when condition IS the expression, the right side is
+        // narrowed to NonNullable<T>.  TypeScript shows `t : NonNullable<T>`
+        // in this position (the left-side truthy check eliminates null/undefined).
+        if (self.nodesSyntacticallyEqual(cond_node, expr_node)) {
+            const et = self.store.get(expr_type);
+            // For type parameters and generic-looking types, produce NonNullable<T>
+            // as a display-alias type_ref (matches what tsc shows).
+            if (et.kind == .type_param or et.kind == .type_ref) {
+                const t_str = self.typeToString(expr_type) catch return null;
+                defer self.gpa.free(t_str);
+                const display = std.fmt.allocPrint(self.gpa, "NonNullable<{s}>", .{t_str}) catch return null;
+                return self.tagAliasArgs(self.removeNullUndefined(expr_type), display, &.{expr_type});
+            }
+            // For concrete types (unions etc.), just remove null/undefined.
+            return self.removeNullUndefined(expr_type);
+        }
         // Handle typeof checks: typeof x === "string" narrows x
         if (self.ast_ref.nodeTag(cond_node) == .strict_equal or self.ast_ref.nodeTag(cond_node) == .equal) {
             const cond_data = self.ast_ref.nodeData(cond_node);
@@ -20774,7 +20801,13 @@ pub const Checker = struct {
                     try buf.append(gpa, '>');
                 }
             },
-            .type_param  => try buf.appendSlice(gpa, t.name),
+            .type_param  => {
+                if (t.alias_name.len > 0) {
+                    try buf.appendSlice(gpa, t.alias_name);
+                } else {
+                    try buf.appendSlice(gpa, t.name);
+                }
+            },
             .string_literal => {
                 // String enum members render as EnumName.MemberName; a
                 // single-member enum's lone member is aliased to the enum name.

@@ -68,13 +68,18 @@ pub fn build(b: *std.Build) void {
         .name = "oracle",
         .root_module = oracle_exe_mod,
     });
-    b.installArtifact(oracle_exe);
+    const install_oracle = b.addInstallArtifact(oracle_exe, .{});
+    b.getInstallStep().dependOn(&install_oracle.step);
     const run_oracle = b.addRunArtifact(oracle_exe);
+    // Always install (sync zig-out/bin/oracle) before running so that manual
+    // `zig-out/bin/oracle --trace ...` invocations never see a stale binary.
+    run_oracle.step.dependOn(&install_oracle.step);
     const run_oracle_step = b.step("run-oracle", "Sweep the TypeScript corpus and report conformance");
     run_oracle_step.dependOn(&run_oracle.step);
 
     // Regenerate the ratchet baseline from the current numbers (never hand-edited).
     const save_baseline = b.addRunArtifact(oracle_exe);
+    save_baseline.step.dependOn(&install_oracle.step);
     save_baseline.addArg("--save-baseline");
     const save_baseline_step = b.step("save-baseline", "Overwrite oracle/baseline.lock with the current conformance numbers");
     save_baseline_step.dependOn(&save_baseline.step);
