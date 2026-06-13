@@ -14854,6 +14854,29 @@ pub const Checker = struct {
             const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
             self.matchTypeParam(match_node, arg_ty, names[0..tp_count], bindings[0..tp_count]);
         }
+        // Backward (contextual) inference: when the arguments leave some type
+        // params unbound — typically because a callback argument is an
+        // un-annotated arrow whose param can't be inferred forward — unify the
+        // call's CONTEXTUAL (expected) type against the callee's RETURN
+        // annotation.  `let f: Mapper<string,number> = wrap(s => s.length)`,
+        // `wrap<T,U>(cb: Mapper<T,U>): Mapper<T,U>` — the expected
+        // `Mapper<string,number>` unifies against `Mapper<T,U>` → T=string,
+        // U=number.  Only consulted for still-unbound params (forward
+        // inference from arguments takes precedence).
+        var any_unbound = false;
+        for (bindings[0..tp_count]) |b| {
+            if (b.eq(TypeId.none)) { any_unbound = true; break; }
+        }
+        if (any_unbound and fd.return_type != .none) {
+            var ret_node = fd.return_type;
+            if (self.ast_ref.nodeTag(ret_node) == .ts_type_annotation)
+                ret_node = self.ast_ref.nodeData(ret_node).lhs;
+            if (ret_node != .none) {
+                if (self.expectedTypeOf(call)) |exp| {
+                    self.matchTypeParam(ret_node, exp, names[0..tp_count], bindings[0..tp_count]);
+                }
+            }
+        }
         return tp_count;
     }
 
