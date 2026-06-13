@@ -7278,26 +7278,6 @@ pub const Checker = struct {
         return self.store.add(t) catch id;
     }
 
-    /// True when a `ts_typeof_type` node is a direct member of a union /
-    /// intersection type (its parent, peeling parenthesized types, is one).
-    fn typeofNodeInComposite(self: *Checker, ty_node: NodeIndex) bool {
-        const parents = self.semantic.parent_indices;
-        var idx = ty_node.toInt();
-        const NONE: u32 = @intFromEnum(NodeIndex.none);
-        var depth: u32 = 0;
-        while (depth < 4) : (depth += 1) {
-            if (idx >= parents.len) return false;
-            const p = parents[idx];
-            if (p == NONE) return false;
-            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
-                .ts_parenthesized_type => idx = p,
-                .ts_union_type, .ts_intersection_type => return true,
-                else => return false,
-            }
-        }
-        return false;
-    }
-
     /// Build the `typeof <name>` display string (owned by `string_pool`).
     fn typeofDisplayName(self: *Checker, name: []const u8) ?[]const u8 {
         const disp = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return null;
@@ -7388,6 +7368,12 @@ pub const Checker = struct {
             if (t.eq(tymod.ID_UNKNOWN) and self.constInitIsSymbolCall(name)) {
                 return self.store.stringLiteral(name) catch t;
             }
+            // NOTE: `typeof <var>` is NOT tagged for display preservation here —
+            // tsc's keep-vs-expand choice for a variable query is
+            // position-dependent (a function-type param `(a: typeof y)` is kept
+            // verbatim, but a class-field `a: typeof x` expands to the structure),
+            // too subtle to replicate reliably.  Only `typeof ClassName` (above)
+            // is preserved.
             return t;
         }
         if (self.global_value_types.get(name)) |t| return t;
