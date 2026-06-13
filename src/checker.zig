@@ -18015,7 +18015,8 @@ pub const Checker = struct {
             const ref_name2 = obj2.name;  // snapshot before resolveDeclaredType may grow store
             if (self.resolveDeclaredType(ref_name2)) |resolved| {
                 if (!resolved.eq(obj_ty)) {
-                    return self.inferComputedMember(resolved, key_node, obj_node);
+                    const subst = self.applyDeclTypeArgs(obj_ty, ref_name2, resolved);
+                    return self.inferComputedMember(subst, key_node, obj_node);
                 }
             }
             // `ArrayLike<T>` / `Array<T>` / `ReadonlyArray<T>`: numeric
