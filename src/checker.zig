@@ -7307,6 +7307,14 @@ pub const Checker = struct {
                     const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.rhs));
                     if (self.global_value_types.get(prop)) |t| return t;
                 }
+                // `typeof <Ns>.<Member>` where `<Ns>` is a LOCAL top-level
+                // namespace → the member's static side, displayed
+                // `typeof <Ns>.<Member>` (same lever as the value-side access).
+                if (qd.rhs != .none and self.ast_ref.nodeTag(qd.lhs) == .identifier) {
+                    const ns_root = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.lhs));
+                    const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.rhs));
+                    if (self.localNamespaceMemberValue(ns_root, prop, ty_node)) |t| return t;
+                }
                 // `typeof <ns>.Member` where `<ns>` is a DIRECT namespace import
                 // (`import * as types`): tsc keeps the query verbatim as
                 // `typeof types.Member` (the namespace type doesn't structurally
@@ -16912,6 +16920,13 @@ pub const Checker = struct {
                 }
             }
         }
+        // Local-namespace member: receiver `typeof <Ns>` where Ns is a locally
+        // declared namespace/module and prop is an exported class/enum/namespace
+        // → the member's static side, displayed `typeof <Ns>.<prop>`.
+        if (self.typeofRootName(lookup_ty)) |ns_root| {
+            if (self.localNamespaceMemberValue(ns_root, prop_name, node)) |resolved|
+                return self.maybeAddOptionalUndefined(resolved, obj_ty, in_chain);
+        }
         // Simple `=` assignment target: a divergent get/set accessor exposes its
         // setter (write) type here, not the getter type used for reads.
         if (self.nodeIsSimpleAssignTarget(node)) {
@@ -16948,6 +16963,137 @@ pub const Checker = struct {
                 if (!t.eq(tymod.ID_UNKNOWN)) return t;
             }
         }
+        return null;
+    }
+
+    /// `<Ns>.<Member>` where `<Ns>` is a LOCALLY-declared namespace/module and
+    /// `<Member>` is an exported class / enum / nested namespace inside it.  tsc
+    /// types the value as the member's static side, displayed by the canonical
+    /// qualified name `typeof <Ns>.<Member>`.  `ns_root` is the receiver's
+    /// namespace name (extracted from a `typeof <Ns>` receiver — works for both
+    /// the direct `Ns.M` access and an alias `var m: typeof Ns; m.M`, since both
+    /// carry the same canonical name).  Var/function members fall through (null)
+    /// to the normal structural lookup — they show their own value type, not a
+    /// `typeof`.
+    fn localNamespaceMemberValue(self: *Checker, ns_root: []const u8, prop_name: []const u8, use_site: NodeIndex) ?TypeId {
+        if (ns_root.len == 0 or prop_name.len == 0) return null;
+        // Restrict to TOP-LEVEL namespaces accessed from a TOP-LEVEL use-site.
+        // For nested namespaces (or references from inside a namespace), tsc
+        // displays the symbol minimally-qualified relative to the use site
+        // (`A.B.C.E` → `typeof E`), which our simple full-path display can't
+        // reproduce — so we cap at the unambiguous case.
+        if (std.mem.indexOfScalar(u8, ns_root, '.') != null) return null;
+        if (self.nodeInsideNamespace(use_site)) return null;
+        // A heritage clause (`class X extends Ns.C`) or other bare-name position
+        // shows the reference by its plain qualified name (`Ns.C`), not `typeof`.
+        if (self.identifierInBareNamePosition(use_site)) return null;
+        const ns_decl = self.type_decl_nodes.get(ns_root) orelse return null;
+        const dt = self.ast_ref.nodeTag(ns_decl);
+        if (dt != .ts_namespace_decl and dt != .ts_module_decl) return null;
+        if (!self.namespaceIsTopLevel(ns_decl)) return null;
+        var member = self.nsMemberStmt(ns_decl, prop_name);
+        if (member == null) {
+            for (self.merged_ns_extra.items) |e| {
+                if (!std.mem.eql(u8, e.name, ns_root)) continue;
+                member = self.nsMemberStmt(e.node, prop_name);
+                if (member != null) break;
+            }
+        }
+        const m = member orelse return null;
+        // Only an exported CLASS member is resolved here: its static side is a
+        // clean, display-stable `typeof <Ns>.<Class>`.  Enum and nested-namespace
+        // members are intentionally excluded — tsc's display for those is
+        // minimally-qualified / import-alias-sensitive and cascades wrongly.
+        if (self.ast_ref.nodeTag(m) != .class_decl) return null;
+        const base = self.buildClassStaticType(m, prop_name);
+        const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ ns_root, prop_name }) catch return null;
+        self.string_pool.append(self.gpa, disp) catch {
+            self.gpa.free(disp);
+            return null;
+        };
+        return self.tagDisplayName(base, disp);
+    }
+
+    /// True when `node` is lexically inside any `namespace`/`module` block.
+    fn nodeInsideNamespace(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var depth: u16 = 0;
+        while (p != NONE and depth < 128) : (depth += 1) {
+            const tag = self.ast_ref.nodeTag(@enumFromInt(p));
+            if (tag == .ts_namespace_decl or tag == .ts_module_decl) return true;
+            p = parents[p];
+        }
+        return false;
+    }
+
+    /// True when the namespace/module declaration node has no enclosing
+    /// namespace/module (i.e. it is declared at the program top level).
+    fn namespaceIsTopLevel(self: *Checker, decl: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (decl.toInt() < parents.len) parents[decl.toInt()] else NONE;
+        var depth: u16 = 0;
+        while (p != NONE and depth < 128) : (depth += 1) {
+            const tag = self.ast_ref.nodeTag(@enumFromInt(p));
+            if (tag == .ts_namespace_decl or tag == .ts_module_decl) return false;
+            p = parents[p];
+        }
+        return true;
+    }
+
+    /// Find the inner declaration node for an exported member named `name` in a
+    /// namespace/module body.  Unwraps `export class/enum/namespace` wrappers.
+    fn nsMemberStmt(self: *Checker, ns_decl: NodeIndex, name: []const u8) ?NodeIndex {
+        const ns_data = self.ast_ref.nodeData(ns_decl);
+        const body = ns_data.rhs;
+        if (body == .none or self.ast_ref.nodeTag(body) != .block_stmt) return null;
+        const bd = self.ast_ref.nodeData(body);
+        const start = @intFromEnum(bd.lhs);
+        const end = @intFromEnum(bd.rhs);
+        if (start >= end or end > self.ast_ref.extra_data.len) return null;
+        for (self.ast_ref.extra_data[start..end]) |raw| {
+            const wrapper: NodeIndex = @enumFromInt(raw);
+            const wtag = self.ast_ref.nodeTag(wrapper);
+            // Only EXPORTED members are accessible as `Ns.Member`; a bare
+            // (non-exported) declaration is module-private and reads as `any`.
+            if (wtag != .export_named and wtag != .export_default_fn and wtag != .export_default_class)
+                continue;
+            const stmt = self.ast_ref.nodeData(wrapper).lhs;
+            if (stmt == .none) continue;
+            const tg = self.ast_ref.nodeTag(stmt);
+            const decl_name: []const u8 = switch (tg) {
+                .class_decl => nm: {
+                    const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(self.ast_ref.nodeData(stmt).lhs));
+                    if (cd.name == .none) break :nm "";
+                    break :nm self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+                },
+                .ts_enum_decl => nm: {
+                    const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(self.ast_ref.nodeData(stmt).lhs));
+                    break :nm self.ast_ref.tokenText(ed.name);
+                },
+                .ts_namespace_decl, .ts_module_decl => nm: {
+                    const nd = self.ast_ref.nodeData(stmt);
+                    if (nd.lhs == .none) break :nm "";
+                    break :nm self.ast_ref.tokenText(self.ast_ref.nodeMainToken(nd.lhs));
+                },
+                else => "",
+            };
+            if (decl_name.len > 0 and std.mem.eql(u8, decl_name, name)) return stmt;
+        }
+        return null;
+    }
+
+    /// The `Ns` in a receiver type whose display is `typeof Ns` — checking the
+    /// `display_name` tag first, then a `type_ref` named `typeof Ns`.  Returns
+    /// null when the type is not a `typeof <name>` form.
+    fn typeofRootName(self: *Checker, ty: TypeId) ?[]const u8 {
+        const t = self.store.get(ty);
+        if (t.display_name.len > 0 and std.mem.startsWith(u8, t.display_name, "typeof "))
+            return t.display_name["typeof ".len..];
+        if (t.kind == .type_ref and std.mem.startsWith(u8, t.name, "typeof "))
+            return t.name["typeof ".len..];
         return null;
     }
 
