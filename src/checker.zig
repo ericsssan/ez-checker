@@ -16481,6 +16481,16 @@ pub const Checker = struct {
                         .boolean_literal => tymod.ID_BOOLEAN,
                         else => val_ty,
                     };
+                    // When context preserves a literal, pre-populate the key
+                    // identifier's node_types entry so typeOf(key_ident) returns
+                    // the literal.  The key node index is always > the object
+                    // literal index, so the oracle visits us first.
+                    if (ctx_preserves and pd.lhs != .none) {
+                        const ki = pd.lhs.toInt();
+                        if (ki < self.node_types.len and self.node_types[ki].eq(TypeId.none)) {
+                            self.node_types[ki] = val_ty;
+                        }
+                    }
                     const vt = self.ast_ref.nodeTag(pd.rhs);
                     const is_plain_fn = vt == .fn_expr or vt == .async_fn_expr or
                         vt == .generator_fn_expr or vt == .async_generator_fn_expr;
