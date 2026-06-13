@@ -823,7 +823,7 @@ pub const Checker = struct {
     fn inferExpr(self: *Checker, node: NodeIndex) TypeId {
         const t = self.ast_ref.nodeTag(node);
         return switch (t) {
-            .string_literal => self.literalString(node),
+            .string_literal => self.moduleNameLiteralType(node) orelse self.literalString(node),
             .number_literal => self.literalNumber(node),
             .bigint_literal => self.literalBigint(node),
             .boolean_literal => self.literalBoolean(node),
@@ -1232,6 +1232,50 @@ pub const Checker = struct {
             }
         }
         return i >= inner.len;
+    }
+
+    /// When a string literal is the NAME of a `declare module 'X' {}`, return a
+    /// type that displays as `typeof import("X")`.  Returns null otherwise.
+    fn moduleNameLiteralType(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return null;
+        const pidx = parents[nidx];
+        if (pidx == @intFromEnum(NodeIndex.none)) return null;
+        const pn: NodeIndex = @enumFromInt(pidx);
+        const ptag = self.ast_ref.nodeTag(pn);
+        if (ptag != .ts_module_decl) return null;
+        if (self.ast_ref.nodeData(pn).lhs != node) return null;
+        // Only apply to `declare module "X"` — not bare `module "X"` (ASI edge case).
+        // When `declare` and `module` are on different lines, ASI separates them.
+        const tags = self.ast_ref.tokens.items(.tag);
+        const has_newline = self.ast_ref.tokens.items(.has_newline_before);
+        const mt = self.ast_ref.nodeMainToken(pn);
+        var has_declare = false;
+        var i: u32 = mt;
+        while (i > 0) {
+            i -= 1;
+            // Newline before `module` → ASI would separate `declare;` from `module`.
+            if (i + 1 == mt and has_newline[mt]) break;
+            switch (tags[i]) {
+                .kw_declare => { has_declare = true; break; },
+                .kw_export, .identifier => {},
+                else => break,
+            }
+        }
+        if (!has_declare) return null;
+        // Extract module name (strip surrounding quotes).
+        const tok = self.ast_ref.nodeMainToken(node);
+        const raw = self.ast_ref.tokenText(tok);
+        if (raw.len < 2) return null;
+        const inner = raw[1 .. raw.len - 1];
+        const disp = std.fmt.allocPrint(self.gpa, "typeof import(\"{s}\")", .{inner}) catch return null;
+        self.string_pool.append(self.gpa, disp) catch {
+            self.gpa.free(disp);
+            return null;
+        };
+        const base = self.store.stringLiteral(inner) catch return null;
+        return self.tagDisplayName(base, disp);
     }
 
     fn literalString(self: *Checker, node: NodeIndex) TypeId {
