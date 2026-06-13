@@ -59,6 +59,9 @@ pub const CheckerOpts = struct {
     /// True under `--noUncheckedIndexedAccess`: an index-signature access
     /// (`record[k]` / `record.prop`) yields `V | undefined` instead of `V`.
     no_unchecked_indexed_access: bool = false,
+    /// True under `--exactOptionalPropertyTypes`: optional property access does
+    /// NOT add `| undefined`; the property is either present (type T) or absent.
+    exact_optional_property_types: bool = false,
     /// True when JSX is checked in a React-style mode (`jsx: react` /
     /// `react-jsx` / `react-jsxdev` / `react-native`).  Under these modes a
     /// JSX element expression has type `JSX.Element`; under `preserve` / unset
@@ -868,7 +871,7 @@ pub const Checker = struct {
 
             .ts_as_expr, .ts_type_assertion => self.inferAsCast(node, t),
             .ts_satisfies_expr => self.inferSatisfies(node),
-            .ts_non_null_expr => self.typeOf(self.ast_ref.nodeData(node).lhs),
+            .ts_non_null_expr => self.inferNonNull(node),
 
             .grouping_expr => self.typeOf(self.ast_ref.nodeData(node).lhs),
             .sequence_expr => self.inferSequence(node),
@@ -907,21 +910,32 @@ pub const Checker = struct {
                 }
                 break :blk self.typeOf(ad.rhs);
             },
-            // Compound assignments: result is the new value of LHS.  If
-            // LHS is any, result is any.  Otherwise approximate based on
-            // operator class (most produce number; string/bigint variants
-            // would need a more refined check but rarely surface for
-            // unsafe-* rules).
-            .add_assign, .sub_assign, .mul_assign, .div_assign, .mod_assign,
+            // += produces string when either operand is string; number when LHS is enum.
+            .add_assign => blk: {
+                const data = self.ast_ref.nodeData(node);
+                if (data.lhs == .none or data.rhs == .none) break :blk tymod.ID_ANY;
+                const lhs_ty = self.typeOf(data.lhs);
+                const rhs_ty = self.typeOf(data.rhs);
+                // If either operand is string, the result is string.
+                const lhs_t = self.store.get(lhs_ty);
+                const rhs_t = self.store.get(rhs_ty);
+                if (lhs_t.kind == .string or lhs_t.kind == .string_literal) break :blk tymod.ID_STRING;
+                if (rhs_t.kind == .string or rhs_t.kind == .string_literal) break :blk tymod.ID_STRING;
+                // Enum LHS coerces to number for arithmetic.
+                if (lhs_t.enum_name.len > 0) break :blk tymod.ID_NUMBER;
+                if (tymod.isAny(&self.store, lhs_ty)) break :blk tymod.ID_ANY;
+                if (tymod.isAny(&self.store, rhs_ty)) break :blk tymod.ID_ANY;
+                break :blk lhs_ty;
+            },
+            // All other compound arithmetic/bitwise assignments always produce number.
+            .sub_assign, .mul_assign, .div_assign, .mod_assign,
             .exp_assign, .and_assign, .or_assign, .xor_assign, .shl_assign,
             .shr_assign, .ushr_assign => blk: {
                 const data = self.ast_ref.nodeData(node);
                 if (data.lhs == .none or data.rhs == .none) break :blk tymod.ID_ANY;
-                const lhs_ty = self.typeOf(data.lhs);
-                if (tymod.isAny(&self.store, lhs_ty)) break :blk tymod.ID_ANY;
-                const rhs_ty = self.typeOf(data.rhs);
-                if (tymod.isAny(&self.store, rhs_ty)) break :blk tymod.ID_ANY;
-                break :blk lhs_ty;
+                // Arithmetic compound assignments ALWAYS produce number regardless
+                // of operand types (TypeScript coerces operands to numbers).
+                break :blk tymod.ID_NUMBER;
             },
 
             // Logical compound assignments evaluate to the assigned value:
@@ -2283,7 +2297,9 @@ pub const Checker = struct {
             if (full.eq(tymod.ID_UNKNOWN)) return null;
             break :blk full;
         };
-        if (self.propertyHasOptionalMarker(node) and !self.typeContainsUndefined(base_ty)) {
+        if (self.propertyHasOptionalMarker(node) and !self.typeContainsUndefined(base_ty) and
+            !self.checker_opts.strict_null_checks_explicit_off)
+        {
             return self.store.unionOf(&.{ base_ty, tymod.ID_UNDEFINED }) catch base_ty;
         }
         return base_ty;
@@ -2345,7 +2361,7 @@ pub const Checker = struct {
                         if (std.mem.eql(u8, self.ast_ref.tokenText(mn_tok), method_name)) match_count += 1;
                     }
                     if (match_count == 1) {
-                        return self.buildFunctionTypeG(
+                        const fn_ty = self.buildFunctionTypeG(
                             sig_data.params_start,
                             sig_data.params_end,
                             sig_data.return_type,
@@ -2355,6 +2371,12 @@ pub const Checker = struct {
                             sig_data.type_params,
                             sig_data.type_params_end,
                         );
+                        if (self.propertyHasOptionalMarker(node) and
+                            !self.checker_opts.strict_null_checks_explicit_off)
+                        {
+                            return self.store.unionOf(&.{ fn_ty, tymod.ID_UNDEFINED }) catch fn_ty;
+                        }
+                        return fn_ty;
                     }
                     return null;
                 }
@@ -2376,8 +2398,11 @@ pub const Checker = struct {
                 for (self.store.propsOf(rt.object_props)) |p| {
                     if (std.mem.eql(u8, p.name, method_name)) {
                         const pt = self.store.get(p.type_id);
-                        if (pt.kind == .function_t) return p.type_id;
-                        return null;
+                        if (pt.kind != .function_t) return null;
+                        if (p.optional and !self.checker_opts.strict_null_checks_explicit_off) {
+                            return self.store.unionOf(&.{ p.type_id, tymod.ID_UNDEFINED }) catch p.type_id;
+                        }
+                        return p.type_id;
                     }
                 }
                 return null;
@@ -2496,29 +2521,44 @@ pub const Checker = struct {
         switch (ptag) {
             .property_def => {
                 const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(pdata.rhs));
+                var base_ty: TypeId = tymod.ID_ANY;
                 if (pd.type_annotation != .none and
                     self.ast_ref.nodeTag(pd.type_annotation) == .ts_type_annotation)
                 {
                     const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
-                    if (self.resolveSimpleTypeNodeSafe(ty_node)) |t| return t;
-                    return self.resolveTypeNode(ty_node);
-                }
-                if (pd.value != .none) {
+                    base_ty = self.resolveSimpleTypeNodeSafe(ty_node) orelse self.resolveTypeNode(ty_node);
+                } else if (pd.value != .none) {
                     const raw = self.typeOf(pd.value);
                     const t = self.store.get(raw);
-                    // Enum members widen to the enum type (`p1 = E.B` → E).
                     if (t.enum_name.len > 0 and self.enumInitIsFresh(pd.value, 0)) {
-                        if (self.buildEnumUnionType(t.enum_name)) |eu| return eu;
+                        base_ty = self.buildEnumUnionType(t.enum_name) orelse raw;
+                    } else {
+                        // Preserve literal types for `readonly` properties and `as const` values.
+                        const is_readonly = self.propertyHasReadonlyModifier(node);
+                        const val_tag = self.ast_ref.nodeTag(pd.value);
+                        const is_as_const_val = (val_tag == .ts_as_expr or val_tag == .ts_type_assertion) and blk: {
+                            const vd = self.ast_ref.nodeData(pd.value);
+                            const ty_node = if (val_tag == .ts_as_expr) vd.rhs else vd.lhs;
+                            if (ty_node == .none) break :blk false;
+                            if (self.ast_ref.nodeTag(ty_node) != .ts_type_reference) break :blk false;
+                            const n = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ty_node));
+                            break :blk std.mem.eql(u8, n, "const");
+                        };
+                        base_ty = if (is_readonly or is_as_const_val) raw else switch (t.kind) {
+                            .string_literal => tymod.ID_STRING,
+                            .number_literal => tymod.ID_NUMBER,
+                            .boolean_literal => tymod.ID_BOOLEAN,
+                            .bigint_literal => tymod.ID_BIGINT,
+                            else => raw,
+                        };
                     }
-                    return switch (t.kind) {
-                        .string_literal => tymod.ID_STRING,
-                        .number_literal => tymod.ID_NUMBER,
-                        .boolean_literal => tymod.ID_BOOLEAN,
-                        .bigint_literal => tymod.ID_BIGINT,
-                        else => raw,
-                    };
                 }
-                return tymod.ID_ANY;
+                if (pd.optional != 0 and !self.typeContainsUndefined(base_ty) and
+                    !self.checker_opts.strict_null_checks_explicit_off)
+                {
+                    return self.store.unionOf(&.{ base_ty, tymod.ID_UNDEFINED }) catch base_ty;
+                }
+                return base_ty;
             },
             .getter_def => {
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
@@ -2543,6 +2583,11 @@ pub const Checker = struct {
                 const is_async = (md.modifiers & ast.ModifierBit.@"async") != 0;
                 const is_generator = (md.modifiers & ast.ModifierBit.generator) != 0;
                 const mres = self.buildFunctionTypeG(md.params_start, md.params_end, md.return_type, md.body, is_async, is_generator, md.type_params, md.type_params_end);
+                if (propertyHasOptionalMarker(self, pdata.lhs) and
+                    !self.checker_opts.strict_null_checks_explicit_off)
+                {
+                    return self.store.unionOf(&.{ mres, tymod.ID_UNDEFINED }) catch mres;
+                }
                 return mres;
             },
             else => return null,
@@ -5436,19 +5481,28 @@ pub const Checker = struct {
                     const is_as_const = blk: {
                         if (!is_mutable) break :blk false;
                         const init_tag = self.ast_ref.nodeTag(data.rhs);
-                        if (init_tag != .ts_as_expr) break :blk false;
                         const init_data = self.ast_ref.nodeData(data.rhs);
-                        if (init_data.rhs == .none) break :blk false;
-                        if (self.ast_ref.nodeTag(init_data.rhs) != .ts_type_reference) break :blk false;
-                        const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(init_data.rhs));
-                        break :blk std.mem.eql(u8, name, "const");
-                    };
-                    if (is_mutable and !is_as_const) {
-                        // In non-strict mode, null/undefined initializers widen to any.
-                        // `var x = null` → x: any (TypeScript's null-widening rule).
-                        if (!self.checker_opts.strict_null_checks) {
-                            if (t.kind == .null_t or t.kind == .undefined_t) return tymod.ID_ANY;
+                        if (init_tag == .ts_as_expr) {
+                            // `expr as const`
+                            if (init_data.rhs == .none) break :blk false;
+                            if (self.ast_ref.nodeTag(init_data.rhs) != .ts_type_reference) break :blk false;
+                            const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(init_data.rhs));
+                            break :blk std.mem.eql(u8, name, "const");
+                        } else if (init_tag == .ts_type_assertion) {
+                            // `<const> expr` (angle-bracket form)
+                            if (init_data.lhs == .none) break :blk false;
+                            if (self.ast_ref.nodeTag(init_data.lhs) != .ts_type_reference) break :blk false;
+                            const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(init_data.lhs));
+                            break :blk std.mem.eql(u8, name, "const");
                         }
+                        break :blk false;
+                    };
+                    // In non-strict mode, null/undefined initializers widen to any
+                    // for ALL declaration kinds (const z = null → any).
+                    if (!self.checker_opts.strict_null_checks and !is_as_const) {
+                        if (t.kind == .null_t or t.kind == .undefined_t) return tymod.ID_ANY;
+                    }
+                    if (is_mutable and !is_as_const) {
                         // Enum members widen member-wise on let/var: FRESH
                         // members (direct `E.B` accesses, through unannotated
                         // const chains) widen to the full enum type E, which
@@ -13100,7 +13154,15 @@ pub const Checker = struct {
             const dd = self.ast_ref.nodeData(decl_node);
             if (dd.lhs == .none or self.ast_ref.nodeTag(dd.lhs) != .identifier) continue;
             const vname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(dd.lhs));
-            const vty = if (dd.rhs != .none) self.typeOf(dd.rhs) else tymod.ID_UNKNOWN;
+            const vty = if (dd.rhs != .none) self.typeOf(dd.rhs) else blk: {
+                // No initializer — check for a type annotation on the identifier.
+                const ann = self.ast_ref.nodeData(dd.lhs).rhs;
+                if (ann != .none and self.ast_ref.nodeTag(ann) == .ts_type_annotation) {
+                    const ty_node = self.ast_ref.nodeData(ann).lhs;
+                    break :blk self.resolveSimpleTypeNodeSafe(ty_node) orelse self.resolveTypeNode(ty_node);
+                }
+                break :blk tymod.ID_UNKNOWN;
+            };
             props.append(self.gpa, .{ .name = vname, .type_id = vty }) catch {};
         }
     }
@@ -13567,7 +13629,8 @@ pub const Checker = struct {
                         }
                     }
                 }
-                return .{ .name = name, .type_id = fn_ty, .is_method = true };
+                const m_optional = propertyHasOptionalMarker(self, sig_data.key);
+                return .{ .name = name, .type_id = fn_ty, .is_method = true, .optional = m_optional };
             },
             .ts_index_signature => {
                 if (data.rhs == .none) return null;
@@ -14010,10 +14073,20 @@ pub const Checker = struct {
                 } else if (pd.value != .none) {
                     const raw = self.typeOf(pd.value);
                     const t = self.store.get(raw);
-                    // Class properties without explicit type annotations are widened
-                    // from literal types to their base types, like let declarations.
+                    // Readonly properties and `as const` values preserve literal types.
+                    const is_readonly = propertyHasReadonlyModifier(self, data.lhs);
+                    const val_tag2 = self.ast_ref.nodeTag(pd.value);
+                    const is_as_const2 = (val_tag2 == .ts_as_expr or val_tag2 == .ts_type_assertion) and blk: {
+                        const vd = self.ast_ref.nodeData(pd.value);
+                        const tyn = if (val_tag2 == .ts_as_expr) vd.rhs else vd.lhs;
+                        if (tyn == .none) break :blk false;
+                        if (self.ast_ref.nodeTag(tyn) != .ts_type_reference) break :blk false;
+                        break :blk std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tyn)), "const");
+                    };
+                    if (is_readonly or is_as_const2) {
+                        ty = raw;
                     // Enum members widen to the enum type (`p1 = E.B` → E).
-                    if (t.enum_name.len > 0 and self.enumInitIsFresh(pd.value, 0)) {
+                    } else if (t.enum_name.len > 0 and self.enumInitIsFresh(pd.value, 0)) {
                         ty = self.buildEnumUnionType(t.enum_name) orelse raw;
                     } else ty = switch (t.kind) {
                         .string_literal => tymod.ID_STRING,
@@ -14032,7 +14105,8 @@ pub const Checker = struct {
                     break :blk vt == .fn_expr or vt == .async_fn_expr or
                         vt == .generator_fn_expr or vt == .async_generator_fn_expr;
                 } else false;
-                return .{ .name = name, .type_id = ty, .is_method = is_method_like, .is_fn_property = is_method_like };
+                const is_optional = pd.optional != 0;
+                return .{ .name = name, .type_id = ty, .is_method = is_method_like, .is_fn_property = is_method_like, .optional = is_optional };
             },
             .method_def, .getter_def, .setter_def => {
                 if (data.lhs == .none) return null;
@@ -14095,10 +14169,12 @@ pub const Checker = struct {
                     md.type_params,
                     md.type_params_end,
                 );
+                const m_is_optional = propertyHasOptionalMarker(self, data.lhs);
                 return .{
                     .name = name,
                     .type_id = fn_ty,
                     .is_method = true,
+                    .optional = m_is_optional,
                 };
             },
             else => return null,
@@ -14428,6 +14504,28 @@ pub const Checker = struct {
     fn inferSatisfies(self: *Checker, node: NodeIndex) TypeId {
         // `x satisfies T` leaves the type of x unchanged.
         return self.typeOf(self.ast_ref.nodeData(node).lhs);
+    }
+
+    fn inferNonNull(self: *Checker, node: NodeIndex) TypeId {
+        const inner = self.typeOf(self.ast_ref.nodeData(node).lhs);
+        const t = self.store.get(inner);
+        switch (t.kind) {
+            .null_t, .undefined_t => return tymod.ID_NEVER,
+            .union_t => {
+                const members = self.store.idsOf(t.list_data);
+                var buf: [16]TypeId = undefined;
+                var n: usize = 0;
+                for (members) |m| {
+                    const mk = self.store.get(m).kind;
+                    if (mk == .null_t or mk == .undefined_t) continue;
+                    if (n < buf.len) { buf[n] = m; n += 1; }
+                }
+                if (n == 0) return tymod.ID_NEVER;
+                if (n == 1) return buf[0];
+                return self.store.unionOf(buf[0..n]) catch inner;
+            },
+            else => return inner,
+        }
     }
 
     fn inferSequence(self: *Checker, node: NodeIndex) TypeId {
@@ -16180,7 +16278,16 @@ pub const Checker = struct {
 
     fn isNumericish(store: *const tymod.TypeStore, id: TypeId) bool {
         const t = store.get(id);
-        return t.kind == .number or t.kind == .number_literal;
+        if (t.kind == .number or t.kind == .number_literal) return true;
+        if (t.kind == .union_t) {
+            const members = store.idsOf(t.list_data);
+            if (members.len == 0) return false;
+            for (members) |m| {
+                if (!isNumericish(store, m)) return false;
+            }
+            return true;
+        }
+        return false;
     }
 
     fn isStringish(store: *const tymod.TypeStore, id: TypeId) bool {
@@ -16320,6 +16427,54 @@ pub const Checker = struct {
             return self.store.arrayOf(elem) catch tymod.ID_ANY;
         };
         if (slice.len == 0) {
+            // With a tuple contextual type, `[]` → empty tuple `[]` not `never[]`.
+            // Check declarator/annotation context (safe: no recursion possible).
+            const exp_ctx: ?TypeId = blk: {
+                if (self.expectedTypeOf(node)) |e| break :blk e;
+                // Assignment RHS: `t = []` where t is an already-typed identifier
+                // or a destructuring pattern. Use the cached LHS type.
+                const parents = self.semantic.parent_indices;
+                const ni = node.toInt();
+                if (ni >= parents.len) break :blk null;
+                const pidx = parents[ni];
+                if (pidx == @intFromEnum(NodeIndex.none)) break :blk null;
+                const pn: NodeIndex = @enumFromInt(pidx);
+                const pn_data = self.ast_ref.nodeData(pn);
+                if (self.ast_ref.nodeTag(pn) != .assign) break :blk null;
+                if (pn_data.rhs != node) break :blk null;
+                const lhs = pn_data.lhs;
+                if (lhs == .none) break :blk null;
+                // If LHS is an array destructuring pattern, `[] = pattern` → empty tuple.
+                const lhs_tag = self.ast_ref.nodeTag(lhs);
+                if (lhs_tag == .array_pattern) {
+                    // Synthetic tuple type (empty) to indicate tuple context.
+                    const empty_list2 = self.store.appendTypeIds(&.{}) catch break :blk null;
+                    const empty_tuple = self.store.add(.{ .kind = .tuple_t, .list_data = empty_list2 }) catch break :blk null;
+                    break :blk empty_tuple;
+                }
+                const lhs_ni = lhs.toInt();
+                if (lhs_ni >= self.node_types.len) break :blk null;
+                const cached = self.node_types[lhs_ni];
+                if (cached.eq(TypeId.none) or cached.eq(tymod.ID_UNKNOWN)) break :blk null;
+                break :blk cached;
+            };
+            if (exp_ctx) |exp| {
+                const et = self.store.get(exp);
+                const is_tuple_ctx = blk: {
+                    if (et.kind == .tuple_t) break :blk true;
+                    // Union where any member is a tuple → empty tuple context.
+                    if (et.kind == .union_t) {
+                        for (self.store.idsOf(et.list_data)) |m| {
+                            if (self.store.get(m).kind == .tuple_t) break :blk true;
+                        }
+                    }
+                    break :blk false;
+                };
+                if (is_tuple_ctx) {
+                    const empty_list = self.store.appendTypeIds(&.{}) catch return tymod.ID_ANY;
+                    return self.store.add(.{ .kind = .tuple_t, .list_data = empty_list }) catch tymod.ID_ANY;
+                }
+            }
             const elem = self.emptyArrayElem(node);
             if (tymod.isAny(&self.store, elem)) return tymod.ID_ANY;
             return self.store.arrayOf(elem) catch tymod.ID_ANY;
@@ -16345,15 +16500,21 @@ pub const Checker = struct {
             }
             if (has_rest) {
                 if (slice.len < fixed) break :tuple_blk;
-            } else if (exp_elems.len != slice.len) {
-                break :tuple_blk;
             }
+            // Allow partial match: if literal is shorter than context, use only
+            // as many context elements as the literal has (TypeScript contextually
+            // types each element at its index position).
             var tup_buf: [32]TypeId = undefined;
             var i: usize = 0;
             while (i < slice.len) : (i += 1) {
                 const en: NodeIndex = @enumFromInt(slice[i]);
                 if (en == .none or self.ast_ref.nodeTag(en) == .spread_element) break :tuple_blk;
-                const exp_el = if (i < fixed) self.peelRestElem(exp_elems[i]) else rest_el;
+                const exp_el: TypeId = if (has_rest and i >= fixed)
+                    rest_el
+                else if (i < fixed)
+                    self.peelRestElem(exp_elems[i])
+                else
+                    tymod.ID_ANY; // element beyond context range
                 tup_buf[i] = self.contextualElementType(self.typeOf(en), exp_el);
             }
             const list = self.store.appendTypeIds(tup_buf[0..slice.len]) catch break :tuple_blk;
@@ -18024,6 +18185,83 @@ pub const Checker = struct {
         }
     }
 
+    /// Scan a namespace/module decl body for an exported var/let/const member with
+    /// the given name.  Returns only scalar types (number, string, boolean, etc.);
+    /// skips classes, interfaces, and function exports to avoid returning wrong
+    /// concrete types for members that tsc renders as `typeof X`.
+    fn namespaceVarMemberType(self: *Checker, ns_decl: NodeIndex, prop_name: []const u8) ?TypeId {
+        const ns_data = self.ast_ref.nodeData(ns_decl);
+        const body = ns_data.rhs;
+        if (body == .none) return null;
+        if (self.ast_ref.nodeTag(body) != .block_stmt) return null;
+        const bd = self.ast_ref.nodeData(body);
+        const start = @intFromEnum(bd.lhs);
+        const end = @intFromEnum(bd.rhs);
+        if (start >= end or end > self.ast_ref.extra_data.len) return null;
+        for (self.ast_ref.extra_data[start..end]) |raw| {
+            const stmt: NodeIndex = @enumFromInt(raw);
+            // Only consider exported declarations — non-exported namespace members
+            // are invisible outside the namespace (M.x where x is not exported → any).
+            if (self.ast_ref.nodeTag(stmt) != .export_named) continue;
+            const inner = self.ast_ref.nodeData(stmt).lhs;
+            if (inner == .none) continue;
+            const inner_stmt = inner;
+            const stag = self.ast_ref.nodeTag(inner_stmt);
+            if (stag != .var_decl and stag != .let_decl and stag != .const_decl) continue;
+            const d = self.ast_ref.nodeData(inner_stmt);
+            const range = self.safeSubRange(d.lhs) orelse continue;
+            for (self.ast_ref.extra_data[range.start..range.end]) |draw| {
+                const decl_node: NodeIndex = @enumFromInt(draw);
+                if (self.ast_ref.nodeTag(decl_node) != .declarator) continue;
+                const dd = self.ast_ref.nodeData(decl_node);
+                if (dd.lhs == .none or self.ast_ref.nodeTag(dd.lhs) != .identifier) continue;
+                const vname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(dd.lhs));
+                if (!std.mem.eql(u8, vname, prop_name)) continue;
+                // Guard against parser quirk: a var_decl's declarator range can include
+                // declarators from PRECEDING non-exported var statements. Skip any declarator
+                // whose source position is BEFORE the export_named statement itself.
+                const decl_pos = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(dd.lhs));
+                const stmt_pos = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(stmt));
+                if (decl_pos < stmt_pos) continue;
+                // Found matching name — resolve type via annotation or initializer.
+                const vty: TypeId = if (dd.rhs != .none) blk: {
+                    const raw_ty = self.typeOf(dd.rhs);
+                    // Widen literals for `var`/`let` declarations.
+                    if (stag != .const_decl) {
+                        const rt = self.store.get(raw_ty);
+                        break :blk switch (rt.kind) {
+                            .number_literal => tymod.ID_NUMBER,
+                            .string_literal => tymod.ID_STRING,
+                            .boolean_literal => tymod.ID_BOOLEAN,
+                            else => raw_ty,
+                        };
+                    }
+                    break :blk raw_ty;
+                } else blk: {
+                    const ann = self.ast_ref.nodeData(dd.lhs).rhs;
+                    if (ann != .none and self.ast_ref.nodeTag(ann) == .ts_type_annotation) {
+                        const ty_node = self.ast_ref.nodeData(ann).lhs;
+                        break :blk self.resolveSimpleTypeNodeSafe(ty_node) orelse self.resolveTypeNode(ty_node);
+                    }
+                    break :blk tymod.ID_UNKNOWN;
+                };
+                if (vty.eq(tymod.ID_UNKNOWN) or vty.eq(tymod.ID_ANY)) return null;
+                // Only return scalar / simple types — avoid returning function/object
+                // types that would conflict with tsc's `typeof X` rendering.
+                const vt = self.store.get(vty);
+                switch (vt.kind) {
+                    .number, .string, .boolean, .bigint, .symbol, .void_t,
+                    .number_literal, .string_literal, .boolean_literal, .bigint_literal,
+                    .null_t, .undefined_t, .never,
+                    => return vty,
+                    .union_t => return vty,
+                    else => return null,
+                }
+            }
+        }
+        return null;
+    }
+
     fn memberOnApparentType(self: *Checker, obj_ty: TypeId, prop_name: []const u8, obj_node: NodeIndex) TypeId {
         // Cross-file enum member access (`SymbolFlags.Type` where SymbolFlags is
         // an imported enum): tsc displays the qualified member name regardless of
@@ -18190,6 +18428,16 @@ pub const Checker = struct {
                 if (self.namespace_import_map.get(inner_name)) |mod_spec| {
                     if (self.inferMemberOnNamespace(mod_spec, prop_name)) |resolved| return resolved;
                 }
+                // `typeof LocalNamespace` — scan exported var/let/const members only.
+                // We avoid building the full namespace type (which stores classes as instance
+                // types, causing regressions); instead we do a direct AST scan for variable
+                // declarations that have a type annotation matching the property name.
+                if (self.type_decl_nodes.get(inner_name)) |ns_decl| {
+                    const ndtag = self.ast_ref.nodeTag(ns_decl);
+                    if (ndtag == .ts_namespace_decl or ndtag == .ts_module_decl) {
+                        if (self.namespaceVarMemberType(ns_decl, prop_name)) |vt| return vt;
+                    }
+                }
                 // `typeof ClassName` — look up static member on the class.
                 if (self.type_decl_nodes.get(inner_name)) |cls_decl| {
                     if (self.ast_ref.nodeTag(cls_decl) == .class_decl) {
@@ -18224,7 +18472,11 @@ pub const Checker = struct {
                 if (std.mem.eql(u8, p.name, prop_name)) {
                     // An optional property access is `T | undefined` only under
                     // strictNullChecks; without it the access type is just `T`.
-                    if (p.optional and self.checker_opts.strict_null_checks) {
+                    // Under exactOptionalPropertyTypes, assignment targets show just
+                    // `T` (can't write undefined), so we omit `| undefined` here.
+                    if (p.optional and self.checker_opts.strict_null_checks and
+                        !self.checker_opts.exact_optional_property_types)
+                    {
                         return self.store.unionOf(&.{ p.type_id, tymod.ID_UNDEFINED }) catch p.type_id;
                     }
                     return p.type_id;
