@@ -5394,10 +5394,12 @@ pub const Checker = struct {
                             return tymod.ID_SYMBOL;
                         }
                     }
-                    // Array/tuple literals are always widened to T[] — TypeScript
-                    // widens `['c', 'd']` to `string[]` for both let and const
-                    // (only `as const` produces a readonly tuple literal type).
-                    if (t.kind == .tuple_t) {
+                    // Array/tuple LITERALS are widened to T[] — TypeScript widens
+                    // `['c', 'd']` to `string[]` for both let and const (only
+                    // `as const` produces a readonly tuple literal type).
+                    // Function-returned tuples (`tuple2(1, "s") : [number, string]`)
+                    // are NOT widened — preserve the tuple type in that case.
+                    if (t.kind == .tuple_t and self.ast_ref.nodeTag(data.rhs) == .array_literal) {
                         if (t.name.len > 0) return raw; // readonly tuple from `as const` — preserve
                         const elems = self.store.idsOf(t.list_data);
                         if (elems.len == 0) {
@@ -15403,8 +15405,25 @@ pub const Checker = struct {
             if (!b.eq(TypeId.none)) { any_bound = true; break; }
         }
         if (!any_bound) return null;
+        // TypeScript widens literal type params only when the return type is a
+        // tuple (e.g. `tuple2(1,"s"):[T0,T1]` → `[number,string]`).
+        // For `f<T>(x:T):T`, the literal `1` is preserved as-is.
+        const ret_is_tuple = self.store.get(return_ty).kind == .tuple_t;
         for (bindings_buf[0..tp_count]) |*b| {
-            if (b.eq(TypeId.none)) b.* = tymod.ID_UNKNOWN;
+            if (b.eq(TypeId.none)) {
+                b.* = tymod.ID_UNKNOWN;
+                continue;
+            }
+            if (ret_is_tuple) {
+                const bk = self.store.get(b.*).kind;
+                b.* = switch (bk) {
+                    .number_literal => tymod.ID_NUMBER,
+                    .string_literal => tymod.ID_STRING,
+                    .boolean_literal => tymod.ID_BOOLEAN,
+                    .bigint_literal => tymod.ID_BIGINT,
+                    else => b.*,
+                };
+            }
         }
         return self.substituteTypeId(return_ty, names_buf[0..tp_count], bindings_buf[0..tp_count]);
     }
