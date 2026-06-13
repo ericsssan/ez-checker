@@ -2666,14 +2666,15 @@ pub const Checker = struct {
         // asserted literal type — TypeScript does not widen explicitly-asserted types.
         const rhs_tag = self.ast_ref.nodeTag(pdata.rhs);
         if (rhs_tag == .ts_as_expr or rhs_tag == .ts_type_assertion) return val_ty;
-        const t = self.store.get(val_ty);
-        // When the enclosing object literal is a call argument and the callee's
-        // type expects a literal for this property (e.g. `until(other, { largestUnit: "hour" })`
-        // where largestUnit expects `"year" | "month" | ...`), preserve the literal
-        // instead of widening.  Guard: only check if the callee is already in the
-        // node_types cache (bottom-up parsers always allocate the callee before its
-        // argument list, so the callee index is smaller and the oracle has typed it).
-        if (t.kind == .string_literal or t.kind == .number_literal or t.kind == .boolean_literal) {
+        // Copy .kind immediately — store.get() returns a pointer into the type store's
+        // ArrayList. Any subsequent call that builds new types (resolveTypeNode, typeOf,
+        // resolveDeclaredType …) may reallocate that ArrayList, leaving a dangling pointer.
+        // Copying the enum value (a u8) is free and safe across reallocations.
+        const t_kind = self.store.get(val_ty).kind;
+        // When the enclosing object literal is a call argument, a declarator with a type
+        // annotation, or the RHS of an assignment, and the context expects a literal for
+        // this property, preserve the literal instead of widening.
+        if (t_kind == .string_literal or t_kind == .number_literal or t_kind == .boolean_literal) {
             const obj_node: NodeIndex = @enumFromInt(gp_pidx);
             const obj_ni = gp_pidx;
             const should_check_ctx = blk: {
@@ -2682,7 +2683,10 @@ pub const Checker = struct {
                 if (cp == @intFromEnum(NodeIndex.none) or cp >= self.ast_ref.nodes.len) break :blk false;
                 const cn: NodeIndex = @enumFromInt(cp);
                 const ctag = self.ast_ref.nodeTag(cn);
-                // (no extra cases)
+                // Declarator with type annotation: annotation is always available.
+                if (ctag == .declarator) break :blk true;
+                // Assignment `x = {…}`: use the already-typed identifier LHS.
+                if (ctag == .assign) break :blk true;
                 // Call/new expression: only if callee type is already cached (bottom-up ordering).
                 if (ctag != .call_expr and ctag != .optional_call_expr and ctag != .new_expr) break :blk false;
                 const cd = self.ast_ref.nodeData(cn);
@@ -2702,7 +2706,7 @@ pub const Checker = struct {
         }
         // Widen primitive literal types to their base types, matching TypeScript's
         // widening behavior for object literal property types.
-        return switch (t.kind) {
+        return switch (t_kind) {
             .string_literal => tymod.ID_STRING,
             .number_literal => tymod.ID_NUMBER,
             .boolean_literal => tymod.ID_BOOLEAN,
