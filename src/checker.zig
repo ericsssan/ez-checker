@@ -18869,13 +18869,84 @@ pub const Checker = struct {
         return self.store.typeRef(name, &.{}) catch null;
     }
 
+    /// Build a union of string literal types from a comptime list.
+    fn buildStrLitUnion(self: *Checker, comptime values: []const []const u8) TypeId {
+        var ids: [values.len]TypeId = undefined;
+        inline for (values, 0..) |v, i| {
+            ids[i] = self.store.stringLiteral(v) catch tymod.ID_STRING;
+        }
+        return self.store.unionOf(&ids) catch tymod.ID_STRING;
+    }
+
+    /// Build `Temporal.OverflowOptions` as an `object_t` with `overflow?: "constrain" | "reject"`.
+    /// Tagged with `display_name = "Temporal.OverflowOptions"` so the function signature renders correctly.
+    fn buildTemporalOverflowOptions(self: *Checker) ?TypeId {
+        const overflow_t = self.buildStrLitUnion(&.{ "constrain", "reject" });
+        const obj = self.store.objectOf(&.{
+            .{ .name = "overflow", .type_id = overflow_t, .optional = true },
+        }) catch return null;
+        return self.tagDisplayName(obj, "Temporal.OverflowOptions");
+    }
+
+    /// Build `Temporal.ZonedDateTimeFromOptions` (overflow + disambiguation).
+    fn buildTemporalZdtFromOptions(self: *Checker) ?TypeId {
+        const overflow_t = self.buildStrLitUnion(&.{ "constrain", "reject" });
+        const disambiguation_t = self.buildStrLitUnion(&.{ "compatible", "earlier", "later", "reject" });
+        const offset_t = self.buildStrLitUnion(&.{ "use", "ignore", "prefer", "reject" });
+        const obj = self.store.objectOf(&.{
+            .{ .name = "overflow", .type_id = overflow_t, .optional = true },
+            .{ .name = "disambiguation", .type_id = disambiguation_t, .optional = true },
+            .{ .name = "offset", .type_id = offset_t, .optional = true },
+        }) catch return null;
+        return self.tagDisplayName(obj, "Temporal.ZonedDateTimeFromOptions");
+    }
+
+    /// Build `Temporal.RoundingOptionsWithLargestUnit<UNITS>` as an `object_t`.
+    /// `units_t` is the concrete union type (e.g. TimeUnit or DateUnit union).
+    /// `display_name` must match what tsc renders (e.g. "Temporal.RoundingOptionsWithLargestUnit<Temporal.TimeUnit>").
+    fn buildTemporalRoundingOptionsWithLargestUnit(self: *Checker, units_t: TypeId, display_name: []const u8) ?TypeId {
+        const auto_t = self.store.stringLiteral("auto") catch tymod.ID_STRING;
+        const largest_t = self.store.unionOf(&.{ units_t, auto_t }) catch units_t;
+        const rounding_mode_t = self.buildStrLitUnion(&.{
+            "ceil", "floor", "expand", "trunc",
+            "halfCeil", "halfFloor", "halfExpand", "halfTrunc", "halfEven",
+        });
+        const obj = self.store.objectOf(&.{
+            .{ .name = "largestUnit", .type_id = largest_t, .optional = true },
+            .{ .name = "smallestUnit", .type_id = units_t, .optional = true },
+            .{ .name = "roundingMode", .type_id = rounding_mode_t, .optional = true },
+            .{ .name = "roundingIncrement", .type_id = tymod.ID_NUMBER, .optional = true },
+        }) catch return null;
+        return self.tagDisplayName(obj, display_name);
+    }
+
+    /// Build `Temporal.RoundingOptions<UNITS>` (for `round` method — no largestUnit).
+    fn buildTemporalRoundingOptions(self: *Checker, units_t: TypeId, display_name: []const u8) ?TypeId {
+        const rounding_mode_t = self.buildStrLitUnion(&.{
+            "ceil", "floor", "expand", "trunc",
+            "halfCeil", "halfFloor", "halfExpand", "halfTrunc", "halfEven",
+        });
+        const obj = self.store.objectOf(&.{
+            .{ .name = "smallestUnit", .type_id = units_t, .optional = false },
+            .{ .name = "roundingMode", .type_id = rounding_mode_t, .optional = true },
+            .{ .name = "roundingIncrement", .type_id = tymod.ID_NUMBER, .optional = true },
+        }) catch return null;
+        return self.tagDisplayName(obj, display_name);
+    }
+
     /// `(item: Temporal.XLike[, options?: OPT]) => Temporal.X` — the static
     /// `from` shape shared by every Temporal type.
     fn tempFromFn(self: *Checker, like: []const u8, opt: ?[]const u8, ret: []const u8) ?TypeId {
         const like_t = self.tempRef(like) orelse return null;
         const ret_t = self.tempRef(ret) orelse return null;
         if (opt) |o| {
-            const opt_t = self.tempRef(o) orelse return null;
+            const opt_t: TypeId = blk: {
+                if (std.mem.eql(u8, o, "Temporal.OverflowOptions"))
+                    break :blk self.buildTemporalOverflowOptions() orelse self.tempRef(o) orelse return null;
+                if (std.mem.eql(u8, o, "Temporal.ZonedDateTimeFromOptions"))
+                    break :blk self.buildTemporalZdtFromOptions() orelse self.tempRef(o) orelse return null;
+                break :blk self.tempRef(o) orelse return null;
+            };
             return self.makeNamedFn(&.{ like_t, opt_t }, &.{ "item", "options" }, &.{ false, true }, ret_t);
         }
         return self.makeNamedFn(&.{like_t}, &.{"item"}, &.{false}, ret_t);
@@ -18902,7 +18973,7 @@ pub const Checker = struct {
         const dur_like = self.tempRef("Temporal.DurationLike") orelse return null;
         const ret_t = self.tempRef(ret) orelse return null;
         if (with_overflow) {
-            const opt_t = self.tempRef("Temporal.OverflowOptions") orelse return null;
+            const opt_t = self.buildTemporalOverflowOptions() orelse self.tempRef("Temporal.OverflowOptions") orelse return null;
             return self.makeNamedFn(&.{ dur_like, opt_t }, &.{ "duration", "options" }, &.{ false, true }, ret_t);
         }
         return self.makeNamedFn(&.{dur_like}, &.{"duration"}, &.{false}, ret_t);
@@ -18912,8 +18983,16 @@ pub const Checker = struct {
     fn tempUntilFn(self: *Checker, like: []const u8, units: []const u8) ?TypeId {
         const like_t = self.tempRef(like) orelse return null;
         const dur_t = self.tempRef("Temporal.Duration") orelse return null;
-        const units_t = self.tempRef(units) orelse return null;
-        const opt_t = self.store.typeRef("Temporal.RoundingOptionsWithLargestUnit", &.{units_t}) catch return null;
+        const is_date = std.mem.eql(u8, units, "Temporal.DateUnit");
+        const units_t = if (is_date)
+            self.buildStrLitUnion(&.{ "year", "month", "week", "day" })
+        else
+            self.buildStrLitUnion(&.{ "year", "month", "week", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond" });
+        const disp = if (is_date)
+            "Temporal.RoundingOptionsWithLargestUnit<Temporal.DateUnit>"
+        else
+            "Temporal.RoundingOptionsWithLargestUnit<Temporal.TimeUnit>";
+        const opt_t = self.buildTemporalRoundingOptionsWithLargestUnit(units_t, disp) orelse return null;
         return self.makeNamedFn(&.{ like_t, opt_t }, &.{ "other", "options" }, &.{ false, true }, dur_t);
     }
 
@@ -19057,12 +19136,10 @@ pub const Checker = struct {
         if (std.mem.eql(u8, owner, "Temporal.PlainDateTime")) {
             if (eqAny(name, &.{ "add", "subtract" })) return self.tempAddFn("Temporal.PlainDateTime", true);
             if (eqAny(name, &.{ "until", "since" })) {
-                const du = self.tempRef("Temporal.DateUnit") orelse return null;
-                const tu = self.tempRef("Temporal.TimeUnit") orelse return null;
-                const units = self.store.unionOf(&.{ du, tu }) catch return null;
+                const units_t = self.buildStrLitUnion(&.{ "year", "month", "week", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond" });
                 const like_t = self.tempRef("Temporal.PlainDateTimeLike") orelse return null;
                 const dur_t = self.tempRef("Temporal.Duration") orelse return null;
-                const opt_t = self.store.typeRef("Temporal.RoundingOptionsWithLargestUnit", &.{units}) catch return null;
+                const opt_t = self.buildTemporalRoundingOptionsWithLargestUnit(units_t, "Temporal.RoundingOptionsWithLargestUnit<Temporal.DateUnit | Temporal.TimeUnit>") orelse return null;
                 return self.makeNamedFn(&.{ like_t, opt_t }, &.{ "other", "options" }, &.{ false, true }, dur_t);
             }
             if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.PlainDateTimeLike");
@@ -19087,12 +19164,10 @@ pub const Checker = struct {
             if (eqAny(name, &.{ "timeZoneId", "offset" })) return tymod.ID_STRING;
             if (eqAny(name, &.{ "add", "subtract" })) return self.tempAddFn("Temporal.ZonedDateTime", true);
             if (eqAny(name, &.{ "until", "since" })) {
-                const du = self.tempRef("Temporal.DateUnit") orelse return null;
-                const tu = self.tempRef("Temporal.TimeUnit") orelse return null;
-                const units = self.store.unionOf(&.{ du, tu }) catch return null;
+                const units_t = self.buildStrLitUnion(&.{ "year", "month", "week", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond" });
                 const like_t = self.tempRef("Temporal.ZonedDateTimeLike") orelse return null;
                 const dur_t = self.tempRef("Temporal.Duration") orelse return null;
-                const opt_t = self.store.typeRef("Temporal.RoundingOptionsWithLargestUnit", &.{units}) catch return null;
+                const opt_t = self.buildTemporalRoundingOptionsWithLargestUnit(units_t, "Temporal.RoundingOptionsWithLargestUnit<Temporal.DateUnit | Temporal.TimeUnit>") orelse return null;
                 return self.makeNamedFn(&.{ like_t, opt_t }, &.{ "other", "options" }, &.{ false, true }, dur_t);
             }
             if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.ZonedDateTimeLike");
