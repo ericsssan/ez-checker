@@ -1510,6 +1510,47 @@ fn normalizeType(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
     if (std.mem.indexOf(u8, trimmed, " & ") != null) {
         if (try sortMembers(arena, trimmed, " & ")) |sorted| return sorted;
     }
+    // Handle `(A | B)SUFFIX` patterns like `(string | number)[]` or `(A | B)[][]`.
+    // sortMembers above bails on `(`, so do it here with bracket-aware handling.
+    if (std.mem.startsWith(u8, trimmed, "(")) {
+        // Find matching close paren — must be a single balanced pair starting at 0.
+        var depth: usize = 0;
+        var close: ?usize = null;
+        for (trimmed, 0..) |c, i| {
+            if (c == '(') depth += 1
+            else if (c == ')') {
+                depth -= 1;
+                if (depth == 0) { close = i; break; }
+            }
+        }
+        if (close) |ci| {
+            const inner = trimmed[1..ci];
+            const suffix = trimmed[ci + 1 ..];
+            // Only handle simple suffixes: [], [][], etc. (no further unions).
+            var suffix_ok = true;
+            for (suffix) |c| if (c != '[' and c != ']') { suffix_ok = false; break; };
+            if (suffix_ok and std.mem.indexOf(u8, inner, " | ") != null) {
+                if (try sortMembers(arena, inner, " | ")) |sorted_inner| {
+                    return try std.fmt.allocPrint(arena, "({s}){s}", .{ sorted_inner, suffix });
+                }
+            }
+        }
+    }
+    // Handle `Name<A | B>` patterns like `Promise<number | boolean>`.
+    if (std.mem.indexOf(u8, trimmed, "<") != null) {
+        const lt = std.mem.indexOf(u8, trimmed, "<").?;
+        if (std.mem.endsWith(u8, trimmed, ">")) {
+            const inner = trimmed[lt + 1 .. trimmed.len - 1];
+            // Only sort if inner has no nested angles (keep it simple/safe).
+            if (std.mem.indexOf(u8, inner, "<") == null and
+                std.mem.indexOf(u8, inner, " | ") != null)
+            {
+                if (try sortMembers(arena, inner, " | ")) |sorted_inner| {
+                    return try std.fmt.allocPrint(arena, "{s}<{s}>", .{ trimmed[0..lt], sorted_inner });
+                }
+            }
+        }
+    }
     return trimmed;
 }
 
