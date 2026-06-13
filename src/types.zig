@@ -203,6 +203,13 @@ pub const Type = struct {
     /// Part of interning identity so overload types stay distinct from
     /// structurally-identical regular function types.
     is_overload_set: bool = false,
+    /// DISPLAY-ONLY override: when non-empty, the type RENDERS as this string
+    /// while keeping its full structure for computation (member access,
+    /// assignability, etc.).  The render/compute split — used for `typeof X`
+    /// query types, which tsc displays verbatim (`typeof Foo`) but treats
+    /// structurally.  Part of interning identity so a display-tagged type stays
+    /// distinct from its bare structural form (and from a differently-tagged one).
+    display_name: []const u8 = "",
 };
 
 pub const LiteralValue = union(enum) {
@@ -326,6 +333,7 @@ pub const InternContext = struct {
         }
         h.update(t.name);
         h.update(t.alias_name);
+        h.update(t.display_name);
         for (self.store.idsOf(t.alias_args)) |a| {
             const av = a.toInt();
             h.update(std.mem.asBytes(&av));
@@ -389,6 +397,7 @@ pub const InternContext = struct {
         if (!literalEql(ta.literal_value, tb.literal_value)) return false;
         if (!std.mem.eql(u8, ta.name, tb.name)) return false;
         if (!std.mem.eql(u8, ta.alias_name, tb.alias_name)) return false;
+        if (!std.mem.eql(u8, ta.display_name, tb.display_name)) return false;
         {
             const aa = self.store.idsOf(ta.alias_args);
             const ba = self.store.idsOf(tb.alias_args);
@@ -700,6 +709,7 @@ pub const TypeStore = struct {
         };
         if (t.name.len > 0) nt.name = try self.gpa.dupe(u8, t.name);
         if (t.alias_name.len > 0) nt.alias_name = try self.gpa.dupe(u8, t.alias_name);
+        if (t.display_name.len > 0) nt.display_name = try self.gpa.dupe(u8, t.display_name);
         if (t.enum_name.len > 0) nt.enum_name = try self.gpa.dupe(u8, t.enum_name);
 
         // Nested TypeId lists (union/intersection/tuple/function/array element).

@@ -7267,6 +7267,47 @@ pub const Checker = struct {
     /// `typeof x` in type position — resolve to the value-side type of
     /// the identifier `x`.  Falls back to ID_UNKNOWN when the inner
     /// expression isn't a bare identifier or no value is found.
+    /// Return a copy of `id` that RENDERS as `name` (a display-only override)
+    /// while keeping its full structure for computation.  `name` must outlive
+    /// the checker (own it in `string_pool`).  Used so `typeof X` query types
+    /// display verbatim but still resolve members / assignability structurally.
+    fn tagDisplayName(self: *Checker, id: TypeId, name: []const u8) TypeId {
+        var t = self.store.get(id).*;
+        if (std.mem.eql(u8, t.display_name, name)) return id;
+        t.display_name = name;
+        return self.store.add(t) catch id;
+    }
+
+    /// True when a `ts_typeof_type` node is a direct member of a union /
+    /// intersection type (its parent, peeling parenthesized types, is one).
+    fn typeofNodeInComposite(self: *Checker, ty_node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        var idx = ty_node.toInt();
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var depth: u32 = 0;
+        while (depth < 4) : (depth += 1) {
+            if (idx >= parents.len) return false;
+            const p = parents[idx];
+            if (p == NONE) return false;
+            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
+                .ts_parenthesized_type => idx = p,
+                .ts_union_type, .ts_intersection_type => return true,
+                else => return false,
+            }
+        }
+        return false;
+    }
+
+    /// Build the `typeof <name>` display string (owned by `string_pool`).
+    fn typeofDisplayName(self: *Checker, name: []const u8) ?[]const u8 {
+        const disp = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return null;
+        self.string_pool.append(self.gpa, disp) catch {
+            self.gpa.free(disp);
+            return null;
+        };
+        return disp;
+    }
+
     fn resolveTypeofType(self: *Checker, ty_node: NodeIndex) TypeId {
         const d = self.ast_ref.nodeData(ty_node);
         var inner = d.lhs;
@@ -7330,7 +7371,12 @@ pub const Checker = struct {
         // getTypeToClassRelation returns Class (objectFlags.Anonymous) rather than
         // Instance (Interface) for modifications via `that = {} as typeof Foo & …`.
         if (self.classAstNodeByName(name)) |class_node| {
-            return self.buildClassStaticType(class_node, name);
+            const static_ty = self.buildClassStaticType(class_node, name);
+            // tsc renders `typeof ClassName` verbatim — tag the static
+            // (constructor) type with a display override, keeping its structure
+            // for member access / `new` / assignability.
+            if (self.typeofDisplayName(name)) |disp| return self.tagDisplayName(static_ty, disp);
+            return static_ty;
         }
         // Find a declarator binding the same name and use its inferred type.
         if (self.typeOfNameByAstSearch(name)) |t| {
@@ -20124,6 +20170,12 @@ pub const Checker = struct {
             return;
         }
         const t = self.store.get(id);
+        // Display-only override (the render/compute split): a `typeof X` query
+        // type renders verbatim while keeping its structure for computation.
+        if (t.display_name.len > 0) {
+            try buf.appendSlice(gpa, t.display_name);
+            return;
+        }
         switch (t.kind) {
             .any         => try buf.appendSlice(gpa, "any"),
             .unknown     => try buf.appendSlice(gpa, "unknown"),
