@@ -15837,9 +15837,64 @@ pub const Checker = struct {
                 return self.store.typeRef(name, args) catch null;
             }
         }
+        // JS constructor function: `new C()` where `C` is a function whose body
+        // assigns `this.<prop>` → an INSTANCE of `C` (rendered by the
+        // constructor's name).  A plain function stays `any` (new-on-function).
+        if (self.checker_opts.is_js_file and self.jsConstructorFnForName(name) != null) {
+            return self.store.typeRef(name, &.{}) catch null;
+        }
         // Type alias or enum (structural resolve).
         if (self.resolveDeclaredType(name)) |ty| return ty;
         return null;
+    }
+
+    /// The function node (fn_decl, or a `var X = function(){…}` declarator's
+    /// fn-expr) bound to `name` when it is a JS constructor function (its body
+    /// assigns `this.<prop>`), else null.
+    fn jsConstructorFnForName(self: *Checker, name: []const u8) ?NodeIndex {
+        const decls = self.value_decl_by_name.get(name) orelse return null;
+        for (decls.items) |decl| {
+            var fnode: NodeIndex = .none;
+            switch (self.ast_ref.nodeTag(decl)) {
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl => fnode = decl,
+                .declarator => {
+                    const rhs = self.ast_ref.nodeData(decl).rhs;
+                    if (rhs != .none) switch (self.ast_ref.nodeTag(rhs)) {
+                        .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => fnode = rhs,
+                        else => {},
+                    };
+                },
+                else => {},
+            }
+            if (fnode == .none) continue;
+            const d = self.ast_ref.nodeData(fnode);
+            if (d.lhs == .none) continue;
+            const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
+            if (!self.bodyAssignsThisProperty(fd.body)) continue;
+            // Skip GENERIC JS constructors (JSDoc `@template`): tsc renders the
+            // instance with type args (`new Cp(1)` → `Cp<number>`), which the
+            // bare `Cp` type_ref can't represent — leave those as the prior gap.
+            if (self.jsFnHasTemplateTag(fnode)) continue;
+            return fnode;
+        }
+        return null;
+    }
+
+    /// True when the JS function (or its enclosing var/assignment) has a leading
+    /// JSDoc `@template` tag — i.e. it is generic.  Scans a small window of
+    /// source before the function for an `@template` inside a `/** … */` block.
+    fn jsFnHasTemplateTag(self: *Checker, fn_node: NodeIndex) bool {
+        const src = self.ast_ref.source;
+        const start = self.ast_ref.nodeSpan(fn_node).start;
+        if (start == 0) return false;
+        const window_start = if (start > 600) start - 600 else 0;
+        const window = src[window_start..start];
+        // The `@template` must be in the immediately-preceding comment: require
+        // a `/**` after the last statement boundary before the function.
+        const at = std.mem.lastIndexOf(u8, window, "@template") orelse return false;
+        // Confirm an enclosing `/**` with no intervening `*/` close after it.
+        const open = std.mem.lastIndexOf(u8, window[0..at], "/**") orelse return false;
+        return std.mem.indexOf(u8, window[open..at], "*/") == null;
     }
 
     fn inferArith(self: *Checker, node: NodeIndex, tag: ast.Node.Tag) TypeId {
