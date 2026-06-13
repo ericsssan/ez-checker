@@ -20047,6 +20047,23 @@ pub const Checker = struct {
                 }
                 return false;
             },
+            // A type parameter constrained to string (or a union of string
+            // literals) is inferred from the literal — TypeScript preserves
+            // "foo" so the caller can infer `Name = "foo"` (not `string`).
+            // Unconstrained T widens to string, so only gate on string-bounded params.
+            .type_param => {
+                const constraint_ids = self.store.idsOf(t.list_data);
+                if (constraint_ids.len == 0) return false; // unconstrained — widen
+                const constraint_kind = self.store.get(constraint_ids[0]).kind;
+                return constraint_kind == .string or constraint_kind == .string_literal or
+                    (constraint_kind == .union_t and blk: {
+                    for (self.store.idsOf(self.store.get(constraint_ids[0]).list_data)) |m| {
+                        const mk = self.store.get(m).kind;
+                        if (mk != .string_literal and mk != .string) break :blk false;
+                    }
+                    break :blk true;
+                });
+            },
             else => return false,
         }
     }
