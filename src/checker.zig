@@ -19931,6 +19931,19 @@ pub const Checker = struct {
                 const obj_expected = self.expectedTypeOfD(pn, depth + 1) orelse return null;
                 return self.objectPropExpectedType(obj_expected, key_name);
             },
+            // Concise arrow body: `outer => node` where `node` IS the return expression.
+            // The expected type of `node` is the return type of outer's contextual type.
+            // Handles `f(a => b => c)` where b's param types come from a's contextual return.
+            .arrow_fn, .async_arrow_fn => {
+                const ad = self.ast_ref.extraData(ast.ArrowData, @intFromEnum(self.ast_ref.nodeData(pn).lhs));
+                if (ad.body != node) return null;
+                const outer_exp = self.expectedTypeOfD(pn, depth + 1) orelse return null;
+                const outer_ft = self.store.get(outer_exp);
+                if (outer_ft.kind != .function_t) return null;
+                const sigs = self.store.signaturesOf(outer_ft.signatures);
+                if (sigs.len == 0) return null;
+                return self.nonNullExpected(sigs[0].return_type);
+            },
             else => return null,
         }
     }
