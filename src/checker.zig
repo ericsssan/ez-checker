@@ -7669,15 +7669,54 @@ pub const Checker = struct {
         // `this.<prop>` is treated by tsc as a class-like constructor — its
         // VALUE renders `typeof <Name>` (not the plain call signature).  Tag the
         // display only (the structure stays the call signature for computation).
-        if (self.checker_opts.is_js_file and fd.name != .none and !is_async and !is_generator) {
-            if (self.bodyAssignsThisProperty(fd.body)) {
-                const fname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(fd.name));
-                if (fname.len > 0) {
-                    if (self.typeofDisplayName(fname)) |disp| return self.tagDisplayName(result, disp);
-                }
+        if (self.checker_opts.is_js_file and !is_async and !is_generator and
+            self.bodyAssignsThisProperty(fd.body))
+        {
+            // The constructor's name: the function's own name, else the
+            // identifier / member it is assigned to (`Foo = function(){…}`,
+            // `var Foo = function(){…}`, `exports.Foo = function(){…}`).
+            const fname = if (fd.name != .none)
+                self.ast_ref.tokenText(self.ast_ref.nodeMainToken(fd.name))
+            else
+                (self.jsFunctionAssignedName(fn_node) orelse "");
+            if (fname.len > 0) {
+                if (self.typeofDisplayName(fname)) |disp| return self.tagDisplayName(result, disp);
             }
         }
         return result;
+    }
+
+    /// The name a function EXPRESSION is bound to by its enclosing declarator
+    /// or assignment (`var Foo = fn`, `X.Foo = fn`), for JS constructor-function
+    /// naming.  Returns the rightmost identifier of the target, or null.
+    fn jsFunctionAssignedName(self: *Checker, fn_node: NodeIndex) ?[]const u8 {
+        const parents = self.semantic.parent_indices;
+        const ni = fn_node.toInt();
+        if (ni >= parents.len) return null;
+        const p = parents[ni];
+        if (p == @intFromEnum(NodeIndex.none)) return null;
+        const pn: NodeIndex = @enumFromInt(p);
+        const pd = self.ast_ref.nodeData(pn);
+        switch (self.ast_ref.nodeTag(pn)) {
+            .declarator => {
+                if (pd.rhs != fn_node or pd.lhs == .none) return null;
+                if (self.ast_ref.nodeTag(pd.lhs) != .identifier) return null;
+                return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs));
+            },
+            .assign => {
+                if (pd.rhs != fn_node or pd.lhs == .none) return null;
+                switch (self.ast_ref.nodeTag(pd.lhs)) {
+                    .identifier => return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs)),
+                    .member_expr => {
+                        const prop = self.ast_ref.nodeData(pd.lhs).rhs;
+                        if (prop != .none) return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(prop));
+                    },
+                    else => {},
+                }
+                return null;
+            },
+            else => return null,
+        }
     }
 
     /// True when `body` (a block) has a top-level statement assigning to a
