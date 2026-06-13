@@ -4289,6 +4289,92 @@ pub const Checker = struct {
     }
 
     /// Find the symbol bound to an identifier reference, if any.
+    /// True when `binding` (a parameter's binding identifier) sits inside an
+    /// object/array destructuring pattern of its enclosing function's
+    /// parameter list — i.e. it is a destructured ELEMENT, not a simple
+    /// `(x) => …` parameter.  Walks up to the first function boundary.
+    /// True when the function enclosing parameter `binding` is the RHS of a
+    /// typed binding — a `declarator`, class-field initializer, object-literal
+    /// property, `return`, or `as`/`satisfies` — i.e. a context where the
+    /// expected function type is read DIRECTLY from an annotation and
+    /// contextualParamType's slot walk is reliable.  Call-argument and
+    /// array-element (tuple/variadic) contexts are EXCLUDED: those are owned by
+    /// contextualCallbackParamType / have positional subtleties (variadic-tuple
+    /// rests) the plain slot walk mis-handles.
+    fn bindingFnInSimpleContext(self: *Checker, binding: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (binding.toInt() < parents.len) parents[binding.toInt()] else NONE;
+        var depth: u32 = 0;
+        while (p != NONE and depth < 8) : ({ p = parents[p]; depth += 1; }) {
+            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
+                .arrow_fn, .async_arrow_fn, .fn_expr, .async_fn_expr,
+                .generator_fn_expr, .async_generator_fn_expr => {
+                    var fp = if (p < parents.len) parents[p] else NONE;
+                    // Peel grouping (`(function(){})`).
+                    while (fp != NONE and self.ast_ref.nodeTag(@enumFromInt(fp)) == .grouping_expr)
+                        fp = if (fp < parents.len) parents[fp] else NONE;
+                    if (fp == NONE) return false;
+                    // Exclude only the two contexts with positional subtleties:
+                    // call arguments (owned by contextualCallbackParamType) and
+                    // array elements (variadic-tuple rests mis-slot).  Every
+                    // other RHS-of-typed-binding context is reliable.
+                    return switch (self.ast_ref.nodeTag(@enumFromInt(fp))) {
+                        .call_expr, .optional_call_expr, .new_expr, .array_literal => false,
+                        else => true,
+                    };
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// True when `id` is a union whose members are all literal types — usually
+    /// the expansion of a named alias whose name tsc would display instead.
+    fn typeIsAllLiteralUnion(self: *Checker, id: TypeId) bool {
+        const t = self.store.get(id);
+        if (t.kind != .union_t) return false;
+        const members = self.store.idsOf(t.list_data);
+        if (members.len == 0) return false;
+        for (members) |m| {
+            switch (self.store.get(m).kind) {
+                .string_literal, .number_literal, .boolean_literal, .bigint_literal => {},
+                else => return false,
+            }
+        }
+        return true;
+    }
+
+    /// True when `id` is a tuple, or a union any of whose members is a tuple.
+    fn typeIsTupleOrTupleUnion(self: *Checker, id: TypeId) bool {
+        const t = self.store.get(id);
+        if (t.kind == .tuple_t) return true;
+        if (t.kind == .union_t) {
+            for (self.store.idsOf(t.list_data)) |m| {
+                if (self.store.get(m).kind == .tuple_t) return true;
+            }
+        }
+        return false;
+    }
+
+    fn bindingInDestructuringPattern(self: *Checker, binding: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (binding.toInt() < parents.len) parents[binding.toInt()] else NONE;
+        var depth: u32 = 0;
+        while (p != NONE and depth < 8) : ({ p = parents[p]; depth += 1; }) {
+            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
+                .object_pattern, .array_pattern => return true,
+                .arrow_fn, .async_arrow_fn, .fn_expr, .async_fn_expr,
+                .generator_fn_expr, .async_generator_fn_expr,
+                .fn_decl, .async_fn_decl, .method_def, .computed_method_def => return false,
+                else => {},
+            }
+        }
+        return false;
+    }
+
     fn symbolForIdentRef(self: *Checker, ident_node: NodeIndex) ?symbol_mod.SymbolId {
         const ni = ident_node.toInt();
         if (ni >= self.node_to_sym.len) return null;
@@ -5612,6 +5698,43 @@ pub const Checker = struct {
                 // across unrelated code).
                 if (binding.toInt() < self.ast_ref.nodes.len) {
                     if (self.param_ctx_types.get(binding.toInt())) |t| return t;
+                }
+                // Lazy fallback: a reference to an un-annotated, contextually
+                // typed parameter resolves to that contextual type even when
+                // queried OUTSIDE the enclosing function's return inference
+                // (the transient `param_ctx_types` binding above only exists
+                // during that inference).  `var f: (x: number) => number =
+                // function(x) { return x; }` — `x` in the body is `number`.
+                // Restricted to a SIMPLE identifier parameter: a destructured
+                // element (`[a, b]: [T, U]`) is handled by
+                // destructuredParamBindingType above; the contextual slot type
+                // there is the whole pattern, wrong for an element.
+                if (self.bindingFnInSimpleContext(binding) and
+                    !self.bindingInDestructuringPattern(binding))
+                {
+                    if (self.contextualParamType(binding)) |t| {
+                        // A tuple / tuple-union contextual type means the param
+                        // is destructured (`[a, b]: [T, U]`) or a labelled
+                        // rest; the body identifier wants the ELEMENT type, not
+                        // the whole tuple — leave it `any` rather than leak the
+                        // tuple.
+                        // A union of only literals is usually the EXPANSION of
+                        // a named alias (`type Values = 1|2|3`); tsc displays
+                        // the alias, which we'd lose — leave it `any` rather
+                        // than render the expanded union.
+                        if (!self.typeIsTupleOrTupleUnion(t) and !self.typeIsAllLiteralUnion(t)) {
+                            // An optional parameter (`(a, b?) => …`) contextually
+                            // typed `T` is `T | undefined` under strictNullChecks.
+                            if (self.paramHasOptionalMarker(binding) and
+                                self.checker_opts.strict_null_checks and
+                                self.store.get(t).kind != .union_t)
+                            {
+                                const ids = [_]TypeId{ t, tymod.ID_UNDEFINED };
+                                return self.store.unionOf(&ids) catch t;
+                            }
+                            return t;
+                        }
+                    }
                 }
                 return tymod.ID_ANY;
             },
@@ -19207,8 +19330,14 @@ pub const Checker = struct {
         const sigs = self.store.signaturesOf(ft.signatures);
         if (sigs.len == 0) return null;
         const cparams = self.store.signatureParamsOf(sigs[0]);
-        if (idx >= cparams.len) return null;
-        const cty = cparams[idx];
+        // A leading `this` parameter (`(this: T, x: U) => …`) is not a real
+        // argument slot — the callback's params align AFTER it.  Offset so
+        // arrow param 0 maps to the first non-`this` contextual param.
+        const cnames = self.store.signatureParamNamesOf(sigs[0]);
+        const this_off: usize = if (cnames.len > 0 and std.mem.eql(u8, cnames[0], "this")) 1 else 0;
+        const cidx = idx + this_off;
+        if (cidx >= cparams.len) return null;
+        const cty = cparams[cidx];
         // An uninstantiated type-param contextual type (`<T>(x: T) => …` not yet
         // resolved) is shown as implicit `any` by tsc — don't surface the `T`.
         if (self.store.get(cty).kind == .type_param) return null;
