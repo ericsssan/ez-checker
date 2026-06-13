@@ -2317,9 +2317,49 @@ pub const Checker = struct {
         if (pdata.lhs == .none) return null;
         const sig_data = self.ast_ref.extraData(ast.InterfaceSigData, @intFromEnum(pdata.lhs));
         if (sig_data.key != node) return null;
+        // Skip getter/setter accessors (kind=1/2) — TS returns `any` for those key identifiers.
+        if (sig_data.kind != 0) return null;
+        // Skip computed property keys: `[expr]()` — the method sig's main token is `[`.
+        if (self.ast_ref.tokenTag(self.ast_ref.nodeMainToken(parent)) == .l_bracket) return null;
         const method_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
         if (method_name.len == 0) return null;
-        // Walk up to the interface declaration.
+        // Direct-parent fast path: ts_method_signature ← ts_type_literal.
+        // Only fire when there's exactly ONE method with this name in the type literal
+        // (overloaded methods require a merged type we can't easily compute here).
+        {
+            const gidx = parents[pidx];
+            if (gidx != @intFromEnum(NodeIndex.none) and gidx < self.ast_ref.nodes.len) {
+                const gn: NodeIndex = @enumFromInt(gidx);
+                if (self.ast_ref.nodeTag(gn) == .ts_type_literal) {
+                    const lit_data = self.ast_ref.nodeData(gn);
+                    const members = self.directRange(lit_data.lhs, lit_data.rhs) orelse return null;
+                    var match_count: u32 = 0;
+                    for (members) |mraw| {
+                        const mn: NodeIndex = @enumFromInt(mraw);
+                        if (self.ast_ref.nodeTag(mn) != .ts_method_signature) continue;
+                        const mdata = self.ast_ref.nodeData(mn);
+                        if (mdata.lhs == .none) continue;
+                        const msd = self.ast_ref.extraData(ast.InterfaceSigData, @intFromEnum(mdata.lhs));
+                        if (msd.key == .none) continue;
+                        const mn_tok = self.ast_ref.nodeMainToken(msd.key);
+                        if (std.mem.eql(u8, self.ast_ref.tokenText(mn_tok), method_name)) match_count += 1;
+                    }
+                    if (match_count == 1) {
+                        return self.buildFunctionTypeG(
+                            sig_data.params_start,
+                            sig_data.params_end,
+                            sig_data.return_type,
+                            .none,
+                            false,
+                            false,
+                            sig_data.type_params,
+                            sig_data.type_params_end,
+                        );
+                    }
+                    return null;
+                }
+            }
+        }
         var q = parents[pidx];
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         var depth: u8 = 0;

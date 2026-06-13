@@ -1090,10 +1090,23 @@ fn parseFunctionTypeParam(p: *Parser) Error!NodeIndex {
             });
         }
 
-        // Skip default value without type: `param = value` (semantic error in TS, but parseable)
+        // Default value without type: `param = value`.
+        // Wrap in assignment_pattern so paramDeclaredType can infer the widened type
+        // (e.g. `(x = 1)` → x?: number).
         if (p.peek() == .equal) {
             _ = p.advance();
-            _ = try p.parseAssignmentExpression();
+            const default_val = try p.parseAssignmentExpression();
+            const name_node = try p.addNode(.{
+                .tag = .identifier,
+                .main_token = name_tok,
+                .data = .{ .lhs = opt_flag, .rhs = .none },
+            });
+            const ap = try p.addNode(.{
+                .tag = .assignment_pattern,
+                .main_token = name_tok,
+                .data = .{ .lhs = name_node, .rhs = default_val },
+            });
+            return ap;
         }
 
         // No colon — bare identifier parameter (possibly rest)
