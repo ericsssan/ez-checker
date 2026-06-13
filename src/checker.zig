@@ -2556,6 +2556,37 @@ pub const Checker = struct {
         const rhs_tag = self.ast_ref.nodeTag(pdata.rhs);
         if (rhs_tag == .ts_as_expr or rhs_tag == .ts_type_assertion) return val_ty;
         const t = self.store.get(val_ty);
+        // When the enclosing object literal is a call argument and the callee's
+        // type expects a literal for this property (e.g. `until(other, { largestUnit: "hour" })`
+        // where largestUnit expects `"year" | "month" | ...`), preserve the literal
+        // instead of widening.  Guard: only check if the callee is already in the
+        // node_types cache (bottom-up parsers always allocate the callee before its
+        // argument list, so the callee index is smaller and the oracle has typed it).
+        if (t.kind == .string_literal or t.kind == .number_literal or t.kind == .boolean_literal) {
+            const obj_node: NodeIndex = @enumFromInt(gp_pidx);
+            const obj_ni = gp_pidx;
+            const callee_cached = blk: {
+                if (obj_ni >= parents.len) break :blk false;
+                const cp = parents[obj_ni];
+                if (cp == @intFromEnum(NodeIndex.none) or cp >= self.ast_ref.nodes.len) break :blk false;
+                const cn: NodeIndex = @enumFromInt(cp);
+                const ctag = self.ast_ref.nodeTag(cn);
+                if (ctag != .call_expr and ctag != .optional_call_expr and ctag != .new_expr) break :blk false;
+                const cd = self.ast_ref.nodeData(cn);
+                if (cd.lhs == .none) break :blk false;
+                const callee_ni = cd.lhs.toInt();
+                if (callee_ni >= self.node_types.len) break :blk false;
+                const cached = self.node_types[callee_ni];
+                break :blk !cached.eq(TypeId.none) and !cached.eq(tymod.ID_UNKNOWN);
+            };
+            if (callee_cached) {
+                if (self.expectedTypeOf(obj_node)) |ctx| {
+                    const key_tok = self.ast_ref.nodeMainToken(node);
+                    const key_name = self.ast_ref.tokenText(key_tok);
+                    if (self.contextualPropExpectsLiteral(ctx, key_name, val_ty)) return val_ty;
+                }
+            }
+        }
         // Widen primitive literal types to their base types, matching TypeScript's
         // widening behavior for object literal property types.
         return switch (t.kind) {
@@ -20156,7 +20187,7 @@ pub const Checker = struct {
     }
 
     fn nonNullExpected(_: *Checker, ty: TypeId) ?TypeId {
-        if (ty.eq(tymod.ID_ANY) or ty.eq(tymod.ID_UNKNOWN) or ty.eq(tymod.ID_ERROR)) return null;
+        if (ty.eq(TypeId.none) or ty.eq(tymod.ID_ANY) or ty.eq(tymod.ID_UNKNOWN) or ty.eq(tymod.ID_ERROR)) return null;
         return ty;
     }
 
