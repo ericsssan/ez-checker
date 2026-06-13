@@ -7665,7 +7665,38 @@ pub const Checker = struct {
             else => false,
         };
         const result = self.buildFunctionTypeG(fd.params, fd.params_end, fd.return_type, fd.body, is_async, is_generator, fd.type_params, fd.type_params_end);
+        // JS constructor function: a NAMED function whose body assigns to
+        // `this.<prop>` is treated by tsc as a class-like constructor — its
+        // VALUE renders `typeof <Name>` (not the plain call signature).  Tag the
+        // display only (the structure stays the call signature for computation).
+        if (self.checker_opts.is_js_file and fd.name != .none and !is_async and !is_generator) {
+            if (self.bodyAssignsThisProperty(fd.body)) {
+                const fname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(fd.name));
+                if (fname.len > 0) {
+                    if (self.typeofDisplayName(fname)) |disp| return self.tagDisplayName(result, disp);
+                }
+            }
+        }
         return result;
+    }
+
+    /// True when `body` (a block) has a top-level statement assigning to a
+    /// `this.<prop>` member — the JS "constructor function" signal.
+    fn bodyAssignsThisProperty(self: *Checker, body: NodeIndex) bool {
+        if (body == .none or self.ast_ref.nodeTag(body) != .block_stmt) return false;
+        const bd = self.ast_ref.nodeData(body);
+        const slice = self.directRange(bd.lhs, bd.rhs) orelse return false;
+        for (slice) |raw| {
+            var stmt: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(stmt) == .expression_stmt)
+                stmt = self.ast_ref.nodeData(stmt).lhs;
+            if (stmt == .none or self.ast_ref.nodeTag(stmt) != .assign) continue;
+            const lhs = self.ast_ref.nodeData(stmt).lhs;
+            if (lhs == .none or self.ast_ref.nodeTag(lhs) != .member_expr) continue;
+            const obj = self.ast_ref.nodeData(lhs).lhs;
+            if (obj != .none and self.ast_ref.nodeTag(obj) == .this_expr) return true;
+        }
+        return false;
     }
 
     /// Build a function_t from an arrow_fn / async_arrow_fn node.
