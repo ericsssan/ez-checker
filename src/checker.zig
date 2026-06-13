@@ -558,6 +558,11 @@ pub const Checker = struct {
     /// unification in matchTypeParam), so mutually-referential aliases can't
     /// loop.
     alias_match_depth: u8 = 0,
+
+    /// Recursion guard for instantiating a callback parameter's type from the
+    /// enclosing call's inferred type arguments (contextualCallbackParamType →
+    /// inferGenericParamType → collectCallBindings), so the chain can't loop.
+    cb_instantiate_depth: u8 = 0,
     /// Set while resolving a member access through a union/intersection
     /// receiver — suppresses the string-index-signature fallback so a member
     /// served only by an index signature counts as "absent" (the union access
@@ -6956,6 +6961,29 @@ pub const Checker = struct {
                         count += 1;
                     }
                     if (count > 0) result = self.substituteTypeId(result, names_buf[0..count], vals_buf[0..count]);
+                }
+            }
+        }
+        // The param type still mentions a type parameter (`(x: T) => …` where T
+        // is the callee's own type param, e.g. `wrap(s => …)` with
+        // `wrap<T,U>(cb: Mapper<T,U>)`).  Instantiate the WHOLE callback
+        // parameter from the call's inferred type arguments (forward + backward
+        // inference via inferGenericParamType), then re-extract our slot — so
+        // `s` gets the inferred `T` instead of a bare, suppressed type param.
+        if (self.typeMentionsTypeParam(result) and self.cb_instantiate_depth < 2 and arg_slot >= 0) {
+            self.cb_instantiate_depth += 1;
+            const inst = self.inferGenericParamType(call_node, @intCast(arg_slot));
+            self.cb_instantiate_depth -= 1;
+            if (inst) |inst_cb| {
+                const ict = self.store.get(inst_cb);
+                if (ict.kind == .function_t) {
+                    const isigs = self.store.signaturesOf(ict.signatures);
+                    if (isigs.len > 0) {
+                        const iparams = self.store.signatureParamsOf(isigs[0]);
+                        const psl: usize = @intCast(param_slot);
+                        if (psl < iparams.len and !self.typeMentionsTypeParam(iparams[psl]))
+                            return iparams[psl];
+                    }
                 }
             }
         }
