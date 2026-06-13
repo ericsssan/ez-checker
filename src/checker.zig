@@ -1114,7 +1114,7 @@ pub const Checker = struct {
                 };
             },
             .class_decl => tymod.ID_ANY,
-            .class_expr => tymod.ID_UNKNOWN,
+            .class_expr => self.classExprValueType(node),
             // Spread element `...expr` in call args/array literals:
             // its type is the element type of the spread argument (with
             // literals widened, matching tsc's spread behaviour).
@@ -7684,6 +7684,28 @@ pub const Checker = struct {
             }
         }
         return result;
+    }
+
+    /// A class EXPRESSION's value type: its static (constructor) type, rendered
+    /// `typeof <Name>` — where Name is the class's own name (`class C {…}`) or,
+    /// for an anonymous class, the declarator/assignment target it is bound to
+    /// (`foo.x = class {…}` → `typeof x`).  Matches tsc, which names anonymous
+    /// class expressions by their binding.
+    fn classExprValueType(self: *Checker, node: NodeIndex) TypeId {
+        const data = self.ast_ref.nodeData(node);
+        if (data.lhs == .none) return tymod.ID_UNKNOWN;
+        const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(data.lhs));
+        var name: []const u8 = "";
+        if (cd.name != .none) name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+        if (name.len == 0) name = self.jsFunctionAssignedName(node) orelse "";
+        if (name.len == 0) return tymod.ID_UNKNOWN;
+        // `module.exports = class {…}` / `exports = class {…}` — the binding
+        // target is `exports`, but tsc names the module's export by its import
+        // type (`typeof import("mod")`), not `typeof exports`.  Leave un-tagged.
+        if (std.mem.eql(u8, name, "exports")) return tymod.ID_UNKNOWN;
+        const static_ty = self.buildClassStaticType(node, name);
+        if (self.typeofDisplayName(name)) |disp| return self.tagDisplayName(static_ty, disp);
+        return static_ty;
     }
 
     /// The name a function EXPRESSION is bound to by its enclosing declarator
