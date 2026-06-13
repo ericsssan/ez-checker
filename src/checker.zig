@@ -553,6 +553,11 @@ pub const Checker = struct {
     /// globally re-typing param references elsewhere.  Populated and torn down
     /// around the return-inference block in `buildSignatureRaw`.
     param_ctx_types: std.AutoHashMapUnmanaged(u32, TypeId) = .empty,
+
+    /// Recursion guard for `matchThroughAlias` (generic alias-expansion
+    /// unification in matchTypeParam), so mutually-referential aliases can't
+    /// loop.
+    alias_match_depth: u8 = 0,
     /// Set while resolving a member access through a union/intersection
     /// receiver — suppresses the string-index-signature fallback so a member
     /// served only by an index signature counts as "absent" (the union access
@@ -14964,6 +14969,53 @@ pub const Checker = struct {
         return self.ast_ref.nodeData(bd.rhs).lhs;
     }
 
+    /// Match a generic type-alias reference `ref<...>` against `arg_ty` when
+    /// `arg_ty` is the alias's structural EXPANSION (not a same-named ref):
+    /// unify the alias body against `arg_ty` keyed by the alias's OWN type
+    /// params, then propagate each resulting binding to `ref`'s corresponding
+    /// type-argument NODE (so the alias's `X` flows to this ref's `T`).
+    fn matchThroughAlias(
+        self: *Checker,
+        ref_node: NodeIndex,
+        tname: []const u8,
+        arg_ty: TypeId,
+        names: []const []const u8,
+        bindings: []TypeId,
+    ) void {
+        if (self.alias_match_depth >= 4) return;
+        const decl = self.type_decl_nodes.get(tname) orelse return;
+        if (self.ast_ref.nodeTag(decl) != .ts_type_alias_decl) return;
+        const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
+        if (ad.type_node == .none) return;
+        const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+        if (ad.type_params >= ad.type_params_end or ad.type_params_end > ext_len) return;
+        var alias_names: [8][]const u8 = undefined;
+        var an: usize = 0;
+        for (self.ast_ref.extra_data[ad.type_params..ad.type_params_end]) |raw| {
+            if (an >= alias_names.len) break;
+            const tp: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) continue;
+            alias_names[an] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+            an += 1;
+        }
+        if (an == 0) return;
+        var alias_binds: [8]TypeId = undefined;
+        for (0..an) |i| alias_binds[i] = TypeId.none;
+        self.alias_match_depth += 1;
+        self.matchTypeParam(ad.type_node, arg_ty, alias_names[0..an], alias_binds[0..an]);
+        self.alias_match_depth -= 1;
+        // Propagate alias-param bindings to this ref's type-argument nodes.
+        const refd = self.ast_ref.nodeData(ref_node);
+        if (refd.rhs == .none) return;
+        const sr = self.safeSubRange(refd.rhs) orelse return;
+        const ta_nodes = self.ast_ref.extra_data[sr.start..sr.end];
+        for (0..an) |i| {
+            if (i >= ta_nodes.len) break;
+            if (alias_binds[i].eq(TypeId.none)) continue;
+            self.matchTypeParam(@enumFromInt(ta_nodes[i]), alias_binds[i], names, bindings);
+        }
+    }
+
     /// Walk `param_node` looking for `ts_type_reference`s whose name
     /// matches one of `names`.  When found and not yet bound, set
     /// `bindings[i]` to `arg_ty`.  Recurses through unions /
@@ -15020,8 +15072,16 @@ pub const Checker = struct {
                         const ta_node: NodeIndex = @enumFromInt(raw);
                         self.matchTypeParam(ta_node, arg_type_args[ai], names, bindings);
                     }
+                    return;
                 }
             }
+            // The ref names a generic type ALIAS (`Mapper<T,U>`) but `arg_ty`
+            // is its EXPANSION (a function/object, not a `Mapper<…>` ref) —
+            // common when the arg came from an inferred/contextual type.  Match
+            // the alias BODY against the arg using the alias's own param names,
+            // then propagate those bindings to this ref's type-argument nodes
+            // (the alias's `X` is this ref's `T`).
+            self.matchThroughAlias(n, tname, arg_ty, names, bindings);
             return;
         }
         if (tag == .ts_array_type) {
