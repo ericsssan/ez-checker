@@ -7698,6 +7698,9 @@ pub const Checker = struct {
         var name: []const u8 = "";
         if (cd.name != .none) name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
         if (name.len == 0) name = self.jsFunctionAssignedName(node) orelse "";
+        // Class expression as an OBJECT-LITERAL property value (`{ x: class {…} }`)
+        // → named by the property key (`typeof x`).
+        if (name.len == 0) name = self.classExprObjectPropertyKey(node) orelse "";
         if (name.len == 0) return tymod.ID_UNKNOWN;
         // `module.exports = class {…}` / `exports = class {…}` — the binding
         // target is `exports`, but tsc names the module's export by its import
@@ -7706,6 +7709,22 @@ pub const Checker = struct {
         const static_ty = self.buildClassStaticType(node, name);
         if (self.typeofDisplayName(name)) |disp| return self.tagDisplayName(static_ty, disp);
         return static_ty;
+    }
+
+    /// The object-literal property KEY whose value is `node` (a class
+    /// expression): `{ x: class {…} }` → "x".  Null when `node` isn't an
+    /// object-literal property value.
+    fn classExprObjectPropertyKey(self: *Checker, node: NodeIndex) ?[]const u8 {
+        const parents = self.semantic.parent_indices;
+        const ni = node.toInt();
+        if (ni >= parents.len) return null;
+        const p = parents[ni];
+        if (p == @intFromEnum(NodeIndex.none)) return null;
+        const pn: NodeIndex = @enumFromInt(p);
+        if (self.ast_ref.nodeTag(pn) != .property) return null;
+        const pd = self.ast_ref.nodeData(pn);
+        if (pd.rhs != node or pd.lhs == .none) return null;
+        return self.staticPropertyKey(pd.lhs);
     }
 
     /// The name a function EXPRESSION is bound to by its enclosing declarator
