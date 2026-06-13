@@ -13592,7 +13592,12 @@ pub const Checker = struct {
             .ts_property_signature => {
                 if (data.lhs == .none) return null;
                 const name_tok = self.ast_ref.nodeMainToken(data.lhs);
-                const name = self.ast_ref.tokenText(name_tok);
+                const raw_name = self.ast_ref.tokenText(name_tok);
+                const name_tag = self.ast_ref.nodeTag(data.lhs);
+                const name = if ((name_tag == .string_literal or name_tag == .template_literal) and raw_name.len >= 2)
+                    raw_name[1 .. raw_name.len - 1]
+                else
+                    raw_name;
                 var ty: TypeId = tymod.ID_UNKNOWN;
                 if (data.rhs != .none and self.ast_ref.nodeTag(data.rhs) == .ts_type_annotation) {
                     const ty_node = self.ast_ref.nodeData(data.rhs).lhs;
@@ -14060,9 +14065,14 @@ pub const Checker = struct {
             .property_def => {
                 // lhs = key, rhs = extra index to PropertyData
                 if (data.lhs == .none) return null;
-                if (self.ast_ref.nodeTag(data.lhs) != .identifier and
-                    self.ast_ref.nodeTag(data.lhs) != .property_ident) return null;
-                const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
+                const key_tag_pd = self.ast_ref.nodeTag(data.lhs);
+                if (key_tag_pd != .identifier and key_tag_pd != .property_ident and
+                    key_tag_pd != .string_literal and key_tag_pd != .number_literal) return null;
+                const raw_name_pd = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
+                const name = if ((key_tag_pd == .string_literal) and raw_name_pd.len >= 2)
+                    raw_name_pd[1 .. raw_name_pd.len - 1]
+                else
+                    raw_name_pd;
                 const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(data.rhs));
                 var ty: TypeId = tymod.ID_UNKNOWN;
                 if (pd.type_annotation != .none and
