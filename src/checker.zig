@@ -11960,6 +11960,10 @@ pub const Checker = struct {
                             const alias_str = alias_buf.toOwnedSlice(self.gpa) catch name;
                             return self.tagAliasArgs(result, alias_str, use_args);
                         }
+                        // Generic alias with simple/literal result (e.g. `type Id<T> = T`
+                        // or `type Constrained<T extends number> = T`): TypeScript expands
+                        // the instantiation and shows the underlying type, not the alias name.
+                        return result;
                     }
                     return self.tagAliasName(result, name);
                 }
@@ -21601,7 +21605,16 @@ pub const Checker = struct {
                             else => {},
                         }
                     } else false;
-                    if (has_complex) {
+                    // TypeScript also preserves alias names for unions of ONLY literal types
+                    // (e.g. `type B = 2 | 3`, `type Kind = "A" | "B"`).  Unions that include
+                    // broad primitive keywords (string, number, boolean) are expanded instead.
+                    const all_literals = members.len > 0 and for (members) |m| {
+                        switch (self.store.get(m).kind) {
+                            .string_literal, .number_literal, .boolean_literal => {},
+                            else => break false,
+                        }
+                    } else true;
+                    if (has_complex or all_literals) {
                         try buf.appendSlice(gpa, t.alias_name);
                         return;
                     }
