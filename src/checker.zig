@@ -5722,14 +5722,15 @@ pub const Checker = struct {
                         .arrow_fn, .async_arrow_fn => return self.typeOf(data.rhs),
                         else => {},
                     }
-                    // Composed default (e.g. `x = arr[0]`): infer, then widen
-                    // fresh literal types to their base, other non-literals → unknown.
+                    // Composed default (e.g. `x = arr[0]`, `y = x + 1`): infer,
+                    // then widen literal types to their base; pass through base
+                    // primitives directly; complex types fall back to unknown.
                     const raw = self.typeOf(data.rhs);
                     return switch (self.store.get(raw).kind) {
-                        .string_literal => tymod.ID_STRING,
-                        .number_literal => tymod.ID_NUMBER,
-                        .bigint_literal => tymod.ID_BIGINT,
-                        .boolean_literal => tymod.ID_BOOLEAN,
+                        .string_literal, .string => tymod.ID_STRING,
+                        .number_literal, .number => tymod.ID_NUMBER,
+                        .bigint_literal, .bigint => tymod.ID_BIGINT,
+                        .boolean_literal, .boolean => tymod.ID_BOOLEAN,
                         else => tymod.ID_UNKNOWN,
                     };
                 }
