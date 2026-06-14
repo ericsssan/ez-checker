@@ -4432,10 +4432,25 @@ pub const Checker = struct {
             // Try `<sym>.prop op <literal>` — discriminated union narrowing.
             const keep_only_disc = (!is_neq) != negate;
             if (self.isMemberAccessOfSym(data.lhs, sym)) |prop_name| {
-                return self.narrowDiscriminantProp(ty, prop_name, data.rhs, keep_only_disc);
+                const result = self.narrowDiscriminantProp(ty, prop_name, data.rhs, keep_only_disc);
+                // `sym?.prop === rhs`: in the true branch, if rhs provably can't be
+                // null/undefined, sym can't be nullish (optional chain on a nullish sym
+                // produces undefined, which can't equal a non-nullish rhs).
+                if (self.ast_ref.nodeTag(data.lhs) == .optional_member_expr and
+                    keep_only_disc and !self.nodeCouldBeNullish(data.rhs))
+                {
+                    return self.narrowNullish(result, true);
+                }
+                return result;
             }
             if (self.isMemberAccessOfSym(data.rhs, sym)) |prop_name| {
-                return self.narrowDiscriminantProp(ty, prop_name, data.lhs, keep_only_disc);
+                const result = self.narrowDiscriminantProp(ty, prop_name, data.lhs, keep_only_disc);
+                if (self.ast_ref.nodeTag(data.rhs) == .optional_member_expr and
+                    keep_only_disc and !self.nodeCouldBeNullish(data.lhs))
+                {
+                    return self.narrowNullish(result, true);
+                }
+                return result;
             }
             return ty;
         }
@@ -4542,6 +4557,38 @@ pub const Checker = struct {
     }
 
     const Narrowable = enum(u8) { none, null_t, undefined_t, void_t, string, number, boolean, bigint, symbol, object, function };
+
+    /// Returns true if the node's type might be null or undefined.
+    /// Used to gate optional-chain narrowing: `sym?.prop === rhs` only removes
+    /// null/undefined from sym when rhs provably cannot be null/undefined.
+    fn nodeCouldBeNullish(self: *Checker, node: NodeIndex) bool {
+        var n = node;
+        while (self.ast_ref.nodeTag(n) == .grouping_expr) n = self.ast_ref.nodeData(n).lhs;
+        const tag = self.ast_ref.nodeTag(n);
+        // Explicit null/undefined literals always could be nullish.
+        if (tag == .null_literal or tag == .void_expr) return true;
+        if (tag == .identifier) {
+            const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(n));
+            if (std.mem.eql(u8, name, "undefined")) return true;
+            // Check the declared type of the identifier.
+            const ty = self.typeOf(n);
+            return self.typeCouldBeNullish(ty);
+        }
+        return false;
+    }
+
+    fn typeCouldBeNullish(self: *Checker, ty: TypeId) bool {
+        if (tymod.isAny(&self.store, ty) or tymod.isUnknown(&self.store, ty)) return true;
+        const t = self.store.get(ty);
+        if (t.kind == .null_t or t.kind == .undefined_t) return true;
+        if (t.kind == .union_t) {
+            for (self.store.idsOf(t.list_data)) |m| {
+                const mk = self.store.get(m).kind;
+                if (mk == .null_t or mk == .undefined_t) return true;
+            }
+        }
+        return false;
+    }
 
     fn narrowKindFromLiteral(self: *Checker, lit: NodeIndex) Narrowable {
         var n = lit;
@@ -4725,7 +4772,9 @@ pub const Checker = struct {
         if (t.kind != .union_t) {
             const prop_ty = self.directPropOf(ty, prop_name);
             if (prop_ty.eq(tymod.ID_UNKNOWN)) return ty;
-            const matches = tymod.isAssignableTo(&self.store, prop_ty, lit_id);
+            const sub = tymod.isAssignableTo(&self.store, prop_ty, lit_id);
+            const rev = if (keep_only) tymod.isAssignableTo(&self.store, lit_id, prop_ty) else false;
+            const matches = sub or rev;
             return if (keep_only == matches) ty else tymod.ID_NEVER;
         }
         var buf: [16]TypeId = undefined;
@@ -4734,16 +4783,26 @@ pub const Checker = struct {
             const prop_ty = self.directPropOf(m, prop_name);
             const mk = self.store.get(m).kind;
             const member_is_nullish = mk == .null_t or mk == .undefined_t;
-            const matches = if (prop_ty.eq(tymod.ID_UNKNOWN) and member_is_nullish)
+            const should_keep: bool = if (prop_ty.eq(tymod.ID_UNKNOWN) and member_is_nullish) blk: {
                 // null/undefined have no own properties; via optional-chain they
                 // produce `undefined`, so they only match when the literal is also
                 // null or undefined.
-                lit_id.eq(tymod.ID_NULL) or lit_id.eq(tymod.ID_UNDEFINED)
-            else if (prop_ty.eq(tymod.ID_UNKNOWN))
-                true // unknown prop on non-nullish: can't narrow, keep member
-            else
-                tymod.isAssignableTo(&self.store, prop_ty, lit_id);
-            if (keep_only == matches) {
+                const matches = lit_id.eq(tymod.ID_NULL) or lit_id.eq(tymod.ID_UNDEFINED);
+                break :blk keep_only == matches;
+            } else if (prop_ty.eq(tymod.ID_UNKNOWN)) blk: {
+                break :blk true; // unknown prop on non-nullish: can't narrow, keep member
+            } else if (keep_only) blk: {
+                // TRUE branch: keep if the literal is a possible value of prop_ty.
+                // Check both directions — `prop_ty <: lit` (exact match) and
+                // `lit <: prop_ty` (literal is a subtype, e.g. false <: boolean).
+                break :blk tymod.isAssignableTo(&self.store, prop_ty, lit_id) or
+                           tymod.isAssignableTo(&self.store, lit_id, prop_ty);
+            } else blk: {
+                // FALSE branch: keep if prop_ty is not exclusively the literal
+                // (i.e., can have values other than lit_id).
+                break :blk !tymod.isAssignableTo(&self.store, prop_ty, lit_id);
+            };
+            if (should_keep) {
                 if (n >= buf.len) return ty;
                 buf[n] = m;
                 n += 1;
