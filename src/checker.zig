@@ -16472,6 +16472,12 @@ pub const Checker = struct {
             if (pn_data.lhs == .none) return false;
             return self.ast_ref.nodeTag(pn_data.lhs) == .array_pattern;
         }
+        // Assignment expression (`[a, b] = [1, "x"]`): RHS is destructured.
+        if (ptag == .assign) {
+            const ad = self.ast_ref.nodeData(pn);
+            if (ad.rhs != node or ad.lhs == .none) return false;
+            return self.ast_ref.nodeTag(ad.lhs) == .array_pattern;
+        }
         // Default value of a binding-pattern element (`[a = ["x", "y"]]`) — tsc
         // infers the default array literal as a tuple, like a destructuring RHS.
         if (ptag == .assignment_pattern) {
@@ -16766,10 +16772,16 @@ pub const Checker = struct {
                 return self.store.arrayOf(widened_elems_buf[0]) catch tymod.ID_ANY;
             }
         }
+        // Widened heterogeneous array: TypeScript returns a union array `(T1|T2)[]`
+        // in general, but a per-element tuple in destructuring/spread-arg contexts.
         if (any_widened and !has_spread) {
-            const list = self.store.appendTypeIds(widened_elems_buf[0..n_used]) catch
-                return self.store.arrayOf(self.store.unionOf(widened_elems_buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
-            return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
+            if (self.isArrayInDestructuringRhs(node) or self.isArrayInSpreadArg(node)) {
+                const list = self.store.appendTypeIds(widened_elems_buf[0..n_used]) catch
+                    return self.store.arrayOf(self.store.unionOf(widened_elems_buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
+                return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
+            }
+            sortUnionByTypePriority(&self.store, widened_elems_buf[0..n_used]);
+            return self.store.arrayOf(self.store.unionOf(widened_elems_buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
         }
         // No literals to widen: heterogeneous non-literal elements.
         // In destructuring (`const [a, b] = [d1, d2]`) keep per-position types as a tuple.
