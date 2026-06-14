@@ -3571,6 +3571,26 @@ pub const Checker = struct {
                 .switch_case, .switch_default => {
                     ty = self.narrowBySwitchCase(pn, sym, ty, node);
                 },
+                // Inside a while body the condition was truthy; narrow the
+                // same as the truthy branch of `if (cond)`.
+                .while_stmt => {
+                    const data = self.ast_ref.nodeData(pn);
+                    if (data.rhs != .none and self.descendsFrom(node, data.rhs)) {
+                        ty = self.applyNarrowing(data.lhs, sym, ty, false);
+                    }
+                },
+                // Inside a for-body the condition (if present) was truthy.
+                .for_stmt => {
+                    const data = self.ast_ref.nodeData(pn);
+                    if (data.rhs != .none and self.descendsFrom(node, data.rhs)) {
+                        if (data.lhs != .none) {
+                            const fd = self.ast_ref.extraData(ast.ForData, @intFromEnum(data.lhs));
+                            if (fd.condition != .none) {
+                                ty = self.applyNarrowing(fd.condition, sym, ty, false);
+                            }
+                        }
+                    }
+                },
                 else => {},
             }
             prev = p;
