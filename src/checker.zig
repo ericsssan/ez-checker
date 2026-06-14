@@ -3469,6 +3469,42 @@ pub const Checker = struct {
                     if (init_ty.eq(tymod.ID_UNKNOWN) or init_ty.eq(tymod.ID_ERROR)) {
                         return tymod.ID_ANY;
                     }
+                    // For let/var (mutable) with a direct literal initializer, widen
+                    // primitive literals to their base types (matching TypeScript's
+                    // widening: `var a = true → a: boolean`, not `a: true`).
+                    // Only widen FRESH (direct) literals — not literal types inferred
+                    // from const references (`let t1 = numLiteral` stays as the
+                    // literal type `0`, not widened to `number`).
+                    const it_kind = self.store.get(init_ty).kind;
+                    if (it_kind == .string_literal or it_kind == .number_literal or
+                        it_kind == .boolean_literal or it_kind == .bigint_literal)
+                    {
+                        const is_mutable = blk: {
+                            const ni_idx = @intFromEnum(ni);
+                            if (ni_idx >= self.semantic.parent_indices.len) break :blk false;
+                            const par_idx = self.semantic.parent_indices[ni_idx];
+                            if (par_idx == @intFromEnum(NodeIndex.none)) break :blk false;
+                            if (par_idx >= self.ast_ref.nodes.len) break :blk false;
+                            const ptag = self.ast_ref.nodeTag(@enumFromInt(par_idx));
+                            break :blk ptag == .var_decl or ptag == .let_decl;
+                        };
+                        if (is_mutable) {
+                            const init_tag = self.ast_ref.nodeTag(data.rhs);
+                            const is_fresh = switch (init_tag) {
+                                .boolean_literal, .string_literal,
+                                .number_literal, .bigint_literal => true,
+                                .logical_not => it_kind == .boolean_literal,
+                                else => false,
+                            };
+                            if (is_fresh) return switch (it_kind) {
+                                .boolean_literal => tymod.ID_BOOLEAN,
+                                .string_literal => tymod.ID_STRING,
+                                .number_literal => tymod.ID_NUMBER,
+                                .bigint_literal => tymod.ID_BIGINT,
+                                else => init_ty,
+                            };
+                        }
+                    }
                     return init_ty;
                 },
                 .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
