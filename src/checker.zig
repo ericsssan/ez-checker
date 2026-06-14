@@ -4214,6 +4214,34 @@ pub const Checker = struct {
                 n += 1;
                 continue;
             }
+            // Base `string` / `number` types have a falsy representative:
+            // "" for string, 0 for number.  In the falsy path, substitute the
+            // representative; in the truthy path, keep the base type (TypeScript
+            // does not narrow string to "non-empty string", it keeps `string`).
+            if (m.eq(tymod.ID_STRING)) {
+                if (negate) {
+                    if (n >= buf.len) return ty;
+                    buf[n] = self.store.stringLiteral("") catch m;
+                    n += 1;
+                } else {
+                    if (n >= buf.len) return ty;
+                    buf[n] = m;
+                    n += 1;
+                }
+                continue;
+            }
+            if (m.eq(tymod.ID_NUMBER)) {
+                if (negate) {
+                    if (n >= buf.len) return ty;
+                    buf[n] = self.store.numberLiteral(0.0) catch m;
+                    n += 1;
+                } else {
+                    if (n >= buf.len) return ty;
+                    buf[n] = m;
+                    n += 1;
+                }
+                continue;
+            }
             const mt = self.store.get(m);
             const is_falsy_literal = m.eq(tymod.ID_NULL) or
                 m.eq(tymod.ID_UNDEFINED) or m.eq(tymod.ID_VOID) or
