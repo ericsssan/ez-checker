@@ -4223,6 +4223,16 @@ pub const Checker = struct {
         if (ty.eq(tymod.ID_BOOLEAN)) {
             return self.store.booleanLiteral(!negate) catch ty;
         }
+        // Type parameter: truthy narrows to NonNullable<T>, falsy stays T.
+        if (t.kind == .type_param) {
+            if (!negate) {
+                const t_str = self.typeToString(ty) catch return ty;
+                defer self.gpa.free(t_str);
+                const display = std.fmt.allocPrint(self.gpa, "NonNullable<{s}>", .{t_str}) catch return ty;
+                return self.tagAliasArgs(self.removeNullUndefined(ty), display, &.{ty});
+            }
+            return ty;
+        }
         if (t.kind != .union_t) return ty;
         var buf: [16]TypeId = undefined;
         var n: usize = 0;
