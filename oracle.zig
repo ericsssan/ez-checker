@@ -1893,6 +1893,32 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
             }
         }
 
+        // ts_enum_decl: the enum name lives in extra_data as a token, not as a
+        // separate identifier node.  tsc anchors `>E : E` on the name token, so
+        // record it separately (the full-decl text never matches the baseline entry).
+        if (ast_result.nodeTag(ni) == .ts_enum_decl) {
+            const ed_data = ast_result.nodeData(ni);
+            if (ed_data.lhs != .none) {
+                const ged = ast_result.extraData(ast.EnumData, @intFromEnum(ed_data.lhs));
+                const name_tok = ged.name;
+                const name_start = ast_result.tokenStart(name_tok);
+                const name_tok_len = ast_result.tokens.items(.len)[name_tok];
+                if (name_start + name_tok_len <= source.len) {
+                    const name_text = source[name_start .. name_start + name_tok_len];
+                    if (name_text.len > 0) {
+                        const ekey = Key{ .line = lineOf(starts, name_start), .text = name_text };
+                        const egop = try map.getOrPut(ekey);
+                        if (!egop.found_existing) egop.value_ptr.* = .empty;
+                        var edup = false;
+                        for (egop.value_ptr.items) |o| {
+                            if (o.pos == name_start) { edup = true; break; }
+                        }
+                        if (!edup) try egop.value_ptr.append(arena, .{ .pos = name_start, .ty = tystr });
+                    }
+                }
+            }
+        }
+
         // Computed member names: a `[Symbol.iterator]() {}` method or
         // `[k]: v` property is typed at the whole member, but tsc anchors the
         // type on the bracketed name `[Symbol.iterator]`.  The node's main_token

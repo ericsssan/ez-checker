@@ -1145,6 +1145,18 @@ pub const Checker = struct {
             },
             .class_decl => tymod.ID_ANY,
             .class_expr => self.classExprValueType(node),
+            // Enum declaration: the oracle uses typeOf(ts_enum_decl) to anchor
+            // the declaration-name token (e.g. `E` in `enum E { A, B }`).
+            // Use a bare type_ref so it renders as "E" regardless of member count.
+            // (buildEnumUnionType returns a single member for 1-member enums, and
+            // tagAliasName can't tag a literal kind — e5 would render as "e5.One".)
+            .ts_enum_decl => blk: {
+                const ed_data = self.ast_ref.nodeData(node);
+                if (ed_data.lhs == .none) break :blk tymod.ID_ANY;
+                const ged = self.ast_ref.extraData(ast.EnumData, @intFromEnum(ed_data.lhs));
+                const enum_name = self.ast_ref.tokenText(ged.name);
+                break :blk self.store.typeRef(enum_name, &.{}) catch tymod.ID_ANY;
+            },
             // Spread element `...expr` in call args/array literals:
             // its type is the element type of the spread argument (with
             // literals widened, matching tsc's spread behaviour).
