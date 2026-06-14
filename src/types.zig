@@ -291,7 +291,7 @@ pub fn tsTypeFlags(kind: TypeKind) u32 {
         .type_param => 524288, // TypeParameter
         // Object-ish kinds all carry the Object flag (Array/tuple/function are
         // object types; type_ref resolves to a named object/class).
-        .object_t, .function_t, .array_t, .readonly_array_t, .tuple_t, .type_ref => 1048576, // Object
+        .object_t, .function_t, .array_t, .readonly_array_t, .tuple_t, .type_ref, .rest_t => 1048576, // Object
         .union_t => 134217728, // Union
         .intersection_t => 268435456, // Intersection
         // TS's intrinsic error type behaves like `any` for rule purposes.
