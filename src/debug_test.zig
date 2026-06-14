@@ -248,6 +248,133 @@ test "SKIP contextual literal - full oracle sweep" {
     }
 }
 
+test "interface literal property type" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\interface I {
+        \\    a: "a";
+        \\}
+        \\let i: I;
+        \\i = { ...{ a: "a" } };
+    ;
+    var lex = try parser.Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try parser.Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try parser.semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    var checker = try Checker.init(gpa, &ast, &sem, .{});
+    defer checker.deinit();
+
+    // Warm up
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        _ = checker.typeOf(@enumFromInt(n));
+    }
+
+    n = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        if (tag != .identifier and tag != .string_literal) continue;
+        const span = ast.nodeSpan(ni);
+        if (span.end > src.len or span.end <= span.start) continue;
+        const text = src[span.start..span.end];
+        if (!std.mem.eql(u8, text, "a") and !std.mem.eql(u8, text, "\"a\"")) continue;
+        const ty = checker.typeOf(ni);
+        const tystr = try checker.typeToString(ty);
+        defer gpa.free(tystr);
+        const pidx = if (ni.toInt() < sem.parent_indices.len) sem.parent_indices[ni.toInt()] else 0xFFFF;
+        std.debug.print("node {d} '{s}' (tag={s}) parent={d}(tag={s}) = {s}\n", .{
+            n, text, @tagName(tag),
+            pidx,
+            if (pidx < ast.nodes.len) @tagName(ast.nodeTag(@enumFromInt(pidx))) else "?",
+            tystr,
+        });
+    }
+}
+
+test "tuple destructuring with annotation" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\type RexOrRaptor = "t-rex" | "raptor";
+        \\let [im, a, dinosaur]: ["I'm", "a", RexOrRaptor] = ["I'm", "a", "t-rex"];
+    ;
+    // Debug: print ALL node tags and parents
+    {
+        var lex2 = try parser.Lexer.tokenizeWithLanguage(gpa, src, .ts);
+        defer lex2.deinit(gpa);
+        var tokens2 = lex2.tokens;
+        var ast2 = try parser.Parser.parseWithLanguage(gpa, src, tokens2.slice(), .ts, true);
+        defer ast2.deinit(gpa);
+        var sem2 = try parser.semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast2, .{
+            .is_module = true,
+            .build_parents = true,
+        });
+        defer sem2.deinit(gpa);
+        std.debug.print("=== AST nodes ===\n", .{});
+        var n2: u32 = 1;
+        while (n2 < ast2.nodes.len) : (n2 += 1) {
+            const ni2: NodeIndex = @enumFromInt(n2);
+            const span2 = ast2.nodeSpan(ni2);
+            const text2 = if (span2.end <= src.len and span2.end > span2.start)
+                src[span2.start..@min(span2.end, span2.start + 20)]
+            else
+                "?";
+            const pidx2 = if (n2 < sem2.parent_indices.len) sem2.parent_indices[n2] else 0xFFFF;
+            std.debug.print("n{d}: tag={s} parent={d}({s}) text='{s}'\n", .{
+                n2, @tagName(ast2.nodeTag(ni2)), pidx2,
+                if (pidx2 < ast2.nodes.len) @tagName(ast2.nodeTag(@enumFromInt(pidx2))) else "?",
+                text2,
+            });
+        }
+    }
+    var lex = try parser.Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try parser.Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try parser.semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    var checker = try Checker.init(gpa, &ast, &sem, .{});
+    defer checker.deinit();
+
+    // Warm up
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        _ = checker.typeOf(@enumFromInt(n));
+    }
+
+    n = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        if (tag != .identifier) continue;
+        const span = ast.nodeSpan(ni);
+        if (span.end > src.len or span.end <= span.start) continue;
+        const text = src[span.start..span.end];
+        if (!std.mem.eql(u8, text, "a") and !std.mem.eql(u8, text, "im") and
+            !std.mem.eql(u8, text, "dinosaur")) continue;
+        const ty = checker.typeOf(ni);
+        const tystr = try checker.typeToString(ty);
+        defer gpa.free(tystr);
+        const pidx = if (ni.toInt() < sem.parent_indices.len) sem.parent_indices[ni.toInt()] else 0xFFFF;
+        std.debug.print("node {d} '{s}' (tag={s}) parent={d}(tag={s}) = {s}\n", .{
+            n, text, @tagName(tag),
+            pidx,
+            if (pidx < ast.nodes.len) @tagName(ast.nodeTag(@enumFromInt(pidx))) else "?",
+            tystr,
+        });
+    }
+}
+
 test "SKIP contextual literal - node ordering" {
     const gpa = std.testing.allocator;
     const src =

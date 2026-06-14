@@ -2825,18 +2825,18 @@ pub const Checker = struct {
                 if (cp == @intFromEnum(NodeIndex.none) or cp >= self.ast_ref.nodes.len) break :blk false;
                 const cn: NodeIndex = @enumFromInt(cp);
                 const ctag = self.ast_ref.nodeTag(cn);
-                // Declarator with type annotation: annotation is always available.
-                if (ctag == .declarator) break :blk true;
-                // Assignment `x = {…}`: use the already-typed identifier LHS.
-                if (ctag == .assign) break :blk true;
                 // Call/new expression: only if callee type is already cached (bottom-up ordering).
-                if (ctag != .call_expr and ctag != .optional_call_expr and ctag != .new_expr) break :blk false;
-                const cd = self.ast_ref.nodeData(cn);
-                if (cd.lhs == .none) break :blk false;
-                const callee_ni = cd.lhs.toInt();
-                if (callee_ni >= self.node_types.len) break :blk false;
-                const cached = self.node_types[callee_ni];
-                break :blk !cached.eq(TypeId.none) and !cached.eq(tymod.ID_UNKNOWN);
+                if (ctag == .call_expr or ctag == .optional_call_expr or ctag == .new_expr) {
+                    const cd = self.ast_ref.nodeData(cn);
+                    if (cd.lhs == .none) break :blk false;
+                    const callee_ni = cd.lhs.toInt();
+                    if (callee_ni >= self.node_types.len) break :blk false;
+                    const cached = self.node_types[callee_ni];
+                    break :blk !cached.eq(TypeId.none) and !cached.eq(tymod.ID_UNKNOWN);
+                }
+                // For all other parent contexts (declarator, assign, spread, property, etc.):
+                // always try expectedTypeOf — it returns null when no context exists.
+                break :blk true;
             };
             if (should_check_ctx) {
                 if (self.expectedTypeOf(obj_node)) |ctx| {
@@ -5877,6 +5877,7 @@ pub const Checker = struct {
                             }
                         }
                         // Handle primitive literals
+                        const init_tag = self.ast_ref.nodeTag(data.rhs);
                         const widened_prim = switch (t.kind) {
                             .string_literal => tymod.ID_STRING,
                             .number_literal => tymod.ID_NUMBER,
@@ -5885,7 +5886,6 @@ pub const Checker = struct {
                             // (true/false) or `!expr` — not for &&/|| results which
                             // propagate non-widening literal types from parameters.
                             .boolean_literal => blk: {
-                                const init_tag = self.ast_ref.nodeTag(data.rhs);
                                 break :blk if (init_tag == .boolean_literal or
                                     init_tag == .logical_not)
                                     tymod.ID_BOOLEAN
@@ -7139,6 +7139,53 @@ pub const Checker = struct {
                     // If the pattern we came from is the LHS of this declarator
                     // and there's an RHS, infer the binding's type from the RHS.
                     if (data.lhs == pattern_node and data.rhs != .none) {
+                        // When the pattern has an explicit type annotation (e.g. `let [a, b]: ["a", number] = ...`),
+                        // use the annotation type: it preserves literal types unlike the widened initializer type.
+                        // For function params, buildPatternAnnotations links annotation to pattern via parent_fixup.
+                        // For let/const declarations, the parser leaves the annotation orphaned (no parent), so
+                        // we also scan nodes between the pattern and initializer to find it.
+                        if (!self.pattern_annotations_built) self.buildPatternAnnotations();
+                        var found_ann: ?NodeIndex = self.pattern_annotations.get(pattern_node.toInt());
+                        if (found_ann == null) {
+                            const pat_idx = pattern_node.toInt();
+                            const rhs_idx = data.rhs.toInt();
+                            if (pat_idx < rhs_idx and rhs_idx <= self.ast_ref.nodes.len) {
+                                var si: u32 = pat_idx + 1;
+                                while (si < rhs_idx) : (si += 1) {
+                                    if (self.ast_ref.nodeTag(@enumFromInt(si)) == .ts_type_annotation) {
+                                        const si_pidx = if (si < self.semantic.parent_indices.len)
+                                            self.semantic.parent_indices[si]
+                                        else
+                                            @intFromEnum(NodeIndex.none);
+                                        if (si_pidx == @intFromEnum(NodeIndex.none)) {
+                                            found_ann = @enumFromInt(si);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (found_ann) |ann| {
+                            const ann_ty_node = self.ast_ref.nodeData(ann).lhs;
+                            if (ann_ty_node != .none) {
+                                const ann_ty = self.resolveTypeNode(ann_ty_node);
+                                const ptag_local = self.ast_ref.nodeTag(pattern_node);
+                                if (ptag_local == .array_pattern) {
+                                    if (self.findBindingIndexInPattern(binding, @enumFromInt(cur))) |idx| {
+                                        if (self.tupleOrArrayElement(ann_ty, idx)) |elem_ty| {
+                                            return elem_ty;
+                                        }
+                                    }
+                                } else if (ptag_local == .object_pattern) {
+                                    if (self.findBindingPropertyName(binding, pattern_node)) |key| {
+                                        if (self.propertyTypeOfTypeId(ann_ty, key)) |prop_ty| {
+                                            return prop_ty;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         const rhs_type = self.typeOf(data.rhs);
                         const rhs_t = self.store.get(rhs_type);
 
@@ -7169,13 +7216,22 @@ pub const Checker = struct {
                             if (self.findBindingPropertyName(binding, pattern_node)) |key| {
                                 if (self.propertyTypeOfTypeId(rhs_type, key)) |prop_ty| {
                                     // Widen literal types for object destructuring too
-                                    return switch (self.store.get(prop_ty).kind) {
+                                    const base_ty = switch (self.store.get(prop_ty).kind) {
                                         .number_literal => tymod.ID_NUMBER,
                                         .string_literal => tymod.ID_STRING,
                                         .boolean_literal => tymod.ID_BOOLEAN,
                                         .bigint_literal => tymod.ID_BIGINT,
                                         else => prop_ty,
                                     };
+                                    // Optional property destructuring yields T|undefined
+                                    // (same rule as memberOnApparentType reads).
+                                    if (!self.checker_opts.strict_null_checks_explicit_off and
+                                        self.propertyIsOptionalInType(rhs_type, key) and
+                                        !self.typeContainsUndefined(base_ty))
+                                    {
+                                        return self.store.unionOf(&.{ base_ty, tymod.ID_UNDEFINED }) catch base_ty;
+                                    }
+                                    return base_ty;
                                 }
                             }
                         }
@@ -10839,6 +10895,19 @@ pub const Checker = struct {
         if (member_n == 0) return tymod.ID_UNKNOWN;
         if (member_n == 1) return member_buf[0];
         return self.store.unionOf(member_buf[0..member_n]) catch tymod.ID_UNKNOWN;
+    }
+
+    /// Returns true when `key` is declared as an optional property (`?:`) in
+    /// `obj_ty`'s structural shape.  Used to decide whether to add `| undefined`
+    /// for destructuring bindings (same rule as memberOnApparentType reads).
+    fn propertyIsOptionalInType(self: *Checker, obj_ty: TypeId, key: []const u8) bool {
+        const t = self.store.get(obj_ty);
+        if (t.kind == .object_t) {
+            for (self.store.propsOf(t.object_props)) |p| {
+                if (std.mem.eql(u8, p.name, key)) return p.optional;
+            }
+        }
+        return false;
     }
 
     /// Look up `key` in `obj_ty`'s structural shape, walking unions/
@@ -18568,6 +18637,13 @@ pub const Checker = struct {
                     // error too (the `this`-in-constructor exception only applies
                     // to a plain `this` receiver, which the caller excludes).
                     if (readonly_to_any and p.readonly) return tymod.ID_ANY;
+                    // Under exactOptionalPropertyTypes, writing to an optional
+                    // property only accepts T (not T|undefined).  Return T
+                    // explicitly so the caller doesn't fall through to
+                    // memberOnApparentType which adds | undefined for reads.
+                    if (p.optional and self.checker_opts.exact_optional_property_types) {
+                        return p.type_id;
+                    }
                     return if (p.has_write_type) p.write_type_id else null;
                 }
                 return null;
@@ -18914,12 +18990,12 @@ pub const Checker = struct {
                     continue;
                 }
                 if (std.mem.eql(u8, p.name, prop_name)) {
-                    // An optional property access is `T | undefined` only under
-                    // strictNullChecks; without it the access type is just `T`.
-                    // Under exactOptionalPropertyTypes, assignment targets show just
-                    // `T` (can't write undefined), so we omit `| undefined` here.
-                    if (p.optional and self.checker_opts.strict_null_checks and
-                        !self.checker_opts.exact_optional_property_types)
+                    // Optional property reads always yield `T | undefined` unless
+                    // strictNullChecks was explicitly disabled. Under
+                    // exactOptionalPropertyTypes the write type is just T (handled
+                    // in memberWriteType); reads still include undefined here.
+                    if (p.optional and !self.checker_opts.strict_null_checks_explicit_off and
+                        !self.typeContainsUndefined(p.type_id))
                     {
                         return self.store.unionOf(&.{ p.type_id, tymod.ID_UNDEFINED }) catch p.type_id;
                     }
@@ -20971,6 +21047,20 @@ pub const Checker = struct {
                 const obj_expected = self.expectedTypeOfD(pn, depth + 1) orelse return null;
                 return self.objectPropExpectedType(obj_expected, key_name);
             },
+            // Object spread `{ ...node }`: propagate outer object's contextual type to the spread source.
+            .spread_element => {
+                const se_data = self.ast_ref.nodeData(pn);
+                if (se_data.lhs != node) return null;
+                const sp_ni = pn.toInt();
+                if (sp_ni >= parents.len) return null;
+                const sp_parent_idx = parents[sp_ni];
+                if (sp_parent_idx == @intFromEnum(NodeIndex.none)) return null;
+                const sp_parent: NodeIndex = @enumFromInt(sp_parent_idx);
+                if (self.ast_ref.nodeTag(sp_parent) == .object_literal) {
+                    return self.expectedTypeOfD(sp_parent, depth + 1);
+                }
+                return null;
+            },
             // Concise arrow body: `outer => node` where `node` IS the return expression.
             // The expected type of `node` is the return type of outer's contextual type.
             // Handles `f(a => b => c)` where b's param types come from a's contextual return.
@@ -22079,9 +22169,6 @@ pub const Checker = struct {
                             else => {},
                         }
                     } else false;
-                    // TypeScript also preserves alias names for unions of ONLY literal types
-                    // (e.g. `type B = 2 | 3`, `type Kind = "A" | "B"`).  Unions that include
-                    // broad primitive keywords (string, number, boolean) are expanded instead.
                     const all_literals = members.len > 0 and for (members) |m| {
                         switch (self.store.get(m).kind) {
                             .string_literal, .number_literal, .boolean_literal => {},
