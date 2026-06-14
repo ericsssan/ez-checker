@@ -5831,27 +5831,29 @@ pub const Checker = struct {
                 return tymod.ID_ANY;
             },
             .setter_def => {
-                // Both the setter's *name* and its *parameter* carry the
-                // accessor property type: the annotated param type if present,
-                // otherwise the paired getter's (body-inferred) return type.
+                // Setter name (`set prop(v)` → `>prop`) shows the paired getter's
+                // return type; setter param shows its annotated type. If there is
+                // no paired getter the setter name falls back to the param type.
                 const pdata = self.ast_ref.nodeData(parent);
                 const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(pdata.rhs));
                 const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
                 const is_name = pdata.lhs == binding;
                 var is_param = false;
+                var param_ty: TypeId = tymod.ID_UNKNOWN;
                 if (md.params_start < md.params_end and md.params_end <= ext_len) {
                     const param: NodeIndex = @enumFromInt(self.ast_ref.extra_data[md.params_start]);
                     is_param = param == binding or
                         (self.ast_ref.nodeTag(param) == .assignment_pattern and
                             self.ast_ref.nodeData(param).lhs == binding);
-                    if (is_name or is_param) {
-                        if (self.paramHasAnnotation(param)) {
-                            const pty = self.paramDeclaredType(param);
-                            if (!pty.eq(tymod.ID_UNKNOWN)) return pty;
-                        }
+                    if (self.paramHasAnnotation(param)) {
+                        const pty = self.paramDeclaredType(param);
+                        if (!pty.eq(tymod.ID_UNKNOWN)) param_ty = pty;
                     }
                 }
                 if (!is_name and !is_param) return tymod.ID_ANY;
+                // Param identifier: annotated type takes priority.
+                if (is_param and !param_ty.eq(tymod.ID_UNKNOWN)) return param_ty;
+                // Setter name (or unannotated param): prefer paired getter's return type.
                 if (pdata.lhs != .none) {
                     const ntag = self.ast_ref.nodeTag(pdata.lhs);
                     if (ntag == .identifier or ntag == .property_ident) {
@@ -5859,6 +5861,8 @@ pub const Checker = struct {
                         if (self.pairedGetterReturnType(parent, pname)) |t| return t;
                     }
                 }
+                // No paired getter: fall back to setter param type.
+                if (!param_ty.eq(tymod.ID_UNKNOWN)) return param_ty;
                 return tymod.ID_ANY;
             },
             .property_def => {
