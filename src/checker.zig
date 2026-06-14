@@ -16399,10 +16399,17 @@ pub const Checker = struct {
         if (t.kind == .union_t) {
             const members = store.idsOf(t.list_data);
             if (members.len == 0) return false;
+            var has_numeric = false;
             for (members) |m| {
+                // Without strictNullChecks, undefined is compatible with number
+                // and should not make a `number | undefined` union non-numeric.
+                // But bare `undefined` (not in a union) is NOT numeric — it makes
+                // arithmetic return `any`.
+                if (store.get(m).kind == .undefined_t) continue;
                 if (!isNumericish(store, m)) return false;
+                has_numeric = true;
             }
-            return true;
+            return has_numeric;
         }
         return false;
     }
