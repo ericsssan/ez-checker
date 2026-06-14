@@ -19924,8 +19924,12 @@ pub const Checker = struct {
             return self.makeNullaryFn(tymod.ID_NUMBER);
         }
         // string returners.
-        if (std.mem.eql(u8, name, "toString") or std.mem.eql(u8, name, "toLocaleString")) {
+        if (std.mem.eql(u8, name, "toString")) {
             return self.makeNullaryFn(tymod.ID_STRING);
+        }
+        // toLocaleString: overloaded in ES2020+ with locales/options params.
+        if (std.mem.eql(u8, name, "toLocaleString")) {
+            return self.store.typeRef("{ (): string; (locales: string | string[], options?: Intl.NumberFormatOptions & Intl.DateTimeFormatOptions): string; }", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
         }
         // join: (separator?: string) => string
         if (std.mem.eql(u8, name, "join")) {
