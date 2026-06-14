@@ -22187,7 +22187,7 @@ pub const Checker = struct {
                 for (ids, 0..) |m, i| {
                     if (i > 0) try buf.appendSlice(gpa, " | ");
                     const mt = self.store.get(m);
-                    const needs_parens = mt.kind == .function_t and !mt.is_overload_set;
+                    const needs_parens = mt.kind == .function_t and !mt.is_overload_set and mt.alias_name.len == 0;
                     if (needs_parens) try buf.appendSlice(gpa, "(");
                     try self.typeToStringInner(m, buf, depth + 1);
                     if (needs_parens) try buf.appendSlice(gpa, ")");
