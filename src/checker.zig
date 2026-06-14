@@ -793,9 +793,11 @@ pub const Checker = struct {
         if (!cached.eq(TypeId.none)) return cached;
         // Mark in-progress before recursing so a cyclic expression (e.g.
         // `static bar = A.foo + 1` where resolving `A`'s static side needs
-        // `bar`'s type, which needs `A.foo`…) resolves to `unknown` on the
+        // `bar`'s type, which needs `A.foo`…) resolves to `any` on the
         // back-edge instead of recursing until the stack overflows.
-        self.node_types[idx] = tymod.ID_UNKNOWN;
+        // `any` matches tsc's behavior for circular type inference (tsc also
+        // returns `any` for unresolvable cycles, not `unknown`).
+        self.node_types[idx] = tymod.ID_ANY;
         const computed = self.inferExpr(node);
         // Don't persist results produced while an evolving-any inference is in
         // progress: same-variable reads inside a reaching write's RHS get
@@ -925,16 +927,23 @@ pub const Checker = struct {
                 if (lhs_t.enum_name.len > 0) break :blk tymod.ID_NUMBER;
                 if (tymod.isAny(&self.store, lhs_ty)) break :blk tymod.ID_ANY;
                 if (tymod.isAny(&self.store, rhs_ty)) break :blk tymod.ID_ANY;
+                const lhs_big_add = isBigintish(&self.store, lhs_ty);
+                const rhs_big_add = isBigintish(&self.store, rhs_ty);
+                if (lhs_big_add != rhs_big_add) break :blk tymod.ID_ANY;
+                // If LHS is not numeric or bigint, += is invalid → any.
+                if (!isNumericish(&self.store, lhs_ty) and !lhs_big_add) break :blk tymod.ID_ANY;
                 break :blk lhs_ty;
             },
-            // All other compound arithmetic/bitwise assignments always produce number.
+            // All other compound arithmetic/bitwise assignments: bigint-aware.
             .sub_assign, .mul_assign, .div_assign, .mod_assign,
             .exp_assign, .and_assign, .or_assign, .xor_assign, .shl_assign,
             .shr_assign, .ushr_assign => blk: {
                 const data = self.ast_ref.nodeData(node);
                 if (data.lhs == .none or data.rhs == .none) break :blk tymod.ID_ANY;
-                // Arithmetic compound assignments ALWAYS produce number regardless
-                // of operand types (TypeScript coerces operands to numbers).
+                const lhs_big = isBigintish(&self.store, self.typeOf(data.lhs));
+                const rhs_big = isBigintish(&self.store, self.typeOf(data.rhs));
+                if (lhs_big and rhs_big) break :blk tymod.ID_BIGINT;
+                if (lhs_big or rhs_big) break :blk tymod.ID_ANY;
                 break :blk tymod.ID_NUMBER;
             },
 
@@ -1033,12 +1042,15 @@ pub const Checker = struct {
                     break :blk self.store.numberLiteral(-lit.literal_value.number) catch tymod.ID_NUMBER;
                 }
                 if (lit.kind == .bigint_literal) {
-                    if (self.ast_ref.nodeTag(node) == .unary_plus) break :blk ot;
+                    if (self.ast_ref.nodeTag(node) == .unary_plus) break :blk tymod.ID_NUMBER;
                     const pos = lit.literal_value.bigint;
                     const neg = std.fmt.allocPrint(self.gpa, "-{s}", .{pos}) catch break :blk tymod.ID_BIGINT;
                     break :blk self.store.bigintLiteral(neg) catch tymod.ID_BIGINT;
                 }
-                if (lit.kind == .bigint) break :blk tymod.ID_BIGINT;
+                if (lit.kind == .bigint) {
+                    if (self.ast_ref.nodeTag(node) == .unary_plus) break :blk tymod.ID_NUMBER;
+                    break :blk tymod.ID_BIGINT;
+                }
                 break :blk tymod.ID_NUMBER;
             },
 
@@ -1054,8 +1066,12 @@ pub const Checker = struct {
             // reporting it as an error separately.)
             .bitwise_and, .bitwise_or, .bitwise_xor, .shift_left, .shift_right, .unsigned_shift_right => blk: {
                 const d = self.ast_ref.nodeData(node);
-                if (d.lhs != .none and isBigintish(&self.store, self.typeOf(d.lhs)))
-                    break :blk tymod.ID_BIGINT;
+                if (d.lhs != .none and d.rhs != .none) {
+                    const lhs_big = isBigintish(&self.store, self.typeOf(d.lhs));
+                    const rhs_big = isBigintish(&self.store, self.typeOf(d.rhs));
+                    if (lhs_big and rhs_big) break :blk tymod.ID_BIGINT;
+                    if (lhs_big or rhs_big) break :blk tymod.ID_ANY;
+                }
                 break :blk tymod.ID_NUMBER;
             },
 
@@ -1509,6 +1525,31 @@ pub const Checker = struct {
         const data = self.ast_ref.nodeData(node);
         const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_STRING;
 
+        // Determine parent context: tagged template or `as const`.
+        const nidx = @intFromEnum(node);
+        const parents = self.semantic.parent_indices;
+        const none_sentinel = @intFromEnum(NodeIndex.none);
+        var in_tagged = false;
+        var in_as_const = false;
+        if (nidx < parents.len) {
+            const pidx = parents[nidx];
+            if (pidx != none_sentinel and pidx < self.ast_ref.nodes.len) {
+                const pn: NodeIndex = @enumFromInt(pidx);
+                const ptag = self.ast_ref.nodeTag(pn);
+                if (ptag == .tagged_template) {
+                    in_tagged = true;
+                } else if (ptag == .ts_as_expr) {
+                    const as_data = self.ast_ref.nodeData(pn);
+                    if (as_data.rhs != .none and
+                        self.ast_ref.nodeTag(as_data.rhs) == .ts_type_reference)
+                    {
+                        const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(as_data.rhs));
+                        in_as_const = std.mem.eql(u8, cname, "const");
+                    }
+                }
+            }
+        }
+
         // Parts alternate template_element (quasi) and expression (interpolation).
         // Accumulate the concatenated string if all substitutions are literals.
         var result: std.ArrayList(u8) = .empty;
@@ -1541,8 +1582,11 @@ pub const Checker = struct {
                 continue;
             }
 
-            // Interpolation expression — try to evaluate as a literal.
-            // First try direct literal evaluation (handles arithmetic on literals).
+            // In a tagged-template tsc types the template literal as `string`
+            // when any expression interpolation is present.
+            if (in_tagged) return tymod.ID_STRING;
+
+            // Evaluate constant numeric expressions (tsc folds `${10 + 10}` → "20").
             const maybe_num = self.evalLiteralNumericExpr(part);
             const expr_str: []const u8 = if (maybe_num) |num| blk: {
                 const formatted = std.fmt.allocPrint(self.gpa, "{}", .{num}) catch return tymod.ID_STRING;
@@ -1556,7 +1600,11 @@ pub const Checker = struct {
                         const num = switch (t.literal_value) { .number => |n| n, else => return tymod.ID_STRING };
                         break :inner std.fmt.allocPrint(self.gpa, "{}", .{num}) catch return tymod.ID_STRING;
                     },
-                    .boolean_literal => switch (t.literal_value) { .boolean => |b| if (b) "true" else "false", else => return tymod.ID_STRING },
+                    // tsc does not fold boolean literals unless under `as const`.
+                    .boolean_literal => if (in_as_const)
+                        switch (t.literal_value) { .boolean => |b| if (b) "true" else "false", else => return tymod.ID_STRING }
+                    else
+                        return tymod.ID_STRING,
                     else => return tymod.ID_STRING,
                 };
             };
@@ -2100,7 +2148,15 @@ pub const Checker = struct {
             if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
                 const ty = self.declaredTypeAtBinding(node);
                 if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
+                // Catch param with `:unknown` annotation: declaredTypeAtBinding returns
+                // ID_UNKNOWN (valid), but the guard above skips it. Return it here so
+                // we don't fall through to typeOfNameByAstSearch and find a hoisted var.
+                if (self.bindingIsCatchParam(node)) return ty;
             }
+            // Catch param with no annotation → always `any` at the declaration site.
+            // Must precede typeOfNameByAstSearch so hoisted `var` inside the catch body
+            // doesn't shadow the catch parameter.
+            if (bd.rhs == .none and self.bindingIsCatchParam(node)) return tymod.ID_ANY;
         }
         // Rest / defaulted parameter declaration sites (`...args`, `a = 3`)
         // also have no reference-table symbol — resolve via the binding
@@ -4629,13 +4685,16 @@ pub const Checker = struct {
             // narrowed type across a compound op), while a WRITE-TARGET
             // reference also sees compound writes (its reported type reflects
             // the value the compound op just produced).
-            if (kind_col[ri] != .write and kind_col[ri] != .read_write) continue;
+            if (kind_col[ri] != .write and kind_col[ri] != .read_write and kind_col[ri] != .write_init) continue;
             if (ni >= parents.len) continue;
             const pidx = parents[ni];
             if (pidx == @intFromEnum(NodeIndex.none)) continue;
             const parent: NodeIndex = @enumFromInt(pidx);
             const ptag = self.ast_ref.nodeTag(parent);
-            if (!isAssignTag(ptag)) continue;
+            const is_assign_op = isAssignTag(ptag);
+            // Also track declarator initializers (`var x = expr`) as plain writes.
+            const is_decl_init = ptag == .declarator;
+            if (!is_assign_op and !is_decl_init) continue;
             const pd = self.ast_ref.nodeData(parent);
             if (@intFromEnum(pd.lhs) != ni or pd.rhs == .none) continue;
             const symid = sym_col[ri].toInt();
@@ -4644,7 +4703,7 @@ pub const Checker = struct {
             gop.value_ptr.append(self.gpa, .{
                 .rhs = pd.rhs,
                 .assign = parent,
-                .op = ptag,
+                .op = if (is_decl_init) .assign else ptag,
                 .seg = seg_col[ri],
                 .pos = self.ast_ref.nodeSpan(@as(NodeIndex, @enumFromInt(ni))).start,
             }) catch {};
@@ -6221,7 +6280,14 @@ pub const Checker = struct {
         // Resolve the function node (a var-decl `const f = function(){}` /
         // arrow documents the inner function for @param/@returns).
         const fn_node = self.jsdocFunctionOf(decl);
-        var it = std.mem.splitScalar(u8, block, '\n');
+        // Strip `/**` / `*/` delimiters so that single-line JSDoc comments
+        // like `/** @type {T} */` work: without this, the only "line" starts
+        // with `/`, which is not in the trim set `" \t\r*"`, so `@` is never
+        // reached and the tag is silently ignored.
+        var content = block;
+        if (std.mem.startsWith(u8, content, "/**")) content = content[3..];
+        if (std.mem.endsWith(u8, content, "*/")) content = content[0 .. content.len - 2];
+        var it = std.mem.splitScalar(u8, content, '\n');
         while (it.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, " \t\r*");
             if (!std.mem.startsWith(u8, line, "@")) continue;
@@ -11181,7 +11247,7 @@ pub const Checker = struct {
         // Node.js globals.
         try self.global_value_types.put(self.gpa, "__dirname",  tymod.ID_STRING);
         try self.global_value_types.put(self.gpa, "__filename", tymod.ID_STRING);
-        try self.global_value_types.put(self.gpa, "require",    try h.fnTypeWithParams(&.{tymod.ID_STRING}, tymod.ID_ANY));
+        try self.global_value_types.put(self.gpa, "require",    tymod.ID_ANY);
         try self.global_value_types.put(self.gpa, "module",     tymod.ID_ANY);
         try self.global_value_types.put(self.gpa, "exports",    tymod.ID_ANY);
     }
@@ -16308,17 +16374,21 @@ pub const Checker = struct {
             if (isStringish(&self.store, a) or isStringish(&self.store, b)) return tymod.ID_STRING;
             // Either side any → any (so unsafe-* fires through arithmetic).
             if (tymod.isAny(&self.store, a) or tymod.isAny(&self.store, b)) return tymod.ID_ANY;
-            if (isBigintish(&self.store, a) or isBigintish(&self.store, b)) return tymod.ID_BIGINT;
+            const a_big_plus = isBigintish(&self.store, a);
+            const b_big_plus = isBigintish(&self.store, b);
+            if (a_big_plus and b_big_plus) return tymod.ID_BIGINT;
+            if (a_big_plus or b_big_plus) return tymod.ID_ANY;
             // For `+`, both operands must be numeric (number or number_literal).
             // Non-numeric operands (boolean, Object, type parameter, null, undefined,
             // void, etc.) make the operation invalid → TypeScript returns `any`.
             if (isNumericish(&self.store, a) and isNumericish(&self.store, b)) return tymod.ID_NUMBER;
             return tymod.ID_ANY;
         }
-        // `*`, `/`, `%`, `-`, `**` always coerce to number at runtime.
-        // TypeScript types these as `number` even when operands are `any`,
-        // so we do NOT short-circuit to `any` here.
-        if (isBigintish(&self.store, a) or isBigintish(&self.store, b)) return tymod.ID_BIGINT;
+        // `*`, `/`, `%`, `-`, `**`: mixed bigint/number is a type error → any.
+        const a_big = isBigintish(&self.store, a);
+        const b_big = isBigintish(&self.store, b);
+        if (a_big and b_big) return tymod.ID_BIGINT;
+        if (a_big or b_big) return tymod.ID_ANY;
         return tymod.ID_NUMBER;
     }
 
@@ -16837,12 +16907,15 @@ pub const Checker = struct {
                     // it (e.g. `0 as 0`, `"x" as "x"`, `0 as const`).
                     const val_rhs_tag = self.ast_ref.nodeTag(pd.rhs);
                     const has_type_assertion = val_rhs_tag == .ts_as_expr or val_rhs_tag == .ts_type_assertion;
-                    const val_t = self.store.get(val_ty);
+                    // Copy .kind before contextualPropExpectsLiteral which may
+                    // allocate new types and reallocate the store ArrayList,
+                    // invalidating any pointer returned by store.get().
+                    const val_t_kind = self.store.get(val_ty).kind;
                     // A contextual type that expects this property as a literal
                     // (`let x: { style: "currency" } = { style: "currency" }`)
                     // preserves the literal instead of widening.
                     const ctx_preserves = self.contextualPropExpectsLiteral(ctx_obj_ty, key_name, val_ty);
-                    const widened_ty = if (has_type_assertion or ctx_preserves) val_ty else switch (val_t.kind) {
+                    const widened_ty = if (has_type_assertion or ctx_preserves) val_ty else switch (val_t_kind) {
                         .string_literal => tymod.ID_STRING,
                         .number_literal => tymod.ID_NUMBER,
                         .boolean_literal => tymod.ID_BOOLEAN,
@@ -20502,7 +20575,15 @@ pub const Checker = struct {
             .assign => {
                 const ad = self.ast_ref.nodeData(pn);
                 if (ad.rhs != node or ad.lhs == .none) return null;
-                if (self.ast_ref.nodeTag(ad.lhs) != .identifier) return null;
+                const lhs_tag = self.ast_ref.nodeTag(ad.lhs);
+                // Allow member access LHS: `c.x = { a: "a" }` where c.x has a
+                // literal type. Member types are cached before RHS processing
+                // (bottom-up order), so typeOf(lhs) is safe here.
+                if (lhs_tag != .identifier and
+                    lhs_tag != .member_expr and
+                    lhs_tag != .computed_member_expr and
+                    lhs_tag != .optional_member_expr and
+                    lhs_tag != .optional_computed_member_expr) return null;
                 return self.typeOf(ad.lhs);
             },
             .grouping_expr, .conditional => return self.expectedTypeOfD(pn, depth + 1),
