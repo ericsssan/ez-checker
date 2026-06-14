@@ -3644,6 +3644,13 @@ pub const Checker = struct {
                 },
                 .switch_case, .switch_default => {
                     ty = self.narrowBySwitchCase(pn, sym, ty, node);
+                    // Apply early-exit narrowing from preceding stmts in the
+                    // case body only when NOT inside the case label expression.
+                    // (e.g. `case A: case B: if (A) return; use`)
+                    const sw_label = self.ast_ref.nodeData(pn).lhs;
+                    if (sw_label == .none or !self.descendsFrom(node, sw_label)) {
+                        ty = self.narrowByPriorEarlyExitsInCase(pn, @enumFromInt(prev), sym, ty);
+                    }
                 },
                 // Inside a while body the condition was truthy; narrow the
                 // same as the truthy branch of `if (cond)`.
@@ -4058,6 +4065,42 @@ pub const Checker = struct {
                 // can't narrow safely, leave ty unchanged.  Single-branch
                 // exit (else branch falls through) is handled by the
                 // same shape as if_stmt.
+                const sd = self.ast_ref.nodeData(stmt);
+                const ifd = self.ast_ref.extraData(ast.IfData, @intFromEnum(sd.rhs));
+                if (statementIsEarlyExit(self, ifd.consequent) and !statementIsEarlyExit(self, ifd.alternate)) {
+                    ty = self.applyNarrowing(sd.lhs, sym, ty, true);
+                } else if (statementIsEarlyExit(self, ifd.alternate) and !statementIsEarlyExit(self, ifd.consequent)) {
+                    ty = self.applyNarrowing(sd.lhs, sym, ty, false);
+                }
+            }
+        }
+        return ty;
+    }
+
+    /// Like `narrowByPriorEarlyExits` but reads the case body via `safeSubRange`
+    /// (switch_case stores stmts as a SubRange in extra_data, not a directRange).
+    fn narrowByPriorEarlyExitsInCase(
+        self: *Checker,
+        case_node: NodeIndex,
+        child: NodeIndex,
+        sym: symbol_mod.SymbolId,
+        base: TypeId,
+    ) TypeId {
+        const body = self.safeSubRange(self.ast_ref.nodeData(case_node).rhs) orelse return base;
+        const extra = self.ast_ref.extra_data;
+        if (body.end > extra.len) return base;
+        const stmts = extra[body.start..body.end];
+        var ty = base;
+        for (stmts) |raw| {
+            const stmt: NodeIndex = @enumFromInt(raw);
+            if (stmt == child) break;
+            const stmt_tag = self.ast_ref.nodeTag(stmt);
+            if (stmt_tag == .if_stmt) {
+                const sd = self.ast_ref.nodeData(stmt);
+                if (statementIsEarlyExit(self, sd.rhs)) {
+                    ty = self.applyNarrowing(sd.lhs, sym, ty, true);
+                }
+            } else if (stmt_tag == .if_else_stmt) {
                 const sd = self.ast_ref.nodeData(stmt);
                 const ifd = self.ast_ref.extraData(ast.IfData, @intFromEnum(sd.rhs));
                 if (statementIsEarlyExit(self, ifd.consequent) and !statementIsEarlyExit(self, ifd.alternate)) {
@@ -4689,8 +4732,15 @@ pub const Checker = struct {
         var n: usize = 0;
         for (self.store.idsOf(t.list_data)) |m| {
             const prop_ty = self.directPropOf(m, prop_name);
-            const matches = if (prop_ty.eq(tymod.ID_UNKNOWN))
-                true // unknown prop: can't narrow, keep member
+            const mk = self.store.get(m).kind;
+            const member_is_nullish = mk == .null_t or mk == .undefined_t;
+            const matches = if (prop_ty.eq(tymod.ID_UNKNOWN) and member_is_nullish)
+                // null/undefined have no own properties; via optional-chain they
+                // produce `undefined`, so they only match when the literal is also
+                // null or undefined.
+                lit_id.eq(tymod.ID_NULL) or lit_id.eq(tymod.ID_UNDEFINED)
+            else if (prop_ty.eq(tymod.ID_UNKNOWN))
+                true // unknown prop on non-nullish: can't narrow, keep member
             else
                 tymod.isAssignableTo(&self.store, prop_ty, lit_id);
             if (keep_only == matches) {
