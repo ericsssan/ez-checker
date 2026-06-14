@@ -1601,6 +1601,22 @@ fn leftmostStart(a: *const Ast, node: NodeIndex) u32 {
             if (cs < start) start = cs;
         }
     }
+    // Statement-level sequence_expr: `a, b, c` stores children in extra_data (SubRange),
+    // and uses the first comma as main_token.  The leftmost position is the first child,
+    // not the comma itself.  Look up the first child via extra_data.
+    if (a.nodeTag(node) == .sequence_expr and
+        a.tokens.items(.tag)[mtok] == .comma)
+    {
+        const d = a.nodeData(node);
+        const range_start = @intFromEnum(d.lhs);
+        if (range_start < a.extra_data.len) {
+            const first_child: NodeIndex = @enumFromInt(a.extra_data[range_start]);
+            if (first_child != .none and first_child.toInt() < node.toInt()) {
+                const cs = leftmostStart(a, first_child);
+                if (cs < start) start = cs;
+            }
+        }
+    }
     return start;
 }
 
