@@ -12342,21 +12342,10 @@ pub const Checker = struct {
         // Built-in lib types with structural shapes (Promise, Set, Map,
         // etc.).  Generic args get substituted into the method signatures.
         if (self.resolveLibType(ty_node, name)) |resolved| return resolved;
-        // In type-position mode (inside ts_function_type), always return a genuine
-        // type_param TypeId for in-scope type params so the function type displays
-        // as `<T extends X>(x: T) => T` rather than `(x: X) => X`.
-        if (self.type_pos_depth > 0 and self.argIsInScopeTypeParam(ty_node))
-            return self.buildTypeParam(ty_node, name);
-        // Type parameter with matching name in scope?  Resolve to its
-        // constraint type (an over-approximation that lets `t: T` where
-        // `T extends Foo` behave as `t: Foo`).
-        if (self.resolveTypeParameterConstraint(ty_node, name)) |c| return c;
-        // An in-scope but UNCONSTRAINED type parameter (`<T>`) → a genuine
-        // `.type_param` (TypeParameter flag), not an opaque type_ref, so rules
-        // that special-case a naked type parameter recognize it (e.g.
-        // no-unnecessary-condition's isConditionalAlwaysNecessary via
-        // ts.TypeFlags.TypeVariable).  Constrained params already returned their
-        // constraint above.
+        // In-scope type parameter: always return a genuine type_param TypeId so
+        // the type renders as `T` (matching TypeScript's .types output) rather
+        // than the constraint `Base` or `any`. The constraint is embedded in
+        // type_param for member-access resolution via memberOnApparentType.
         if (self.argIsInScopeTypeParam(ty_node)) return self.buildTypeParam(ty_node, name);
         // Qualified type name (e.g. `Namespace.Enum`): `name` is the first
         // component; try the last component of the member_expr chain so
@@ -18772,6 +18761,15 @@ pub const Checker = struct {
             const elem: TypeId = if (self.arrayMethodElementTypeOf(obj_ty)) |et| et else tymod.ID_UNKNOWN;
             return self.arrayPrototypeProperty(prop_name, elem);
         }
+        // Type parameter: chase the constraint (apparent type), mirroring
+        // TypeScript's getApparentType which substitutes `T extends Base` → Base.
+        if (obj.kind == .type_param) {
+            const constraint_ids = self.store.idsOf(obj.list_data);
+            if (constraint_ids.len > 0 and !constraint_ids[0].eq(obj_ty)) {
+                return self.memberOnApparentType(constraint_ids[0], prop_name, obj_node);
+            }
+            return tymod.ID_ANY;
+        }
         // Lib type_ref methods.
         if (obj.kind == .type_ref) {
             // Snapshot name before any type-adding calls — libTypeRefProperty/resolveDeclaredType
@@ -21051,7 +21049,14 @@ pub const Checker = struct {
         const cty = cparams[cidx];
         // An uninstantiated type-param contextual type (`<T>(x: T) => …` not yet
         // resolved) is shown as implicit `any` by tsc — don't surface the `T`.
-        if (self.store.get(cty).kind == .type_param) return null;
+        // If the type-param carries a constraint, use it as the contextual type
+        // (e.g. `T extends string` lets the callback param be inferred as `string`).
+        const cty_t = self.store.get(cty);
+        if (cty_t.kind == .type_param) {
+            const cs = self.store.idsOf(cty_t.list_data);
+            if (cs.len == 0) return null;
+            return self.nonNullExpected(cs[0]);
+        }
         return self.nonNullExpected(cty);
     }
 
