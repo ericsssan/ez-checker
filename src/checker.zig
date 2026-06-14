@@ -8885,6 +8885,10 @@ pub const Checker = struct {
             }
         }
         if (result.eq(TypeId.none)) {
+            // Bare `return;` stmts contribute to void — a function whose only
+            // returns are bare (no value) implicitly returns void, even if the
+            // last statement is a terminator (the bare return IS the terminator).
+            if (has_bare_return) return tymod.ID_VOID;
             // No return stmts — body may only throw. A body that never
             // falls through (last stmt is throw/guaranteed-terminator) has
             // return type `never`, matching tsc's inference for always-throwing
@@ -9002,7 +9006,8 @@ pub const Checker = struct {
                 const ty = self.ast_ref.nodeData(rdata.rhs).lhs;
                 return self.resolveTypeNodeParamAware(ty);
             }
-            return tymod.ID_ANY;
+            // Unannotated rest parameters in type positions are `any[]`, matching tsc.
+            return self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_ANY;
         }
         const ntag = self.ast_ref.nodeTag(node);
         if (ntag == .object_pattern or ntag == .array_pattern) {
