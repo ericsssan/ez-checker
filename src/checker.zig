@@ -14924,6 +14924,9 @@ pub const Checker = struct {
             // For type parameters and generic-looking types, produce NonNullable<T>
             // as a display-alias type_ref (matches what tsc shows).
             if (et.kind == .type_param or et.kind == .type_ref) {
+                // narrowAtUse may have already wrapped the rhs in NonNullable<T>
+                // (alias_name starts with "NonNullable<"); don't double-wrap.
+                if (std.mem.startsWith(u8, et.alias_name, "NonNullable<")) return expr_type;
                 const t_str = self.typeToString(expr_type) catch return null;
                 defer self.gpa.free(t_str);
                 const display = std.fmt.allocPrint(self.gpa, "NonNullable<{s}>", .{t_str}) catch return null;
