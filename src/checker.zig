@@ -9302,6 +9302,11 @@ pub const Checker = struct {
                         const elems = self.store.idsOf(it.list_data);
                         if (elems.len > 0) break :blk self.store.readonlyArrayOf(elems[0]) catch inner_ty;
                     }
+                    // readonly [T1, T2, ...] — mark the tuple with the "readonly" name
+                    // so typeToStringInner emits the "readonly " prefix.
+                    if (it.kind == .tuple_t and it.name.len == 0) {
+                        break :blk self.store.add(.{ .kind = .tuple_t, .list_data = it.list_data, .name = "readonly" }) catch inner_ty;
+                    }
                     break :blk inner_ty;
                 }
                 // `keyof T` — resolve to the literal union of T's property
@@ -9834,6 +9839,9 @@ pub const Checker = struct {
                     if (it.kind == .array_t) {
                         const elems = self.store.idsOf(it.list_data);
                         if (elems.len > 0) return self.store.readonlyArrayOf(elems[0]) catch inner_ty;
+                    }
+                    if (it.kind == .tuple_t and it.name.len == 0) {
+                        return self.store.add(.{ .kind = .tuple_t, .list_data = it.list_data, .name = "readonly" }) catch inner_ty;
                     }
                     return inner_ty;
                 }
