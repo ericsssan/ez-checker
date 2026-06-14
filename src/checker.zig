@@ -1971,6 +1971,35 @@ pub const Checker = struct {
                 }
                 return tymod.ID_ANY;
             }
+            // Interface declaration name: same "dangling" node issue as type_decl.
+            // Return typeRef(name, type_params) matching tsc's display.
+            if (bkind == .interface_decl) {
+                const iface_tok = self.ast_ref.nodeMainToken(node);
+                const iface_name = self.ast_ref.tokenText(iface_tok);
+                if (iface_name.len > 0) {
+                    if (self.type_decl_nodes.get(iface_name)) |decl| {
+                        if (self.ast_ref.nodeTag(decl) == .ts_interface_decl) {
+                            const id = self.ast_ref.nodeData(decl);
+                            if (id.lhs != .none) {
+                                const ifd = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(id.lhs));
+                                if (ifd.type_params < ifd.type_params_end) {
+                                    const n_params = ifd.type_params_end - ifd.type_params;
+                                    var args_buf: [8]TypeId = undefined;
+                                    const count = @min(n_params, @as(u32, args_buf.len));
+                                    for (0..count) |i| {
+                                        const tp_node: NodeIndex = @enumFromInt(self.ast_ref.extra_data[ifd.type_params + @as(u32, @intCast(i))]);
+                                        const tp_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
+                                        args_buf[i] = self.store.typeParam(tp_name, TypeId.none) catch tymod.ID_ANY;
+                                    }
+                                    return self.store.typeRef(iface_name, args_buf[0..count]) catch tymod.ID_ANY;
+                                }
+                            }
+                            return self.store.typeRef(iface_name, &.{}) catch tymod.ID_ANY;
+                        }
+                    }
+                }
+                return tymod.ID_ANY;
+            }
             // Namespace star import (`import * as NS`) in value position → `typeof NS`.
             // Exception: node16/nodenext mode requires explicit .js/.mjs/.cjs extensions on
             // relative imports; without one the module is unresolvable and tsc types it `any`.
