@@ -16597,6 +16597,11 @@ pub const Checker = struct {
                     return self.store.add(.{ .kind = .tuple_t, .list_data = empty_list }) catch tymod.ID_ANY;
                 }
             }
+            // In a spread-arg or destructuring-RHS context, `[]` is the empty tuple.
+            if (self.isArrayInDestructuringRhs(node) or self.isArrayInSpreadArg(node)) {
+                const empty_list = self.store.appendTypeIds(&.{}) catch return tymod.ID_ANY;
+                return self.store.add(.{ .kind = .tuple_t, .list_data = empty_list }) catch tymod.ID_ANY;
+            }
             const elem = self.emptyArrayElem(node);
             if (tymod.isAny(&self.store, elem)) return tymod.ID_ANY;
             return self.store.arrayOf(elem) catch tymod.ID_ANY;
