@@ -1368,7 +1368,7 @@ pub const Checker = struct {
                 return switch (t.kind) {
                     .string_literal => tymod.ID_STRING,
                     .number_literal => tymod.ID_NUMBER,
-                    .boolean_literal => tymod.ID_BOOLEAN,
+                    .boolean_literal => val_ty,
                     .bigint_literal => tymod.ID_BIGINT,
                     else => val_ty,
                 };
@@ -14659,8 +14659,8 @@ pub const Checker = struct {
 
     fn inferSequence(self: *Checker, node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(node);
-        const range = self.safeSubRange(data.lhs) orelse return tymod.ID_UNDEFINED;
-        if (range.end <= range.start) return tymod.ID_UNDEFINED;
+        const range = self.safeSubRange(data.lhs) orelse return tymod.ID_ANY;
+        if (range.end <= range.start) return tymod.ID_ANY;
         // A sequence expression should have at least 2 elements (comma operator).
         // If there's only 1 element (e.g., `(NUMBER, )` with missing second operand),
         // the result type is `any` to represent the syntax error / missing operand.
