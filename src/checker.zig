@@ -16169,6 +16169,25 @@ pub const Checker = struct {
                 const inferred = self.inferClassTypeArgs(decl, call_node, &args_buf);
                 if (inferred > 0) return self.classOrLibInstance(c, args_buf[0..inferred]);
             }
+            // Infer type params for Set/WeakSet from the first arg's element type.
+            // new Set([a, b, c]) → Set<T>  where T = elem_type_of([a, b, c])
+            const nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(c));
+            if (std.mem.eql(u8, nm, "Set") or std.mem.eql(u8, nm, "WeakSet")) {
+                const arg_nodes = self.callArguments(call_node);
+                if (arg_nodes.len > 0) {
+                    const arg_ty = self.typeOf(@enumFromInt(arg_nodes[0]));
+                    if (self.elementTypeOf(arg_ty)) |elem_ty| {
+                        args_buf[0] = switch (self.store.get(elem_ty).kind) {
+                            .string_literal => tymod.ID_STRING,
+                            .number_literal => tymod.ID_NUMBER,
+                            .boolean_literal => tymod.ID_BOOLEAN,
+                            .bigint_literal => tymod.ID_BIGINT,
+                            else => elem_ty,
+                        };
+                        return self.classOrLibInstance(c, args_buf[0..1]);
+                    }
+                }
+            }
         }
         return self.classOrLibInstance(c, args_buf[0..args_count]);
     }
