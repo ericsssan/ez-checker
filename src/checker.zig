@@ -14658,17 +14658,14 @@ pub const Checker = struct {
     }
 
     fn inferSequence(self: *Checker, node: NodeIndex) TypeId {
+        // sequence_expr stores children directly: extra_data[data.lhs..data.rhs] = child NodeIndex values.
+        // Use directRange — NOT safeSubRange, which expects a SubRange struct pointer.
         const data = self.ast_ref.nodeData(node);
-        const range = self.safeSubRange(data.lhs) orelse return tymod.ID_ANY;
-        if (range.end <= range.start) return tymod.ID_ANY;
-        // A sequence expression should have at least 2 elements (comma operator).
-        // If there's only 1 element (e.g., `(NUMBER, )` with missing second operand),
-        // the result type is `any` to represent the syntax error / missing operand.
-        const num_elements = range.end - range.start;
-        if (num_elements < 2) return tymod.ID_ANY;
-        const last_idx = self.ast_ref.extra_data[range.end - 1]; // zbc-disable-line: index-minus-one-without-zero-guard
-        if (last_idx == @intFromEnum(NodeIndex.none)) return tymod.ID_ANY;
-        return self.typeOf(@enumFromInt(last_idx));
+        const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_ANY;
+        if (slice.len == 0) return tymod.ID_ANY;
+        const last_raw = slice[slice.len - 1]; // zbc-disable-line: index-minus-one-without-zero-guard
+        if (last_raw == @intFromEnum(NodeIndex.none)) return tymod.ID_ANY;
+        return self.typeOf(@enumFromInt(last_raw));
     }
 
     fn inferConditional(self: *Checker, node: NodeIndex) TypeId {
