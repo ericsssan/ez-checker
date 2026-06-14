@@ -16649,13 +16649,25 @@ pub const Checker = struct {
         var n_used: usize = 0;
         const n = @min(slice.len, buf.len);
         var has_spread = false;
+        var has_real_elem = false;
+        // Holes pending flush: leading/trailing holes are ignored; only holes between
+        // two real elements add `undefined`. `pending_holes` counts holes seen after
+        // the last real element — flushed when the next real element arrives.
+        var pending_holes: usize = 0;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const elem_node: NodeIndex = @enumFromInt(slice[i]);
             if (elem_node == .none) {
-                // Hole/elision: skip for type inference (TypeScript ignores holes).
+                if (has_real_elem) pending_holes += 1;
                 continue;
             }
+            // Flush pending holes — they are now confirmed internal holes.
+            if (pending_holes > 0) {
+                const slots = @min(pending_holes, buf.len - n_used);
+                for (0..slots) |_| { buf[n_used] = tymod.ID_UNDEFINED; n_used += 1; }
+                pending_holes = 0;
+            }
+            has_real_elem = true;
             const elem_tag = self.ast_ref.nodeTag(elem_node);
             if (elem_tag == .spread_element) {
                 has_spread = true;
