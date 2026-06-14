@@ -1586,7 +1586,7 @@ fn leftmostStart(a: *const Ast, node: NodeIndex) u32 {
         .call_expr, .optional_call_expr, .new_expr,
         .member_expr, .computed_member_expr,
         .optional_member_expr, .optional_computed_member_expr,
-        .conditional, .sequence_expr, .tagged_template,
+        .conditional, .tagged_template,
         .postfix_inc, .postfix_dec,
         .ts_non_null_expr, .ts_as_expr, .ts_satisfies_expr,
         .ts_instantiation_expr,

@@ -3,6 +3,114 @@ const parser = @import("es_parser");
 const Checker = @import("ez_checker").Checker;
 const NodeIndex = parser.ast.NodeIndex;
 
+test "jsdoc type cast" {
+    const gpa = std.testing.allocator;
+    // Simpler: just the let with @type annotation, no function context
+    const src =
+        \\/** @type {'a' | 'b'} */
+        \\let a = 'x';
+        \\a;
+    ;
+    var lex = try parser.Lexer.tokenizeWithLanguage(gpa, src, .js);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try parser.Parser.parseWithLanguage(gpa, src, tokens.slice(), .js, true);
+    defer ast.deinit(gpa);
+    var sem = try parser.semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    var checker = try Checker.init(gpa, &ast, &sem, .{ .is_js_file = true });
+    defer checker.deinit();
+
+    // Print all nodes to understand structure
+    std.debug.print("=== jsdoc test nodes ===\n", .{});
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: NodeIndex = @enumFromInt(n);
+        const span = ast.nodeSpan(ni);
+        if (span.end > src.len or span.end <= span.start) continue;
+        const text = src[span.start..@min(span.end, span.start + 20)];
+        const pidx = if (ni.toInt() < sem.parent_indices.len) sem.parent_indices[ni.toInt()] else 0xFFFF;
+        std.debug.print("J node {d}: tag={s} parent={d} text='{s}'\n", .{
+            n, @tagName(ast.nodeTag(ni)), pidx, text,
+        });
+    }
+
+    n = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        const span = ast.nodeSpan(ni);
+        if (span.end > src.len or span.end <= span.start) continue;
+        const text = src[span.start..span.end];
+        if (!std.mem.eql(u8, text, "a") and !std.mem.eql(u8, text, "'x'")) continue;
+        if (tag != .identifier and tag != .string_literal) continue;
+        const ty = checker.typeOf(ni);
+        const tystr = try checker.typeToString(ty);
+        defer gpa.free(tystr);
+        const pidx = if (ni.toInt() < sem.parent_indices.len) sem.parent_indices[ni.toInt()] else 0xFFFF;
+        std.debug.print("node {d} '{s}' (tag={s}) parent={d}(tag={s}) = {s}\n", .{
+            n, text, @tagName(tag),
+            pidx,
+            if (pidx < ast.nodes.len) @tagName(ast.nodeTag(@enumFromInt(pidx))) else "?",
+            tystr,
+        });
+    }
+}
+
+test "catch clause type annotation" {
+    const gpa = std.testing.allocator;
+    // Matches catchClauseWithTypeAnnotation.ts structure: catch params inside a function
+    // with var redeclarations in later catch bodies
+    const src =
+        \\function fn(x: boolean) {
+        \\  try { } catch (x) { }
+        \\  try { } catch (x: any) { }
+        \\  try { } catch (x: unknown) { }
+        \\  try { } catch (x: Error) { }
+        \\  try { } catch (x) { var x: string; }
+        \\  try { } catch (x) { var x: boolean; }
+        \\}
+    ;
+    var lex = try parser.Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try parser.Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try parser.semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    var checker = try Checker.init(gpa, &ast, &sem, .{});
+    defer checker.deinit();
+
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        if (tag != .identifier) continue;
+        const span = ast.nodeSpan(ni);
+        if (span.end > src.len or span.end <= span.start) continue;
+        const text = src[span.start..span.end];
+        if (!std.mem.startsWith(u8, text, "x")) continue;
+        const ty = checker.typeOf(ni);
+        const tystr = try checker.typeToString(ty);
+        defer gpa.free(tystr);
+        const data = ast.nodeData(ni);
+        const parent_idx = if (ni.toInt() < sem.parent_indices.len) sem.parent_indices[ni.toInt()] else 0xFFFF;
+        std.debug.print("node {d} '{s}' (tag={s}) rhs={d} parent={d}(tag={s}) = {s}\n", .{
+            n, text, @tagName(tag),
+            @intFromEnum(data.rhs),
+            parent_idx,
+            if (parent_idx < ast.nodes.len) @tagName(ast.nodeTag(@enumFromInt(parent_idx))) else "?",
+            tystr,
+        });
+    }
+}
+
 test "computed enum members" {
     const gpa = std.testing.allocator;
     const src =
