@@ -1926,6 +1926,51 @@ pub const Checker = struct {
             // Namespace or class identifier in value position → `typeof Name`.
             // Guard: skip type-annotation positions (where tsc says `any`).
             const bkind = self.semantic.symbols.getBindingKind(sym);
+            // Type alias declaration name: the name_ident node is "dangling"
+            // (no parent in the AST), so the normal declaredTypeForSymbol path
+            // returns any. Resolve the alias body via its declaration node.
+            if (bkind == .type_decl) {
+                const alias_tok = self.ast_ref.nodeMainToken(node);
+                const alias_name = self.ast_ref.tokenText(alias_tok);
+                if (alias_name.len > 0) {
+                    if (self.type_decl_nodes.get(alias_name)) |decl| {
+                        if (self.ast_ref.nodeTag(decl) == .ts_type_alias_decl) {
+                            const dd = self.ast_ref.nodeData(decl);
+                            if (dd.lhs != .none) {
+                                const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(dd.lhs));
+                                // Resolve the body with type_pos_depth so unconstrained
+                                // type params stay as type_param rather than becoming any.
+                                self.type_pos_depth += 1;
+                                const body = self.resolveTypeNode(ad.type_node);
+                                self.type_pos_depth -= 1;
+                                // For complex/recursive bodies: return alias name form
+                                // (e.g. Tree<T>). For simple types (string, number, etc.):
+                                // return the body directly, matching tsc.
+                                const bt = self.store.get(body);
+                                const is_complex = switch (bt.kind) {
+                                    .object_t, .function_t, .intersection_t, .type_ref,
+                                    .array_t, .readonly_array_t, .tuple_t => true,
+                                    .union_t => true,
+                                    else => false,
+                                };
+                                if (is_complex and ad.type_params < ad.type_params_end) {
+                                    const n_params = ad.type_params_end - ad.type_params;
+                                    var args_buf: [8]TypeId = undefined;
+                                    const count = @min(n_params, @as(u32, args_buf.len));
+                                    for (0..count) |i| {
+                                        const tp_node: NodeIndex = @enumFromInt(self.ast_ref.extra_data[ad.type_params + @as(u32, @intCast(i))]);
+                                        const tp_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
+                                        args_buf[i] = self.store.typeParam(tp_name, TypeId.none) catch tymod.ID_ANY;
+                                    }
+                                    return self.store.typeRef(alias_name, args_buf[0..count]) catch body;
+                                }
+                                return body;
+                            }
+                        }
+                    }
+                }
+                return tymod.ID_ANY;
+            }
             // Namespace star import (`import * as NS`) in value position → `typeof NS`.
             // Exception: node16/nodenext mode requires explicit .js/.mjs/.cjs extensions on
             // relative imports; without one the module is unresolvable and tsc types it `any`.
