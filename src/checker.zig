@@ -5878,10 +5878,65 @@ pub const Checker = struct {
                         }
                         // Handle primitive literals
                         const init_tag = self.ast_ref.nodeTag(data.rhs);
+                        // When the initializer is an identifier reference, the
+                        // literal type is "non-widening" (and therefore preserved)
+                        // if the source variable was declared with a type annotation
+                        // or with `as const` — both mean the type was fixed
+                        // intentionally.  Without an annotation/as-const the
+                        // source variable itself has a "widening" literal and
+                        // TypeScript widens `let y = x` to the base type.
+                        const src_is_non_widening: bool = blk: {
+                            if (init_tag != .identifier and
+                                init_tag != .member_expr and
+                                init_tag != .optional_member_expr) break :blk false;
+                            const src_sym = self.symbolForIdentRef(data.rhs) orelse break :blk false;
+                            const src_decl = self.semantic.symbols.getDeclNode(src_sym);
+                            if (src_decl == .none) break :blk false;
+                            // If the target `let` binding has any post-init assignment
+                            // (>1 write in the evolving index), TypeScript's "evolving
+                            // let" mechanism widens it — don't preserve the literal.
+                            if (self.symbolForIdentRef(data.lhs)) |tgt_sym| {
+                                if (!self.evolving_index_built) self.buildEvolvingIndex();
+                                if (self.evolving_assign_index.get(tgt_sym.toInt())) |writes| {
+                                    if (writes.items.len > 1) break :blk false;
+                                }
+                            }
+                            // Check binding annotation: `const x: "foo" = ...`
+                            const src_bd = self.ast_ref.nodeData(src_decl);
+                            if (src_bd.rhs != .none and
+                                self.ast_ref.nodeTag(src_bd.rhs) == .ts_type_annotation)
+                                break :blk true;
+                            // Check if declaration's init is `as const` or `<const>`
+                            const src_di = src_decl.toInt();
+                            if (src_di >= self.semantic.parent_indices.len) break :blk false;
+                            const src_par_idx = self.semantic.parent_indices[src_di];
+                            const NONE: u32 = @intFromEnum(NodeIndex.none);
+                            if (src_par_idx == NONE) break :blk false;
+                            const src_par: NodeIndex = @enumFromInt(src_par_idx);
+                            if (self.ast_ref.nodeTag(src_par) != .declarator) break :blk false;
+                            const src_dd = self.ast_ref.nodeData(src_par);
+                            if (src_dd.rhs == .none) break :blk false;
+                            const src_init_tag = self.ast_ref.nodeTag(src_dd.rhs);
+                            if (src_init_tag == .ts_as_expr) {
+                                const src_id = self.ast_ref.nodeData(src_dd.rhs);
+                                if (src_id.rhs == .none) break :blk false;
+                                if (self.ast_ref.nodeTag(src_id.rhs) != .ts_type_reference) break :blk false;
+                                const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(src_id.rhs));
+                                break :blk std.mem.eql(u8, cname, "const");
+                            }
+                            if (src_init_tag == .ts_type_assertion) {
+                                const src_id = self.ast_ref.nodeData(src_dd.rhs);
+                                if (src_id.lhs == .none) break :blk false;
+                                if (self.ast_ref.nodeTag(src_id.lhs) != .ts_type_reference) break :blk false;
+                                const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(src_id.lhs));
+                                break :blk std.mem.eql(u8, cname, "const");
+                            }
+                            break :blk false;
+                        };
                         const widened_prim = switch (t.kind) {
-                            .string_literal => tymod.ID_STRING,
-                            .number_literal => tymod.ID_NUMBER,
-                            .bigint_literal => tymod.ID_BIGINT,
+                            .string_literal => if (src_is_non_widening) raw else tymod.ID_STRING,
+                            .number_literal => if (src_is_non_widening) raw else tymod.ID_NUMBER,
+                            .bigint_literal => if (src_is_non_widening) raw else tymod.ID_BIGINT,
                             // Boolean literals are widened only for direct literals
                             // (true/false) or `!expr` — not for &&/|| results which
                             // propagate non-widening literal types from parameters.
