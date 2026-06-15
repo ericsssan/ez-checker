@@ -6731,6 +6731,14 @@ pub const Checker = struct {
         }
         // A bare identifier (possibly dotted) → named type_ref, but only if it
         // looks like a type name; otherwise `any`.
+        // In JSDoc, bare generic types default their type params to `any`.
+        if (std.mem.eql(u8, s, "Array")) return self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_ANY;
+        if (std.mem.eql(u8, s, "Promise")) return self.store.typeRef("Promise", &.{tymod.ID_ANY}) catch tymod.ID_ANY;
+        if (std.mem.eql(u8, s, "Set")) return self.store.typeRef("Set", &.{tymod.ID_ANY}) catch tymod.ID_ANY;
+        if (std.mem.eql(u8, s, "Map")) return self.store.typeRef("Map", &.{ tymod.ID_ANY, tymod.ID_ANY }) catch tymod.ID_ANY;
+        if (std.mem.eql(u8, s, "WeakSet")) return self.store.typeRef("WeakSet", &.{tymod.ID_ANY}) catch tymod.ID_ANY;
+        if (std.mem.eql(u8, s, "WeakMap")) return self.store.typeRef("WeakMap", &.{ tymod.ID_ANY, tymod.ID_ANY }) catch tymod.ID_ANY;
+        if (std.mem.eql(u8, s, "ReadonlyArray")) return self.store.typeRef("ReadonlyArray", &.{tymod.ID_ANY}) catch tymod.ID_ANY;
         if (jsdocLooksLikeName(s)) return self.store.typeRef(s, &.{}) catch tymod.ID_ANY;
         return tymod.ID_ANY;
     }
@@ -21727,8 +21735,21 @@ pub const Checker = struct {
                     try buf.appendSlice(gpa, t.alias_name);
                     return;
                 }
-                try buf.appendSlice(gpa, t.name);
                 const args = self.store.idsOf(t.list_data);
+                // TypeScript always renders Array<T> as T[] in output
+                if (std.mem.eql(u8, t.name, "Array") and args.len == 1) {
+                    try self.typeToStringInner(args[0], buf, depth + 1);
+                    try buf.appendSlice(gpa, "[]");
+                    return;
+                }
+                // TypeScript renders ReadonlyArray<T> as readonly T[]
+                if (std.mem.eql(u8, t.name, "ReadonlyArray") and args.len == 1) {
+                    try buf.appendSlice(gpa, "readonly ");
+                    try self.typeToStringInner(args[0], buf, depth + 1);
+                    try buf.appendSlice(gpa, "[]");
+                    return;
+                }
+                try buf.appendSlice(gpa, t.name);
                 if (args.len > 0) {
                     try buf.append(gpa, '<');
                     for (args, 0..) |arg, ai| {
