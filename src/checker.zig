@@ -7878,6 +7878,35 @@ pub const Checker = struct {
         }
     }
 
+    /// The yield (iteration) type of a `yield* <expr>` delegate: the first type
+    /// argument of a Generator/Iterable-family type ref, else the element type.
+    /// Scoped to yield-delegation so the broader `elementTypeOf` (used by for-of
+    /// / spread, where iterator unwrapping differs) is unaffected.
+    fn yieldDelegateElementType(self: *Checker, id: TypeId) ?TypeId {
+        const t = self.store.get(id);
+        if (t.kind == .type_ref) {
+            const args = self.store.idsOf(t.list_data);
+            if (args.len > 0) {
+                const nm = t.name;
+                if (std.mem.eql(u8, nm, "Generator") or
+                    std.mem.eql(u8, nm, "AsyncGenerator") or
+                    std.mem.eql(u8, nm, "Iterable") or
+                    std.mem.eql(u8, nm, "AsyncIterable") or
+                    std.mem.eql(u8, nm, "IterableIterator") or
+                    std.mem.eql(u8, nm, "AsyncIterableIterator") or
+                    std.mem.eql(u8, nm, "Iterator") or
+                    std.mem.eql(u8, nm, "AsyncIterator"))
+                {
+                    // A bare unresolved type-param arg (`Iterable<T>`) iterates
+                    // as `any` in tsc, not the surfaced `T`.
+                    if (self.store.get(args[0]).kind == .type_param) return null;
+                    return args[0];
+                }
+            }
+        }
+        return self.elementTypeOf(id);
+    }
+
     /// If `ret_node` is a ts_type_reference to a type-parameter `T`
     /// whose constraint is a literal type (`true`, `"foo"`, `42`, `0n`),
     /// return that literal TypeId.  Otherwise return `fallback` (the
@@ -9478,7 +9507,7 @@ pub const Checker = struct {
                 (if (is_async) tymod.ID_ANY else tymod.ID_UNDEFINED)
             else if (ntag == .yield_delegate)
                 // `yield* iterable` — use element type of the delegated iterable.
-                (self.elementTypeOf(self.typeOf(arg)) orelse tymod.ID_UNKNOWN)
+                (self.yieldDelegateElementType(self.typeOf(arg)) orelse tymod.ID_UNKNOWN)
             else
                 self.typeOf(arg);
             // Widen primitive literals — tsc widens yield types in Generator<T,...>.
