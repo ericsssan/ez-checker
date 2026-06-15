@@ -12385,6 +12385,45 @@ pub const Checker = struct {
         return self.tagAliasArgs(id, display, args);
     }
 
+    /// The innermost enclosing `namespace` name of a declaration node, or null.
+    /// Restricted to `ts_namespace_decl` — `declare module "x"` blocks are
+    /// import/module-object contexts where qualifying a member type is unsafe
+    /// (tsc often leaves those `any`).
+    fn innermostNamespaceName(self: *Checker, node: NodeIndex) ?[]const u8 {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .ts_namespace_decl => {
+                    const d = self.ast_ref.nodeData(pn);
+                    if (d.lhs != .none) return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs));
+                    return null;
+                },
+                .ts_module_decl => return null,
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    /// A type declaration named `type_name` whose innermost enclosing namespace
+    /// is `ns_name` — i.e. `ns_name.type_name` is a real local namespace type.
+    /// Returns the decl node, or null.
+    fn namespaceLocalTypeDecl(self: *Checker, ns_name: []const u8, type_name: []const u8) ?NodeIndex {
+        const d = self.type_decl_nodes.get(type_name) orelse return null;
+        const dtag = self.ast_ref.nodeTag(d);
+        // Interfaces/classes display by their (qualified) NAME.  Type aliases
+        // resolve to their underlying type (`N.Str`=`string`), and enums have
+        // their own member/qualification handling (and `N.E` without type-args in
+        // a generic slot is a tsc error → any), so both are excluded here.
+        if (dtag != .ts_interface_decl and dtag != .class_decl) return null;
+        const inner = self.innermostNamespaceName(d) orelse return null;
+        if (!std.mem.eql(u8, inner, ns_name)) return null;
+        return d;
+    }
+
     fn resolveTypeRef(self: *Checker, ty_node: NodeIndex) TypeId {
         const name_tok = self.ast_ref.nodeMainToken(ty_node);
         const name = self.ast_ref.tokenText(name_tok);
@@ -12637,6 +12676,23 @@ pub const Checker = struct {
                                 var args_buf0: [8]TypeId = undefined;
                                 const args0 = self.collectTypeArgs(ty_node, &args_buf0);
                                 return self.store.typeRef(qual, args0) catch tymod.ID_ANY;
+                            }
+                        }
+                        // `A.B` where B IS a type declared INSIDE namespace A
+                        // (`namespace Underscore { interface Static {} }`,
+                        // `var _: Underscore.Static`) → render `A.B` verbatim
+                        // (tsc's scope-relative display).  Verified via B's
+                        // enclosing namespace == A so a global B isn't mis-qualified.
+                        if (last.len > 0 and self.namespaceLocalTypeDecl(name, last) != null) {
+                            const qual = self.qualifiedTypeName(ty_node, md0.rhs);
+                            if (qual.len > 0) {
+                                // Scope-relative display: drop the redundant
+                                // qualifier when the use site is inside the
+                                // namespace (`privateModule.publicClass` → `publicClass`).
+                                const display = self.displayQualifiedName(ty_node, qual);
+                                var args_bufL: [8]TypeId = undefined;
+                                const argsL = self.collectTypeArgs(ty_node, &args_bufL);
+                                return self.store.typeRef(display, argsL) catch tymod.ID_ANY;
                             }
                         }
                     }
