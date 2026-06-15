@@ -507,21 +507,12 @@ pub const Checker = struct {
     /// scope-aware resolution path (`resolveDeclaredTypeInScope`).
     type_decls_by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
 
-    /// Binder symbol table for TYPE declarations: "<scope>\x00<name>" → the
-    /// declarations of that name DIRECTLY in that namespace scope, in source
-    /// order. This is the materialized (scope, name) → decls mapping a binder
-    /// produces — replacing per-query `namespaceScopeKey` parent-walks with an
-    /// O(1) lookup. Built by deriveTypeIndexes; keys are gpa-owned (freed in
-    /// deinit). The first step toward tsc's per-scope SymbolTables.
-    scoped_type_decls: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
-
-    /// Binder symbol table for VALUE declarations (var/let/const/function):
-    /// "<scope>\x00<name>" → the value declarations of that name DIRECTLY in
-    /// that namespace scope, source order. The value-space counterpart of
-    /// scoped_type_decls — together they give a binder's per-scope symbol table
-    /// covering both type and value meanings. Built by deriveTypeIndexes; keys
-    /// gpa-owned (freed in deinit).
-    scoped_value_decls: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
+    /// Binder symbol table: "<scope>\x00<name>" → Symbol. The materialized
+    /// (scope, name) → meaning mapping a binder produces, replacing per-query
+    /// `namespaceScopeKey` parent-walks with an O(1) lookup. Built by
+    /// deriveTypeIndexes; keys are gpa-owned (freed in deinit). The seed of
+    /// tsc's per-scope SymbolTables.
+    symbols: std.StringHashMapUnmanaged(Symbol) = .empty,
 
     /// Maps generic function TypeId → rendered type-parameter prefix string
     /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
@@ -736,20 +727,13 @@ pub const Checker = struct {
             self.type_decls_by_name.deinit(self.gpa);
         }
         {
-            var sit = self.scoped_type_decls.iterator();
+            var sit = self.symbols.iterator();
             while (sit.next()) |e| {
                 self.gpa.free(e.key_ptr.*);
-                e.value_ptr.deinit(self.gpa);
+                e.value_ptr.type_decls.deinit(self.gpa);
+                e.value_ptr.value_decls.deinit(self.gpa);
             }
-            self.scoped_type_decls.deinit(self.gpa);
-        }
-        {
-            var sit = self.scoped_value_decls.iterator();
-            while (sit.next()) |e| {
-                self.gpa.free(e.key_ptr.*);
-                e.value_ptr.deinit(self.gpa);
-            }
-            self.scoped_value_decls.deinit(self.gpa);
+            self.symbols.deinit(self.gpa);
         }
         {
             var it = self.fn_type_params.valueIterator();
@@ -12400,7 +12384,7 @@ pub const Checker = struct {
         var vit = self.value_decl_by_name.iterator();
         while (vit.next()) |entry| {
             const vname = entry.key_ptr.*;
-            for (entry.value_ptr.items) |ni| try self.recordScoped(&self.scoped_value_decls, vname, ni);
+            for (entry.value_ptr.items) |ni| try self.recordScopedValue(vname, ni);
         }
     }
 
@@ -14232,49 +14216,64 @@ pub const Checker = struct {
         return result;
     }
 
-    const ScopeTable = std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex));
+    /// A binder Symbol: the declarations of one (scope, name), bundled by
+    /// meaning — type-side (interface/class/enum/alias/namespace) and value-side
+    /// (var/let/const/function), each in source order. The tsc-style Symbol
+    /// shape: a name's full meaning in a scope is ONE record (the identity is
+    /// the record, not the bare name string).
+    const Symbol = struct {
+        type_decls: std.ArrayListUnmanaged(NodeIndex) = .empty,
+        value_decls: std.ArrayListUnmanaged(NodeIndex) = .empty,
+    };
 
-    /// Append `ni` to a binder symbol table under "<scope>\x00<name>", where
-    /// scope is `ni`'s enclosing namespace scope. Shared by the type and value
-    /// tables. Keys are gpa-owned.
-    fn recordScoped(self: *Checker, table: *ScopeTable, name: []const u8, ni: NodeIndex) !void {
-        var sb: [192]u8 = undefined;
-        const scope = self.namespaceScopeKey(ni, &sb);
-        var kb: [384]u8 = undefined;
-        const key = typeCacheKey(&kb, name, scope) orelse return;
-        const gop = try table.getOrPut(self.gpa, key);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = self.gpa.dupe(u8, key) catch {
-                _ = table.remove(key);
-                return;
-            };
-            gop.value_ptr.* = .empty;
-        }
-        try gop.value_ptr.append(self.gpa, ni);
-    }
-
-    /// Record a type declaration in the type symbol table.
-    fn recordScopedDecl(self: *Checker, name: []const u8, ni: NodeIndex) !void {
-        return self.recordScoped(&self.scoped_type_decls, name, ni);
-    }
-
-    /// Binder symbol-table lookup against `table`: the declarations of `name`
-    /// DIRECTLY in namespace scope `scope`, source order (null if none).
-    /// Returns a borrowed pointer to the stored list.
-    fn scopedDeclsIn(table: *const ScopeTable, name: []const u8, scope: []const u8) ?*const std.ArrayListUnmanaged(NodeIndex) {
+    /// Get-or-create the Symbol for (scope, name). Keys are gpa-owned.
+    fn symbolEnsure(self: *Checker, name: []const u8, scope: []const u8) ?*Symbol {
         var kb: [384]u8 = undefined;
         const key = typeCacheKey(&kb, name, scope) orelse return null;
-        return table.getPtr(key);
+        const gop = self.symbols.getOrPut(self.gpa, key) catch return null;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, key) catch {
+                _ = self.symbols.remove(key);
+                return null;
+            };
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
     }
 
-    /// Type symbol-table lookup (see scopedDeclsIn).
+    /// Record a TYPE declaration in `ni`'s (scope, name) Symbol.
+    fn recordScopedDecl(self: *Checker, name: []const u8, ni: NodeIndex) !void {
+        var sb: [192]u8 = undefined;
+        const scope = self.namespaceScopeKey(ni, &sb);
+        const sym = self.symbolEnsure(name, scope) orelse return;
+        try sym.type_decls.append(self.gpa, ni);
+    }
+
+    /// Record a VALUE declaration in `ni`'s (scope, name) Symbol.
+    fn recordScopedValue(self: *Checker, name: []const u8, ni: NodeIndex) !void {
+        var sb: [192]u8 = undefined;
+        const scope = self.namespaceScopeKey(ni, &sb);
+        const sym = self.symbolEnsure(name, scope) orelse return;
+        try sym.value_decls.append(self.gpa, ni);
+    }
+
+    /// Type-meaning lookup: declarations of `name` DIRECTLY in `scope` (source
+    /// order), or null when the Symbol has no type declarations there.
     fn scopedTypeDecls(self: *Checker, name: []const u8, scope: []const u8) ?*const std.ArrayListUnmanaged(NodeIndex) {
-        return scopedDeclsIn(&self.scoped_type_decls, name, scope);
+        var kb: [384]u8 = undefined;
+        const key = typeCacheKey(&kb, name, scope) orelse return null;
+        const sym = self.symbols.getPtr(key) orelse return null;
+        if (sym.type_decls.items.len == 0) return null;
+        return &sym.type_decls;
     }
 
-    /// Value symbol-table lookup (see scopedDeclsIn).
+    /// Value-meaning lookup (mirror of scopedTypeDecls).
     fn scopedValueDecls(self: *Checker, name: []const u8, scope: []const u8) ?*const std.ArrayListUnmanaged(NodeIndex) {
-        return scopedDeclsIn(&self.scoped_value_decls, name, scope);
+        var kb: [384]u8 = undefined;
+        const key = typeCacheKey(&kb, name, scope) orelse return null;
+        const sym = self.symbols.getPtr(key) orelse return null;
+        if (sym.value_decls.items.len == 0) return null;
+        return &sym.value_decls;
     }
 
     /// The first interface/class declaration of `name` whose namespace scope
