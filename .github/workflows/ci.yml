@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Newer pushes to the same ref supersede in-flight runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: unit tests + conformance ratchet
+    runs-on: ubuntu-latest
+    steps:
+      # The TypeScript test corpus the oracle reads is a git submodule
+      # (microsoft/TypeScript), so it must be checked out. fetch-depth: 1 keeps
+      # the (large) submodule clone shallow.
+      - name: Checkout (with TypeScript corpus submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # Pinned to the exact dev toolchain in build.zig.zon's minimum_zig_version.
+      # If this build is no longer hosted, bump both this and build.zig.zon.
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.607+456b2ec07
+
+      # NOTE: we deliberately run the specific steps below rather than the
+      # default `zig build` — the default step also runs the `zbc` linter, which
+      # currently reports 4 pre-existing false positives and would fail the job.
+
+      - name: Unit tests
+        run: zig build test
+
+      # The ratchet: fails if conformance regresses below oracle/baseline.lock
+      # (match_min / wrong_max / prim_match_min / prim_wrong_max).
+      - name: Conformance ratchet (oracle)
+        run: zig build test-oracle
