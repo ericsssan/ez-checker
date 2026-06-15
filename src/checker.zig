@@ -19138,6 +19138,22 @@ pub const Checker = struct {
                     }
                 }
             }
+            // Numeric-literal key (`c[1]`, `c[1.0]`, `i[-1]`): a number indexes
+            // by its CANONICAL string form — `1.0` and `0x1` index as "1", `-1`
+            // as "-1" — so match a string-named-numeric property of that name.
+            if (kt.kind == .number_literal) {
+                const v = kt.literal_value.number;
+                var nbuf: [32]u8 = undefined;
+                const canon: []const u8 = if (v == @floor(v) and @abs(v) < 1e21)
+                    (std.fmt.bufPrint(&nbuf, "{d}", .{@as(i64, @intFromFloat(v))}) catch "")
+                else
+                    (std.fmt.bufPrint(&nbuf, "{d}", .{v}) catch "");
+                if (canon.len > 0) {
+                    for (self.store.propsOf(snap_props)) |p| {
+                        if (std.mem.eql(u8, p.name, canon)) return p.type_id;
+                    }
+                }
+            }
             // Symbol-keyed access (`obj[Symbol.iterator]`): the member is stored
             // under its computed display name `[Symbol.iterator]`.  Match when the
             // key's type is `unique symbol` (a real symbol key, not a string).
