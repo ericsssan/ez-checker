@@ -2595,7 +2595,12 @@ pub const Checker = struct {
                 if (qdata.lhs == .none) return null;
                 const iface = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(qdata.lhs));
                 const iface_name = self.ast_ref.tokenText(iface.name);
-                const resolved = self.resolveDeclaredType(iface_name) orelse return null;
+                // Scope-local interface first: when this interface name also
+                // exists in sibling namespaces, the scope-blind merge piles this
+                // method up as a bogus overload set (`{ (): T; (): T; }`). `node`
+                // sits inside this declaration, so its scope selects the right one.
+                const resolved = self.resolveDeclaredTypeInScope(iface_name, node) orelse
+                    (self.resolveDeclaredType(iface_name) orelse return null);
                 const rt = self.store.get(resolved);
                 if (rt.kind != .object_t) return null;
                 for (self.store.propsOf(rt.object_props)) |p| {
