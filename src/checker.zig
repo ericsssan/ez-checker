@@ -6384,6 +6384,9 @@ pub const Checker = struct {
                 // element type.  `arr.some(x => x)` → x has type arr's
                 // element.
                 if (self.contextualArrayPredicateParamType(binding)) |t| return t;
+                // IIFE parameter: `(jake => {})("build")` → `jake` is the widened
+                // matching call argument.
+                if (self.iifeArgParamType(binding)) |t| return t;
                 // Generic contextual typing: arrow callback passed to a
                 // function whose parameter has a function type.  Walk
                 // the callee's signature to find the matching arg slot's
@@ -9775,6 +9778,10 @@ pub const Checker = struct {
         if (default_val != .none) {
             return self.widenForParamDefault(self.typeOf(default_val), 0);
         }
+        // Immediately-invoked function expression: `(jake => {})("build")` —
+        // an unannotated param is contextually typed by the matching call
+        // argument (widened: `"build"` → string).
+        if (self.iifeArgParamType(param)) |t| return t;
         // Contextual parameter type from an expected callback signature
         // (`arr.map(x => …)` → `x` is the element type).
         if (self.contextualParamType(param)) |ct| return ct;
@@ -21494,6 +21501,75 @@ pub const Checker = struct {
     /// The contextual type of an unannotated parameter `param`: when its
     /// enclosing arrow/function has an expected function type (e.g. a callback
     /// argument of `arr.map(...)`), the parameter takes the matching slot's type.
+    /// Immediately-invoked function expression parameter type:
+    /// `(jake => {})("build")` → `jake` is contextually typed by the matching
+    /// call argument, widened (`"build"` → string).  The function may be wrapped
+    /// in any number of parentheses, and the call may be inside or outside them
+    /// (`(function(x){}("!"))` vs `(function(x){})("!")`).
+    fn iifeArgParamType(self: *Checker, param: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        // Find the enclosing fn-expr/arrow and the param's positional index.
+        var p = if (param.toInt() < parents.len) parents[param.toInt()] else NONE;
+        var fn_node: NodeIndex = .none;
+        var ps: u32 = 0;
+        var pe: u32 = 0;
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            const d = self.ast_ref.nodeData(pn);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .arrow_fn, .async_arrow_fn => {
+                    const ad = self.ast_ref.extraData(ast.ArrowData, @intFromEnum(d.lhs));
+                    fn_node = pn; ps = ad.params_start; pe = ad.params_end;
+                    break;
+                },
+                .fn_expr, .async_fn_expr => {
+                    if (d.lhs == .none) return null;
+                    const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
+                    fn_node = pn; ps = fd.params; pe = fd.params_end;
+                    break;
+                },
+                else => return null,
+            }
+        }
+        if (fn_node == .none) return null;
+        const ext = self.ast_ref.extra_data;
+        if (ps > pe or pe > ext.len) return null;
+        var idx: ?usize = null;
+        for (ext[ps..pe], 0..) |raw, i| {
+            if (raw == param.toInt()) { idx = i; break; }
+        }
+        const pidx = idx orelse return null;
+        // Walk up through any wrapping parentheses to a call whose CALLEE is the
+        // (wrapped) function.
+        var cur = fn_node;
+        var guard: u8 = 0;
+        while (guard < 8) : (guard += 1) {
+            const cp = if (cur.toInt() < parents.len) parents[cur.toInt()] else NONE;
+            if (cp == NONE) return null;
+            const cpn: NodeIndex = @enumFromInt(cp);
+            const ctag = self.ast_ref.nodeTag(cpn);
+            if (ctag == .grouping_expr) { cur = cpn; continue; }
+            if (ctag == .call_expr or ctag == .optional_call_expr) {
+                if (self.ast_ref.nodeData(cpn).lhs != cur) return null; // fn must be the callee
+                const args = self.callArguments(cpn);
+                if (pidx >= args.len) return null;
+                const arg_ty = self.typeOf(@enumFromInt(args[pidx]));
+                const widened = self.widenForParamDefault(arg_ty, 0);
+                // An optional param (`(j?) => …`) is `T | undefined` under
+                // strictNullChecks even when the call supplies the argument.
+                if (self.paramHasOptionalMarker(param) and
+                    !self.checker_opts.strict_null_checks_explicit_off)
+                {
+                    return self.store.unionOf(&.{ widened, tymod.ID_UNDEFINED }) catch widened;
+                }
+                return widened;
+            }
+            return null;
+        }
+        return null;
+    }
+
     fn contextualParamType(self: *Checker, param: NodeIndex) ?TypeId {
         const parents = self.semantic.parent_indices;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
