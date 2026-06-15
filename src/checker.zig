@@ -401,10 +401,15 @@ pub const Checker = struct {
     jsdoc_built: bool = false,
     jsdoc_type_depth: u8 = 0,
 
-    /// Cache: type name → resolved TypeId for declared structural types.
-    /// Populated lazily by `resolveDeclaredType`.  Recursion-safe via a
-    /// sentinel (ID_UNKNOWN inserted before recursion, replaced after).
-    declared_type_cache: std.StringHashMapUnmanaged(TypeId),
+    /// Unified declared-type cache: "<scope>\x00<name>" → resolved TypeId.
+    /// One store keyed by (scope, name): the reserved scope "\x01" is the
+    /// AMBIENT (scope-blind) resolution; any other scope is a namespace-scoped
+    /// build. Populated lazily by `resolveDeclaredTypeIn`. Recursion-safe via a
+    /// sentinel (ID_UNKNOWN inserted before recursion, replaced after). Keys are
+    /// gpa-owned (uniform ownership); freed in deinit. Replaces the former
+    /// name-keyed `declared_type_cache` + scope-keyed `scoped_type_cache` — the
+    /// two parallel paths are now one (scope,name)-keyed path.
+    type_cache: std.StringHashMapUnmanaged(TypeId) = .empty,
 
     /// Per-enum classification: number-valued or string-valued.  TS infers
     /// each enum as one or the other based on whether ANY member has a
@@ -501,12 +506,6 @@ pub const Checker = struct {
     /// alongside `type_decl_nodes` during registration; consumed by the
     /// scope-aware resolution path (`resolveDeclaredTypeInScope`).
     type_decls_by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
-
-    /// Cache for the scope-aware resolution path, keyed by "<scope>\x00<name>"
-    /// (NUL separator — never present in dotted identifier paths). Distinct from
-    /// `declared_type_cache` (bare-name keyed) so the same name in different
-    /// namespaces caches independently. Keys are gpa-owned; freed in deinit.
-    scoped_type_cache: std.StringHashMapUnmanaged(TypeId) = .empty,
 
     /// Maps generic function TypeId → rendered type-parameter prefix string
     /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
@@ -638,7 +637,6 @@ pub const Checker = struct {
             .node_to_sym = node_to_sym,
             .known_type_names = .empty,
             .type_decl_nodes = .empty,
-            .declared_type_cache = .empty,
             .enum_kinds = .empty,
             .global_value_types = .empty,
             .natively_bound_type_ids = .empty,
@@ -682,7 +680,11 @@ pub const Checker = struct {
         self.jsdoc_returns.deinit(self.gpa);
         self.jsdoc_vars.deinit(self.gpa);
         self.type_decl_nodes.deinit(self.gpa);
-        self.declared_type_cache.deinit(self.gpa);
+        {
+            var cit = self.type_cache.keyIterator();
+            while (cit.next()) |k| self.gpa.free(k.*);
+            self.type_cache.deinit(self.gpa);
+        }
         self.global_value_types.deinit(self.gpa);
         self.natively_bound_type_ids.deinit(self.gpa);
         self.import_map.deinit(self.gpa);
@@ -716,11 +718,6 @@ pub const Checker = struct {
             var dit = self.type_decls_by_name.valueIterator();
             while (dit.next()) |list| list.deinit(self.gpa);
             self.type_decls_by_name.deinit(self.gpa);
-        }
-        {
-            var sit = self.scoped_type_cache.keyIterator();
-            while (sit.next()) |k| self.gpa.free(k.*);
-            self.scoped_type_cache.deinit(self.gpa);
         }
         {
             var it = self.fn_type_params.valueIterator();
@@ -14008,16 +14005,81 @@ pub const Checker = struct {
         return t;
     }
 
-    /// type (e.g. an import or type alias to a non-structural type).
-    fn resolveDeclaredType(self: *Checker, name: []const u8) ?TypeId {
-        if (self.declared_type_cache.get(name)) |cached| {
-            // Resolved or sentinel (recursion in progress).
-            return cached;
+    /// Unified declared-type cache key: "<scope>\x00<name>". The reserved scope
+    /// "\x01" marks AMBIENT (scope-blind) resolution; any other value is a
+    /// namespace-scope path. Returns null only on buffer overflow (caching skipped).
+    fn typeCacheKey(buf: []u8, name: []const u8, scope: ?[]const u8) ?[]const u8 {
+        const s = scope orelse "\x01";
+        return std.fmt.bufPrint(buf, "{s}\x00{s}", .{ s, name }) catch null;
+    }
+
+    fn typeCacheGet(self: *Checker, name: []const u8, scope: ?[]const u8) ?TypeId {
+        var kb: [384]u8 = undefined;
+        const key = typeCacheKey(&kb, name, scope) orelse return null;
+        return self.type_cache.get(key);
+    }
+
+    fn typeCachePut(self: *Checker, name: []const u8, scope: ?[]const u8, val: TypeId) void {
+        var kb: [384]u8 = undefined;
+        const key = typeCacheKey(&kb, name, scope) orelse return;
+        const gop = self.type_cache.getOrPut(self.gpa, key) catch return;
+        if (!gop.found_existing) {
+            // getOrPut stored the stack slice as the key; own it.
+            gop.key_ptr.* = self.gpa.dupe(u8, key) catch {
+                _ = self.type_cache.remove(key);
+                return;
+            };
         }
+        gop.value_ptr.* = val;
+    }
+
+    fn typeCacheRemove(self: *Checker, name: []const u8, scope: ?[]const u8) void {
+        var kb: [384]u8 = undefined;
+        const key = typeCacheKey(&kb, name, scope) orelse return;
+        if (self.type_cache.fetchRemove(key)) |kv| self.gpa.free(kv.key);
+    }
+
+    /// Resolve a declared type by bare name in the AMBIENT (scope-blind) scope.
+    /// Thin wrapper over the unified `resolveDeclaredTypeIn`.
+    fn resolveDeclaredType(self: *Checker, name: []const u8) ?TypeId {
+        return self.resolveDeclaredTypeIn(name, null);
+    }
+
+    /// THE declared-type resolver, keyed by (scope, name).
+    ///   * scope == null → AMBIENT: build from the `type_decl_nodes` primary,
+    ///     merging ALL same-named declarations (legacy scope-blind behavior),
+    ///     plus cross-file import fallback.
+    ///   * scope != null → SCOPED: build only the scope-local declaration group
+    ///     (interfaces/single class) of `name` whose namespace scope == scope.
+    /// One cache, one recursion sentinel, one build dispatch.
+    fn resolveDeclaredTypeIn(self: *Checker, name: []const u8, scope: ?[]const u8) ?TypeId {
+        if (self.typeCacheGet(name, scope)) |cached| return cached; // resolved or recursion sentinel
+
+        if (scope) |s| {
+            // SCOPED build: the chosen scope's first interface/class declaration,
+            // merging only same-scope same-name decls (buildInterfaceType /
+            // buildClassInstanceType honor the scope_filter).
+            const primary = self.scopeLocalPrimary(name, s) orelse return null;
+            self.typeCachePut(name, scope, tymod.ID_UNKNOWN); // sentinel
+            self.type_pos_depth += 1;
+            defer self.type_pos_depth -= 1;
+            const result = switch (self.ast_ref.nodeTag(primary)) {
+                .ts_interface_decl => self.buildInterfaceType(primary, s),
+                .class_decl => self.buildClassInstanceType(primary, name, s),
+                else => {
+                    self.typeCacheRemove(name, scope);
+                    return null;
+                },
+            };
+            self.typeCachePut(name, scope, result);
+            return result;
+        }
+
+        // AMBIENT build.
         const decl = self.type_decl_nodes.get(name) orelse {
             // Not declared locally — try cross-file import resolution.
             if (self.resolveImportedType(name)) |imported| {
-                self.declared_type_cache.put(self.gpa, name, imported) catch {};
+                self.typeCachePut(name, null, imported);
                 return imported;
             }
             // Name is imported but module resolution failed → preserve as type_ref
@@ -14025,7 +14087,7 @@ pub const Checker = struct {
             // `() => ImportedType` rather than `() => any`.
             if (self.import_map.get(name) != null) {
                 const tr = self.store.typeRef(name, &.{}) catch tymod.ID_ANY;
-                self.declared_type_cache.put(self.gpa, name, tr) catch {};
+                self.typeCachePut(name, null, tr);
                 return tr;
             }
             return null;
@@ -14034,7 +14096,7 @@ pub const Checker = struct {
         // On OOM, skip the sentinel rather than returning null — a missing sentinel
         // risks deeper recursion on recursive types but won't silently drop results
         // for non-recursive types under memory pressure.
-        self.declared_type_cache.put(self.gpa, name, tymod.ID_UNKNOWN) catch {};
+        self.typeCachePut(name, null, tymod.ID_UNKNOWN);
         // Build interface/class structural types with type_pos_depth > 0 so that
         // unconstrained type parameters (e.g. `T` in `interface Pair<T>`) resolve to
         // `type_param("T")` rather than `any`.  This makes the cached structural type
@@ -14057,7 +14119,7 @@ pub const Checker = struct {
             // wrapping union — matching tsc, which is what keeps
             // no-unsafe-enum-comparison FP-safe on `Enum | string` etc.
             .ts_enum_decl => self.buildEnumUnionType(name) orelse {
-                _ = self.declared_type_cache.remove(name);
+                self.typeCacheRemove(name, null);
                 return null;
             },
             .ts_namespace_decl, .ts_module_decl => self.buildNamespaceType(decl),
@@ -14073,12 +14135,27 @@ pub const Checker = struct {
                 break :blk r;
             },
             else => {
-                _ = self.declared_type_cache.remove(name);
+                self.typeCacheRemove(name, null);
                 return null;
             },
         };
-        self.declared_type_cache.put(self.gpa, name, result) catch {};
+        self.typeCachePut(name, null, result);
         return result;
+    }
+
+    /// The first interface/class declaration of `name` whose namespace scope
+    /// equals `scope` — the representative to build a scoped type from.
+    fn scopeLocalPrimary(self: *Checker, name: []const u8, scope: []const u8) ?NodeIndex {
+        const list = self.type_decls_by_name.get(name) orelse return null;
+        for (list.items) |d| {
+            switch (self.ast_ref.nodeTag(d)) {
+                .ts_interface_decl, .class_decl => {},
+                else => continue,
+            }
+            var db: [192]u8 = undefined;
+            if (std.mem.eql(u8, self.namespaceScopeKey(d, &db), scope)) return d;
+        }
+        return null;
     }
 
     /// True when decl-scope `outer` lexically encloses (or equals) use-site
@@ -14161,30 +14238,8 @@ pub const Checker = struct {
         if (n_class == 1 and n_iface > 0) return null; // class+interface merge: scope-blind
         if (primary == .none) return null;
 
-        return self.buildScopedType(name, scope, primary);
-    }
-
-    /// Build (and cache) the structural type for the chosen scope's `primary`
-    /// declaration, merging only same-scope same-name declarations. Recursion
-    /// is broken by a sentinel keyed on "<scope>\x00<name>".
-    fn buildScopedType(self: *Checker, name: []const u8, scope: []const u8, primary: NodeIndex) ?TypeId {
-        var key_buf: [384]u8 = undefined;
-        const cache_key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}", .{ scope, name }) catch return null;
-        if (self.scoped_type_cache.get(cache_key)) |cached| return cached;
-        const owned_key = self.gpa.dupe(u8, cache_key) catch return null;
-        self.scoped_type_cache.put(self.gpa, owned_key, tymod.ID_UNKNOWN) catch {
-            self.gpa.free(owned_key);
-            return null;
-        };
-        self.type_pos_depth += 1;
-        defer self.type_pos_depth -= 1;
-        const result = switch (self.ast_ref.nodeTag(primary)) {
-            .ts_interface_decl => self.buildInterfaceType(primary, scope),
-            .class_decl => self.buildClassInstanceType(primary, name, scope),
-            else => return null,
-        };
-        self.scoped_type_cache.put(self.gpa, owned_key, result) catch {};
-        return result;
+        // Build (and cache) the scope-local group via the unified resolver.
+        return self.resolveDeclaredTypeIn(name, scope);
     }
 
     /// Build an object_t from a namespace/module body.  Exported `const`/`let`
