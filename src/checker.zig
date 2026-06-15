@@ -12142,7 +12142,8 @@ pub const Checker = struct {
                     const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(data.lhs));
                     const name = self.ast_ref.tokenText(ad.name);
                     try self.known_type_names.put(self.gpa, name, {});
-                    try self.type_decl_nodes.put(self.gpa, name, ni);
+                    // type_decl_nodes (primary) is derived later from
+                    // type_decls_by_name by deriveTypeIndexes.
                     self.registerScopedDecl(name, ni);
                 },
                 .ts_interface_decl => {
@@ -12150,57 +12151,17 @@ pub const Checker = struct {
                     const name = self.ast_ref.tokenText(id.name);
                     try self.known_type_names.put(self.gpa, name, {});
                     self.registerScopedDecl(name, ni);
-                    const gop = try self.type_decl_nodes.getOrPut(self.gpa, name);
-                    if (!gop.found_existing) {
-                        gop.value_ptr.* = ni;
-                    } else {
-                        // Declaration merging: store extra declaration for later.
-                        try self.merged_iface_extra.append(self.gpa, .{ .name = name, .node = ni });
-                    }
                 },
                 .ts_enum_decl => {
                     const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
                     const enum_name = self.ast_ref.tokenText(ed.name);
                     try self.known_type_names.put(self.gpa, enum_name, {});
                     self.registerScopedDecl(enum_name, ni);
-                    // Two-block enum merge: if an earlier `enum <name>` decl is
-                    // already registered IN THE SAME LEXICAL SCOPE, keep it so
-                    // buildEnumObjectType can combine members (source order =
-                    // extras… then primary).  Scope-aware: same-named enums in
-                    // DIFFERENT namespaces (`A.B.C.E` vs `A1.B.C.E`) must NOT
-                    // merge — they're distinct types.
-                    const egop = try self.type_decl_nodes.getOrPut(self.gpa, enum_name);
-                    if (egop.found_existing and self.ast_ref.nodeTag(egop.value_ptr.*) == .ts_enum_decl and
-                        self.declContainerKey(ni) == self.declContainerKey(egop.value_ptr.*))
-                        try self.merged_enum_extra.append(self.gpa, .{ .name = enum_name, .node = egop.value_ptr.* });
-                    egop.value_ptr.* = ni;
-                    // Determine the ESTABLISHED member kind: the kind of
-                    // the FIRST member with a concrete value (string or
-                    // number).  This is the rule's "established" kind:
-                    // subsequent mismatches fire.  Decl merging: only set
-                    // if no prior decl with the same name already set it.
-                    if (self.enum_kinds.get(enum_name) == null) {
-                        var saw_number = false;
-                        var saw_string = false;
-                        if (ed.members_start < ed.members_end and ed.members_end <= self.ast_ref.extra_data.len) {
-                            for (self.ast_ref.extra_data[ed.members_start..ed.members_end]) |raw| {
-                                const m: NodeIndex = @enumFromInt(raw);
-                                if (self.ast_ref.nodeTag(m) != .ts_enum_member) continue;
-                                const md = self.ast_ref.nodeData(m);
-                                if (md.rhs == .none) {
-                                    saw_number = true; // auto-increment is numeric
-                                    continue;
-                                }
-                                if (self.enumMemberKindIsString(md.rhs)) { saw_string = true; continue; }
-                                if (self.enumMemberKindIsNumber(md.rhs)) { saw_number = true; continue; }
-                            }
-                        }
-                        const kind: ?EnumKind = if (saw_string and saw_number) .mixed
-                            else if (saw_string) .string
-                            else if (saw_number) .number
-                            else null;
-                        if (kind) |k| try self.enum_kinds.put(self.gpa, enum_name, k);
-                    }
+                    // Primary, merged_enum_extra AND enum_kinds are derived later
+                    // by deriveTypeIndexes — enum_kinds classification can call
+                    // typeOf on complex member initializers (`b = Foo.a`), which
+                    // needs type_decl_nodes already populated, so it must run
+                    // AFTER derivation, not inline during this scan.
                 },
                 .class_decl => {
                     const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(data.lhs));
@@ -12209,17 +12170,6 @@ pub const Checker = struct {
                         const name = self.ast_ref.tokenText(tok);
                         try self.known_type_names.put(self.gpa, name, {});
                         self.registerScopedDecl(name, ni);
-                        const gop = try self.type_decl_nodes.getOrPut(self.gpa, name);
-                        if (!gop.found_existing) {
-                            gop.value_ptr.* = ni;
-                        } else {
-                            // If a same-named interface was registered first, rescue it
-                            // into merged_iface_extra so buildClassInstanceType can merge it.
-                            if (self.ast_ref.nodeTag(gop.value_ptr.*) == .ts_interface_decl) {
-                                try self.merged_iface_extra.append(self.gpa, .{ .name = name, .node = gop.value_ptr.* });
-                            }
-                            gop.value_ptr.* = ni;
-                        }
                     }
                 },
                 .ts_namespace_decl, .ts_module_decl => {
@@ -12228,12 +12178,6 @@ pub const Checker = struct {
                         const ns_name = self.ast_ref.tokenText(tok);
                         try self.known_type_names.put(self.gpa, ns_name, {});
                         self.registerScopedDecl(ns_name, ni);
-                        const gop = try self.type_decl_nodes.getOrPut(self.gpa, ns_name);
-                        if (!gop.found_existing) {
-                            gop.value_ptr.* = ni;
-                        } else {
-                            try self.merged_ns_extra.append(self.gpa, .{ .name = ns_name, .node = ni });
-                        }
                     } else if (data.lhs != .none) {
                         const tok = self.ast_ref.nodeMainToken(data.lhs);
                         try self.known_type_names.put(self.gpa, self.ast_ref.tokenText(tok), {});
@@ -12346,7 +12290,101 @@ pub const Checker = struct {
                 else => {},
             }
         }
+        try self.deriveTypeIndexes();
         try self.buildExpandoFns();
+    }
+
+    /// Derive the `type_decl_nodes` primary map and the `merged_*_extra` lists
+    /// from the single authoritative `type_decls_by_name` index. Replaces the
+    /// former inline maintenance during the registration scan: there is now ONE
+    /// source of truth for type declarations; the primary and the declaration-
+    /// merge extras are derived views computed here by replaying the selection
+    /// rules over each name's declarations in registration (source) order.
+    ///
+    /// Selection per name (matching the historical getOrPut behavior):
+    ///   * type alias / enum / class — always become the primary (last wins).
+    ///   * interface / namespace — become the primary only if none set yet
+    ///     (first wins); later same-name interfaces/namespaces are merge extras.
+    ///   * a class after an interface rescues that interface as a merge extra.
+    ///   * consecutive same-scope enums of one name record the prior primary as
+    ///     a merge extra (two-block enum merging).
+    fn deriveTypeIndexes(self: *Checker) !void {
+        var it = self.type_decls_by_name.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            var primary: NodeIndex = .none;
+            for (entry.value_ptr.items) |ni| {
+                switch (self.ast_ref.nodeTag(ni)) {
+                    .ts_type_alias_decl => primary = ni,
+                    .ts_interface_decl => {
+                        if (primary == .none) primary = ni
+                        else try self.merged_iface_extra.append(self.gpa, .{ .name = name, .node = ni });
+                    },
+                    .ts_enum_decl => {
+                        if (primary != .none and self.ast_ref.nodeTag(primary) == .ts_enum_decl and
+                            self.declContainerKey(ni) == self.declContainerKey(primary))
+                            try self.merged_enum_extra.append(self.gpa, .{ .name = name, .node = primary });
+                        primary = ni;
+                    },
+                    .class_decl => {
+                        if (primary != .none and self.ast_ref.nodeTag(primary) == .ts_interface_decl)
+                            try self.merged_iface_extra.append(self.gpa, .{ .name = name, .node = primary });
+                        primary = ni;
+                    },
+                    .ts_namespace_decl, .ts_module_decl => {
+                        if (primary == .none) primary = ni
+                        else try self.merged_ns_extra.append(self.gpa, .{ .name = name, .node = ni });
+                    },
+                    else => {},
+                }
+            }
+            if (primary != .none) try self.type_decl_nodes.put(self.gpa, name, primary);
+        }
+        // Pass B: enum classification, in SOURCE order. Runs with
+        // type_decl_nodes fully populated so the typeOf fallback in
+        // computeEnumKind (complex initializers like `b = Foo.a`) resolves
+        // correctly instead of poisoning node_types. Source order matters: the
+        // member-expr shortcut in enumMemberKindIsNumber/String reads the
+        // enum_kinds of an EARLIER-declared enum (`Zero = OtherEnum.Zero`), so
+        // earlier enums must be classified first — hashmap order would force the
+        // poisoning typeOf. First declaration of a name with a concrete kind wins.
+        const enum_total: u32 = @intCast(self.ast_ref.nodes.len);
+        var ei: u32 = 0;
+        while (ei < enum_total) : (ei += 1) {
+            const en: NodeIndex = @enumFromInt(ei);
+            if (self.ast_ref.nodeTag(en) != .ts_enum_decl) continue;
+            const data = self.ast_ref.nodeData(en);
+            if (data.lhs == .none) continue;
+            const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
+            const ename = self.ast_ref.tokenText(ed.name);
+            if (self.enum_kinds.get(ename) != null) continue; // first concrete kind wins
+            if (self.computeEnumKind(en)) |k| try self.enum_kinds.put(self.gpa, ename, k);
+        }
+    }
+
+    /// Classify an enum declaration as number/string/mixed by its members'
+    /// initializers (auto-increment counts as numeric). Returns null when no
+    /// member yields a determinable kind. May call typeOf for complex
+    /// initializers, so requires type_decl_nodes to be populated.
+    fn computeEnumKind(self: *Checker, enum_node: NodeIndex) ?EnumKind {
+        const data = self.ast_ref.nodeData(enum_node);
+        const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
+        var saw_number = false;
+        var saw_string = false;
+        if (ed.members_start < ed.members_end and ed.members_end <= self.ast_ref.extra_data.len) {
+            for (self.ast_ref.extra_data[ed.members_start..ed.members_end]) |raw| {
+                const m: NodeIndex = @enumFromInt(raw);
+                if (self.ast_ref.nodeTag(m) != .ts_enum_member) continue;
+                const md = self.ast_ref.nodeData(m);
+                if (md.rhs == .none) {
+                    saw_number = true; // auto-increment is numeric
+                    continue;
+                }
+                if (self.enumMemberKindIsString(md.rhs)) { saw_string = true; continue; }
+                if (self.enumMemberKindIsNumber(md.rhs)) { saw_number = true; continue; }
+            }
+        }
+        return if (saw_string and saw_number) .mixed else if (saw_string) .string else if (saw_number) .number else null;
     }
 
     /// Scan all assignment expressions for `funcName.prop = value` patterns.
