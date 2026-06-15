@@ -7827,8 +7827,43 @@ pub const Checker = struct {
             if (at.kind != .function_t) continue;
             const arg_sigs = self.store.signaturesOf(at.signatures);
             if (arg_sigs.len == 0) continue;
-            const concrete = arg_sigs[0].return_type;
-            if (self.typeMentionsTypeParam(concrete)) continue;
+            var concrete = arg_sigs[0].return_type;
+            // The argument is itself a GENERIC function (`identity: <A>(a:A)=>A`,
+            // whose return `A` is a type param): bind its type params by matching
+            // its params against the expected callback's concrete param types
+            // (`value: number`), then substitute into the return → `number`.
+            if (self.typeMentionsTypeParam(concrete)) {
+                const exp_params = self.store.signatureParamsOf(cb_sigs[0]);
+                const arg_params = self.store.signatureParamsOf(arg_sigs[0]);
+                var ak_buf: [4][]const u8 = undefined;
+                var av_buf: [4]TypeId = undefined;
+                var an: usize = 0;
+                for (arg_params, 0..) |ap, pi| {
+                    if (pi >= exp_params.len) break;
+                    const apt = self.store.get(ap);
+                    if (apt.kind == .type_param and !self.typeMentionsTypeParam(exp_params[pi])) {
+                        // A type param matched against MULTIPLE param positions
+                        // (`g<T>(x:T,y:T)` vs `(number, string)`) unions the
+                        // candidates, matching tsc (`T` = number | string).
+                        var found = false;
+                        for (ak_buf[0..an], 0..) |k, ki| {
+                            if (std.mem.eql(u8, k, apt.name)) {
+                                av_buf[ki] = self.store.unionOf(&.{ av_buf[ki], exp_params[pi] }) catch av_buf[ki];
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found and an < ak_buf.len) {
+                            ak_buf[an] = apt.name;
+                            av_buf[an] = exp_params[pi];
+                            an += 1;
+                        }
+                    }
+                }
+                if (an == 0) continue;
+                concrete = self.substituteTypeId(concrete, ak_buf[0..an], av_buf[0..an]);
+                if (self.typeMentionsTypeParam(concrete)) continue;
+            }
             if (concrete.eq(tymod.ID_UNKNOWN)) continue;
             // Widen literal returns (`x => 0` infers U = number).
             const widened = switch (self.store.get(concrete).kind) {
