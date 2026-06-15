@@ -1,5 +1,9 @@
 # ez-checker
 
+[![CI](https://github.com/ericsssan/ez-checker/actions/workflows/ci.yml/badge.svg)](https://github.com/ericsssan/ez-checker/actions/workflows/ci.yml)
+[![TypeScript corpus](https://img.shields.io/badge/TypeScript_corpus-83.2%25-brightgreen)](#conformance)
+[![primitive types](https://img.shields.io/badge/primitive_types-90.3%25-brightgreen)](#conformance)
+
 A reimplementation of the TypeScript type checker. Just the type system: infer the type of any expression, resolve declarations, narrow through control flow. No emit, no diagnostics, no `tsconfig.json`.
 
 Originally extracted from the [Ez](https://github.com/ericsssan/Ez) linter, but the type inference engine is general-purpose — usable by linters, compilers, language servers, or any tool that needs to reason about TypeScript types.
@@ -27,6 +31,19 @@ Variables, functions (with overloads), classes (instance + static, inheritance),
 
 **Cross-file resolution**
 Optional. Implement `ModuleResolver` and set `Checker.module_resolver` to resolve types from imported modules lazily.
+
+---
+
+## Conformance
+
+Measured against the TypeScript compiler itself: for every expression in the [microsoft/TypeScript](https://github.com/microsoft/TypeScript) test corpus, ez-checker infers a type and compares it — string for string — against the `.types` baseline `tsc` emits for that same expression.
+
+| Metric | Correct | Total | Rate |
+| --- | --- | --- | --- |
+| All expression types | 547,099 | 657,474 | **83.2%** |
+| Primitive types (sub-metric) | 336,325 | 372,262 | **90.3%** |
+
+A ratchet (`oracle/baseline.lock`) records these floors; `zig build test-oracle` fails if any metric regresses, and CI enforces it on every push and pull request. Sweep the corpus with `zig build run-oracle`; raise the floor after a genuine gain with `zig build save-baseline`.
 
 ---
 
