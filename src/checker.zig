@@ -11960,6 +11960,10 @@ pub const Checker = struct {
 
         // Temporal (lib.esnext): the namespace value renders `typeof Temporal`.
         try self.global_value_types.put(self.gpa, "Temporal", try self.store.typeRef("typeof Temporal", &.{}));
+        // Intl (lib.*.intl): the namespace value renders `typeof Intl`; member
+        // access yields the per-API `Intl.XConstructor` (see intlProperty).
+        if (!self.global_value_types.contains("Intl"))
+            try self.global_value_types.put(self.gpa, "Intl", try self.store.typeRef("typeof Intl", &.{}));
 
         // TypedArray / ArrayBuffer constructors — the bare global in value
         // position is `typeof Xxx` which tsc prints as `XxxConstructor`.
@@ -12515,6 +12519,26 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "bigint")) return tymod.ID_BIGINT;
         if (std.mem.eql(u8, name, "symbol")) return tymod.ID_SYMBOL;
         if (std.mem.eql(u8, name, "object")) return tymod.ID_OBJECT_KW;
+        // Qualified lib-namespace type `Intl.X` / `Temporal.X` (not locally
+        // shadowed): tsc keeps the verbatim qualified name (`Intl.Locale`,
+        // `Temporal.Duration`).  We don't model these lib structures, so render
+        // the name and let member access stay a (smaller) gap.
+        if ((std.mem.eql(u8, name, "Intl") or std.mem.eql(u8, name, "Temporal")) and
+            !self.type_decl_nodes.contains(name))
+        {
+            const tdL = self.ast_ref.nodeData(ty_node);
+            if (tdL.lhs != .none and self.ast_ref.nodeTag(tdL.lhs) == .member_expr) {
+                const mdL = self.ast_ref.nodeData(tdL.lhs);
+                if (mdL.rhs != .none) {
+                    const qual = self.qualifiedTypeName(ty_node, mdL.rhs);
+                    if (qual.len > 0) {
+                        var args_bufI: [8]TypeId = undefined;
+                        const argsI = self.collectTypeArgs(ty_node, &args_bufI);
+                        return self.store.typeRef(qual, argsI) catch tymod.ID_ANY;
+                    }
+                }
+            }
+        }
         if (std.mem.eql(u8, name, "void")) return tymod.ID_VOID;
         if (std.mem.eql(u8, name, "undefined")) return tymod.ID_UNDEFINED;
         if (std.mem.eql(u8, name, "null")) return tymod.ID_NULL;
@@ -16971,13 +16995,34 @@ pub const Checker = struct {
         if (self.ast_ref.nodeTag(c) == .member_expr) {
             const mt = self.store.get(self.typeOf(c));
             if (mt.kind == .type_ref and
-                std.mem.startsWith(u8, mt.name, "Temporal.") and
+                (std.mem.startsWith(u8, mt.name, "Temporal.") or
+                    std.mem.startsWith(u8, mt.name, "Intl.")) and
                 std.mem.endsWith(u8, mt.name, "Constructor"))
             {
                 const inst = mt.name[0 .. mt.name.len - "Constructor".len];
                 const owned = self.gpa.dupe(u8, inst) catch return null;
                 self.string_pool.append(self.gpa, owned) catch {};
                 return self.store.typeRef(owned, &.{}) catch null;
+            }
+            // `new Intl.X(...)` / `new Temporal.X(...)` by SYNTAX: root is the
+            // lib namespace global → the instance is `Intl.X` / `Temporal.X`,
+            // even when we don't model the constructor value (e.g. Intl.Locale,
+            // whose constructor lib.d.ts defines inline).
+            const md = self.ast_ref.nodeData(c);
+            if (md.lhs != .none and md.rhs != .none and
+                self.ast_ref.nodeTag(md.lhs) == .identifier)
+            {
+                const root = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.lhs));
+                if ((std.mem.eql(u8, root, "Intl") or std.mem.eql(u8, root, "Temporal")) and
+                    !self.type_decl_nodes.contains(root))
+                {
+                    const member = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
+                    if (member.len > 0) {
+                        const q = std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ root, member }) catch return null;
+                        self.string_pool.append(self.gpa, q) catch self.gpa.free(q);
+                        return self.store.typeRef(q, &.{}) catch null;
+                    }
+                }
             }
             return null;
         }
@@ -20257,6 +20302,10 @@ pub const Checker = struct {
         {
             if (self.temporalProperty(t.name, name)) |ty| return ty;
         }
+        // Intl namespace: `Intl.NumberFormat` (value) → `Intl.NumberFormatConstructor`.
+        if (std.mem.eql(u8, t.name, "typeof Intl")) {
+            if (self.intlProperty(name)) |ty| return ty;
+        }
         // High-fidelity Object/Array statics (lib.es5 shapes tsc prints).
         if (std.mem.eql(u8, t.name, "ObjectConstructor")) {
             if (self.objectConstructorProperty(name)) |ty| return ty;
@@ -20570,6 +20619,25 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, c)) return true;
         }
         return false;
+    }
+
+    /// `typeof Intl` member access: the well-known constructor APIs render as
+    /// `Intl.<Name>Constructor`; `getCanonicalLocales` is a function.
+    fn intlProperty(self: *Checker, name: []const u8) ?TypeId {
+        // Only the lib.es5/es2018 APIs that lib.d.ts defines via a NAMED
+        // `XConstructor` interface — tsc prints those as `Intl.XConstructor`.
+        // Newer APIs (ListFormat/Segmenter/DisplayNames/Locale/…) are defined
+        // inline (`{ new(...): X }`), too structural to model, so left as gaps.
+        if (eqAny(name, &.{
+            "NumberFormat", "DateTimeFormat", "Collator", "PluralRules",
+        })) {
+            var buf: [64]u8 = undefined;
+            const ctor = std.fmt.bufPrint(&buf, "Intl.{s}Constructor", .{name}) catch return null;
+            const owned = self.gpa.dupe(u8, ctor) catch return null;
+            self.string_pool.append(self.gpa, owned) catch {};
+            return self.store.typeRef(owned, &.{}) catch null;
+        }
+        return null;
     }
 
     fn temporalProperty(self: *Checker, owner: []const u8, name: []const u8) ?TypeId {
