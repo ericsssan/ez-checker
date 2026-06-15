@@ -17077,6 +17077,7 @@ pub const Checker = struct {
         // For type inference, TypeScript excludes hole elements (elisions) — e.g.
         // `[,, 2, 3, 4]` infers as `number[]`, not a tuple with undefined holes.
         var buf: [32]TypeId = undefined;
+        var is_const_elem: [32]bool = std.mem.zeroes([32]bool);
         var n_used: usize = 0;
         const n = @min(slice.len, buf.len);
         var has_spread = false;
@@ -17113,6 +17114,7 @@ pub const Checker = struct {
                 }
             } else {
                 buf[n_used] = self.typeOf(elem_node);
+                is_const_elem[n_used] = self.nodeIsAsConst(elem_node);
             }
             n_used += 1;
         }
@@ -17147,6 +17149,21 @@ pub const Checker = struct {
             // Exception: when the array literal is the RHS of an array-destructuring
             // declarator, tsc infers a fixed-length tuple ([1, 2] → [number, number]).
             // Special case: enum members widen to their enum type, not the underlying number.
+            // If ALL elements are `as const`, preserve the literal types.
+            var all_as_const = true;
+            for (0..n_used) |j| {
+                if (!is_const_elem[j]) { all_as_const = false; break; }
+            }
+            if (all_as_const) {
+                // `["a" as const, "b" as const]` → `("a" | "b")[]`
+                if (self.isArrayInDestructuringRhs(node) or self.isArrayInSpreadArg(node)) {
+                    const list = self.store.appendTypeIds(buf[0..n_used]) catch
+                        return self.store.arrayOf(self.store.unionOf(buf[0..n_used]) catch tymod.ID_ANY) catch tymod.ID_ANY;
+                    return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_ANY;
+                }
+                const lit_elem_t = self.store.unionOf(buf[0..n_used]) catch tymod.ID_ANY;
+                return self.store.arrayOf(lit_elem_t) catch tymod.ID_ANY;
+            }
             const elem_t: TypeId = blk: {
                 if (first_kind == .number_literal) {
                     const first_enum_name = self.store.get(buf[0]).enum_name;
@@ -17187,7 +17204,7 @@ pub const Checker = struct {
         var any_widened = false;
         for (0..n_used) |j| {
             const et = self.store.get(buf[j]);
-            const w: TypeId = switch (et.kind) {
+            const w: TypeId = if (is_const_elem[j]) buf[j] else switch (et.kind) {
                 .string_literal => blk: { any_widened = true; break :blk tymod.ID_STRING; },
                 .number_literal => blk: { any_widened = true; break :blk tymod.ID_NUMBER; },
                 .bigint_literal => blk: { any_widened = true; break :blk tymod.ID_BIGINT; },
@@ -17311,6 +17328,25 @@ pub const Checker = struct {
         if (as_data.rhs == .none or self.ast_ref.nodeTag(as_data.rhs) != .ts_type_reference) return false;
         const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(as_data.rhs));
         return std.mem.eql(u8, cname, "const");
+    }
+
+    /// True when `node` itself is `expr as const` or `<const>expr`.
+    fn nodeIsAsConst(self: *Checker, node: NodeIndex) bool {
+        const tag = self.ast_ref.nodeTag(node);
+        const data = self.ast_ref.nodeData(node);
+        if (tag == .ts_as_expr) {
+            if (data.rhs == .none) return false;
+            if (self.ast_ref.nodeTag(data.rhs) != .ts_type_reference) return false;
+            const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.rhs));
+            return std.mem.eql(u8, name, "const");
+        }
+        if (tag == .ts_type_assertion) {
+            if (data.lhs == .none) return false;
+            if (self.ast_ref.nodeTag(data.lhs) != .ts_type_reference) return false;
+            const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
+            return std.mem.eql(u8, name, "const");
+        }
+        return false;
     }
 
     fn inferObjectLiteral(self: *Checker, node: NodeIndex) TypeId {
