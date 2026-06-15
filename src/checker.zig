@@ -5886,6 +5886,80 @@ pub const Checker = struct {
                         // source variable itself has a "widening" literal and
                         // TypeScript widens `let y = x` to the base type.
                         const src_is_non_widening: bool = blk: {
+                            // Walk `||` chains: `let x = a || b` inherits non-widening
+                            // if the leftmost annotated/as-const identifier is found.
+                            // Also recurses into the init when the left side is itself
+                            // a `||` chain (e.g. `let d = b || "bar"` where b = `a || "foo"`).
+                            if (init_tag == .logical_or) lor_walk: {
+                                var lor_cur = data.rhs;
+                                var lor_depth: u8 = 0;
+                                while (lor_depth < 8) : (lor_depth += 1) {
+                                    if (lor_cur == .none) break :lor_walk;
+                                    if (self.ast_ref.nodeTag(lor_cur) != .logical_or) break :lor_walk;
+                                    const lor_d = self.ast_ref.nodeData(lor_cur);
+                                    if (lor_d.lhs == .none) break :lor_walk;
+                                    if (self.ast_ref.nodeTag(lor_d.lhs) != .identifier) break :lor_walk;
+                                    const lor_sym = self.symbolForIdentRef(lor_d.lhs) orelse break :lor_walk;
+                                    const lor_decl = self.semantic.symbols.getDeclNode(lor_sym);
+                                    if (lor_decl == .none) break :lor_walk;
+                                    const lor_bd = self.ast_ref.nodeData(lor_decl);
+                                    if (lor_bd.rhs != .none and
+                                        self.ast_ref.nodeTag(lor_bd.rhs) == .ts_type_annotation)
+                                        break :blk true;
+                                    const lor_di = lor_decl.toInt();
+                                    if (lor_di >= self.semantic.parent_indices.len) break :lor_walk;
+                                    const lor_par_idx = self.semantic.parent_indices[lor_di];
+                                    const NONE_LOR: u32 = @intFromEnum(NodeIndex.none);
+                                    if (lor_par_idx == NONE_LOR) break :lor_walk;
+                                    const lor_par: NodeIndex = @enumFromInt(lor_par_idx);
+                                    if (self.ast_ref.nodeTag(lor_par) != .declarator) break :lor_walk;
+                                    const lor_dd = self.ast_ref.nodeData(lor_par);
+                                    if (lor_dd.lhs != .none) {
+                                        const lor_bbd = self.ast_ref.nodeData(lor_dd.lhs);
+                                        if (lor_bbd.rhs != .none and
+                                            self.ast_ref.nodeTag(lor_bbd.rhs) == .ts_type_annotation)
+                                            break :blk true;
+                                    }
+                                    if (lor_dd.rhs == .none) break :lor_walk;
+                                    const lor_rhs_tag = self.ast_ref.nodeTag(lor_dd.rhs);
+                                    if (lor_rhs_tag == .ts_as_expr) {
+                                        const lor_id = self.ast_ref.nodeData(lor_dd.rhs);
+                                        if (lor_id.rhs != .none and
+                                            self.ast_ref.nodeTag(lor_id.rhs) == .ts_type_reference)
+                                        {
+                                            const type_tok = self.ast_ref.nodeMainToken(lor_id.rhs);
+                                            const tok_tag = self.ast_ref.tokenTag(type_tok);
+                                            if (tok_tag == .string_literal or tok_tag == .number_literal or
+                                                tok_tag == .bigint_literal or tok_tag == .kw_true or
+                                                tok_tag == .kw_false) break :blk true;
+                                            if (std.mem.eql(u8, self.ast_ref.tokenText(type_tok), "const"))
+                                                break :blk true;
+                                        }
+                                        break :lor_walk;
+                                    }
+                                    if (lor_rhs_tag == .ts_type_assertion) {
+                                        const lor_id = self.ast_ref.nodeData(lor_dd.rhs);
+                                        if (lor_id.lhs != .none and
+                                            self.ast_ref.nodeTag(lor_id.lhs) == .ts_type_reference)
+                                        {
+                                            const type_tok = self.ast_ref.nodeMainToken(lor_id.lhs);
+                                            const tok_tag = self.ast_ref.tokenTag(type_tok);
+                                            if (tok_tag == .string_literal or tok_tag == .number_literal or
+                                                tok_tag == .bigint_literal or tok_tag == .kw_true or
+                                                tok_tag == .kw_false) break :blk true;
+                                            if (std.mem.eql(u8, self.ast_ref.tokenText(type_tok), "const"))
+                                                break :blk true;
+                                        }
+                                        break :lor_walk;
+                                    }
+                                    // Left identifier has a `||` init — walk into it.
+                                    if (lor_rhs_tag == .logical_or) {
+                                        lor_cur = lor_dd.rhs;
+                                        continue;
+                                    }
+                                    break :lor_walk;
+                                }
+                            }
                             if (init_tag != .identifier and
                                 init_tag != .member_expr and
                                 init_tag != .optional_member_expr) break :blk false;
