@@ -524,6 +524,14 @@ pub const Checker = struct {
     /// of the scope it introduces. Used to find a node's enclosing scope.
     scope_intro: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 
+    /// The print LOCATION for the current type-to-string render (tsc's
+    /// `enclosingDeclaration`): the expression node whose type is being rendered.
+    /// A type's name is qualified relative to THIS node's scope. `.none` =
+    /// location-unaware render (no qualification). Set by `typeToStringAt` for
+    /// the duration of one render; constant across the whole type (matching tsc,
+    /// which fixes enclosingDeclaration for an entire typeToString call).
+    render_location: NodeIndex = .none,
+
     /// Maps generic function TypeId → rendered type-parameter prefix string
     /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
     /// method type is built; looked up by typeToStringInner to emit the correct
@@ -22994,6 +23002,16 @@ pub const Checker = struct {
         errdefer buf.deinit(self.gpa);
         try self.typeToStringInner(id, &buf, 0);
         return buf.toOwnedSlice(self.gpa);
+    }
+
+    /// Location-aware render (tsc's typeToString with an enclosingDeclaration):
+    /// renders `id` as seen from `location`, qualifying named types relative to
+    /// that node's scope. With `location == .none` this is exactly `typeToString`.
+    pub fn typeToStringAt(self: *Checker, id: TypeId, location: NodeIndex) ![]const u8 {
+        const prev = self.render_location;
+        self.render_location = location;
+        defer self.render_location = prev;
+        return self.typeToString(id);
     }
 
     fn typeToStringInner(self: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8) !void {

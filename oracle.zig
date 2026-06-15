@@ -1867,7 +1867,9 @@ fn evalSectionInner(arena: std.mem.Allocator, sec: Section, lang: Language, chec
         } else raw_text;
         const line = lineOf(starts, span.start);
         const ty = checker.typeOf(ni);
-        const tystr = checker.typeToString(ty) catch continue;
+        // Render as seen from this expression node (tsc's enclosingDeclaration),
+        // so named types qualify relative to where they're printed.
+        const tystr = checker.typeToStringAt(ty, ni) catch continue;
         const key = Key{ .line = line, .text = text };
         const gop = try map.getOrPut(key);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
