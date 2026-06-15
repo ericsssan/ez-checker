@@ -3227,22 +3227,6 @@ pub const Checker = struct {
     /// namespace body / program it's a statement of), skipping `export …`
     /// wrappers.  Two declarations with the same container key are in the same
     /// scope.  Used to gate scope-aware enum merging.
-    fn declContainerKey(self: *Checker, node: NodeIndex) u32 {
-        const parents = self.semantic.parent_indices;
-        const NONE: u32 = @intFromEnum(NodeIndex.none);
-        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
-        var guard: u8 = 0;
-        while (p != NONE and p < self.ast_ref.nodes.len and guard < 6) : (guard += 1) {
-            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
-                .export_named, .export_default_class, .export_default_fn, .export_default_expr => {
-                    p = if (p < parents.len) parents[p] else NONE;
-                },
-                else => return p,
-            }
-        }
-        return p;
-    }
-
     fn buildEnumObjectType(self: *Checker, enum_name: []const u8) ?TypeId {
         const decl = self.type_decl_nodes.get(enum_name) orelse return null;
         if (self.ast_ref.nodeTag(decl) != .ts_enum_decl) return null;
@@ -12415,8 +12399,11 @@ pub const Checker = struct {
                         else try self.merged_iface_extra.append(self.gpa, .{ .name = name, .node = ni });
                     },
                     .ts_enum_decl => {
+                        // Two-block enum merge only within ONE physical container
+                        // (same enclosing lexical scope), so sibling-namespace
+                        // homonyms stay distinct.
                         if (primary != .none and self.ast_ref.nodeTag(primary) == .ts_enum_decl and
-                            self.declContainerKey(ni) == self.declContainerKey(primary))
+                            self.enclosingScopeIdx(ni) == self.enclosingScopeIdx(primary))
                             try self.merged_enum_extra.append(self.gpa, .{ .name = name, .node = primary });
                         primary = ni;
                     },
