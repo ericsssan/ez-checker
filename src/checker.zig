@@ -14075,6 +14075,57 @@ pub const Checker = struct {
     /// `ts_property_signature` / `ts_method_signature` becomes one
     /// ObjectProp.  Method signatures resolve to a function_t for that
     /// method.  Extends clauses are flattened through the full hierarchy.
+    /// The dotted name-path of `node`'s enclosing namespace/module chain
+    /// (`""` = global), into `buf`.  Two same-named declarations declaration-merge
+    /// iff their scope keys match — same LOGICAL namespace even across separate
+    /// `namespace M {}` blocks (distinct AST nodes, same scope).  Distinct names
+    /// (global vs `M` vs `N`) are different scopes → distinct types.
+    fn enclosingScopeKey(self: *Checker, node: NodeIndex, buf: []u8) []const u8 {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var names: [16][]const u8 = undefined;
+        var n: usize = 0;
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .ts_namespace_decl, .ts_module_decl => {
+                    if (n < names.len) {
+                        const d = self.ast_ref.nodeData(pn);
+                        names[n] = if (d.lhs != .none)
+                            self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs))
+                        else
+                            "";
+                        n += 1;
+                    }
+                },
+                else => {},
+            }
+        }
+        var len: usize = 0;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            if (len > 0 and len < buf.len) {
+                buf[len] = '.';
+                len += 1;
+            }
+            for (names[i]) |c| {
+                if (len < buf.len) {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        return buf[0..len];
+    }
+
+    fn sameEnclosingScope(self: *Checker, a: NodeIndex, b: NodeIndex) bool {
+        var buf_a: [256]u8 = undefined;
+        var buf_b: [256]u8 = undefined;
+        return std.mem.eql(u8, self.enclosingScopeKey(a, &buf_a), self.enclosingScopeKey(b, &buf_b));
+    }
+
     fn buildInterfaceType(self: *Checker, decl: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(decl);
         const id = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(data.lhs));
@@ -14170,6 +14221,12 @@ pub const Checker = struct {
         const iface_name = self.ast_ref.tokenText(id.name);
         for (self.merged_iface_extra.items) |entry| {
             if (!std.mem.eql(u8, entry.name, iface_name)) continue;
+            // A same-named declaration in a DIFFERENT namespace is a distinct
+            // type we can't resolve separately; merging it is a pragmatic
+            // approximation, but its methods must be DEDUPED (else identical
+            // signatures pile up as bogus overloads `{ (): X; (): X; }`).
+            // Genuine same-scope merging keeps duplicate overloads verbatim.
+            const cross_scope = !self.sameEnclosingScope(decl, entry.node);
             const extra_data = self.ast_ref.nodeData(entry.node);
             const extra_id = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(extra_data.lhs));
             if (extra_id.body_end > extra_id.body_start) {
@@ -14201,7 +14258,7 @@ pub const Checker = struct {
                                 if (std.mem.eql(u8, existing.name, p.name) and
                                     self.store.get(existing.type_id).kind == .function_t)
                                 {
-                                    existing.type_id = self.mergeFunctionTypes(existing.type_id, p.type_id);
+                                    existing.type_id = self.mergeFunctionTypesD(existing.type_id, p.type_id, cross_scope);
                                     merged = true;
                                     break;
                                 }
@@ -14485,7 +14542,35 @@ pub const Checker = struct {
 
     /// Merge two function_t types into one multi-sig function_t by appending
     /// the signatures of `new_ty` after those of `existing_ty`.
+    /// Two signatures are structurally equal for overload-dedup purposes: same
+    /// return type, same param types (interned, so TypeId equality suffices),
+    /// and same construct/rest shape.  Names are ignored.
+    fn signaturesStructurallyEqual(self: *Checker, a: tymod.Signature, b: tymod.Signature) bool {
+        if (!a.return_type.eq(b.return_type)) return false;
+        if (a.is_construct != b.is_construct) return false;
+        if (a.rest_param_index != b.rest_param_index) return false;
+        if (a.type_param_fp != b.type_param_fp) return false;
+        const pa = self.store.signatureParamsOf(a);
+        const pb = self.store.signatureParamsOf(b);
+        if (pa.len != pb.len) return false;
+        for (pa, pb) |x, y| if (!x.eq(y)) return false;
+        const oa = self.store.signatureParamOptionalsOf(a);
+        const ob = self.store.signatureParamOptionalsOf(b);
+        if (oa.len == ob.len) {
+            for (oa, ob) |x, y| if (x != y) return false;
+        }
+        return true;
+    }
+
     fn mergeFunctionTypes(self: *Checker, existing_ty: TypeId, new_ty: TypeId) TypeId {
+        return self.mergeFunctionTypesD(existing_ty, new_ty, false);
+    }
+
+    /// `dedup` collapses structurally-identical signatures — correct ONLY for a
+    /// CROSS-scope false merge (a same-named interface in two different
+    /// namespaces).  Genuine same-scope declaration merging keeps duplicate
+    /// overloads verbatim (tsc shows `{ (): X; (): X; }`), so dedup=false there.
+    fn mergeFunctionTypesD(self: *Checker, existing_ty: TypeId, new_ty: TypeId, dedup: bool) TypeId {
         const et = self.store.get(existing_ty);
         const nt = self.store.get(new_ty);
         if (et.kind != .function_t or nt.kind != .function_t) return new_ty;
@@ -14509,6 +14594,17 @@ pub const Checker = struct {
         }
         for (new_sigs, 0..) |s, j| {
             if (n >= sig_buf.len) break;
+            // Dedup structurally-identical signatures (cross-scope merges only):
+            // a same-named interface in two different namespaces merges its
+            // method once per scope, but tsc shows ONE signature, not
+            // `{ (): X; (): X; }`.  Genuine same-scope overloads are kept.
+            if (dedup) {
+                var is_dup = false;
+                for (sig_buf[0..n]) |kept| {
+                    if (self.signaturesStructurallyEqual(kept, s)) { is_dup = true; break; }
+                }
+                if (is_dup) continue;
+            }
             sig_buf[n] = s;
             src_idx[n] = n_list.start + @as(u32, @intCast(j));
             n += 1;
@@ -14524,7 +14620,7 @@ pub const Checker = struct {
                 }
             }
         }
-        return self.store.add(.{ .kind = .function_t, .signatures = merged_sigs, .is_overload_set = true }) catch new_ty;
+        return self.store.add(.{ .kind = .function_t, .signatures = merged_sigs, .is_overload_set = n > 1 }) catch new_ty;
     }
 
     /// Build the INSTANCE type of a class — a record of fields and methods.
