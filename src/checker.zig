@@ -23705,16 +23705,32 @@ pub const Checker = struct {
                     }
                 }
                 const ids = self.store.idsOf(t.list_data);
-                // Output union members in insertion order (matches tsc's declaration order).
+                // Output union members in insertion order (matches tsc's declaration order),
+                // deduped by rendered form — tsc collapses members that display identically
+                // (e.g. two same-named type_refs distinguished only by symbol_scope).
                 // Function types in a union need parens to distinguish `(() => T) | U`
                 // from `() => T | U` (which reads as `() => (T | U)`).
-                for (ids, 0..) |m, i| {
-                    if (i > 0) try buf.appendSlice(gpa, " | ");
+                var seen: std.ArrayListUnmanaged([]const u8) = .empty;
+                defer {
+                    for (seen.items) |s| gpa.free(s);
+                    seen.deinit(gpa);
+                }
+                for (ids) |m| {
+                    var mbuf: std.ArrayList(u8) = .empty;
+                    defer mbuf.deinit(gpa);
                     const mt = self.store.get(m);
                     const needs_parens = mt.kind == .function_t and !mt.is_overload_set and mt.alias_name.len == 0;
-                    if (needs_parens) try buf.appendSlice(gpa, "(");
-                    try self.typeToStringInner(m, buf, depth + 1);
-                    if (needs_parens) try buf.appendSlice(gpa, ")");
+                    if (needs_parens) try mbuf.appendSlice(gpa, "(");
+                    try self.typeToStringInner(m, &mbuf, depth + 1);
+                    if (needs_parens) try mbuf.appendSlice(gpa, ")");
+                    var dup = false;
+                    for (seen.items) |s| {
+                        if (std.mem.eql(u8, s, mbuf.items)) { dup = true; break; }
+                    }
+                    if (dup) continue;
+                    if (seen.items.len > 0) try buf.appendSlice(gpa, " | ");
+                    try buf.appendSlice(gpa, mbuf.items);
+                    try seen.append(gpa, try gpa.dupe(u8, mbuf.items));
                 }
             },
         }
