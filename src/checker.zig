@@ -21742,6 +21742,27 @@ pub const Checker = struct {
                 if (self.objectPropExpectedType(m, key)) |pt| return pt;
             }
         }
+        // `A | B` — a union contextual type has property P with the union of P
+        // from each member that has it (TS: "members present in any constituent").
+        // Restricted to FUNCTION-typed members: the target is contextual param
+        // typing of an object-literal method value (`{ m: a => a }` under
+        // `I1 | I2`), where members share the signature.  Non-function property
+        // unions (e.g. mapped/conditional `ev.type`) are left to other paths to
+        // avoid over-widening a literal union to its base type.
+        if (t.kind == .union_t) {
+            const members = self.store.idsOf(t.list_data);
+            var buf: [16]TypeId = undefined;
+            var n: usize = 0;
+            for (members) |m| {
+                const pt = self.objectPropExpectedType(m, key) orelse return null;
+                if (n >= buf.len) break;
+                buf[n] = pt;
+                n += 1;
+            }
+            if (n == 0 or n != members.len) return null;
+            if (n == 1) return buf[0];
+            return self.store.unionOf(buf[0..n]) catch buf[0];
+        }
         // Named interface / alias (`interface G { func(n: T): void }`): resolve
         // the member via apparent-type lookup so an object literal contextually
         // typed by `G` propagates `func`'s parameter types to its arrow value.
