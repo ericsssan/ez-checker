@@ -3588,7 +3588,51 @@ pub const Checker = struct {
     /// Walk the AST looking for a top-level declarator/fn_decl/class_decl
     /// with the given name.  Returns the declared/inferred type, or null
     /// if not found.
+    /// The type of a single `declarator` node (its annotation, else its
+    /// initializer; `any` for an un-annotated/un-initialized declaration).
+    fn typeOfDeclarator(self: *Checker, decl: NodeIndex) ?TypeId {
+        const data = self.ast_ref.nodeData(decl);
+        if (data.lhs == .none or self.ast_ref.nodeTag(data.lhs) != .identifier) return null;
+        const ann = self.ast_ref.nodeData(data.lhs).rhs;
+        if (ann != .none and self.ast_ref.nodeTag(ann) == .ts_type_annotation) {
+            return self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs);
+        }
+        if (data.rhs == .none) return tymod.ID_ANY;
+        const init_ty = self.typeOf(data.rhs);
+        if (init_ty.eq(tymod.ID_UNKNOWN) or init_ty.eq(tymod.ID_ERROR)) return tymod.ID_ANY;
+        return init_ty;
+    }
+
+    /// The declarator of variable `name` in the innermost namespace scope
+    /// enclosing `use_site` — the lexically-correct one when `name` is declared
+    /// in several scopes — read from the value symbol table; .none if none on the
+    /// enclosing scope chain. Binder resolveName for the value space.
+    fn scopeLocalValueDecl(self: *Checker, name: []const u8, use_site: NodeIndex) NodeIndex {
+        if (use_site == .none) return .none;
+        var lb: [192]u8 = undefined;
+        var key = self.namespaceScopeKey(use_site, &lb);
+        while (true) {
+            if (self.scopedValueDecls(name, key)) |group| {
+                for (group.items) |d| {
+                    if (self.ast_ref.nodeTag(d) == .declarator) return d;
+                }
+            }
+            if (key.len == 0) break;
+            key = if (std.mem.lastIndexOfScalar(u8, key, '.')) |dot| key[0..dot] else key[0..0];
+        }
+        return .none;
+    }
+
     pub fn typeOfNameByAstSearch(self: *Checker, name: []const u8, use_site: NodeIndex) ?TypeId {
+        // Scope-aware variable resolution: when `name` has declarators in several
+        // namespace scopes, resolve the one lexically nearest the use site, not
+        // the source-order first. (.none use_site / single scope → unchanged.)
+        {
+            const chosen = self.scopeLocalValueDecl(name, use_site);
+            if (chosen != .none) {
+                if (self.typeOfDeclarator(chosen)) |t| return t;
+            }
+        }
         // Overload handling: when both signature declarations (no body) AND an
         // implementation exist, TS exposes the OVERLOAD SET, not the impl's
         // inferred type — so `function a(): Promise<void>; function a(x): void;
