@@ -21062,10 +21062,43 @@ pub const Checker = struct {
             .declarator => {
                 const dd = self.ast_ref.nodeData(pn);
                 if (dd.rhs != node) return null;
-                if (dd.lhs == .none or self.ast_ref.nodeTag(dd.lhs) != .identifier) return null;
-                const ann = self.ast_ref.nodeData(dd.lhs).rhs;
-                if (ann == .none or self.ast_ref.nodeTag(ann) != .ts_type_annotation) return null;
-                return self.nonNullExpected(self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs));
+                if (dd.lhs == .none) return null;
+                const lhs_tag2 = self.ast_ref.nodeTag(dd.lhs);
+                if (lhs_tag2 == .identifier) {
+                    const ann = self.ast_ref.nodeData(dd.lhs).rhs;
+                    if (ann == .none or self.ast_ref.nodeTag(ann) != .ts_type_annotation) return null;
+                    return self.nonNullExpected(self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs));
+                }
+                // Destructuring: `var [a, b]: T = init` — annotation is orphaned
+                // (parser doesn't attach it to the pattern). Scan nodes between
+                // the pattern and the initializer to find the orphaned annotation.
+                if (lhs_tag2 == .array_pattern or lhs_tag2 == .object_pattern) {
+                    if (!self.pattern_annotations_built) self.buildPatternAnnotations();
+                    if (self.pattern_annotations.get(dd.lhs.toInt())) |ann2| {
+                        const ann_ty_node = self.ast_ref.nodeData(ann2).lhs;
+                        if (ann_ty_node == .none) return null;
+                        return self.nonNullExpected(self.resolveTypeNode(ann_ty_node));
+                    }
+                    const pat_idx2 = dd.lhs.toInt();
+                    const rhs_idx2 = dd.rhs.toInt();
+                    if (pat_idx2 < rhs_idx2 and rhs_idx2 <= self.ast_ref.nodes.len) {
+                        var si2: u32 = pat_idx2 + 1;
+                        while (si2 < rhs_idx2) : (si2 += 1) {
+                            if (self.ast_ref.nodeTag(@enumFromInt(si2)) == .ts_type_annotation) {
+                                const si2_pidx = if (si2 < self.semantic.parent_indices.len)
+                                    self.semantic.parent_indices[si2]
+                                else
+                                    @intFromEnum(NodeIndex.none);
+                                if (si2_pidx == @intFromEnum(NodeIndex.none)) {
+                                    const ann_ty_node = self.ast_ref.nodeData(@enumFromInt(si2)).lhs;
+                                    return self.nonNullExpected(self.resolveTypeNode(ann_ty_node));
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                return null;
             },
             // Class field with a type annotation initialized by this expression:
             // `member: (s: T) => U = n => …` contextually types the initializer.
