@@ -2596,8 +2596,7 @@ pub const Checker = struct {
                 // exists in sibling namespaces, the scope-blind merge piles this
                 // method up as a bogus overload set (`{ (): T; (): T; }`). `node`
                 // sits inside this declaration, so its scope selects the right one.
-                const resolved = self.resolveDeclaredTypeInScope(iface_name, node) orelse
-                    (self.resolveDeclaredType(iface_name) orelse return null);
+                const resolved = self.resolveDeclaredTypeAt(iface_name, node) orelse return null;
                 const rt = self.store.get(resolved);
                 if (rt.kind != .object_t) return null;
                 for (self.store.propsOf(rt.object_props)) |p| {
@@ -14042,6 +14041,16 @@ pub const Checker = struct {
     /// Resolve a declared type by bare name in the AMBIENT (scope-blind) scope.
     /// Thin wrapper over the unified `resolveDeclaredTypeIn`.
     fn resolveDeclaredType(self: *Checker, name: []const u8) ?TypeId {
+        return self.resolveDeclaredTypeIn(name, null);
+    }
+
+    /// Resolve a declared type by name AS SEEN FROM `use_site`: the scope-local
+    /// homonym when `name` is a multi-namespace declaration the use site
+    /// disambiguates, else ambient. The single use-site-aware entry — callers
+    /// holding the referencing node should prefer this over `resolveDeclaredType`
+    /// (analogous to tsc resolving a name in the symbol scope of its reference).
+    fn resolveDeclaredTypeAt(self: *Checker, name: []const u8, use_site: NodeIndex) ?TypeId {
+        if (self.resolveDeclaredTypeInScope(name, use_site)) |scoped| return scoped;
         return self.resolveDeclaredTypeIn(name, null);
     }
 
