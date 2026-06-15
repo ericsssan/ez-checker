@@ -12634,20 +12634,18 @@ pub const Checker = struct {
     /// import/module-object contexts where qualifying a member type is unsafe
     /// (tsc often leaves those `any`).
     fn innermostNamespaceName(self: *Checker, node: NodeIndex) ?[]const u8 {
-        const parents = self.semantic.parent_indices;
-        const NONE: u32 = @intFromEnum(NodeIndex.none);
-        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
-        while (p != NONE) : (p = parents[p]) {
-            const pn: NodeIndex = @enumFromInt(p);
-            switch (self.ast_ref.nodeTag(pn)) {
-                .ts_namespace_decl => {
-                    const d = self.ast_ref.nodeData(pn);
-                    if (d.lhs != .none) return self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs));
-                    return null;
-                },
-                .ts_module_decl => return null,
+        // Walk the lexical scope chain inward→out: the first namespace gives its
+        // name; a module boundary (or no namespace) yields null. Function/block
+        // scopes are transparent.
+        var idx = self.enclosingScopeIdx(node);
+        while (idx != 0) {
+            const sc = self.lex_scopes.items[idx];
+            switch (sc.kind) {
+                .namespace => return if (sc.name.len > 0) sc.name else null,
+                .module => return null,
                 else => {},
             }
+            idx = sc.parent;
         }
         return null;
     }
@@ -14649,44 +14647,11 @@ pub const Checker = struct {
     /// iff their scope keys match — same LOGICAL namespace even across separate
     /// `namespace M {}` blocks (distinct AST nodes, same scope).  Distinct names
     /// (global vs `M` vs `N`) are different scopes → distinct types.
+    /// Namespace AND module scope path — used by the interface declaration-merge
+    /// dedup (`sameEnclosingScope`), where a `declare module` block is a distinct
+    /// declaration space.
     fn enclosingScopeKey(self: *Checker, node: NodeIndex, buf: []u8) []const u8 {
-        const parents = self.semantic.parent_indices;
-        const NONE: u32 = @intFromEnum(NodeIndex.none);
-        var names: [16][]const u8 = undefined;
-        var n: usize = 0;
-        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
-        while (p != NONE) : (p = parents[p]) {
-            const pn: NodeIndex = @enumFromInt(p);
-            switch (self.ast_ref.nodeTag(pn)) {
-                .ts_namespace_decl, .ts_module_decl => {
-                    if (n < names.len) {
-                        const d = self.ast_ref.nodeData(pn);
-                        names[n] = if (d.lhs != .none)
-                            self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs))
-                        else
-                            "";
-                        n += 1;
-                    }
-                },
-                else => {},
-            }
-        }
-        var len: usize = 0;
-        var i: usize = n;
-        while (i > 0) {
-            i -= 1;
-            if (len > 0 and len < buf.len) {
-                buf[len] = '.';
-                len += 1;
-            }
-            for (names[i]) |c| {
-                if (len < buf.len) {
-                    buf[len] = c;
-                    len += 1;
-                }
-            }
-        }
-        return buf[0..len];
+        return self.scopeKeyOf(node, buf, true);
     }
 
     fn sameEnclosingScope(self: *Checker, a: NodeIndex, b: NodeIndex) bool {
@@ -14834,13 +14799,20 @@ pub const Checker = struct {
     /// the lexical scope tree from `node`'s enclosing scope to the global root and
     /// collecting only namespace-kind scope names (modules/functions/blocks are
     /// transparent). "" at the top level. Result written into `buf`.
-    fn namespaceScopeKey(self: *Checker, node: NodeIndex, buf: []u8) []const u8 {
+    /// The dotted scope path of `node`, derived from the lexical scope tree by
+    /// walking from `node`'s enclosing scope to the global root. `include_modules`
+    /// selects which scope kinds contribute a name: namespaces only (the
+    /// declaration-merging scope; module/function/block transparent) or
+    /// namespaces AND modules. The single source of scope-path truth — every
+    /// scope-key query routes through here.
+    fn scopeKeyOf(self: *Checker, node: NodeIndex, buf: []u8, include_modules: bool) []const u8 {
         var names: [16][]const u8 = undefined;
         var n: usize = 0;
         var idx = self.enclosingScopeIdx(node);
         while (idx != 0) {
             const sc = self.lex_scopes.items[idx];
-            if (sc.kind == .namespace and n < names.len) {
+            const take = sc.kind == .namespace or (include_modules and sc.kind == .module);
+            if (take and n < names.len) {
                 names[n] = sc.name;
                 n += 1;
             }
@@ -14862,6 +14834,12 @@ pub const Checker = struct {
             }
         }
         return buf[0..len];
+    }
+
+    /// Namespace-only scope path (modules transparent) — the declaration-merging
+    /// and scope-resolution key.
+    fn namespaceScopeKey(self: *Checker, node: NodeIndex, buf: []u8) []const u8 {
+        return self.scopeKeyOf(node, buf, false);
     }
 
     /// `scope_filter` (null in the scope-blind path) restricts declaration
