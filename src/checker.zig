@@ -8899,16 +8899,18 @@ pub const Checker = struct {
                 ret_ty = self.store.typeRef(gen_name, &.{ t_yield, t_return, tymod.ID_UNKNOWN }) catch ret_ty;
             }
         }
-        // Async (non-generator) functions return Promise<T> at the call site,
-        // even if the body's return type is `T`.  Wrap unless the user already
-        // annotated `: Promise<T>` (avoid double-wrapping).
-        else if (is_async and !is_assertion and !ret_ty.eq(tymod.ID_UNKNOWN)) {
+        // Async (non-generator) functions return Promise<T> at the call site
+        // when the return type is INFERRED from the body.  An EXPLICIT return
+        // annotation is trusted verbatim — tsc shows `async f(): MyPromise<void>`
+        // as `() => MyPromise<void>`, NOT `Promise<MyPromise<void>>` (the
+        // annotation must already be a valid awaitable; we don't re-wrap it).
+        else if (is_async and !is_assertion and !was_annotated and !ret_ty.eq(tymod.ID_UNKNOWN)) {
             const rt = self.store.get(ret_ty);
             const already_promise = rt.kind == .type_ref and std.mem.eql(u8, rt.name, "Promise");
             if (!already_promise) {
                 ret_ty = self.store.typeRef("Promise", &.{ret_ty}) catch ret_ty;
             }
-        } else if (is_async and ret_ty.eq(tymod.ID_UNKNOWN)) {
+        } else if (is_async and !was_annotated and ret_ty.eq(tymod.ID_UNKNOWN)) {
             ret_ty = self.store.typeRef("Promise", &.{tymod.ID_UNKNOWN}) catch ret_ty;
         }
         const param_range = self.store.appendSignatureParamsFull(param_buf[0..count], name_buf[0..count], opt_buf[0..count]) catch return null;
