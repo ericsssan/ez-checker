@@ -8423,7 +8423,20 @@ pub const Checker = struct {
             .async_generator_fn_decl, .async_generator_fn_expr => true,
             else => false,
         };
+        // A function EXPRESSION (not a statement decl) can be contextually typed
+        // (`f(function(){ return true })`, `var g: () => boolean = function(){…}`):
+        // capture its expected return type so block-body literal returns are
+        // preserved under a literal-like context (`() => true`, not `() => boolean`).
+        const is_fn_expr = switch (fn_tag) {
+            .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => true,
+            else => false,
+        };
+        const saved_ctx_ret = self.contextual_arrow_return;
+        // A plain function DECLARATION is never contextually typed; reset so a
+        // nested decl inside a contextually-typed arrow doesn't inherit it.
+        self.contextual_arrow_return = if (is_fn_expr) self.arrowContextualReturn(fn_node) else null;
         const result = self.buildFunctionTypeG(fd.params, fd.params_end, fd.return_type, fd.body, is_async, is_generator, fd.type_params, fd.type_params_end);
+        self.contextual_arrow_return = saved_ctx_ret;
         // JS constructor function: a NAMED function whose body assigns to
         // `this.<prop>` is treated by tsc as a class-like constructor — its
         // VALUE renders `typeof <Name>` (not the plain call signature).  Tag the
@@ -8550,9 +8563,44 @@ pub const Checker = struct {
         if (sigs.len == 0) return null;
         const ret = sigs[0].return_type;
         const rk = self.store.get(ret).kind;
+        // `.boolean` (= true | false) is literal-like for boolean-literal
+        // preservation; literals and unions may pin a literal too.
         if (rk == .string_literal or rk == .number_literal or rk == .boolean_literal or
-            rk == .bigint_literal or rk == .union_t) return ret;
+            rk == .bigint_literal or rk == .boolean or rk == .union_t) return ret;
         return null;
+    }
+
+    /// Whether a contextual RETURN type is "literal-like" for a body value of
+    /// kind `vk` — i.e. the context is (or contains) a literal of the same base
+    /// kind, or is `boolean` for a boolean literal.  Unlike `typeExpectsLiteral`
+    /// this does NOT require value-assignability: tsc preserves the freshness of
+    /// `() => "b"` under context `() => "a"` (the literal value `"b"` is kept,
+    /// the mismatch is a separate assignability error).
+    fn returnContextPreservesLiteral(self: *Checker, ctx: TypeId, vk: tymod.TypeKind) bool {
+        const is_lit = vk == .string_literal or vk == .number_literal or
+            vk == .boolean_literal or vk == .bigint_literal;
+        if (!is_lit) return false;
+        return self.ctxHasLiteralOfKind(ctx, vk, 0);
+    }
+
+    fn ctxHasLiteralOfKind(self: *Checker, ctx: TypeId, vk: tymod.TypeKind, depth: u8) bool {
+        if (depth > 4) return false;
+        const t = self.store.get(ctx);
+        return switch (t.kind) {
+            .string_literal => vk == .string_literal,
+            .number_literal => vk == .number_literal,
+            .boolean_literal => vk == .boolean_literal,
+            .bigint_literal => vk == .bigint_literal,
+            // `boolean` is semantically `true | false`.
+            .boolean => vk == .boolean_literal,
+            .union_t => blk: {
+                for (self.store.idsOf(t.list_data)) |m| {
+                    if (self.ctxHasLiteralOfKind(m, vk, depth + 1)) break :blk true;
+                }
+                break :blk false;
+            },
+            else => false,
+        };
     }
 
     fn functionTypeFromArrow(self: *Checker, arrow_node: NodeIndex) TypeId {
@@ -8811,10 +8859,11 @@ pub const Checker = struct {
             const btag = self.ast_ref.nodeTag(body_for_inference);
             if (btag != .block_stmt) {
                 const raw_ret = self.typeOf(body_for_inference);
-                // A contextual return type that expects this literal preserves it;
+                // A literal-like contextual return type preserves the body's
+                // literal freshness (`() => "b"` under `() => "a"` keeps `"b"`);
                 // otherwise widen the literal to its base type.
                 const ctx_preserve = if (self.contextual_arrow_return) |cr|
-                    self.typeExpectsLiteral(cr, raw_ret)
+                    self.returnContextPreservesLiteral(cr, self.store.get(raw_ret).kind)
                 else
                     false;
                 ret_ty = if (ctx_preserve) raw_ret else switch (self.store.get(raw_ret).kind) {
@@ -9336,9 +9385,16 @@ pub const Checker = struct {
             const arg = self.ast_ref.nodeData(ni).lhs;
             if (arg == .none) { has_bare_return = true; continue; }
             const raw_t = self.typeOf(arg);
-            // Widen primitive literal types in return expressions to their base types.
+            // Widen primitive literal types in return expressions to their base
+            // types — unless a literal-like contextual return type preserves the
+            // literal's freshness (`function(){ return true }` typed by
+            // `() => boolean` keeps `() => true`).
             const type_info = self.store.get(raw_t);
-            const t = switch (type_info.kind) {
+            const preserve_lit = if (self.contextual_arrow_return) |cr|
+                self.returnContextPreservesLiteral(cr, type_info.kind)
+            else
+                false;
+            const t = if (preserve_lit) raw_t else switch (type_info.kind) {
                 .string_literal => tymod.ID_STRING,
                 .number_literal => tymod.ID_NUMBER,
                 .bigint_literal => tymod.ID_BIGINT,
