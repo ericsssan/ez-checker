@@ -507,6 +507,14 @@ pub const Checker = struct {
     /// scope-aware resolution path (`resolveDeclaredTypeInScope`).
     type_decls_by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
 
+    /// Binder symbol table for TYPE declarations: "<scope>\x00<name>" → the
+    /// declarations of that name DIRECTLY in that namespace scope, in source
+    /// order. This is the materialized (scope, name) → decls mapping a binder
+    /// produces — replacing per-query `namespaceScopeKey` parent-walks with an
+    /// O(1) lookup. Built by deriveTypeIndexes; keys are gpa-owned (freed in
+    /// deinit). The first step toward tsc's per-scope SymbolTables.
+    scoped_type_decls: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
+
     /// Maps generic function TypeId → rendered type-parameter prefix string
     /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
     /// method type is built; looked up by typeToStringInner to emit the correct
@@ -718,6 +726,14 @@ pub const Checker = struct {
             var dit = self.type_decls_by_name.valueIterator();
             while (dit.next()) |list| list.deinit(self.gpa);
             self.type_decls_by_name.deinit(self.gpa);
+        }
+        {
+            var sit = self.scoped_type_decls.iterator();
+            while (sit.next()) |e| {
+                self.gpa.free(e.key_ptr.*);
+                e.value_ptr.deinit(self.gpa);
+            }
+            self.scoped_type_decls.deinit(self.gpa);
         }
         {
             var it = self.fn_type_params.valueIterator();
@@ -12314,6 +12330,8 @@ pub const Checker = struct {
             const name = entry.key_ptr.*;
             var primary: NodeIndex = .none;
             for (entry.value_ptr.items) |ni| {
+                // Binder symbol table: record this declaration under its scope.
+                try self.recordScopedDecl(name, ni);
                 switch (self.ast_ref.nodeTag(ni)) {
                     .ts_type_alias_decl => primary = ni,
                     .ts_interface_decl => {
@@ -14190,17 +14208,43 @@ pub const Checker = struct {
         return result;
     }
 
+    /// Record a type declaration in the binder symbol table under its namespace
+    /// scope: scoped_type_decls["<scope>\x00<name>"] gets `ni` appended.
+    fn recordScopedDecl(self: *Checker, name: []const u8, ni: NodeIndex) !void {
+        var sb: [192]u8 = undefined;
+        const scope = self.namespaceScopeKey(ni, &sb);
+        var kb: [384]u8 = undefined;
+        const key = typeCacheKey(&kb, name, scope) orelse return;
+        const gop = try self.scoped_type_decls.getOrPut(self.gpa, key);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, key) catch {
+                _ = self.scoped_type_decls.remove(key);
+                return;
+            };
+            gop.value_ptr.* = .empty;
+        }
+        try gop.value_ptr.append(self.gpa, ni);
+    }
+
+    /// Binder symbol-table lookup: the declarations of `name` DIRECTLY in
+    /// namespace scope `scope`, in source order (null if none). Returns a
+    /// borrowed pointer to the stored list (owned by scoped_type_decls).
+    fn scopedTypeDecls(self: *Checker, name: []const u8, scope: []const u8) ?*const std.ArrayListUnmanaged(NodeIndex) {
+        var kb: [384]u8 = undefined;
+        const key = typeCacheKey(&kb, name, scope) orelse return null;
+        return self.scoped_type_decls.getPtr(key);
+    }
+
     /// The first interface/class declaration of `name` whose namespace scope
-    /// equals `scope` — the representative to build a scoped type from.
+    /// equals `scope` — the representative to build a scoped type from. Reads the
+    /// binder symbol table (scoped_type_decls) directly.
     fn scopeLocalPrimary(self: *Checker, name: []const u8, scope: []const u8) ?NodeIndex {
-        const list = self.type_decls_by_name.get(name) orelse return null;
-        for (list.items) |d| {
+        const decls = self.scopedTypeDecls(name, scope) orelse return null;
+        for (decls.items) |d| {
             switch (self.ast_ref.nodeTag(d)) {
-                .ts_interface_decl, .class_decl => {},
-                else => continue,
+                .ts_interface_decl, .class_decl => return d,
+                else => {},
             }
-            var db: [192]u8 = undefined;
-            if (std.mem.eql(u8, self.namespaceScopeKey(d, &db), scope)) return d;
         }
         return null;
     }
@@ -14259,11 +14303,13 @@ pub const Checker = struct {
         }
         const scope = chosen orelse return null;
 
+        // The chosen scope's declaration group, straight from the binder symbol
+        // table (no re-scan/re-keying of every declaration of the name).
+        const group = self.scopedTypeDecls(name, scope) orelse return null;
+
         // If the chosen scope contains every declaration, resolution is
         // effectively scope-blind → delegate.
-        var chosen_count: usize = 0;
-        for (keys[0..count]) |k| if (std.mem.eql(u8, k, scope)) { chosen_count += 1; };
-        if (chosen_count == count) return null;
+        if (group.items.len == count) return null;
 
         // The chosen group must be a clean set we can build in isolation:
         // all interfaces, OR exactly one class (no namespace/enum/alias). Mixed
@@ -14272,8 +14318,7 @@ pub const Checker = struct {
         var n_class: usize = 0;
         var n_other: usize = 0;
         var primary: NodeIndex = .none;
-        for (list.items, 0..) |d, i| {
-            if (!std.mem.eql(u8, keys[i], scope)) continue;
+        for (group.items) |d| {
             switch (self.ast_ref.nodeTag(d)) {
                 .ts_interface_decl => { if (primary == .none) primary = d; n_iface += 1; },
                 .class_decl => { if (n_class == 0) primary = d; n_class += 1; },
