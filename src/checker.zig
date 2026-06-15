@@ -8892,7 +8892,7 @@ pub const Checker = struct {
                 const gen_name: []const u8 = if (is_async) "AsyncGenerator" else "Generator";
                 // Generator<T, TReturn, TNext>: T = yielded type, TReturn = return type, TNext = unknown.
                 const t_yield = if (body_for_inference != .none)
-                    self.inferYieldType(body_for_inference)
+                    self.inferYieldType(body_for_inference, is_async)
                 else
                     tymod.ID_UNKNOWN;
                 const t_return = if (ret_ty.eq(tymod.ID_UNKNOWN)) tymod.ID_VOID else ret_ty;
@@ -9441,7 +9441,7 @@ pub const Checker = struct {
     /// the types of all `yield <expr>` expressions in `body` (direct — not nested
     /// in inner functions) and returning their union.  Returns `never` when there
     /// are no yield statements (a generator that never yields).
-    fn inferYieldType(self: *Checker, body: NodeIndex) TypeId {
+    fn inferYieldType(self: *Checker, body: NodeIndex, is_async: bool) TypeId {
         const parents = self.semantic.parent_indices;
         if (parents.len == 0) return tymod.ID_NEVER;
         const body_idx = @intFromEnum(body);
@@ -9470,8 +9470,12 @@ pub const Checker = struct {
             }
             if (!reached) continue;
             const arg = self.ast_ref.nodeData(ni).lhs;
+            // A bare `yield;` (no operand): a SYNC generator yields `undefined`
+            // (`Generator<undefined, …>`), but an ASYNC generator's yield type is
+            // `any` (`AsyncGenerator<any, …>`) — tsc never shows `<undefined>` for
+            // an async bare yield.
             const raw_yt: TypeId = if (arg == .none)
-                tymod.ID_UNDEFINED
+                (if (is_async) tymod.ID_ANY else tymod.ID_UNDEFINED)
             else if (ntag == .yield_delegate)
                 // `yield* iterable` — use element type of the delegated iterable.
                 (self.elementTypeOf(self.typeOf(arg)) orelse tymod.ID_UNKNOWN)
