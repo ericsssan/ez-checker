@@ -16906,9 +16906,28 @@ pub const Checker = struct {
         }
         // Default value of a binding-pattern element (`[a = ["x", "y"]]`) — tsc
         // infers the default array literal as a tuple, like a destructuring RHS.
+        // Also handles function parameter defaults where the whole pattern
+        // defaults: `function f([x, y] = [1, 2])` — the assignment_pattern's
+        // lhs is the array_pattern itself, not inside one.
         if (ptag == .assignment_pattern) {
             const apd = self.ast_ref.nodeData(pn);
             if (apd.rhs != node) return false;
+            // Function param default: `([x, y] = [1, 2])` — lhs is the array_pattern.
+            // Only when the pattern is non-empty and not purely a rest spread:
+            // `([] = [1,2,3])` and `([...r] = [])` keep T[] instead of a tuple.
+            if (apd.lhs != .none and self.ast_ref.nodeTag(apd.lhs) == .array_pattern) {
+                const pat_d = self.ast_ref.nodeData(apd.lhs);
+                const pat_slice = self.directRange(pat_d.lhs, pat_d.rhs) orelse return false;
+                if (pat_slice.len == 0) return false;
+                // A pattern consisting solely of a rest element like `[...r]`
+                // does not fix the tuple length; the default stays T[].
+                if (pat_slice.len == 1) {
+                    const e0: NodeIndex = @enumFromInt(pat_slice[0]);
+                    if (e0 != .none and self.ast_ref.nodeTag(e0) == .rest_element) return false;
+                }
+                return true;
+            }
+            // Element default inside a pattern: `[a = [1, 2]]` — grandparent is the outer pattern.
             if (pn.toInt() >= parents.len) return false;
             const gp = parents[pn.toInt()];
             if (gp == @intFromEnum(NodeIndex.none)) return false;
