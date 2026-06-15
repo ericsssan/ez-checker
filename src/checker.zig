@@ -9618,13 +9618,47 @@ pub const Checker = struct {
                 count += 1;
             }
         }
-        const ret_ty = if (fd.body != .none) self.resolveTypeNodeParamAware(fd.body) else tymod.ID_UNKNOWN;
+        var ret_ty: tymod.TypeId = tymod.ID_UNKNOWN;
+        var pred_param_idx: u16 = 0xFFFF;
+        var pred_target: tymod.TypeId = .none;
+        var is_assertion: bool = false;
+        if (fd.body != .none) {
+            const ret_node = fd.body;
+            if (self.ast_ref.nodeTag(ret_node) == .ts_type_predicate) {
+                const pd = self.ast_ref.nodeData(ret_node);
+                const pred_main = self.ast_ref.nodeMainToken(ret_node);
+                is_assertion = std.mem.eql(u8, self.ast_ref.tokenText(pred_main), "asserts");
+                if (pd.lhs != .none and self.ast_ref.nodeTag(pd.lhs) == .identifier) {
+                    const pred_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs));
+                    if (fd.params <= fd.params_end and fd.params_end <= ext_len) {
+                        var pi: usize = 0;
+                        for (self.ast_ref.extra_data[fd.params..fd.params_end]) |raw| {
+                            const p_node: NodeIndex = @enumFromInt(raw);
+                            const pn = self.paramName(p_node);
+                            if (std.mem.eql(u8, pn, "this")) continue;
+                            if (pn.len > 0 and std.mem.eql(u8, pn, pred_name)) {
+                                pred_param_idx = @intCast(pi);
+                                break;
+                            }
+                            pi += 1;
+                        }
+                    }
+                    if (pd.rhs != .none) pred_target = self.resolveTypeNodeParamAware(pd.rhs);
+                }
+                ret_ty = if (is_assertion) tymod.ID_VOID else tymod.ID_BOOLEAN;
+            } else {
+                ret_ty = self.resolveTypeNodeParamAware(fd.body);
+            }
+        }
         const param_range = self.store.appendSignatureParamsFull(param_buf[0..count], name_buf[0..count], opt_buf[0..count]) catch return tymod.ID_UNKNOWN;
         const sig: tymod.Signature = .{
             .params_start = param_range.start,
             .params_end = param_range.end,
             .return_type = ret_ty,
             .rest_param_index = rest_idx,
+            .predicate_param_index = pred_param_idx,
+            .predicate_target = pred_target,
+            .is_assertion = is_assertion,
             .is_construct = (self.ast_ref.nodeTag(ty_node) == .ts_constructor_type),
         };
         const fn_ty = self.internFnSig(sig, fd.type_params, fd.type_params_end);
@@ -9745,8 +9779,9 @@ pub const Checker = struct {
                 if (sig_data.key == .none) continue;
                 const name_tag = self.ast_ref.nodeTag(sig_data.key);
                 const name = blk: {
-                    // Computed `[Symbol.toPrimitive]` key — synthesize a stable
-                    // name so consumers can detect user-defined string coercion.
+                    // Computed `[Symbol.xxx]` key — synthesize a bracketed name
+                    // matching tsc's display: `[Symbol.hasInstance]` etc.
+                    // `[Symbol.toPrimitive]` uses the legacy `@@toPrimitive` sentinel.
                     if (name_tag == .member_expr or name_tag == .optional_member_expr) {
                         const kd = self.ast_ref.nodeData(sig_data.key);
                         if (kd.lhs != .none and kd.rhs != .none and
@@ -9754,8 +9789,17 @@ pub const Checker = struct {
                         {
                             const obj = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(kd.lhs));
                             const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(kd.rhs));
-                            if (std.mem.eql(u8, obj, "Symbol") and std.mem.eql(u8, prop, "toPrimitive")) {
-                                break :blk "@@toPrimitive";
+                            if (std.mem.eql(u8, obj, "Symbol")) {
+                                if (std.mem.eql(u8, prop, "toPrimitive")) {
+                                    break :blk "@@toPrimitive";
+                                }
+                                // Other Symbol.xxx → display as [Symbol.xxx]
+                                const disp = std.fmt.allocPrint(self.gpa, "[Symbol.{s}]", .{prop}) catch break :blk prop;
+                                self.string_pool.append(self.gpa, disp) catch {
+                                    self.gpa.free(disp);
+                                    break :blk prop;
+                                };
+                                break :blk disp;
                             }
                         }
                     }
@@ -22045,7 +22089,27 @@ pub const Checker = struct {
                                     try self.typeToStringInner(mp, buf, depth + 1);
                                 }
                                 try buf.appendSlice(gpa, "): ");
-                                try self.typeToStringInner(msig.return_type, buf, depth + 1);
+                                if (msig.predicate_param_index != 0xFFFF and msig.predicate_target != .none) {
+                                    const pred_name = if (msig.predicate_param_index < mnames.len) mnames[msig.predicate_param_index] else "";
+                                    if (pred_name.len > 0) {
+                                        if (msig.is_assertion) try buf.appendSlice(gpa, "asserts ");
+                                        try buf.appendSlice(gpa, pred_name);
+                                        try buf.appendSlice(gpa, " is ");
+                                        try self.typeToStringInner(msig.predicate_target, buf, depth + 1);
+                                    } else {
+                                        try self.typeToStringInner(msig.return_type, buf, depth + 1);
+                                    }
+                                } else if (msig.is_assertion and msig.predicate_param_index != 0xFFFF) {
+                                    const pred_name = if (msig.predicate_param_index < mnames.len) mnames[msig.predicate_param_index] else "";
+                                    if (pred_name.len > 0) {
+                                        try buf.appendSlice(gpa, "asserts ");
+                                        try buf.appendSlice(gpa, pred_name);
+                                    } else {
+                                        try self.typeToStringInner(msig.return_type, buf, depth + 1);
+                                    }
+                                } else {
+                                    try self.typeToStringInner(msig.return_type, buf, depth + 1);
+                                }
                             } else {
                                 // Multi-sig overloaded method: render each sig separately.
                                 // The name + optional '?' for the first sig were already written.
@@ -22257,6 +22321,31 @@ fn sortUnionByTypePriority(store: *const tymod.TypeStore, members: []tymod.TypeI
         const kp = typePriorityForSort(store, key);
         var j: usize = i;
         while (j > 0 and typePriorityForSort(store, members[j - 1]) > kp) : (j -= 1) {
+            members[j] = members[j - 1];
+        }
+        members[j] = key;
+    }
+}
+
+/// Stable sort that only pushes null to the end,
+/// preserving relative order among all other types (for explicit union annotations).
+/// TypeScript reorders `null | T` to `T | null` but preserves undefined's source position.
+fn sortUnionNullsLast(store: *const tymod.TypeStore, members: []tymod.TypeId) void {
+    if (members.len <= 1) return;
+    const nullsLastPriority = struct {
+        fn f(s: *const tymod.TypeStore, id: tymod.TypeId) u8 {
+            return switch (s.get(id).kind) {
+                .null_t => 1,
+                else => 0,
+            };
+        }
+    }.f;
+    var i: usize = 1;
+    while (i < members.len) : (i += 1) {
+        const key = members[i];
+        const kp = nullsLastPriority(store, key);
+        var j: usize = i;
+        while (j > 0 and nullsLastPriority(store, members[j - 1]) > kp) : (j -= 1) {
             members[j] = members[j - 1];
         }
         members[j] = key;
