@@ -807,7 +807,17 @@ pub const Checker = struct {
         // otherwise a node's type would depend on whether it was first touched
         // during an evolving computation — e.g. the oracle's parent-first
         // full-tree sweep vs a lazy query.)
-        if (self.evolving_in_progress.count() == 0) {
+        //
+        // Likewise, an `any`/`unknown` result computed WHILE a class instance
+        // type is being built may be a self-reference sentinel artifact
+        // (`return this.x` inside a method, where resolving `this` re-enters the
+        // in-progress class and the expression's own node was short-circuited to
+        // the in-progress `any`).  Leaving such results uncached lets them
+        // recompute against the finished class type on the next query, instead
+        // of poisoning the method's whole return type to `any`.
+        const poisoned_by_class_build = self.building_n > 0 and
+            (computed.eq(tymod.ID_ANY) or computed.eq(tymod.ID_UNKNOWN));
+        if (self.evolving_in_progress.count() == 0 and !poisoned_by_class_build) {
             self.node_types[idx] = computed;
         } else {
             self.node_types[idx] = TypeId.none;
