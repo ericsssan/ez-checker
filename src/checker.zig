@@ -21436,7 +21436,19 @@ pub const Checker = struct {
         }
         const idx = pi orelse return null;
         const exp = self.expectedTypeOf(fn_node) orelse return null;
-        const ft = self.store.get(exp);
+        // The contextual type may itself be a type parameter with a function
+        // constraint (`<T extends (p: number) => number>(cb: T)`): unwrap to the
+        // constraint so the arrow's own params are contextually typed from it.
+        var fn_ty_id = exp;
+        {
+            const et = self.store.get(exp);
+            if (et.kind == .type_param) {
+                const cs = self.store.idsOf(et.list_data);
+                if (cs.len == 0) return null;
+                fn_ty_id = cs[0];
+            }
+        }
+        const ft = self.store.get(fn_ty_id);
         if (ft.kind != .function_t) return null;
         const sigs = self.store.signaturesOf(ft.signatures);
         if (sigs.len == 0) return null;
