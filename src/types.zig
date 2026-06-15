@@ -210,6 +210,12 @@ pub const Type = struct {
     /// structurally.  Part of interning identity so a display-tagged type stays
     /// distinct from its bare structural form (and from a differently-tagged one).
     display_name: []const u8 = "",
+    /// Symbol-as-identity: the namespace scope a named type's symbol is DECLARED
+    /// in ("" = global). Set for user class/interface type_refs. The context-aware
+    /// printer renders this qualified when the bare name is NOT accessible from
+    /// the print location (`getAccessibleSymbolChain`). Part of interning identity
+    /// so the same name from different scopes stays distinct.
+    symbol_scope: []const u8 = "",
 };
 
 pub const LiteralValue = union(enum) {
@@ -334,6 +340,7 @@ pub const InternContext = struct {
         h.update(t.name);
         h.update(t.alias_name);
         h.update(t.display_name);
+        h.update(t.symbol_scope);
         for (self.store.idsOf(t.alias_args)) |a| {
             const av = a.toInt();
             h.update(std.mem.asBytes(&av));
@@ -398,6 +405,7 @@ pub const InternContext = struct {
         if (!std.mem.eql(u8, ta.name, tb.name)) return false;
         if (!std.mem.eql(u8, ta.alias_name, tb.alias_name)) return false;
         if (!std.mem.eql(u8, ta.display_name, tb.display_name)) return false;
+        if (!std.mem.eql(u8, ta.symbol_scope, tb.symbol_scope)) return false;
         {
             const aa = self.store.idsOf(ta.alias_args);
             const ba = self.store.idsOf(tb.alias_args);
@@ -711,6 +719,7 @@ pub const TypeStore = struct {
         if (t.alias_name.len > 0) nt.alias_name = try self.gpa.dupe(u8, t.alias_name);
         if (t.display_name.len > 0) nt.display_name = try self.gpa.dupe(u8, t.display_name);
         if (t.enum_name.len > 0) nt.enum_name = try self.gpa.dupe(u8, t.enum_name);
+        if (t.symbol_scope.len > 0) nt.symbol_scope = try self.gpa.dupe(u8, t.symbol_scope);
 
         // Nested TypeId lists (union/intersection/tuple/function/array element).
         nt.list_data = try self.cloneIdList(src, t.list_data, depth);
@@ -1052,6 +1061,14 @@ pub const TypeStore = struct {
     pub fn typeRef(self: *TypeStore, name: []const u8, args: []const TypeId) !TypeId {
         const list = if (args.len == 0) TypeIdList.empty else try self.appendTypeIds(args);
         return try self.add(.{ .kind = .type_ref, .name = name, .list_data = list });
+    }
+
+    /// A `type_ref` tagged with the declaring `symbol_scope` of its named symbol
+    /// (for the context-aware printer). `symbol_scope` must outlive the store
+    /// (interned by the checker).
+    pub fn typeRefScoped(self: *TypeStore, name: []const u8, args: []const TypeId, symbol_scope: []const u8) !TypeId {
+        const list = if (args.len == 0) TypeIdList.empty else try self.appendTypeIds(args);
+        return try self.add(.{ .kind = .type_ref, .name = name, .list_data = list, .symbol_scope = symbol_scope });
     }
 
     /// A type-parameter type carrying its constraint (in `list_data[0]`, empty

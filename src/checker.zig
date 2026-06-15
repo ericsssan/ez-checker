@@ -532,6 +532,10 @@ pub const Checker = struct {
     /// which fixes enclosingDeclaration for an entire typeToString call).
     render_location: NodeIndex = .none,
 
+    /// Interner for namespace-scope strings stored as `Type.symbol_scope` — each
+    /// distinct scope path gets one gpa-owned slice (freed in deinit).
+    scope_intern: std.StringHashMapUnmanaged(void) = .empty,
+
     /// Maps generic function TypeId → rendered type-parameter prefix string
     /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
     /// method type is built; looked up by typeToStringInner to emit the correct
@@ -755,6 +759,11 @@ pub const Checker = struct {
         }
         self.lex_scopes.deinit(self.gpa);
         self.scope_intro.deinit(self.gpa);
+        {
+            var sit = self.scope_intern.keyIterator();
+            while (sit.next()) |k| self.gpa.free(k.*);
+            self.scope_intern.deinit(self.gpa);
+        }
         {
             var it = self.fn_type_params.valueIterator();
             while (it.next()) |v| self.gpa.free(v.*);
@@ -1936,7 +1945,7 @@ pub const Checker = struct {
         const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata.lhs));
         if (cd.name != node) return null;
         if (cd.type_params >= cd.type_params_end) {
-            return self.store.typeRef(name, &.{}) catch null;
+            return self.scopeTaggedRef(name, &.{}, parent) catch null;
         }
         const n_params = cd.type_params_end - cd.type_params;
         var args_buf: [8]TypeId = undefined;
@@ -1946,7 +1955,7 @@ pub const Checker = struct {
             const tp_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
             args_buf[i] = self.store.typeParam(tp_name, TypeId.none) catch return null;
         }
-        return self.store.typeRef(name, args_buf[0..count]) catch null;
+        return self.scopeTaggedRef(name, args_buf[0..count], parent) catch null;
     }
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
@@ -12846,6 +12855,13 @@ pub const Checker = struct {
             if (dtag == .class_decl or dtag == .ts_interface_decl) {
                 var args_buf: [8]TypeId = undefined;
                 const args = self.collectTypeArgs(ty_node, &args_buf);
+                // Tag with the scope where this bare name LEXICALLY RESOLVES from
+                // the reference site (the actual symbol it names), not the
+                // scope-blind primary — `var a: ClassA` inside SubModule1 binds
+                // that module's ClassA, even if another ClassA is the primary.
+                if (self.scopeOfNameAt(name, ty_node)) |s| {
+                    if (s.len > 0) return self.store.typeRefScoped(name, args, s) catch tymod.ID_ANY;
+                }
                 return self.store.typeRef(name, args) catch tymod.ID_ANY;
             }
         }
@@ -14642,6 +14658,77 @@ pub const Checker = struct {
     /// NOT across true sibling namespaces. Used by the scope-aware resolution
     /// path so module augmentation keeps merging while sibling-namespace
     /// homonyms stay distinct.
+    /// Intern a namespace-scope string for storage as `Type.symbol_scope`,
+    /// returning a stable gpa-owned slice (deduplicated; freed in deinit).
+    fn internScope(self: *Checker, scope: []const u8) []const u8 {
+        if (scope.len == 0) return "";
+        const gop = self.scope_intern.getOrPut(self.gpa, scope) catch return "";
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.gpa.dupe(u8, scope) catch {
+                _ = self.scope_intern.remove(scope);
+                return "";
+            };
+        }
+        return gop.key_ptr.*;
+    }
+
+    /// A `type_ref` for a user-declared named type, tagged with `decl`'s declaring
+    /// namespace scope so the context-aware printer can qualify it. Untagged
+    /// (plain ref) when `decl` is at global scope (a global is accessible bare
+    /// everywhere, so it never needs qualification).
+    fn scopeTaggedRef(self: *Checker, name: []const u8, args: []const TypeId, decl: NodeIndex) !TypeId {
+        var sb: [192]u8 = undefined;
+        const scope = self.internScope(self.namespaceScopeKey(decl, &sb));
+        if (scope.len == 0) return self.store.typeRef(name, args);
+        return self.store.typeRefScoped(name, args, scope);
+    }
+
+    /// The namespace scope where bare type name `name` resolves when looked up
+    /// from `location` (innermost enclosing namespace scope that declares it,
+    /// interned), or null. The binder's resolveName for the printer.
+    fn scopeOfNameAt(self: *Checker, name: []const u8, location: NodeIndex) ?[]const u8 {
+        var lb: [192]u8 = undefined;
+        var key = self.namespaceScopeKey(location, &lb);
+        while (true) {
+            if (self.scopedTypeDecls(name, key) != null) return self.internScope(key);
+            if (key.len == 0) break;
+            key = if (std.mem.lastIndexOfScalar(u8, key, '.')) |dot| key[0..dot] else key[0..0];
+        }
+        return null;
+    }
+
+    /// Whether the bare type name `name` (symbol declared in `symbol_scope`) is
+    /// ACCESSIBLE — refers to that symbol — when written at `location`. tsc
+    /// renders a type bare exactly when its name is accessible there
+    /// (getAccessibleSymbolChain); otherwise it qualifies. Models accessibility
+    /// via: global symbols (always), names IMPORTED into the file (import_map /
+    /// namespace_import_map), and the lexical namespace scope chain.
+    fn isAccessibleBare(self: *Checker, name: []const u8, symbol_scope: []const u8, location: NodeIndex) bool {
+        if (symbol_scope.len == 0) return true; // global → accessible everywhere
+        // Imported into this file (an import binds the name in the file scope).
+        if (self.import_map.contains(name)) return true;
+        if (self.namespace_import_map.contains(name)) return true;
+        // Lexical: SOME symbol of this name is reachable from the location (the
+        // bare name names a type there). tsc qualifies only when the name is
+        // reachable NOWHERE — when a homonym IS reachable it renders bare (and a
+        // weaker check here also avoids mis-qualifying when our scope-blind value
+        // resolution picked a sibling-scope symbol of the same name).
+        if (self.scopeOfNameAt(name, location) != null) return true;
+        return false;
+    }
+
+    /// The minimal qualification prefix to prepend to a scoped named type when
+    /// it is NOT accessible bare at `render_location` (innermost namespace
+    /// component of `symbol_scope`), or null to render bare.
+    fn qualificationPrefix(self: *Checker, name: []const u8, symbol_scope: []const u8) ?[]const u8 {
+        if (symbol_scope.len == 0 or self.render_location == .none) return null;
+        if (self.isAccessibleBare(name, symbol_scope, self.render_location)) return null;
+        return if (std.mem.lastIndexOfScalar(u8, symbol_scope, '.')) |dot|
+            symbol_scope[dot + 1 ..]
+        else
+            symbol_scope;
+    }
+
     /// The lexical scope kinds a binder distinguishes.
     const ScopeKind = enum(u8) { global, namespace, module, function, block };
 
@@ -23072,6 +23159,15 @@ pub const Checker = struct {
                     try self.typeToStringInner(args[0], buf, depth + 1);
                     try buf.appendSlice(gpa, "[]");
                     return;
+                }
+                // Context-aware qualification (tsc's enclosingDeclaration): a user
+                // named type renders qualified (`A.Point`) when its bare name is
+                // NOT accessible from the print location.
+                if (t.symbol_scope.len > 0) {
+                    if (self.qualificationPrefix(t.name, t.symbol_scope)) |prefix| {
+                        try buf.appendSlice(gpa, prefix);
+                        try buf.append(gpa, '.');
+                    }
                 }
                 try buf.appendSlice(gpa, t.name);
                 if (args.len > 0) {
