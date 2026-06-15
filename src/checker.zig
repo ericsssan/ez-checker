@@ -493,6 +493,21 @@ pub const Checker = struct {
     /// Ordered by appearance (so source order = extras… then primary).
     merged_enum_extra: std.ArrayListUnmanaged(struct { name: []const u8, node: NodeIndex }) = .empty,
 
+    /// Scope-aware type-declaration index: every interface/class/enum/alias/
+    /// namespace declaration grouped by bare name, preserving ALL declarations
+    /// across ALL lexical scopes (unlike `type_decl_nodes`, which keeps one
+    /// primary per name). Lets resolution pick the lexically-correct declaration
+    /// for a use site when a name is declared in multiple namespaces. Built
+    /// alongside `type_decl_nodes` during registration; consumed by the
+    /// scope-aware resolution path (`resolveDeclaredTypeInScope`).
+    type_decls_by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
+
+    /// Cache for the scope-aware resolution path, keyed by "<scope>\x00<name>"
+    /// (NUL separator — never present in dotted identifier paths). Distinct from
+    /// `declared_type_cache` (bare-name keyed) so the same name in different
+    /// namespaces caches independently. Keys are gpa-owned; freed in deinit.
+    scoped_type_cache: std.StringHashMapUnmanaged(TypeId) = .empty,
+
     /// Maps generic function TypeId → rendered type-parameter prefix string
     /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
     /// method type is built; looked up by typeToStringInner to emit the correct
@@ -697,6 +712,16 @@ pub const Checker = struct {
         self.merged_iface_extra.deinit(self.gpa);
         self.merged_ns_extra.deinit(self.gpa);
         self.merged_enum_extra.deinit(self.gpa);
+        {
+            var dit = self.type_decls_by_name.valueIterator();
+            while (dit.next()) |list| list.deinit(self.gpa);
+            self.type_decls_by_name.deinit(self.gpa);
+        }
+        {
+            var sit = self.scoped_type_cache.keyIterator();
+            while (sit.next()) |k| self.gpa.free(k.*);
+            self.scoped_type_cache.deinit(self.gpa);
+        }
         {
             var it = self.fn_type_params.valueIterator();
             while (it.next()) |v| self.gpa.free(v.*);
@@ -12083,11 +12108,13 @@ pub const Checker = struct {
                     const name = self.ast_ref.tokenText(ad.name);
                     try self.known_type_names.put(self.gpa, name, {});
                     try self.type_decl_nodes.put(self.gpa, name, ni);
+                    self.registerScopedDecl(name, ni);
                 },
                 .ts_interface_decl => {
                     const id = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(data.lhs));
                     const name = self.ast_ref.tokenText(id.name);
                     try self.known_type_names.put(self.gpa, name, {});
+                    self.registerScopedDecl(name, ni);
                     const gop = try self.type_decl_nodes.getOrPut(self.gpa, name);
                     if (!gop.found_existing) {
                         gop.value_ptr.* = ni;
@@ -12100,6 +12127,7 @@ pub const Checker = struct {
                     const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
                     const enum_name = self.ast_ref.tokenText(ed.name);
                     try self.known_type_names.put(self.gpa, enum_name, {});
+                    self.registerScopedDecl(enum_name, ni);
                     // Two-block enum merge: if an earlier `enum <name>` decl is
                     // already registered IN THE SAME LEXICAL SCOPE, keep it so
                     // buildEnumObjectType can combine members (source order =
@@ -12145,6 +12173,7 @@ pub const Checker = struct {
                         const tok = self.ast_ref.nodeMainToken(cd.name);
                         const name = self.ast_ref.tokenText(tok);
                         try self.known_type_names.put(self.gpa, name, {});
+                        self.registerScopedDecl(name, ni);
                         const gop = try self.type_decl_nodes.getOrPut(self.gpa, name);
                         if (!gop.found_existing) {
                             gop.value_ptr.* = ni;
@@ -12163,6 +12192,7 @@ pub const Checker = struct {
                         const tok = self.ast_ref.nodeMainToken(data.lhs);
                         const ns_name = self.ast_ref.tokenText(tok);
                         try self.known_type_names.put(self.gpa, ns_name, {});
+                        self.registerScopedDecl(ns_name, ni);
                         const gop = try self.type_decl_nodes.getOrPut(self.gpa, ns_name);
                         if (!gop.found_existing) {
                             gop.value_ptr.* = ni;
@@ -12602,7 +12632,7 @@ pub const Checker = struct {
                     if (pd.lhs != .none) {
                         const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(pd.lhs));
                         const cname = if (cd.name != .none) self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name)) else "";
-                        return self.buildClassInstanceType(pn, cname);
+                        return self.buildClassInstanceType(pn, cname, null);
                     }
                     // Class found but instance type couldn't be built → `any`.
                     return tymod.ID_ANY;
@@ -13717,6 +13747,14 @@ pub const Checker = struct {
         return self.resolveDeclaredType(name);
     }
 
+    /// Append a type declaration node to the scope-aware index under its bare
+    /// name. Preserves every declaration (all scopes), unlike `type_decl_nodes`.
+    fn registerScopedDecl(self: *Checker, name: []const u8, ni: NodeIndex) void {
+        const gop = self.type_decls_by_name.getOrPut(self.gpa, name) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.append(self.gpa, ni) catch {};
+    }
+
     /// The declaration node of a named type or value (class/interface/alias/enum
     /// via type_decl_nodes, or a function via value_decl_by_name).
     fn declNodeForName(self: *Checker, name: []const u8) ?NodeIndex {
@@ -13967,12 +14005,12 @@ pub const Checker = struct {
             .ts_interface_decl => blk: {
                 self.type_pos_depth += 1;
                 defer self.type_pos_depth -= 1;
-                break :blk self.buildInterfaceType(decl);
+                break :blk self.buildInterfaceType(decl, null);
             },
             .class_decl => blk: {
                 self.type_pos_depth += 1;
                 defer self.type_pos_depth -= 1;
-                break :blk self.buildClassInstanceType(decl, name);
+                break :blk self.buildClassInstanceType(decl, name, null);
             },
             // A value typed `: Fruit` has the union of the enum's member literals
             // (the enum's type-side). unionOf collapses a single-member enum to
@@ -14001,6 +14039,112 @@ pub const Checker = struct {
             },
         };
         self.declared_type_cache.put(self.gpa, name, result) catch {};
+        return result;
+    }
+
+    /// True when decl-scope `outer` lexically encloses (or equals) use-site
+    /// scope `inner`. Both are dotted namespace paths ("" = top level, which
+    /// encloses everything). A type declared in `outer` is visible at `inner`.
+    fn scopeEncloses(outer: []const u8, inner: []const u8) bool {
+        if (outer.len == 0) return true;
+        if (outer.len > inner.len) return false;
+        if (!std.mem.startsWith(u8, inner, outer)) return false;
+        return inner.len == outer.len or inner[outer.len] == '.';
+    }
+
+    /// Scope-aware resolution of a named type at a specific use site.
+    ///
+    /// When `name` is declared in two or more DISTINCT lexical scopes (the same
+    /// interface/class name in sibling namespaces), the scope-blind
+    /// `resolveDeclaredType` merges them all into one bogus structure. This
+    /// picks the declaration group visible at `use_site` (the innermost
+    /// enclosing scope) and builds ONLY that group, so same-named types in
+    /// different namespaces stay distinct.
+    ///
+    /// Returns null — so the caller falls back to `resolveDeclaredType` for
+    /// byte-identical behavior — whenever the name is unambiguous (≤1 scope),
+    /// the use site sees the whole decl set anyway, or the chosen group is not a
+    /// clean interface-only / single-class set (the tricky namespace+interface,
+    /// enum, and alias merges stay on the proven scope-blind path).
+    fn resolveDeclaredTypeInScope(self: *Checker, name: []const u8, use_site: NodeIndex) ?TypeId {
+        if (use_site == .none) return null;
+        const list = self.type_decls_by_name.get(name) orelse return null;
+        const count = list.items.len;
+        if (count < 2 or count > 32) return null;
+
+        // Scope key per declaration (own stable backing rows). Namespace-only
+        // scope so module-augmentation homonyms share one scope (they merge).
+        var keys_storage: [32][192]u8 = undefined;
+        var keys: [32][]const u8 = undefined;
+        for (list.items, 0..) |d, i| keys[i] = self.namespaceScopeKey(d, &keys_storage[i]);
+
+        // Unambiguous when every decl shares one scope — delegate.
+        var multi = false;
+        for (keys[1..count]) |k| {
+            if (!std.mem.eql(u8, k, keys[0])) { multi = true; break; }
+        }
+        if (!multi) return null;
+
+        // Innermost decl-scope enclosing the use site.
+        var ub: [192]u8 = undefined;
+        const use_scope = self.namespaceScopeKey(use_site, &ub);
+        var chosen: ?[]const u8 = null;
+        for (keys[0..count]) |k| {
+            if (scopeEncloses(k, use_scope)) {
+                if (chosen == null or k.len > chosen.?.len) chosen = k;
+            }
+        }
+        const scope = chosen orelse return null;
+
+        // If the chosen scope contains every declaration, resolution is
+        // effectively scope-blind → delegate.
+        var chosen_count: usize = 0;
+        for (keys[0..count]) |k| if (std.mem.eql(u8, k, scope)) { chosen_count += 1; };
+        if (chosen_count == count) return null;
+
+        // The chosen group must be a clean set we can build in isolation:
+        // all interfaces, OR exactly one class (no namespace/enum/alias). Mixed
+        // or merge-bearing groups stay on the scope-blind path.
+        var n_iface: usize = 0;
+        var n_class: usize = 0;
+        var n_other: usize = 0;
+        var primary: NodeIndex = .none;
+        for (list.items, 0..) |d, i| {
+            if (!std.mem.eql(u8, keys[i], scope)) continue;
+            switch (self.ast_ref.nodeTag(d)) {
+                .ts_interface_decl => { if (primary == .none) primary = d; n_iface += 1; },
+                .class_decl => { if (n_class == 0) primary = d; n_class += 1; },
+                else => n_other += 1,
+            }
+        }
+        if (n_other > 0) return null;
+        if (n_class > 1) return null; // duplicate classes don't merge
+        if (n_class == 1 and n_iface > 0) return null; // class+interface merge: scope-blind
+        if (primary == .none) return null;
+
+        return self.buildScopedType(name, scope, primary);
+    }
+
+    /// Build (and cache) the structural type for the chosen scope's `primary`
+    /// declaration, merging only same-scope same-name declarations. Recursion
+    /// is broken by a sentinel keyed on "<scope>\x00<name>".
+    fn buildScopedType(self: *Checker, name: []const u8, scope: []const u8, primary: NodeIndex) ?TypeId {
+        var key_buf: [384]u8 = undefined;
+        const cache_key = std.fmt.bufPrint(&key_buf, "{s}\x00{s}", .{ scope, name }) catch return null;
+        if (self.scoped_type_cache.get(cache_key)) |cached| return cached;
+        const owned_key = self.gpa.dupe(u8, cache_key) catch return null;
+        self.scoped_type_cache.put(self.gpa, owned_key, tymod.ID_UNKNOWN) catch {
+            self.gpa.free(owned_key);
+            return null;
+        };
+        self.type_pos_depth += 1;
+        defer self.type_pos_depth -= 1;
+        const result = switch (self.ast_ref.nodeTag(primary)) {
+            .ts_interface_decl => self.buildInterfaceType(primary, scope),
+            .class_decl => self.buildClassInstanceType(primary, name, scope),
+            else => return null,
+        };
+        self.scoped_type_cache.put(self.gpa, owned_key, result) catch {};
         return result;
     }
 
@@ -14055,7 +14199,7 @@ pub const Checker = struct {
                 const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(self.ast_ref.nodeData(stmt).lhs));
                 if (cd.name == .none) return;
                 const cls_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
-                const cls_ty = self.buildClassInstanceType(stmt, cls_name);
+                const cls_ty = self.buildClassInstanceType(stmt, cls_name, null);
                 props.append(self.gpa, .{ .name = cls_name, .type_id = cls_ty }) catch {};
             },
             .ts_enum_decl => {
@@ -14242,7 +14386,55 @@ pub const Checker = struct {
         return std.mem.eql(u8, self.enclosingScopeKey(a, &buf_a), self.enclosingScopeKey(b, &buf_b));
     }
 
-    fn buildInterfaceType(self: *Checker, decl: NodeIndex) TypeId {
+    /// Like `enclosingScopeKey` but counts ONLY `namespace N {}` nesting —
+    /// `declare module "spec"` boundaries are transparent. This is the scope
+    /// notion that drives type-declaration merging: interfaces of the same name
+    /// merge across module-augmentation boundaries (same declaration space) but
+    /// NOT across true sibling namespaces. Used by the scope-aware resolution
+    /// path so module augmentation keeps merging while sibling-namespace
+    /// homonyms stay distinct.
+    fn namespaceScopeKey(self: *Checker, node: NodeIndex, buf: []u8) []const u8 {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var names: [16][]const u8 = undefined;
+        var n: usize = 0;
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            if (self.ast_ref.nodeTag(pn) == .ts_namespace_decl) {
+                if (n < names.len) {
+                    const d = self.ast_ref.nodeData(pn);
+                    names[n] = if (d.lhs != .none)
+                        self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs))
+                    else
+                        "";
+                    n += 1;
+                }
+            }
+        }
+        var len: usize = 0;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            if (len > 0 and len < buf.len) {
+                buf[len] = '.';
+                len += 1;
+            }
+            for (names[i]) |c| {
+                if (len < buf.len) {
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+        }
+        return buf[0..len];
+    }
+
+    /// `scope_filter` (null in the scope-blind path) restricts declaration
+    /// merging to same-name extras whose enclosing scope equals the filter, so a
+    /// scoped build of one namespace's interface ignores sibling-namespace
+    /// homonyms. The `decl` being built is always excluded from its own merge.
+    fn buildInterfaceType(self: *Checker, decl: NodeIndex, scope_filter: ?[]const u8) TypeId {
         const data = self.ast_ref.nodeData(decl);
         const id = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(data.lhs));
         var props: std.ArrayList(tymod.ObjectProp) = .empty;
@@ -14337,6 +14529,15 @@ pub const Checker = struct {
         const iface_name = self.ast_ref.tokenText(id.name);
         for (self.merged_iface_extra.items) |entry| {
             if (!std.mem.eql(u8, entry.name, iface_name)) continue;
+            // Building this very declaration (it sits in merged_iface_extra as a
+            // non-primary): its members already came from the body loop above.
+            if (entry.node == decl) continue;
+            // Scope-aware build: only fold same-name extras that live in the
+            // chosen scope; sibling-namespace homonyms are a distinct type.
+            if (scope_filter) |sf| {
+                var eb: [192]u8 = undefined;
+                if (!std.mem.eql(u8, self.namespaceScopeKey(entry.node, &eb), sf)) continue;
+            }
             // A same-named declaration in a DIFFERENT namespace is a distinct
             // type we can't resolve separately; merging it is a pragmatic
             // approximation, but its methods must be DEDUPED (else identical
@@ -14743,7 +14944,7 @@ pub const Checker = struct {
     /// Static members are not included (those live on the constructor).
     /// `extends ParentClass` contributes the parent's instance props so
     /// structural assignability (subclass → superclass) holds.
-    fn buildClassInstanceType(self: *Checker, decl: NodeIndex, name: []const u8) TypeId {
+    fn buildClassInstanceType(self: *Checker, decl: NodeIndex, name: []const u8, scope_filter: ?[]const u8) TypeId {
         // Cycle break: if this class is already being built (reached via a
         // `this` annotation on one of its own members, or an inheritance
         // cycle), resolve to a `type_ref` by name rather than rebuilding it.
@@ -14926,6 +15127,13 @@ pub const Checker = struct {
         // Declaration merging: merge members from any same-named interface declarations.
         for (self.merged_iface_extra.items) |entry| {
             if (!std.mem.eql(u8, entry.name, name)) continue;
+            if (entry.node == decl) continue;
+            // Scope-aware build: only merge same-name interfaces in the chosen
+            // scope; a sibling-namespace `interface X` is not part of this class.
+            if (scope_filter) |sf| {
+                var eb: [192]u8 = undefined;
+                if (!std.mem.eql(u8, self.namespaceScopeKey(entry.node, &eb), sf)) continue;
+            }
             const extra_data = self.ast_ref.nodeData(entry.node);
             const extra_id = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(extra_data.lhs));
             if (extra_id.body_end > extra_id.body_start) {
@@ -19556,6 +19764,18 @@ pub const Checker = struct {
             // may grow types.items, invalidating the `obj` pointer obtained from store.get().
             const ref_name = obj.name;
             if (self.libTypeRefProperty(obj_ty, prop_name)) |ty| return ty;
+            // Scope-aware build first, as a PURE ADDITION: when `ref_name` is
+            // declared in several namespaces, try the homonym visible at the use
+            // site. Only short-circuit if it actually resolves the member —
+            // otherwise fall through to the scope-blind lookup unchanged, so we
+            // never lose a member the over-merged structure happened to provide.
+            if (self.resolveDeclaredTypeInScope(ref_name, obj_node)) |scoped| {
+                if (!scoped.eq(obj_ty)) {
+                    const subst = self.applyDeclTypeArgs(obj_ty, ref_name, scoped);
+                    const t = self.memberOnApparentType(subst, prop_name, obj_node);
+                    if (!tymod.isUnknown(&self.store, t)) return t;
+                }
+            }
             // User-declared types — resolve via the declared cache.
             if (self.resolveDeclaredType(ref_name)) |resolved| {
                 if (!resolved.eq(obj_ty)) {
