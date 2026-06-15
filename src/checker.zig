@@ -514,6 +514,16 @@ pub const Checker = struct {
     /// tsc's per-scope SymbolTables.
     symbols: std.StringHashMapUnmanaged(Symbol) = .empty,
 
+    /// Lexical scope tree (binder containers): index 0 is the global scope; each
+    /// namespace/module/function/block body is a node with a `parent` link and a
+    /// `kind`. Materialized once by `buildScopeTree`; the scope chain a binder
+    /// walks for name resolution. `namespaceScopeKey` is derived from it.
+    lex_scopes: std.ArrayListUnmanaged(LexScope) = .empty,
+
+    /// Maps a scope-introducing AST node (its u32 index) → the lex_scopes index
+    /// of the scope it introduces. Used to find a node's enclosing scope.
+    scope_intro: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+
     /// Maps generic function TypeId → rendered type-parameter prefix string
     /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
     /// method type is built; looked up by typeToStringInner to emit the correct
@@ -735,6 +745,8 @@ pub const Checker = struct {
             }
             self.symbols.deinit(self.gpa);
         }
+        self.lex_scopes.deinit(self.gpa);
+        self.scope_intro.deinit(self.gpa);
         {
             var it = self.fn_type_params.valueIterator();
             while (it.next()) |v| self.gpa.free(v.*);
@@ -12326,6 +12338,8 @@ pub const Checker = struct {
     ///   * consecutive same-scope enums of one name record the prior primary as
     ///     a merge extra (two-block enum merging).
     fn deriveTypeIndexes(self: *Checker) !void {
+        // The lexical scope tree backs namespaceScopeKey, used below — build first.
+        try self.buildScopeTree();
         var it = self.type_decls_by_name.iterator();
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
@@ -14620,24 +14634,78 @@ pub const Checker = struct {
     /// NOT across true sibling namespaces. Used by the scope-aware resolution
     /// path so module augmentation keeps merging while sibling-namespace
     /// homonyms stay distinct.
-    fn namespaceScopeKey(self: *Checker, node: NodeIndex, buf: []u8) []const u8 {
+    /// The lexical scope kinds a binder distinguishes.
+    const ScopeKind = enum(u8) { global, namespace, module, function, block };
+
+    /// One lexical scope (binder container) in `lex_scopes`. `name` is the
+    /// namespace/module identifier (borrowed from source), "" for the others.
+    const LexScope = struct { kind: ScopeKind, parent: u32, name: []const u8 = "" };
+
+    /// Build the lexical scope tree from the AST: a scope for the global file
+    /// plus every namespace/module/function/block, each linked to its enclosing
+    /// scope. Run once (before any namespaceScopeKey query), when parent_indices
+    /// is available. Function/block scopes make it a full lexical tree; only
+    /// namespace scopes contribute to the namespace-scope key (modules are
+    /// transparent, matching declaration-merging rules).
+    fn buildScopeTree(self: *Checker) !void {
+        if (self.lex_scopes.items.len != 0) return; // already built
+        try self.lex_scopes.append(self.gpa, .{ .kind = .global, .parent = 0 });
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        // Pass 1: a scope per introducer node (parent filled in pass 2).
+        var i: u32 = 0;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            const kind: ScopeKind = switch (self.ast_ref.nodeTag(ni)) {
+                .ts_namespace_decl => .namespace,
+                .ts_module_decl => .module,
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .method_def, .getter_def, .setter_def => .function,
+                .block_stmt, .for_stmt, .for_in_stmt, .for_of_stmt => .block,
+                else => continue,
+            };
+            var name: []const u8 = "";
+            if (kind == .namespace or kind == .module) {
+                const d = self.ast_ref.nodeData(ni);
+                if (d.lhs != .none) name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs));
+            }
+            const idx: u32 = @intCast(self.lex_scopes.items.len);
+            try self.lex_scopes.append(self.gpa, .{ .kind = kind, .parent = 0, .name = name });
+            try self.scope_intro.put(self.gpa, i, idx);
+        }
+        // Pass 2: link each scope to its enclosing scope.
+        var it = self.scope_intro.iterator();
+        while (it.next()) |e| {
+            self.lex_scopes.items[e.value_ptr.*].parent = self.enclosingScopeIdx(@enumFromInt(e.key_ptr.*));
+        }
+    }
+
+    /// The lex_scopes index of the scope CONTAINING `node` — the scope of its
+    /// nearest scope-introducing ancestor (global = 0 when there is none).
+    fn enclosingScopeIdx(self: *Checker, node: NodeIndex) u32 {
         const parents = self.semantic.parent_indices;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
-        var names: [16][]const u8 = undefined;
-        var n: usize = 0;
         var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
         while (p != NONE) : (p = parents[p]) {
-            const pn: NodeIndex = @enumFromInt(p);
-            if (self.ast_ref.nodeTag(pn) == .ts_namespace_decl) {
-                if (n < names.len) {
-                    const d = self.ast_ref.nodeData(pn);
-                    names[n] = if (d.lhs != .none)
-                        self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs))
-                    else
-                        "";
-                    n += 1;
-                }
+            if (self.scope_intro.get(p)) |idx| return idx;
+        }
+        return 0;
+    }
+
+    /// The dotted namespace-scope path of `node` (e.g. "A.B"), derived by walking
+    /// the lexical scope tree from `node`'s enclosing scope to the global root and
+    /// collecting only namespace-kind scope names (modules/functions/blocks are
+    /// transparent). "" at the top level. Result written into `buf`.
+    fn namespaceScopeKey(self: *Checker, node: NodeIndex, buf: []u8) []const u8 {
+        var names: [16][]const u8 = undefined;
+        var n: usize = 0;
+        var idx = self.enclosingScopeIdx(node);
+        while (idx != 0) {
+            const sc = self.lex_scopes.items[idx];
+            if (sc.kind == .namespace and n < names.len) {
+                names[n] = sc.name;
+                n += 1;
             }
+            idx = sc.parent;
         }
         var len: usize = 0;
         var i: usize = n;
