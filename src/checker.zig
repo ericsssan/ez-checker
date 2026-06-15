@@ -3251,9 +3251,10 @@ pub const Checker = struct {
             const member_name_tok = self.ast_ref.nodeMainToken(md.lhs);
             const member_name = self.ast_ref.tokenText(member_name_tok);
             // In strict mode, reserved words as enum member names cause the enum
-            // to be treated as any when accessed. Return null to signal the caller
-            // to fall back to any.
-            if (Checker.isReservedWordForEnum(member_name)) return null;
+            // to be treated as any when accessed.  In NON-strict mode tsc accepts
+            // them (`enum E { abstract }` → `E.abstract`), so only bail under
+            // strict (proxied by strictNullChecks, which `@strict` enables).
+            if (self.checker_opts.strict_null_checks and Checker.isReservedWordForEnum(member_name)) return null;
             const value_ty: TypeId = if (md.rhs != .none) blk: {
                 // Initializer specified — use its inferred type.
                 const init_ty = self.typeOf(md.rhs);
