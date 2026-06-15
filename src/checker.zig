@@ -8603,27 +8603,38 @@ pub const Checker = struct {
                 const pred_main = self.ast_ref.nodeMainToken(ty_inner);
                 is_assertion = std.mem.eql(u8, self.ast_ref.tokenText(pred_main), "asserts");
                 // pd.lhs = param-name identifier (or this_expr).
-                if (pd.lhs != .none and self.ast_ref.nodeTag(pd.lhs) == .identifier) {
-                    const pred_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs));
-                    // Find which param has this name.  `this` parameters
-                    // are a TS-only declaration of the receiver type and
-                    // don't take an argument slot — exclude them from
-                    // the index used to match call-site arg positions.
-                    var pi: usize = 0;
-                    if (params_start <= params_end and params_end <= ext_len) {
-                        const params = self.ast_ref.extra_data[params_start..params_end];
-                        for (params) |raw| {
-                            const p_node: NodeIndex = @enumFromInt(raw);
-                            const pn = self.paramName(p_node);
-                            if (std.mem.eql(u8, pn, "this")) continue;
-                            if (pn.len > 0 and std.mem.eql(u8, pn, pred_name)) {
-                                predicate_param_idx = @intCast(pi);
-                                break;
+                // pd.lhs is the predicate subject: `.identifier` for named params
+                // (including `asserts this`) or `.this_expr` for `this is T`.
+                if (pd.lhs != .none) {
+                    const pred_lhs_tag = self.ast_ref.nodeTag(pd.lhs);
+                    const is_this_subj = pred_lhs_tag == .this_expr or
+                        (pred_lhs_tag == .identifier and std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs)), "this"));
+                    if (is_this_subj) {
+                        // `this is T` / `asserts this [is T]` — sentinel 0xFFFE means
+                        // the predicate subject is the implicit receiver, not a param.
+                        predicate_param_idx = 0xFFFE;
+                        if (pd.rhs != .none) predicate_target = self.resolveTypeNode(pd.rhs);
+                    } else if (pred_lhs_tag == .identifier) {
+                        const pred_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs));
+                        // Find which param has this name.  `this` parameters are a
+                        // TS-only declaration of the receiver type and don't take an
+                        // argument slot — exclude them from the index.
+                        var pi: usize = 0;
+                        if (params_start <= params_end and params_end <= ext_len) {
+                            const params = self.ast_ref.extra_data[params_start..params_end];
+                            for (params) |raw| {
+                                const p_node: NodeIndex = @enumFromInt(raw);
+                                const pn = self.paramName(p_node);
+                                if (std.mem.eql(u8, pn, "this")) continue;
+                                if (pn.len > 0 and std.mem.eql(u8, pn, pred_name)) {
+                                    predicate_param_idx = @intCast(pi);
+                                    break;
+                                }
+                                pi += 1;
                             }
-                            pi += 1;
                         }
+                        if (pd.rhs != .none) predicate_target = self.resolveTypeNode(pd.rhs);
                     }
-                    if (pd.rhs != .none) predicate_target = self.resolveTypeNode(pd.rhs);
                 }
                 // Assertion-style: return type is void (not boolean).
                 ret_ty = if (is_assertion) tymod.ID_VOID else tymod.ID_BOOLEAN;
@@ -9628,22 +9639,30 @@ pub const Checker = struct {
                 const pd = self.ast_ref.nodeData(ret_node);
                 const pred_main = self.ast_ref.nodeMainToken(ret_node);
                 is_assertion = std.mem.eql(u8, self.ast_ref.tokenText(pred_main), "asserts");
-                if (pd.lhs != .none and self.ast_ref.nodeTag(pd.lhs) == .identifier) {
-                    const pred_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs));
-                    if (fd.params <= fd.params_end and fd.params_end <= ext_len) {
-                        var pi: usize = 0;
-                        for (self.ast_ref.extra_data[fd.params..fd.params_end]) |raw| {
-                            const p_node: NodeIndex = @enumFromInt(raw);
-                            const pn = self.paramName(p_node);
-                            if (std.mem.eql(u8, pn, "this")) continue;
-                            if (pn.len > 0 and std.mem.eql(u8, pn, pred_name)) {
-                                pred_param_idx = @intCast(pi);
-                                break;
+                if (pd.lhs != .none) {
+                    const pred_lhs_tag2 = self.ast_ref.nodeTag(pd.lhs);
+                    const is_this_subj2 = pred_lhs_tag2 == .this_expr or
+                        (pred_lhs_tag2 == .identifier and std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs)), "this"));
+                    if (is_this_subj2) {
+                        pred_param_idx = 0xFFFE;
+                        if (pd.rhs != .none) pred_target = self.resolveTypeNodeParamAware(pd.rhs);
+                    } else if (pred_lhs_tag2 == .identifier) {
+                        const pred_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs));
+                        if (fd.params <= fd.params_end and fd.params_end <= ext_len) {
+                            var pi: usize = 0;
+                            for (self.ast_ref.extra_data[fd.params..fd.params_end]) |raw| {
+                                const p_node: NodeIndex = @enumFromInt(raw);
+                                const pn = self.paramName(p_node);
+                                if (std.mem.eql(u8, pn, "this")) continue;
+                                if (pn.len > 0 and std.mem.eql(u8, pn, pred_name)) {
+                                    pred_param_idx = @intCast(pi);
+                                    break;
+                                }
+                                pi += 1;
                             }
-                            pi += 1;
                         }
+                        if (pd.rhs != .none) pred_target = self.resolveTypeNodeParamAware(pd.rhs);
                     }
-                    if (pd.rhs != .none) pred_target = self.resolveTypeNodeParamAware(pd.rhs);
                 }
                 ret_ty = if (is_assertion) tymod.ID_VOID else tymod.ID_BOOLEAN;
             } else {
@@ -21897,7 +21916,7 @@ pub const Checker = struct {
                     }
                     try buf.appendSlice(gpa, ") => ");
                     if (sig.predicate_param_index != 0xFFFF and sig.predicate_target != .none) {
-                        const pred_name = if (sig.predicate_param_index < names.len) names[sig.predicate_param_index] else "";
+                        const pred_name = if (sig.predicate_param_index == 0xFFFE) "this" else if (sig.predicate_param_index < names.len) names[sig.predicate_param_index] else "";
                         if (pred_name.len > 0) {
                             if (sig.is_assertion) try buf.appendSlice(gpa, "asserts ");
                             try buf.appendSlice(gpa, pred_name);
@@ -21907,7 +21926,7 @@ pub const Checker = struct {
                             try self.typeToStringInner(sig.return_type, buf, depth + 1);
                         }
                     } else if (sig.is_assertion and sig.predicate_param_index != 0xFFFF) {
-                        const pred_name = if (sig.predicate_param_index < names.len) names[sig.predicate_param_index] else "";
+                        const pred_name = if (sig.predicate_param_index == 0xFFFE) "this" else if (sig.predicate_param_index < names.len) names[sig.predicate_param_index] else "";
                         if (pred_name.len > 0) {
                             try buf.appendSlice(gpa, "asserts ");
                             try buf.appendSlice(gpa, pred_name);
@@ -22090,7 +22109,7 @@ pub const Checker = struct {
                                 }
                                 try buf.appendSlice(gpa, "): ");
                                 if (msig.predicate_param_index != 0xFFFF and msig.predicate_target != .none) {
-                                    const pred_name = if (msig.predicate_param_index < mnames.len) mnames[msig.predicate_param_index] else "";
+                                    const pred_name = if (msig.predicate_param_index == 0xFFFE) "this" else if (msig.predicate_param_index < mnames.len) mnames[msig.predicate_param_index] else "";
                                     if (pred_name.len > 0) {
                                         if (msig.is_assertion) try buf.appendSlice(gpa, "asserts ");
                                         try buf.appendSlice(gpa, pred_name);
@@ -22100,7 +22119,7 @@ pub const Checker = struct {
                                         try self.typeToStringInner(msig.return_type, buf, depth + 1);
                                     }
                                 } else if (msig.is_assertion and msig.predicate_param_index != 0xFFFF) {
-                                    const pred_name = if (msig.predicate_param_index < mnames.len) mnames[msig.predicate_param_index] else "";
+                                    const pred_name = if (msig.predicate_param_index == 0xFFFE) "this" else if (msig.predicate_param_index < mnames.len) mnames[msig.predicate_param_index] else "";
                                     if (pred_name.len > 0) {
                                         try buf.appendSlice(gpa, "asserts ");
                                         try buf.appendSlice(gpa, pred_name);
