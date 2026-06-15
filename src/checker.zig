@@ -5906,7 +5906,7 @@ pub const Checker = struct {
                             if (src_bd.rhs != .none and
                                 self.ast_ref.nodeTag(src_bd.rhs) == .ts_type_annotation)
                                 break :blk true;
-                            // Check if declaration's init is `as const` or `<const>`
+                            // Walk to the parent declarator for additional checks.
                             const src_di = src_decl.toInt();
                             if (src_di >= self.semantic.parent_indices.len) break :blk false;
                             const src_par_idx = self.semantic.parent_indices[src_di];
@@ -5915,20 +5915,44 @@ pub const Checker = struct {
                             const src_par: NodeIndex = @enumFromInt(src_par_idx);
                             if (self.ast_ref.nodeTag(src_par) != .declarator) break :blk false;
                             const src_dd = self.ast_ref.nodeData(src_par);
+                            // Also check annotation via declarator.lhs (mirrors declaredTypeAtBinding).
+                            // getDeclNode may return a reference node rather than the actual binding,
+                            // so we must check the annotation on declarator.lhs as well.
+                            if (src_dd.lhs != .none) {
+                                const binding_bd = self.ast_ref.nodeData(src_dd.lhs);
+                                if (binding_bd.rhs != .none and
+                                    self.ast_ref.nodeTag(binding_bd.rhs) == .ts_type_annotation)
+                                    break :blk true;
+                            }
+                            // Check if declaration's init is `as const` / `as "lit"` / `<const>` / `<"lit">`.
                             if (src_dd.rhs == .none) break :blk false;
                             const src_init_tag = self.ast_ref.nodeTag(src_dd.rhs);
                             if (src_init_tag == .ts_as_expr) {
                                 const src_id = self.ast_ref.nodeData(src_dd.rhs);
                                 if (src_id.rhs == .none) break :blk false;
                                 if (self.ast_ref.nodeTag(src_id.rhs) != .ts_type_reference) break :blk false;
-                                const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(src_id.rhs));
+                                const type_tok = self.ast_ref.nodeMainToken(src_id.rhs);
+                                const type_tok_tag = self.ast_ref.tokenTag(type_tok);
+                                if (type_tok_tag == .string_literal or
+                                    type_tok_tag == .number_literal or
+                                    type_tok_tag == .bigint_literal or
+                                    type_tok_tag == .kw_true or
+                                    type_tok_tag == .kw_false) break :blk true;
+                                const cname = self.ast_ref.tokenText(type_tok);
                                 break :blk std.mem.eql(u8, cname, "const");
                             }
                             if (src_init_tag == .ts_type_assertion) {
                                 const src_id = self.ast_ref.nodeData(src_dd.rhs);
                                 if (src_id.lhs == .none) break :blk false;
                                 if (self.ast_ref.nodeTag(src_id.lhs) != .ts_type_reference) break :blk false;
-                                const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(src_id.lhs));
+                                const type_tok = self.ast_ref.nodeMainToken(src_id.lhs);
+                                const type_tok_tag = self.ast_ref.tokenTag(type_tok);
+                                if (type_tok_tag == .string_literal or
+                                    type_tok_tag == .number_literal or
+                                    type_tok_tag == .bigint_literal or
+                                    type_tok_tag == .kw_true or
+                                    type_tok_tag == .kw_false) break :blk true;
+                                const cname = self.ast_ref.tokenText(type_tok);
                                 break :blk std.mem.eql(u8, cname, "const");
                             }
                             break :blk false;
