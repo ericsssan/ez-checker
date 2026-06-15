@@ -805,7 +805,7 @@ pub const Checker = struct {
             }
             return null;
         }
-        if (self.typeOfNameByAstSearch(real)) |t| {
+        if (self.typeOfNameByAstSearch(real, .none)) |t| {
             if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ERROR) and !t.eq(tymod.ID_ANY)) return t;
         }
         return null;
@@ -2377,7 +2377,7 @@ pub const Checker = struct {
             if (self.isForInLoopBinding(node)) return tymod.ID_STRING;
             if (self.forOfBindingElementType(node)) |t| return t;
         }
-        if (self.typeOfNameByAstSearch(name)) |t| {
+        if (self.typeOfNameByAstSearch(name, node)) |t| {
             // Fundule (function + namespace merge): the name maps to both a
             // function in value_decl_by_name AND a namespace in type_decl_nodes.
             // tsc types such an identifier as `typeof F`, not the function type.
@@ -3542,7 +3542,7 @@ pub const Checker = struct {
     /// Walk the AST looking for a top-level declarator/fn_decl/class_decl
     /// with the given name.  Returns the declared/inferred type, or null
     /// if not found.
-    pub fn typeOfNameByAstSearch(self: *Checker, name: []const u8) ?TypeId {
+    pub fn typeOfNameByAstSearch(self: *Checker, name: []const u8, use_site: NodeIndex) ?TypeId {
         // Overload handling: when both signature declarations (no body) AND an
         // implementation exist, TS exposes the OVERLOAD SET, not the impl's
         // inferred type — so `function a(): Promise<void>; function a(x): void;
@@ -3600,7 +3600,7 @@ pub const Checker = struct {
         }
         // Overload signatures present → the overload set is the type.
         if (fn_decl_fallback != .none) {
-            if (self.functionTypeFromAllOverloads(name)) |t| return t;
+            if (self.functionTypeFromAllOverloads(name, use_site)) |t| return t;
             return self.functionTypeFromFnDecl(fn_decl_fallback);
         }
         // No overloads → the implementation's own (most-general) type.
@@ -6235,7 +6235,7 @@ pub const Checker = struct {
                         // collects no-body signature decls, so it returns null for a
                         // plain single-bodied function → falls through to its own type.
                         const fn_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(fd.name));
-                        if (self.functionTypeFromAllOverloads(fn_name)) |t| return t;
+                        if (self.functionTypeFromAllOverloads(fn_name, parent)) |t| return t;
                     }
                 }
                 return self.functionTypeFromFnDecl(parent);
@@ -8214,7 +8214,7 @@ pub const Checker = struct {
             return static_ty;
         }
         // Find a declarator binding the same name and use its inferred type.
-        if (self.typeOfNameByAstSearch(name)) |t| {
+        if (self.typeOfNameByAstSearch(name, .none)) |t| {
             // `const x = Symbol(...)` — TypeScript treats `typeof x` as a unique
             // symbol type (a finite singleton).  Our checker infers ID_UNKNOWN for
             // the Symbol() call.  Return a string_literal carrying the variable name
@@ -9103,12 +9103,41 @@ pub const Checker = struct {
     /// excluded — TypeScript does not expose it as a call signature.
     ///
     /// Returns null when no call-visible overloads are found.
-    fn functionTypeFromAllOverloads(self: *Checker, fn_name: []const u8) ?TypeId {
+    fn functionTypeFromAllOverloads(self: *Checker, fn_name: []const u8, use_site: NodeIndex) ?TypeId {
         var sig_buf: [16]tymod.Signature = undefined;
         var tp_buf: [16]struct { start: u32, end: u32 } = undefined;
         var sig_count: usize = 0;
         var has_impl: bool = false; // true if any declaration has a body
         const list = self.value_decl_by_name.get(fn_name) orelse return null;
+        // Scope-aware overload set: when the same function name is declared in
+        // multiple namespace scopes (sibling-namespace homonyms), only the
+        // declarations in the innermost scope enclosing the use site are genuine
+        // overloads of one another. Merging all of them manufactures bogus
+        // duplicate signatures (`{ (): X; (): X; }`). With no use site (.none)
+        // the scope-blind behavior is preserved.
+        var chosen_buf: [192]u8 = undefined;
+        var chosen_scope: ?[]const u8 = null;
+        if (use_site != .none) {
+            var ub: [192]u8 = undefined;
+            const use_scope = self.namespaceScopeKey(use_site, &ub);
+            var best_len: usize = 0;
+            var have_best = false;
+            for (list.items) |ni| {
+                switch (self.ast_ref.nodeTag(ni)) {
+                    .fn_decl, .async_fn_decl, .generator_fn_decl,
+                    .async_generator_fn_decl, .ts_declare_function => {},
+                    else => continue,
+                }
+                var db: [192]u8 = undefined;
+                const ds = self.namespaceScopeKey(ni, &db);
+                if (scopeEncloses(ds, use_scope) and (!have_best or ds.len > best_len)) {
+                    have_best = true;
+                    best_len = ds.len;
+                    @memcpy(chosen_buf[0..ds.len], ds);
+                    chosen_scope = chosen_buf[0..ds.len];
+                }
+            }
+        }
         for (list.items) |ni| {
             if (sig_count >= sig_buf.len) break;
             const t = self.ast_ref.nodeTag(ni);
@@ -9121,6 +9150,11 @@ pub const Checker = struct {
                     if (fd.name == .none) continue;
                     const dn = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(fd.name));
                     if (!std.mem.eql(u8, dn, fn_name)) continue;
+                    // Skip declarations outside the use site's chosen scope.
+                    if (chosen_scope) |cs| {
+                        var db: [192]u8 = undefined;
+                        if (!std.mem.eql(u8, self.namespaceScopeKey(ni, &db), cs)) continue;
+                    }
                     // Implementation signatures (with body) are not call-visible.
                     if (fd.body != .none) { has_impl = true; continue; }
                     const is_async = switch (t) {
@@ -18730,7 +18764,7 @@ pub const Checker = struct {
         if (self.moduleSpecIsLocalSection(module_spec) and
             self.namespace_import_map.get(member_name) == null)
         {
-            if (self.typeOfNameByAstSearch(member_name)) |t| {
+            if (self.typeOfNameByAstSearch(member_name, .none)) |t| {
                 if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ANY)) return t;
             }
             if (self.resolveDeclaredType(member_name)) |t| {
