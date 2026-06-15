@@ -8171,8 +8171,76 @@ pub const Checker = struct {
             return t;
         }
         if (self.global_value_types.get(name)) |t| return t;
+        // `typeof <param>` — a type query on a parameter in scope, e.g.
+        // `declare function f(a: (x: number) => number[]): typeof a`.  tsc keeps
+        // it verbatim as `typeof a` rather than expanding — but only when the
+        // parameter's type isn't `any` (`(a: any): typeof a` is just `any`).
+        if (self.typeofParamInScope(ty_node, name)) |pty| {
+            if (tymod.isAny(&self.store, pty) or pty.eq(tymod.ID_UNKNOWN)) return tymod.ID_ANY;
+            const disp = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return tymod.ID_ANY;
+            const r = self.store.typeRef(disp, &.{}) catch {
+                self.gpa.free(disp);
+                return tymod.ID_ANY;
+            };
+            self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
+            return r;
+        }
         // Unresolved typeof reference → `any` (safe default for unmodeled types).
         return tymod.ID_ANY;
+    }
+
+    /// The declared type of parameter `name` when it belongs to a NO-BODY
+    /// declaration signature enclosing `ty_node` — i.e. a `typeof <name>` query
+    /// references a parameter in scope (`declare function f(a: T): typeof a`).
+    /// Returns null otherwise (a body-bearing function expands the query).
+    fn typeofParamInScope(self: *Checker, ty_node: NodeIndex, name: []const u8) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const ext = self.ast_ref.extra_data;
+        var p = if (ty_node.toInt() < parents.len) parents[ty_node.toInt()] else NONE;
+        var guard: u16 = 0;
+        while (p != NONE and guard < 64) : ({ p = parents[p]; guard += 1; }) {
+            const pn: NodeIndex = @enumFromInt(p);
+            var ps: u32 = 0;
+            var pe: u32 = 0;
+            var has = false;
+            // tsc keeps `typeof a` verbatim only in a NO-BODY declaration
+            // signature (`declare function f(a): typeof a`).  Inside a function
+            // with a body it expands to the parameter's type, so a body-bearing
+            // enclosing function disqualifies (return false, don't keep).
+            switch (self.ast_ref.nodeTag(pn)) {
+                .ts_declare_function => {
+                    const d = self.ast_ref.nodeData(pn);
+                    if (d.lhs == .none) continue;
+                    const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
+                    ps = fd.params; pe = fd.params_end; has = true;
+                },
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr => {
+                    const d = self.ast_ref.nodeData(pn);
+                    if (d.lhs == .none) continue;
+                    const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
+                    if (fd.body != .none) return null; // has a body → tsc expands
+                    ps = fd.params; pe = fd.params_end; has = true;
+                },
+                .arrow_fn, .async_arrow_fn => return null,
+                .method_def, .computed_method_def, .getter_def, .setter_def, .constructor_def => {
+                    const d = self.ast_ref.nodeData(pn);
+                    if (d.rhs == .none) continue;
+                    const md = self.ast_ref.extraData(ast.MethodData, @intFromEnum(d.rhs));
+                    if (md.body != .none) return null; // has a body → tsc expands
+                    ps = md.params_start; pe = md.params_end; has = true;
+                },
+                else => {},
+            }
+            if (has and ps <= pe and pe <= ext.len) {
+                for (ext[ps..pe]) |raw| {
+                    const param: NodeIndex = @enumFromInt(raw);
+                    if (std.mem.eql(u8, self.paramName(param), name)) return self.paramDeclaredType(param);
+                }
+            }
+        }
+        return null;
     }
 
     /// Returns the class_decl AST node for the class named `name`, or null.
