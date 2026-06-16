@@ -509,6 +509,90 @@ const SymbolTable = struct {
     }
 };
 
+/// The declaration index: every type/value declaration in the file, grouped for
+/// resolution. Extracted from the Checker god-object so the binder's "what is
+/// declared where" lives in one cohesive, independently-testable unit.
+/// Population — which reads the AST and classifies enums — stays in the Checker
+/// (`deriveTypeIndexes` / `recordScopedDecl`), writing INTO these maps; the
+/// lookups are the methods here. Holds only `gpa` and owned maps (no Checker
+/// back-pointer), so it survives `Checker.init` returning by value.
+const DeclIndex = struct {
+    /// One declaration-merge extra: a name and the extra declaration node that
+    /// merges into the primary kept in `type_decl_nodes`.
+    const Merged = struct { name: []const u8, node: NodeIndex };
+
+    gpa: std.mem.Allocator,
+
+    /// name → AST node of the *primary* declaration, so `resolveTypeRef` can
+    /// build the structural type on demand. Derived by `deriveTypeIndexes` from
+    /// `type_decls_by_name` (one primary per name; merged blocks go to the
+    /// merged_*_extra lists).
+    type_decl_nodes: std.StringHashMapUnmanaged(NodeIndex) = .empty,
+
+    /// name → ALL type declarations (interface/class/enum/alias/namespace)
+    /// across ALL lexical scopes, source order — unlike `type_decl_nodes`, which
+    /// keeps one primary per name. Lets scope-aware resolution pick the
+    /// lexically-correct declaration for a use site.
+    type_decls_by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
+
+    /// name → `declarator` / `fn_decl`-family nodes that bind it, node order.
+    /// The by-name lookups on the call path iterate the matching list instead of
+    /// re-scanning all N nodes per call.
+    value_decl_by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
+
+    /// name → per-enum classification (number/string/mixed). TS infers each enum
+    /// as one based on whether ANY member has a string initializer.
+    enum_kinds: std.StringHashMapUnmanaged(EnumKind) = .empty,
+
+    /// Extra interface declaration nodes for declaration merging (beyond the
+    /// primary in `type_decl_nodes`), so member merging sees every block.
+    merged_iface_extra: std.ArrayListUnmanaged(Merged) = .empty,
+    /// Same, for namespace/module blocks.
+    merged_ns_extra: std.ArrayListUnmanaged(Merged) = .empty,
+    /// Earlier `enum E {…}` nodes when a later same-named block overwrote the
+    /// primary — two-block enum merging, ordered so source order = extras… primary.
+    merged_enum_extra: std.ArrayListUnmanaged(Merged) = .empty,
+
+    fn deinit(self: *DeclIndex) void {
+        self.type_decl_nodes.deinit(self.gpa);
+        {
+            var dit = self.type_decls_by_name.valueIterator();
+            while (dit.next()) |list| list.deinit(self.gpa);
+            self.type_decls_by_name.deinit(self.gpa);
+        }
+        {
+            var vit = self.value_decl_by_name.valueIterator();
+            while (vit.next()) |list| list.deinit(self.gpa);
+            self.value_decl_by_name.deinit(self.gpa);
+        }
+        self.enum_kinds.deinit(self.gpa);
+        self.merged_iface_extra.deinit(self.gpa);
+        self.merged_ns_extra.deinit(self.gpa);
+        self.merged_enum_extra.deinit(self.gpa);
+    }
+
+    /// Primary declaration node for `name` (exact wrapper over `.get`).
+    fn primaryDecl(self: *const DeclIndex, name: []const u8) ?NodeIndex {
+        return self.type_decl_nodes.get(name);
+    }
+    /// Whether `name` has a primary type declaration.
+    fn hasType(self: *const DeclIndex, name: []const u8) bool {
+        return self.type_decl_nodes.contains(name);
+    }
+    /// Enum classification for `name`, or null.
+    fn enumKind(self: *const DeclIndex, name: []const u8) ?EnumKind {
+        return self.enum_kinds.get(name);
+    }
+    /// All value declarations for `name` (by value, exact wrapper over `.get`).
+    fn valueDecls(self: *const DeclIndex, name: []const u8) ?std.ArrayListUnmanaged(NodeIndex) {
+        return self.value_decl_by_name.get(name);
+    }
+    /// All type declarations for `name` across scopes (by value, over `.get`).
+    fn allTypeDecls(self: *const DeclIndex, name: []const u8) ?std.ArrayListUnmanaged(NodeIndex) {
+        return self.type_decls_by_name.get(name);
+    }
+};
+
 pub const Checker = struct {
     gpa: std.mem.Allocator,
     ast_ref: *const Ast,
@@ -538,11 +622,12 @@ pub const Checker = struct {
     /// `jsxFactoryIsAnyStub`.
     jsx_factory_any_cache: ?bool = null,
 
-    /// Maps type names to their AST declaration node so `resolveTypeRef`
-    /// can build the structural type on demand.  Filled at init time
-    /// for interfaces and classes — type aliases use the same mechanism
-    /// when their RHS is a structural type.
-    type_decl_nodes: std.StringHashMapUnmanaged(NodeIndex),
+    /// The declaration index — every type/value declaration in the file,
+    /// grouped for resolution (primary decl nodes, all-decls-by-name for
+    /// types and values, enum classification, declaration-merge extras).
+    /// Owned cohesive unit; population is `deriveTypeIndexes`, lookups are
+    /// the methods on `DeclIndex`.
+    decl_index: DeclIndex,
 
     /// Flat index of every `ts_type_parameter` node in the file, collected
     /// once during `buildKnownTypeNames`.  Generic-parameter resolution
@@ -574,15 +659,6 @@ pub const Checker = struct {
     /// constraint resolves T, which resolves its constraint again.
     tparam_names: [32][]const u8 = undefined,
     tparam_n: u8 = 0,
-
-    /// Index: declaration name → `declarator` / `fn_decl`-family nodes that
-    /// bind it, in node order.  Built once during `buildKnownTypeNames`.
-    /// The by-name lookups on the call path (`findCalleeFnDecl`,
-    /// `functionTypeFromAllOverloads`, `typeOfNameByAstSearch`,
-    /// `constInitIsSymbolCall`) iterate the matching list instead of
-    /// re-scanning all N nodes per call — was O(calls × nodes) on
-    /// declaration-dense code.
-    value_decl_by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
 
     /// Function names that have property assignments on them (`foo.x = 1`)
     /// outside the function body — expando functions.  tsc types these as
@@ -628,12 +704,6 @@ pub const Checker = struct {
     /// name-keyed `declared_type_cache` + scope-keyed `scoped_type_cache` — the
     /// two parallel paths are now one (scope,name)-keyed path.
     type_cache: std.StringHashMapUnmanaged(TypeId) = .empty,
-
-    /// Per-enum classification: number-valued or string-valued.  TS infers
-    /// each enum as one or the other based on whether ANY member has a
-    /// string initializer.  Used by no-mixed-enums and no-unsafe-enum-
-    /// comparison.  Populated by `buildKnownTypeNames`.
-    enum_kinds: std.StringHashMapUnmanaged(EnumKind),
 
     /// Built-in global *values* (`console`, `Math`, `JSON`, ...).  Maps
     /// the identifier name → structural TypeId.  Acts as a minimal
@@ -701,30 +771,6 @@ pub const Checker = struct {
     /// Null when cross-file resolution is disabled (file_path is empty).
     module_resolver: ?ModuleResolver = null,
 
-    /// Additional interface declaration nodes for declaration merging.
-    /// When the same interface name appears more than once, extra declarations
-    /// (beyond the first in type_decl_nodes) are collected here so
-    /// buildInterfaceType can merge their members.
-    merged_iface_extra: std.ArrayListUnmanaged(struct { name: []const u8, node: NodeIndex }) = .empty,
-
-    /// Additional namespace/module declaration nodes for declaration merging.
-    /// Same pattern as merged_iface_extra but for namespace blocks.
-    merged_ns_extra: std.ArrayListUnmanaged(struct { name: []const u8, node: NodeIndex }) = .empty,
-
-    /// Earlier `enum E {…}` declaration nodes when a later same-named block
-    /// overwrote the primary in type_decl_nodes — two-block enum merging.
-    /// Ordered by appearance (so source order = extras… then primary).
-    merged_enum_extra: std.ArrayListUnmanaged(struct { name: []const u8, node: NodeIndex }) = .empty,
-
-    /// Scope-aware type-declaration index: every interface/class/enum/alias/
-    /// namespace declaration grouped by bare name, preserving ALL declarations
-    /// across ALL lexical scopes (unlike `type_decl_nodes`, which keeps one
-    /// primary per name). Lets resolution pick the lexically-correct declaration
-    /// for a use site when a name is declared in multiple namespaces. Built
-    /// alongside `type_decl_nodes` during registration; consumed by the
-    /// scope-aware resolution path (`resolveDeclaredTypeInScope`).
-    type_decls_by_name: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(NodeIndex)) = .empty,
-
     /// The binder's symbol table — (scope, name) → Symbol + scope interner.
     /// Built by deriveTypeIndexes. Initialized in `init`.
     symbol_table: SymbolTable,
@@ -741,7 +787,6 @@ pub const Checker = struct {
     /// the duration of one render; constant across the whole type (matching tsc,
     /// which fixes enclosingDeclaration for an entire typeToString call).
     render_location: NodeIndex = .none,
-
 
     /// Maps generic function TypeId → rendered type-parameter prefix string
     /// (e.g. `"<T>"`, `"<K, V>"`).  Populated lazily when a generic function or
@@ -872,11 +917,10 @@ pub const Checker = struct {
             .sym_types = sym_types,
             .node_to_sym = node_to_sym,
             .known_type_names = .empty,
-            .type_decl_nodes = .empty,
-            .enum_kinds = .empty,
             .global_value_types = .empty,
             .natively_bound_type_ids = .empty,
             .checker_opts = opts,
+            .decl_index = .{ .gpa = gpa },
             .scope_tree = .{ .gpa = gpa, .ast = ast_ref, .parents = semantic.parent_indices },
             .symbol_table = .{ .gpa = gpa },
         };
@@ -893,13 +937,7 @@ pub const Checker = struct {
         self.gpa.free(self.sym_types);
         self.gpa.free(self.node_to_sym);
         self.type_param_nodes.deinit(self.gpa);
-        {
-            var vit = self.value_decl_by_name.valueIterator();
-            while (vit.next()) |list| list.deinit(self.gpa);
-            self.value_decl_by_name.deinit(self.gpa);
-        }
         self.known_type_names.deinit(self.gpa);
-        self.enum_kinds.deinit(self.gpa);
         {
             var eit = self.expando_fns.valueIterator();
             while (eit.next()) |lst| lst.deinit(self.gpa);
@@ -917,7 +955,6 @@ pub const Checker = struct {
         self.jsdoc_params.deinit(self.gpa);
         self.jsdoc_returns.deinit(self.gpa);
         self.jsdoc_vars.deinit(self.gpa);
-        self.type_decl_nodes.deinit(self.gpa);
         {
             var cit = self.type_cache.keyIterator();
             while (cit.next()) |k| self.gpa.free(k.*);
@@ -949,14 +986,7 @@ pub const Checker = struct {
             while (ait.next()) |list| list.deinit(self.gpa);
             self.evolving_array_contribs.deinit(self.gpa);
         }
-        self.merged_iface_extra.deinit(self.gpa);
-        self.merged_ns_extra.deinit(self.gpa);
-        self.merged_enum_extra.deinit(self.gpa);
-        {
-            var dit = self.type_decls_by_name.valueIterator();
-            while (dit.next()) |list| list.deinit(self.gpa);
-            self.type_decls_by_name.deinit(self.gpa);
-        }
+        self.decl_index.deinit();
         self.symbol_table.deinit();
         self.scope_tree.deinit();
         {
@@ -1026,7 +1056,7 @@ pub const Checker = struct {
         // so the structure only ever feeds member/inheritance lookup, never the
         // rendered annotation.  Enums and type-aliases stay name-only (returning
         // their structure would diverge from tsc's named display).
-        if (self.type_decl_nodes.get(real)) |decl| {
+        if (self.decl_index.primaryDecl(real)) |decl| {
             const dtag = self.ast_ref.nodeTag(decl);
             if (dtag == .ts_interface_decl or dtag == .class_decl) {
                 if (self.resolveDeclaredType(real)) |t| {
@@ -2205,7 +2235,7 @@ pub const Checker = struct {
                 const alias_tok = self.ast_ref.nodeMainToken(node);
                 const alias_name = self.ast_ref.tokenText(alias_tok);
                 if (alias_name.len > 0) {
-                    if (self.type_decl_nodes.get(alias_name)) |decl| {
+                    if (self.decl_index.primaryDecl(alias_name)) |decl| {
                         if (self.ast_ref.nodeTag(decl) == .ts_type_alias_decl) {
                             const dd = self.ast_ref.nodeData(decl);
                             if (dd.lhs != .none) {
@@ -2249,7 +2279,7 @@ pub const Checker = struct {
                 const iface_tok = self.ast_ref.nodeMainToken(node);
                 const iface_name = self.ast_ref.tokenText(iface_tok);
                 if (iface_name.len > 0) {
-                    if (self.type_decl_nodes.get(iface_name)) |decl| {
+                    if (self.decl_index.primaryDecl(iface_name)) |decl| {
                         if (self.ast_ref.nodeTag(decl) == .ts_interface_decl) {
                             const id = self.ast_ref.nodeData(decl);
                             if (id.lhs != .none) {
@@ -2385,7 +2415,7 @@ pub const Checker = struct {
                 const tok_f = self.ast_ref.nodeMainToken(node);
                 const fn_name = self.ast_ref.tokenText(tok_f);
                 if (fn_name.len > 0) {
-                    if (self.type_decl_nodes.get(fn_name)) |ns_node| {
+                    if (self.decl_index.primaryDecl(fn_name)) |ns_node| {
                         const ns_tag = self.ast_ref.nodeTag(ns_node);
                         if (ns_tag == .ts_namespace_decl or ns_tag == .ts_module_decl) {
                             const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{fn_name}) catch return tymod.ID_ANY;
@@ -2618,7 +2648,7 @@ pub const Checker = struct {
             // Fundule (function + namespace merge): the name maps to both a
             // function in value_decl_by_name AND a namespace in type_decl_nodes.
             // tsc types such an identifier as `typeof F`, not the function type.
-            if (self.type_decl_nodes.get(name)) |ns_node| {
+            if (self.decl_index.primaryDecl(name)) |ns_node| {
                 const ns_tag = self.ast_ref.nodeTag(ns_node);
                 if (ns_tag == .ts_namespace_decl or ns_tag == .ts_module_decl) {
                     const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return t;
@@ -2639,7 +2669,7 @@ pub const Checker = struct {
         if (self.typeForNamespaceDeclarationName(node, name)) |ty| return ty;
         // When an enum identifier appears, it should be typed as the union of its members
         // (the type-side), not the object type (which is for member access like `Foo.Bar`).
-        if (self.enum_kinds.get(name) != null) {
+        if (self.decl_index.enumKind(name) != null) {
             const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return tymod.ID_ANY;
             return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
         }
@@ -3423,7 +3453,7 @@ pub const Checker = struct {
     /// wrappers.  Two declarations with the same container key are in the same
     /// scope.  Used to gate scope-aware enum merging.
     fn buildEnumObjectType(self: *Checker, enum_name: []const u8) ?TypeId {
-        const decl = self.type_decl_nodes.get(enum_name) orelse return null;
+        const decl = self.decl_index.primaryDecl(enum_name) orelse return null;
         if (self.ast_ref.nodeTag(decl) != .ts_enum_decl) return null;
         const data = self.ast_ref.nodeData(decl);
         if (data.lhs == .none) return null;
@@ -3438,7 +3468,7 @@ pub const Checker = struct {
         // blocks is preserved; only the running index restarts).
         var block_at = std.ArrayListUnmanaged(bool).empty;
         defer block_at.deinit(self.gpa);
-        for (self.merged_enum_extra.items) |entry| {
+        for (self.decl_index.merged_enum_extra.items) |entry| {
             if (!std.mem.eql(u8, entry.name, enum_name)) continue;
             const xd = self.ast_ref.nodeData(entry.node);
             if (xd.lhs == .none) continue;
@@ -3625,7 +3655,7 @@ pub const Checker = struct {
     /// construction) — used by union rendering to decide whether a union of
     /// members covers the whole enum.
     fn enumDeclMemberCount(self: *Checker, enum_name: []const u8) ?usize {
-        const decl = self.type_decl_nodes.get(enum_name) orelse return null;
+        const decl = self.decl_index.primaryDecl(enum_name) orelse return null;
         if (self.ast_ref.nodeTag(decl) != .ts_enum_decl) return null;
         const data = self.ast_ref.nodeData(decl);
         if (data.lhs == .none) return null;
@@ -3819,7 +3849,7 @@ pub const Checker = struct {
         // impl's body-inferred return. Track both; resolve after the scan.
         var fn_decl_fallback: NodeIndex = .none; // first no-body signature
         var fn_impl: NodeIndex = .none; // implementation (with body)
-        const list = self.value_decl_by_name.get(name) orelse return null;
+        const list = self.decl_index.valueDecls(name) orelse return null;
         for (list.items) |ni| {
             const t = self.ast_ref.nodeTag(ni);
             switch (t) {
@@ -8575,7 +8605,7 @@ pub const Checker = struct {
 
     /// Returns the class_decl AST node for the class named `name`, or null.
     pub fn classAstNodeByName(self: *Checker, name: []const u8) ?NodeIndex {
-        const ni = self.type_decl_nodes.get(name) orelse return null;
+        const ni = self.decl_index.primaryDecl(name) orelse return null;
         if (self.ast_ref.nodeTag(ni) == .class_decl) return ni;
         return null;
     }
@@ -8632,7 +8662,7 @@ pub const Checker = struct {
     }
 
     pub fn constInitIsSymbolCall(self: *Checker, name: []const u8) bool {
-        const list = self.value_decl_by_name.get(name) orelse return false;
+        const list = self.decl_index.valueDecls(name) orelse return false;
         for (list.items) |ni| {
             if (self.ast_ref.nodeTag(ni) != .declarator) continue;
             const data = self.ast_ref.nodeData(ni);
@@ -9377,7 +9407,7 @@ pub const Checker = struct {
         var tp_buf: [16]struct { start: u32, end: u32 } = undefined;
         var sig_count: usize = 0;
         var has_impl: bool = false; // true if any declaration has a body
-        const list = self.value_decl_by_name.get(fn_name) orelse return null;
+        const list = self.decl_index.valueDecls(fn_name) orelse return null;
         // Scope-aware overload set: when the same function name is declared in
         // multiple namespace scopes (sibling-namespace homonyms), only the
         // declarations in the innermost scope enclosing the use site are genuine
@@ -11900,7 +11930,7 @@ pub const Checker = struct {
                 return start + 1;
             }
             const name = raw;
-            if (self.type_decl_nodes.get(name)) |decl| {
+            if (self.decl_index.primaryDecl(name)) |decl| {
                 if (self.ast_ref.nodeTag(decl) == .ts_type_alias_decl) {
                     const dd = self.ast_ref.nodeData(decl);
                     const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(dd.lhs));
@@ -11929,7 +11959,7 @@ pub const Checker = struct {
         if (tag == .identifier) {
             const tok = self.ast_ref.nodeMainToken(n);
             const name = self.ast_ref.tokenText(tok);
-            const decl = self.type_decl_nodes.get(name) orelse return null;
+            const decl = self.decl_index.primaryDecl(name) orelse return null;
             if (self.ast_ref.nodeTag(decl) != .ts_type_alias_decl) return null;
             const dd = self.ast_ref.nodeData(decl);
             const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(dd.lhs));
@@ -11964,7 +11994,7 @@ pub const Checker = struct {
             const md = self.ast_ref.nodeData(n);
             if (md.lhs != .none and self.ast_ref.nodeTag(md.lhs) == .identifier) {
                 const obj_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.lhs));
-                if (self.enum_kinds.get(obj_name)) |k| return k == .string;
+                if (self.decl_index.enumKind(obj_name)) |k| return k == .string;
             }
         }
         // Function call returning string — resolve via type checker.
@@ -11986,7 +12016,7 @@ pub const Checker = struct {
             const md = self.ast_ref.nodeData(n);
             if (md.lhs != .none and self.ast_ref.nodeTag(md.lhs) == .identifier) {
                 const obj_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.lhs));
-                if (self.enum_kinds.get(obj_name)) |k| return k == .number;
+                if (self.decl_index.enumKind(obj_name)) |k| return k == .number;
             }
         }
         const ty = self.typeOf(n);
@@ -11997,7 +12027,7 @@ pub const Checker = struct {
     }
 
     pub fn enumKindOf(self: *const Checker, name: []const u8) ?EnumKind {
-        return self.enum_kinds.get(name);
+        return self.decl_index.enumKind(name);
     }
 
     /// Populate `global_value_types` with structural shapes for the
@@ -12363,7 +12393,7 @@ pub const Checker = struct {
 
     /// Append `node` to the value-declaration index under `name`.
     fn appendValueDecl(self: *Checker, name: []const u8, node: NodeIndex) !void {
-        const gop = try self.value_decl_by_name.getOrPut(self.gpa, name);
+        const gop = try self.decl_index.value_decl_by_name.getOrPut(self.gpa, name);
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(self.gpa, node);
     }
@@ -12580,7 +12610,7 @@ pub const Checker = struct {
     fn deriveTypeIndexes(self: *Checker) !void {
         // The lexical scope tree backs namespaceScopeKey, used below — build first.
         try self.scope_tree.build();
-        var it = self.type_decls_by_name.iterator();
+        var it = self.decl_index.type_decls_by_name.iterator();
         while (it.next()) |entry| {
             const name = entry.key_ptr.*;
             var primary: NodeIndex = .none;
@@ -12591,7 +12621,7 @@ pub const Checker = struct {
                     .ts_type_alias_decl => primary = ni,
                     .ts_interface_decl => {
                         if (primary == .none) primary = ni
-                        else try self.merged_iface_extra.append(self.gpa, .{ .name = name, .node = ni });
+                        else try self.decl_index.merged_iface_extra.append(self.gpa, .{ .name = name, .node = ni });
                     },
                     .ts_enum_decl => {
                         // Two-block enum merge only within ONE physical container
@@ -12599,22 +12629,22 @@ pub const Checker = struct {
                         // homonyms stay distinct.
                         if (primary != .none and self.ast_ref.nodeTag(primary) == .ts_enum_decl and
                             self.scope_tree.enclosingScopeIdx(ni) == self.scope_tree.enclosingScopeIdx(primary))
-                            try self.merged_enum_extra.append(self.gpa, .{ .name = name, .node = primary });
+                            try self.decl_index.merged_enum_extra.append(self.gpa, .{ .name = name, .node = primary });
                         primary = ni;
                     },
                     .class_decl => {
                         if (primary != .none and self.ast_ref.nodeTag(primary) == .ts_interface_decl)
-                            try self.merged_iface_extra.append(self.gpa, .{ .name = name, .node = primary });
+                            try self.decl_index.merged_iface_extra.append(self.gpa, .{ .name = name, .node = primary });
                         primary = ni;
                     },
                     .ts_namespace_decl, .ts_module_decl => {
                         if (primary == .none) primary = ni
-                        else try self.merged_ns_extra.append(self.gpa, .{ .name = name, .node = ni });
+                        else try self.decl_index.merged_ns_extra.append(self.gpa, .{ .name = name, .node = ni });
                     },
                     else => {},
                 }
             }
-            if (primary != .none) try self.type_decl_nodes.put(self.gpa, name, primary);
+            if (primary != .none) try self.decl_index.type_decl_nodes.put(self.gpa, name, primary);
         }
         // Pass B: enum classification, in SOURCE order. Runs with
         // type_decl_nodes fully populated so the typeOf fallback in
@@ -12633,12 +12663,12 @@ pub const Checker = struct {
             if (data.lhs == .none) continue;
             const ed = self.ast_ref.extraData(ast.EnumData, @intFromEnum(data.lhs));
             const ename = self.ast_ref.tokenText(ed.name);
-            if (self.enum_kinds.get(ename) != null) continue; // first concrete kind wins
-            if (self.computeEnumKind(en)) |k| try self.enum_kinds.put(self.gpa, ename, k);
+            if (self.decl_index.enumKind(ename) != null) continue; // first concrete kind wins
+            if (self.computeEnumKind(en)) |k| try self.decl_index.enum_kinds.put(self.gpa, ename, k);
         }
         // Pass C: value symbol table — record every value declaration
         // (var/let/const/function) under its namespace scope.
-        var vit = self.value_decl_by_name.iterator();
+        var vit = self.decl_index.value_decl_by_name.iterator();
         while (vit.next()) |entry| {
             const vname = entry.key_ptr.*;
             for (entry.value_ptr.items) |ni| try self.recordScopedValue(vname, ni);
@@ -12709,7 +12739,7 @@ pub const Checker = struct {
                 if (obj_tag == .identifier) {
                     const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(obj));
                     if (name.len > 0) {
-                        if (self.value_decl_by_name.get(name)) |decls| {
+                        if (self.decl_index.valueDecls(name)) |decls| {
                             for (decls.items) |decl_node| {
                                 switch (self.ast_ref.nodeTag(decl_node)) {
                                     .fn_decl, .async_fn_decl,
@@ -12816,7 +12846,7 @@ pub const Checker = struct {
     /// is `ns_name` — i.e. `ns_name.type_name` is a real local namespace type.
     /// Returns the decl node, or null.
     fn namespaceLocalTypeDecl(self: *Checker, ns_name: []const u8, type_name: []const u8) ?NodeIndex {
-        const d = self.type_decl_nodes.get(type_name) orelse return null;
+        const d = self.decl_index.primaryDecl(type_name) orelse return null;
         const dtag = self.ast_ref.nodeTag(d);
         // Interfaces/classes display by their (qualified) NAME.  Type aliases
         // resolve to their underlying type (`N.Str`=`string`), and enums have
@@ -12904,7 +12934,7 @@ pub const Checker = struct {
         // shadows the name (`interface Array {…}` / `namespace N { interface
         // Array {…} }`) lands in type_decl_nodes (lib seeds never do), so skip
         // the builtin shortcut and fall through to resolveDeclaredType for it.
-        if ((std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "ReadonlyArray")) and !self.type_decl_nodes.contains(name)) {
+        if ((std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "ReadonlyArray")) and !self.decl_index.hasType(name)) {
             const elem = self.firstTypeArg(ty_node);
             const inner = if (elem == .none) tymod.ID_ANY else self.resolveTypeNode(elem);
             return self.store.arrayOf(inner) catch tymod.ID_ANY;
@@ -12923,7 +12953,7 @@ pub const Checker = struct {
         // `Temporal.Duration`).  We don't model these lib structures, so render
         // the name and let member access stay a (smaller) gap.
         if ((std.mem.eql(u8, name, "Intl") or std.mem.eql(u8, name, "Temporal")) and
-            !self.type_decl_nodes.contains(name))
+            !self.decl_index.hasType(name))
         {
             const tdL = self.ast_ref.nodeData(ty_node);
             if (tdL.lhs != .none and self.ast_ref.nodeTag(tdL.lhs) == .member_expr) {
@@ -13054,7 +13084,7 @@ pub const Checker = struct {
         // renders as the class/interface name (matching tsc) rather than
         // expanding to the structural object shape.  Member access resolves
         // lazily via resolveDeclaredType inside memberOnApparentType.
-        if (self.type_decl_nodes.get(name)) |decl| {
+        if (self.decl_index.primaryDecl(name)) |decl| {
             const dtag = self.ast_ref.nodeTag(decl);
             if (dtag == .class_decl or dtag == .ts_interface_decl) {
                 var args_buf: [8]TypeId = undefined;
@@ -13093,7 +13123,7 @@ pub const Checker = struct {
         // Only for a namespace/module first component — enum members
         // (`AnimalType.cat`) and class/interface qualifications resolve through
         // their own paths below.
-        if (self.type_decl_nodes.get(name)) |ndecl0| {
+        if (self.decl_index.primaryDecl(name)) |ndecl0| {
             const ntag0 = self.ast_ref.nodeTag(ndecl0);
             if (ntag0 == .ts_namespace_decl or ntag0 == .ts_module_decl) {
                 const ty_data0 = self.ast_ref.nodeData(ty_node);
@@ -13144,7 +13174,7 @@ pub const Checker = struct {
                 // `.Yes` access and yield the whole enum. Look the member up in
                 // the enum's object shape instead — its props carry the
                 // enum-tagged literal (renders as "Choice.Yes").
-                if (self.type_decl_nodes.get(name)) |edecl| {
+                if (self.decl_index.primaryDecl(name)) |edecl| {
                     if (self.ast_ref.nodeTag(edecl) == .ts_enum_decl) {
                         const member_data = self.ast_ref.nodeData(ty_data.lhs);
                         if (member_data.rhs != .none) {
@@ -13185,8 +13215,8 @@ pub const Checker = struct {
                             // bare type_ref to the enum name — resolve to the
                             // union for assignability and tag the display name.
                             const names_enum = prop_kind == .type_ref and
-                                self.type_decl_nodes.get(prop_t.name) != null and
-                                self.ast_ref.nodeTag(self.type_decl_nodes.get(prop_t.name).?) == .ts_enum_decl;
+                                self.decl_index.primaryDecl(prop_t.name) != null and
+                                self.ast_ref.nodeTag(self.decl_index.primaryDecl(prop_t.name).?) == .ts_enum_decl;
                             if (prop_kind == .union_t or prop_t.enum_name.len > 0 or names_enum) {
                                 const qual_name = self.qualifiedTypeName(ty_node, member_data.rhs);
                                 if (qual_name.len > 0) {
@@ -13231,7 +13261,7 @@ pub const Checker = struct {
             // substitute them through the body.  For conditional type
             // bodies, resolve with the subst context directly so
             // `infer V` and type-param substitution work correctly.
-            const decl_opt = self.type_decl_nodes.get(name);
+            const decl_opt = self.decl_index.primaryDecl(name);
             if (decl_opt) |decl| {
                 if (self.ast_ref.nodeTag(decl) == .ts_type_alias_decl) {
                     const ta_dd = self.ast_ref.nodeData(decl);
@@ -13317,7 +13347,7 @@ pub const Checker = struct {
                         // Enum member inside a namespace: resolve to the enum's
                         // member union so assignability works, displayed with
                         // tsc's scope-relative qualification (`First.E`).
-                        if (self.type_decl_nodes.get(last_name)) |edecl| {
+                        if (self.decl_index.primaryDecl(last_name)) |edecl| {
                             if (self.ast_ref.nodeTag(edecl) == .ts_enum_decl) {
                                 if (self.buildEnumUnionType(last_name)) |eu| {
                                     const qual = self.qualifiedTypeName(ty_node, member_data.rhs);
@@ -14091,7 +14121,7 @@ pub const Checker = struct {
     /// Append a type declaration node to the scope-aware index under its bare
     /// name. Preserves every declaration (all scopes), unlike `type_decl_nodes`.
     fn registerScopedDecl(self: *Checker, name: []const u8, ni: NodeIndex) void {
-        const gop = self.type_decls_by_name.getOrPut(self.gpa, name) catch return;
+        const gop = self.decl_index.type_decls_by_name.getOrPut(self.gpa, name) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         gop.value_ptr.append(self.gpa, ni) catch {};
     }
@@ -14099,8 +14129,8 @@ pub const Checker = struct {
     /// The declaration node of a named type or value (class/interface/alias/enum
     /// via type_decl_nodes, or a function via value_decl_by_name).
     fn declNodeForName(self: *Checker, name: []const u8) ?NodeIndex {
-        if (self.type_decl_nodes.get(name)) |d| return d;
-        if (self.value_decl_by_name.get(name)) |list| {
+        if (self.decl_index.primaryDecl(name)) |d| return d;
+        if (self.decl_index.valueDecls(name)) |list| {
             for (list.items) |ni| switch (self.ast_ref.nodeTag(ni)) {
                 .fn_decl, .async_fn_decl, .generator_fn_decl,
                 .async_generator_fn_decl, .ts_declare_function => return ni,
@@ -14156,9 +14186,9 @@ pub const Checker = struct {
                 }
             }
         }.f;
-        if (self.type_decl_nodes.get(name)) |d| add(&nodes, &n, d);
-        if (self.value_decl_by_name.get(name)) |list| for (list.items) |ni| add(&nodes, &n, ni);
-        for (self.merged_iface_extra.items) |e| if (std.mem.eql(u8, e.name, name)) add(&nodes, &n, e.node);
+        if (self.decl_index.primaryDecl(name)) |d| add(&nodes, &n, d);
+        if (self.decl_index.valueDecls(name)) |list| for (list.items) |ni| add(&nodes, &n, ni);
+        for (self.decl_index.merged_iface_extra.items) |e| if (std.mem.eql(u8, e.name, name)) add(&nodes, &n, e.node);
         return n > 1;
     }
 
@@ -14188,7 +14218,7 @@ pub const Checker = struct {
     /// walks its `extends` chain looking for `base_name`.
     pub fn declaredTypeInheritsFromByName(self: *Checker, decl_name: []const u8, base_name: []const u8) bool {
         if (std.mem.eql(u8, decl_name, base_name)) return true;
-        const decl = self.type_decl_nodes.get(decl_name) orelse return false;
+        const decl = self.decl_index.primaryDecl(decl_name) orelse return false;
         return self.declInheritsFromName(decl, base_name, 0);
     }
 
@@ -14198,7 +14228,7 @@ pub const Checker = struct {
         if (t.kind == .type_ref) {
             if (std.mem.eql(u8, t.name, name)) return true;
             // Walk the declared class's extends chain.
-            const decl = self.type_decl_nodes.get(t.name) orelse return false;
+            const decl = self.decl_index.primaryDecl(t.name) orelse return false;
             return self.declInheritsFromName(decl, name, depth + 1);
         }
         // Union: EVERY constituent must inherit (otherwise the value
@@ -14246,7 +14276,7 @@ pub const Checker = struct {
             if (self.ast_ref.nodeTag(sc) == .identifier) {
                 const parent_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(sc));
                 if (std.mem.eql(u8, parent_name, name)) return true;
-                if (self.type_decl_nodes.get(parent_name)) |parent_decl| {
+                if (self.decl_index.primaryDecl(parent_name)) |parent_decl| {
                     return self.declInheritsFromName(parent_decl, name, depth + 1);
                 }
             }
@@ -14275,7 +14305,7 @@ pub const Checker = struct {
                     self.ast_ref.nodeTag(ext_node) != .identifier) continue;
                 const ext_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ext_node));
                 if (std.mem.eql(u8, ext_name, name)) return true;
-                if (self.type_decl_nodes.get(ext_name)) |parent_decl| {
+                if (self.decl_index.primaryDecl(ext_name)) |parent_decl| {
                     if (self.declInheritsFromName(parent_decl, name, depth + 1)) return true;
                 }
             }
@@ -14391,7 +14421,7 @@ pub const Checker = struct {
         }
 
         // AMBIENT build.
-        const decl = self.type_decl_nodes.get(name) orelse {
+        const decl = self.decl_index.primaryDecl(name) orelse {
             // Not declared locally — try cross-file import resolution.
             if (self.resolveImportedType(name)) |imported| {
                 self.typeCachePut(name, null, imported);
@@ -14515,7 +14545,7 @@ pub const Checker = struct {
     /// enum, and alias merges stay on the proven scope-blind path).
     fn resolveDeclaredTypeInScope(self: *Checker, name: []const u8, use_site: NodeIndex) ?TypeId {
         if (use_site == .none) return null;
-        const list = self.type_decls_by_name.get(name) orelse return null;
+        const list = self.decl_index.allTypeDecls(name) orelse return null;
         const count = list.items.len;
         if (count < 2 or count > 32) return null;
 
@@ -14585,7 +14615,7 @@ pub const Checker = struct {
 
         const ns_name_tok = self.ast_ref.nodeMainToken(self.ast_ref.nodeData(decl).lhs);
         const ns_name = self.ast_ref.tokenText(ns_name_tok);
-        for (self.merged_ns_extra.items) |entry| {
+        for (self.decl_index.merged_ns_extra.items) |entry| {
             if (!std.mem.eql(u8, entry.name, ns_name)) continue;
             self.collectNamespaceProps(entry.node, &props);
         }
@@ -14720,7 +14750,7 @@ pub const Checker = struct {
             props.append(self.gpa, p) catch {};
         }
         // Recurse into the parent's own extends/super chain.
-        const decl = self.type_decl_nodes.get(parent_name) orelse return;
+        const decl = self.decl_index.primaryDecl(parent_name) orelse return;
         switch (self.ast_ref.nodeTag(decl)) {
             .ts_interface_decl => {
                 const d = self.ast_ref.nodeData(decl);
@@ -14923,7 +14953,7 @@ pub const Checker = struct {
         }
         // Declaration merging: add members from any extra declarations with the same name.
         const iface_name = self.ast_ref.tokenText(id.name);
-        for (self.merged_iface_extra.items) |entry| {
+        for (self.decl_index.merged_iface_extra.items) |entry| {
             if (!std.mem.eql(u8, entry.name, iface_name)) continue;
             // Building this very declaration (it sits in merged_iface_extra as a
             // non-primary): its members already came from the body loop above.
@@ -15521,7 +15551,7 @@ pub const Checker = struct {
             break; // only one constructor
         }
         // Declaration merging: merge members from any same-named interface declarations.
-        for (self.merged_iface_extra.items) |entry| {
+        for (self.decl_index.merged_iface_extra.items) |entry| {
             if (!std.mem.eql(u8, entry.name, name)) continue;
             if (entry.node == decl) continue;
             // Scope-aware build: only merge same-name interfaces in the chosen
@@ -16474,7 +16504,7 @@ pub const Checker = struct {
     /// True when the named enum is a `const enum` — const enums preserve
     /// literal member types at use sites, non-const enums widen to the enum type.
     fn isConstEnum(self: *Checker, enum_name: []const u8) bool {
-        const decl = self.type_decl_nodes.get(enum_name) orelse return false;
+        const decl = self.decl_index.primaryDecl(enum_name) orelse return false;
         if (self.ast_ref.nodeTag(decl) != .ts_enum_decl) return false;
         const enum_tok = self.ast_ref.nodeMainToken(decl);
         if (enum_tok == 0) return false;
@@ -16720,7 +16750,7 @@ pub const Checker = struct {
         if (t.kind == .function_t) return true;
         if (t.kind == .type_ref and std.mem.startsWith(u8, t.name, "typeof ")) {
             const inner = t.name["typeof ".len..];
-            if (self.type_decl_nodes.get(inner)) |decl| {
+            if (self.decl_index.primaryDecl(inner)) |decl| {
                 return self.ast_ref.nodeTag(decl) == .class_decl;
             }
         }
@@ -17319,7 +17349,7 @@ pub const Checker = struct {
         bindings: []TypeId,
     ) void {
         if (self.alias_match_depth >= 4) return;
-        const decl = self.type_decl_nodes.get(tname) orelse return;
+        const decl = self.decl_index.primaryDecl(tname) orelse return;
         if (self.ast_ref.nodeTag(decl) != .ts_type_alias_decl) return;
         const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
         if (ad.type_node == .none) return;
@@ -17534,7 +17564,7 @@ pub const Checker = struct {
         if (self.ast_ref.nodeTag(c) != .identifier) return null;
         const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(c));
         if (name.len == 0) return null;
-        const list = self.value_decl_by_name.get(name) orelse return null;
+        const list = self.decl_index.valueDecls(name) orelse return null;
         for (list.items) |ni| {
             const t = self.ast_ref.nodeTag(ni);
             if (t == .fn_decl or t == .async_fn_decl or t == .ts_declare_function or
@@ -17653,7 +17683,7 @@ pub const Checker = struct {
             {
                 const root = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.lhs));
                 if ((std.mem.eql(u8, root, "Intl") or std.mem.eql(u8, root, "Temporal")) and
-                    !self.type_decl_nodes.contains(root))
+                    !self.decl_index.hasType(root))
                 {
                     const member = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
                     if (member.len > 0) {
@@ -17879,7 +17909,7 @@ pub const Checker = struct {
         // type renders as the class name (matching tsc) rather than expanding
         // to the structural object shape.  Member access resolves lazily via
         // memberOnApparentType → resolveDeclaredType.
-        if (self.type_decl_nodes.get(name)) |decl| {
+        if (self.decl_index.primaryDecl(name)) |decl| {
             const dtag = self.ast_ref.nodeTag(decl);
             if (dtag == .class_decl or dtag == .ts_interface_decl) {
                 return self.store.typeRef(name, args) catch null;
@@ -17900,7 +17930,7 @@ pub const Checker = struct {
     /// fn-expr) bound to `name` when it is a JS constructor function (its body
     /// assigns `this.<prop>`), else null.
     fn jsConstructorFnForName(self: *Checker, name: []const u8) ?NodeIndex {
-        const decls = self.value_decl_by_name.get(name) orelse return null;
+        const decls = self.decl_index.valueDecls(name) orelse return null;
         for (decls.items) |decl| {
             var fnode: NodeIndex = .none;
             switch (self.ast_ref.nodeTag(decl)) {
@@ -18999,7 +19029,7 @@ pub const Checker = struct {
                     if (prop.len > 0) return self.memberOnApparentType(tymod.ID_ANY, prop, obj_node);
                 }
                 // Check if this is an enum and try to look up the member
-                if (self.enum_kinds.get(obj_name) != null) {
+                if (self.decl_index.enumKind(obj_name) != null) {
                     const tag = self.ast_ref.nodeTag(node);
                     const prop_name: []const u8 = switch (tag) {
                         .member_expr, .optional_member_expr => blk: {
@@ -19157,13 +19187,13 @@ pub const Checker = struct {
         // A heritage clause (`class X extends Ns.C`) or other bare-name position
         // shows the reference by its plain qualified name (`Ns.C`), not `typeof`.
         if (self.identifierInBareNamePosition(use_site)) return null;
-        const ns_decl = self.type_decl_nodes.get(ns_root) orelse return null;
+        const ns_decl = self.decl_index.primaryDecl(ns_root) orelse return null;
         const dt = self.ast_ref.nodeTag(ns_decl);
         if (dt != .ts_namespace_decl and dt != .ts_module_decl) return null;
         if (!self.namespaceIsTopLevel(ns_decl)) return null;
         var member = self.nsMemberStmt(ns_decl, prop_name);
         if (member == null) {
-            for (self.merged_ns_extra.items) |e| {
+            for (self.decl_index.merged_ns_extra.items) |e| {
                 if (!std.mem.eql(u8, e.name, ns_root)) continue;
                 member = self.nsMemberStmt(e.node, prop_name);
                 if (member != null) break;
@@ -20255,7 +20285,7 @@ pub const Checker = struct {
                         };
                     }
                 }
-                if (self.enum_kinds.get(inner_name) != null) {
+                if (self.decl_index.enumKind(inner_name) != null) {
                     if (self.buildEnumObjectType(inner_name)) |obj_type| {
                         const ot2 = self.store.get(obj_type);
                         if (ot2.kind == .object_t) {
@@ -20272,14 +20302,14 @@ pub const Checker = struct {
                 // We avoid building the full namespace type (which stores classes as instance
                 // types, causing regressions); instead we do a direct AST scan for variable
                 // declarations that have a type annotation matching the property name.
-                if (self.type_decl_nodes.get(inner_name)) |ns_decl| {
+                if (self.decl_index.primaryDecl(inner_name)) |ns_decl| {
                     const ndtag = self.ast_ref.nodeTag(ns_decl);
                     if (ndtag == .ts_namespace_decl or ndtag == .ts_module_decl) {
                         if (self.namespaceVarMemberType(ns_decl, prop_name)) |vt| return vt;
                     }
                 }
                 // `typeof ClassName` — look up static member on the class.
-                if (self.type_decl_nodes.get(inner_name)) |cls_decl| {
+                if (self.decl_index.primaryDecl(inner_name)) |cls_decl| {
                     if (self.ast_ref.nodeTag(cls_decl) == .class_decl) {
                         const st = self.buildClassStaticType(cls_decl, inner_name);
                         if (!st.eq(tymod.ID_UNKNOWN)) {
@@ -20537,7 +20567,7 @@ pub const Checker = struct {
         const args_slice = self.store.idsOf(tr.list_data);
         if (args_slice.len == 0) return body;
 
-        const decl = self.type_decl_nodes.get(name) orelse return body;
+        const decl = self.decl_index.primaryDecl(name) orelse return body;
         var tp_start: u32 = 0;
         var tp_end: u32 = 0;
         switch (self.ast_ref.nodeTag(decl)) {
