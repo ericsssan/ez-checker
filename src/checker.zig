@@ -21728,9 +21728,14 @@ pub const Checker = struct {
             const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_UNKNOWN;
             return self.makePredicateArrayFn(elem, opt);
         }
-        // T[] returners.
+        // filter: (predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => T[]
+        if (std.mem.eql(u8, name, "filter")) {
+            const arr_ty = self.store.arrayOf(elem) catch return tymod.ID_UNKNOWN;
+            return self.makePredicateArrayFn(elem, arr_ty);
+        }
+        // T[] returners (without callback).
         if (std.mem.eql(u8, name, "slice") or std.mem.eql(u8, name, "concat") or
-            std.mem.eql(u8, name, "filter") or std.mem.eql(u8, name, "reverse") or
+            std.mem.eql(u8, name, "reverse") or
             std.mem.eql(u8, name, "toSorted") or std.mem.eql(u8, name, "toReversed") or
             std.mem.eql(u8, name, "splice"))
         {
