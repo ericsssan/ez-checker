@@ -21716,13 +21716,17 @@ pub const Checker = struct {
     fn arrayPrototypeProperty(self: *Checker, name: []const u8, elem: TypeId) TypeId {
         // length / indexOf / lastIndexOf return numbers.
         if (std.mem.eql(u8, name, "length")) return tymod.ID_NUMBER;
-        // T | undefined returners.
+        // T | undefined returners (without callback).
         if (std.mem.eql(u8, name, "shift") or std.mem.eql(u8, name, "pop") or
-            std.mem.eql(u8, name, "at") or std.mem.eql(u8, name, "find") or
-            std.mem.eql(u8, name, "findLast"))
+            std.mem.eql(u8, name, "at"))
         {
             const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_UNKNOWN;
             return self.makeNullaryFn(opt);
+        }
+        // find/findLast: (predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => T | undefined
+        if (std.mem.eql(u8, name, "find") or std.mem.eql(u8, name, "findLast")) {
+            const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_UNKNOWN;
+            return self.makePredicateArrayFn(elem, opt);
         }
         // T[] returners.
         if (std.mem.eql(u8, name, "slice") or std.mem.eql(u8, name, "concat") or
@@ -21733,21 +21737,23 @@ pub const Checker = struct {
             const arr_ty = self.store.arrayOf(elem) catch return tymod.ID_UNKNOWN;
             return self.makeNullaryFn(arr_ty);
         }
-        // boolean returners.
-        if (std.mem.eql(u8, name, "includes") or std.mem.eql(u8, name, "every") or
-            std.mem.eql(u8, name, "some"))
-        {
-            return self.makeNullaryFn(tymod.ID_BOOLEAN);
+        // includes: simple boolean returner (no predicate callback).
+        if (std.mem.eql(u8, name, "includes")) return self.makeNullaryFn(tymod.ID_BOOLEAN);
+        // every/some: (predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => boolean
+        if (std.mem.eql(u8, name, "every") or std.mem.eql(u8, name, "some")) {
+            return self.makePredicateArrayFn(elem, tymod.ID_BOOLEAN);
         }
         // push/unshift: `(...items: T[]) => number`.
         if (std.mem.eql(u8, name, "push") or std.mem.eql(u8, name, "unshift")) {
             return self.makeArrayMutatorFn(elem);
         }
-        // number returners.
-        if (std.mem.eql(u8, name, "indexOf") or std.mem.eql(u8, name, "lastIndexOf") or
-            std.mem.eql(u8, name, "findIndex") or std.mem.eql(u8, name, "findLastIndex"))
-        {
+        // indexOf/lastIndexOf: simple number returners (no predicate).
+        if (std.mem.eql(u8, name, "indexOf") or std.mem.eql(u8, name, "lastIndexOf")) {
             return self.makeNullaryFn(tymod.ID_NUMBER);
+        }
+        // findIndex/findLastIndex: (predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => number
+        if (std.mem.eql(u8, name, "findIndex") or std.mem.eql(u8, name, "findLastIndex")) {
+            return self.makePredicateArrayFn(elem, tymod.ID_NUMBER);
         }
         // string returners.
         if (std.mem.eql(u8, name, "toString")) {
@@ -22011,6 +22017,24 @@ pub const Checker = struct {
             .return_type = ret,
         };
         return self.store.functionType(sig) catch tymod.ID_UNKNOWN;
+    }
+
+    /// `(predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => R`
+    /// — the common shape of find/findLast/findIndex/findLastIndex/some/every.
+    fn makePredicateArrayFn(self: *Checker, elem: TypeId, ret: TypeId) TypeId {
+        const arr_t = self.store.arrayOf(elem) catch return self.makeNullaryFn(ret);
+        const cb = self.makeNamedFn(
+            &.{ elem, tymod.ID_NUMBER, arr_t },
+            &.{ "value", "index", "array" },
+            &.{ false, false, false },
+            tymod.ID_UNKNOWN,
+        ) orelse return self.makeNullaryFn(ret);
+        return self.makeNamedFn(
+            &.{ cb, tymod.ID_ANY },
+            &.{ "predicate", "thisArg" },
+            &.{ false, true },
+            ret,
+        ) orelse self.makeNullaryFn(ret);
     }
 
     /// `(...items: <elem>[]) => number` — the signature of Array.push/unshift.
