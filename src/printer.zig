@@ -197,12 +197,13 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
             const ids = c.store.idsOf(t.list_data);
             if (ids.len > 0) {
                 const elem = c.store.get(ids[0]);
-                // A union/intersection that renders as its alias name is a
-                // single identifier - no parens (`BigUnion[]`, not `(BigUnion)[]`).
+                // An aliased type renders as a single identifier — no parens needed
+                // regardless of underlying kind (`type Cleaner = () => void` → `Cleaner[]`,
+                // not `(Cleaner)[]`).  Non-aliased multi-token kinds need parens.
                 const multi_token_compound = (elem.kind == .union_t or elem.kind == .intersection_t) and
                     elem.alias_name.len == 0;
                 const needs_parens = multi_token_compound or
-                    elem.kind == .function_t or
+                    (elem.kind == .function_t and elem.alias_name.len == 0) or
                     (elem.kind == .type_ref and std.mem.startsWith(u8, elem.name, "typeof "));
                 if (needs_parens) try buf.appendSlice(gpa, "(");
                 try typeToStringInner(c, ids[0], buf, depth + 1);
@@ -217,12 +218,11 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
             const ids = c.store.idsOf(t.list_data);
             if (ids.len > 0) {
                 const elem = c.store.get(ids[0]);
-                // A union/intersection that renders as its alias name is a
-                // single identifier - no parens (`BigUnion[]`, not `(BigUnion)[]`).
+                // Same parens logic as array_t.
                 const multi_token_compound = (elem.kind == .union_t or elem.kind == .intersection_t) and
                     elem.alias_name.len == 0;
                 const needs_parens = multi_token_compound or
-                    elem.kind == .function_t or
+                    (elem.kind == .function_t and elem.alias_name.len == 0) or
                     (elem.kind == .type_ref and std.mem.startsWith(u8, elem.name, "typeof "));
                 if (needs_parens) try buf.appendSlice(gpa, "(");
                 try typeToStringInner(c, ids[0], buf, depth + 1);
