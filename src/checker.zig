@@ -20115,6 +20115,81 @@ pub const Checker = struct {
         return null;
     }
 
+    /// Member lookup on a user-augmented global `Array` / `ReadonlyArray`
+    /// interface. Resolves the merged user interface, finds `prop_name`, and
+    /// binds the interface's first type parameter (`T`) to the array element
+    /// type. Returns null when no user Array interface declares the member, so
+    /// the caller falls back to the builtin Array prototype.
+    fn userArrayMember(self: *Checker, array_name: []const u8, prop_name: []const u8, elem: TypeId, use_site: NodeIndex) ?TypeId {
+        const arr_ty = self.resolveDeclaredTypeAt(array_name, use_site) orelse return null;
+        const at = self.store.get(arr_ty);
+        if (at.kind != .object_t) return null;
+        var found: ?TypeId = null;
+        for (self.store.propsOf(at.object_props)) |p| {
+            if (std.mem.eql(u8, p.name, prop_name)) {
+                found = p.type_id;
+                break;
+            }
+        }
+        const member_ty = found orelse return null;
+        // Guard 1: if the member is itself a generic function (has its own type
+        // parameters), substituting the interface's T would incorrectly capture
+        // the method-level T.  Return null so the caller falls back to gap.
+        if (self.fn_type_params.contains(member_ty)) return null;
+        // Guard 2: if the member's return type is a named type whose primary
+        // declaration lives inside a `declare module "X"` scope, our printer
+        // would display the bare name but tsc qualifies it as `import("X").Name`.
+        // Walk the declaration's parent chain; bail out (return null → gap) when
+        // any ancestor is a ts_module_decl.
+        if (self.store.get(member_ty).kind == .function_t) {
+            const sigs = self.store.signaturesOf(self.store.get(member_ty).signatures);
+            if (sigs.len > 0) {
+                const ret_ty = self.store.get(sigs[0].return_type);
+                const ret_name: []const u8 = switch (ret_ty.kind) {
+                    .object_t => ret_ty.name,
+                    .type_ref => ret_ty.name,
+                    else => "",
+                };
+                if (ret_name.len > 0) {
+                    if (self.decl_index.primaryDecl(ret_name)) |ret_decl| {
+                        const parents = self.semantic.parent_indices;
+                        const NONE: u32 = @intFromEnum(NodeIndex.none);
+                        var p = if (ret_decl.toInt() < parents.len) parents[ret_decl.toInt()] else NONE;
+                        while (p != NONE) : (p = if (p < parents.len) parents[p] else NONE) {
+                            const p_node: NodeIndex = @enumFromInt(p);
+                            if (self.ast_ref.nodeTag(p_node) == .ts_module_decl) return null;
+                        }
+                    }
+                }
+            }
+        }
+        // Guard 3: standard Array methods that aren't modeled in our builtin but
+        // exist in lib.d.ts — tsc merges the user's declaration with the lib
+        // overloads.  We can't produce the merged type, so fall back to gap.
+        if (std.mem.eql(u8, prop_name, "fill") or
+            std.mem.eql(u8, prop_name, "sort") or
+            std.mem.eql(u8, prop_name, "flat") or
+            std.mem.eql(u8, prop_name, "flatMap") or
+            std.mem.eql(u8, prop_name, "copyWithin") or
+            std.mem.eql(u8, prop_name, "entries") or
+            std.mem.eql(u8, prop_name, "keys") or
+            std.mem.eql(u8, prop_name, "values")) return null;
+        // Bind the interface's first type parameter to the element type.
+        if (self.decl_index.primaryDecl(array_name)) |decl| {
+            if (self.ast_ref.nodeTag(decl) == .ts_interface_decl) {
+                const idata = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
+                if (idata.type_params_end > idata.type_params) {
+                    const tp: NodeIndex = @enumFromInt(self.ast_ref.extra_data[idata.type_params]);
+                    if (self.ast_ref.nodeTag(tp) == .ts_type_parameter) {
+                        const tp_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+                        return self.substituteTypeId(member_ty, &.{tp_name}, &.{elem});
+                    }
+                }
+            }
+        }
+        return member_ty;
+    }
+
     fn memberOnApparentType(self: *Checker, obj_ty: TypeId, prop_name: []const u8, obj_node: NodeIndex) TypeId {
         // Cross-file enum member access (`SymbolFlags.Type` where SymbolFlags is
         // an imported enum): tsc displays the qualified member name regardless of
@@ -20177,7 +20252,18 @@ pub const Checker = struct {
         // Array.prototype.
         if (obj.kind == .array_t or obj.kind == .readonly_array_t or obj.kind == .tuple_t) {
             const elem: TypeId = if (self.arrayMethodElementTypeOf(obj_ty)) |et| et else tymod.ID_UNKNOWN;
-            return self.arrayPrototypeProperty(prop_name, elem);
+            // Builtin prototype wins; user augmentation only fills members not in the builtin list.
+            // arrayPrototypeProperty returns ID_ANY as the not-found sentinel (line ~21759).
+            const builtin = self.arrayPrototypeProperty(prop_name, elem);
+            if (!builtin.eq(tymod.ID_ANY)) return builtin;
+            const aug_name: ?[]const u8 = switch (obj.kind) {
+                .readonly_array_t => if (self.decl_index.hasType("ReadonlyArray")) "ReadonlyArray" else null,
+                else => if (self.decl_index.hasType("Array")) "Array" else null,
+            };
+            if (aug_name) |an| {
+                if (self.userArrayMember(an, prop_name, elem, obj_node)) |m| return m;
+            }
+            return builtin;
         }
         // Type parameter: chase the constraint (apparent type), mirroring
         // TypeScript's getApparentType which substitutes `T extends Base` → Base.
