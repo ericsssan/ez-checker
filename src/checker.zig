@@ -1582,6 +1582,26 @@ pub const Checker = struct {
         return i >= inner.len;
     }
 
+    /// Extract and decode the property name from a raw string-literal token text
+    /// (including surrounding quotes).  Returns the interned decoded slice, or the
+    /// raw inner slice when decoding fails or there are no escapes.  Ownership: the
+    /// returned slice is either a substring of `raw` (stack-safe) or an allocation
+    /// stored in `string_pool` (heap, kept alive for the checker's lifetime).
+    fn extractPropName(self: *Checker, raw: []const u8) []const u8 {
+        if (raw.len < 2) return raw;
+        const inner = raw[1 .. raw.len - 1];
+        if (std.mem.indexOfScalar(u8, inner, '\\') == null) return inner;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        if (!self.decodeJsEscapes(inner, &buf)) return inner;
+        const decoded = self.gpa.dupe(u8, buf.items) catch return inner;
+        self.string_pool.append(self.gpa, decoded) catch {
+            self.gpa.free(decoded);
+            return inner;
+        };
+        return decoded;
+    }
+
     /// When a string literal is the NAME of a `declare module 'X' {}`, return a
     /// type that displays as `typeof import("X")`.  Returns null otherwise.
     fn moduleNameLiteralType(self: *Checker, node: NodeIndex) ?TypeId {
@@ -10515,7 +10535,9 @@ pub const Checker = struct {
                 const name_tok = self.ast_ref.nodeMainToken(name_node);
                 const raw_name = self.ast_ref.tokenText(name_tok);
                 const name_tag = self.ast_ref.nodeTag(name_node);
-                const name = if ((name_tag == .string_literal or name_tag == .template_literal) and raw_name.len >= 2)
+                const name = if (name_tag == .string_literal and raw_name.len >= 2)
+                    self.extractPropName(raw_name)
+                else if (name_tag == .template_literal and raw_name.len >= 2)
                     raw_name[1 .. raw_name.len - 1]
                 else
                     raw_name;
@@ -10560,7 +10582,9 @@ pub const Checker = struct {
                     }
                     const name_tok = self.ast_ref.nodeMainToken(sig_data.key);
                     const raw_name = self.ast_ref.tokenText(name_tok);
-                    break :blk if ((name_tag == .string_literal or name_tag == .template_literal) and raw_name.len >= 2)
+                    break :blk if (name_tag == .string_literal and raw_name.len >= 2)
+                        self.extractPropName(raw_name)
+                    else if (name_tag == .template_literal and raw_name.len >= 2)
                         raw_name[1 .. raw_name.len - 1]
                     else
                         raw_name;
@@ -15235,7 +15259,9 @@ pub const Checker = struct {
                 const name_tok = self.ast_ref.nodeMainToken(data.lhs);
                 const raw_name = self.ast_ref.tokenText(name_tok);
                 const name_tag = self.ast_ref.nodeTag(data.lhs);
-                const name = if ((name_tag == .string_literal or name_tag == .template_literal) and raw_name.len >= 2)
+                const name = if (name_tag == .string_literal and raw_name.len >= 2)
+                    self.extractPropName(raw_name)
+                else if (name_tag == .template_literal and raw_name.len >= 2)
                     raw_name[1 .. raw_name.len - 1]
                 else
                     raw_name;
@@ -15757,7 +15783,7 @@ pub const Checker = struct {
                     key_tag_pd != .string_literal and key_tag_pd != .number_literal) return null;
                 const raw_name_pd = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
                 const name = if ((key_tag_pd == .string_literal) and raw_name_pd.len >= 2)
-                    raw_name_pd[1 .. raw_name_pd.len - 1]
+                    self.extractPropName(raw_name_pd)
                 else
                     raw_name_pd;
                 const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(data.rhs));
@@ -18968,7 +18994,7 @@ pub const Checker = struct {
         if (tag == .string_literal) {
             const tok = self.ast_ref.nodeMainToken(key);
             const raw = self.ast_ref.tokenText(tok);
-            if (raw.len >= 2) return raw[1 .. raw.len - 1];
+            if (raw.len >= 2) return self.extractPropName(raw);
         }
         return null;
     }
@@ -19798,7 +19824,7 @@ pub const Checker = struct {
             const tok = self.ast_ref.nodeMainToken(key_node);
             const raw = self.ast_ref.tokenText(tok);
             if (raw.len >= 2) {
-                const name = raw[1 .. raw.len - 1];
+                const name = self.extractPropName(raw);
                 for (self.store.propsOf(obj.object_props)) |p| {
                     if (std.mem.eql(u8, p.name, name)) return p.type_id;
                 }
