@@ -16478,7 +16478,8 @@ pub const Checker = struct {
             },
             // Object-like types have no falsy values — always truthy
             // (`{a:1} || x` / `[1] || x` / `(()=>1) || x` are just the LHS).
-            .object_t, .object_keyword, .array_t, .readonly_array_t, .tuple_t, .function_t => true,
+            // type_ref: class/interface instances are always truthy (matching tsc).
+            .object_t, .object_keyword, .array_t, .readonly_array_t, .tuple_t, .function_t, .type_ref => true,
             else => false,
         };
     }
@@ -19885,6 +19886,10 @@ pub const Checker = struct {
                 const args = self.store.idsOf(obj2.list_data);
                 if (args.len > 0) return args[0];
             }
+            // RegExpMatchArray is Array<string> — numeric index returns string
+            if (std.mem.eql(u8, ref_name2, "RegExpMatchArray")) {
+                return tymod.ID_STRING;
+            }
             // Record<K, V>: any key access returns V (the value type, arg[1]).
             if (std.mem.eql(u8, ref_name2, "Record")) {
                 const args = self.store.idsOf(obj2.list_data);
@@ -20977,6 +20982,10 @@ pub const Checker = struct {
             }
             return r;
         }
+        // RegExpMatchArray extends Array<string> — delegate to string-array prototype
+        if (std.mem.eql(u8, t.name, "RegExpMatchArray")) {
+            return self.arrayPrototypeProperty(name, tymod.ID_STRING);
+        }
         if (std.mem.eql(u8, t.name, "Promise")) {
             const inner = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
             return self.promisePrototypeProperty(name, inner);
@@ -21890,10 +21899,17 @@ pub const Checker = struct {
             const arr = self.store.arrayOf(tymod.ID_STRING) catch return null;
             return self.makeNullaryFn(arr);
         }
-        // RegExpMatchArray | null returners (match/matchAll)
-        if (std.mem.eql(u8, name, "match") or std.mem.eql(u8, name, "matchAll")) {
-            const arr = self.store.arrayOf(tymod.ID_STRING) catch tymod.ID_UNKNOWN;
-            const nullable = self.store.unionOf(&.{ arr, tymod.ID_NULL }) catch arr;
+        // match(regexp): RegExpMatchArray | null
+        if (std.mem.eql(u8, name, "match")) {
+            const rma = self.store.typeRef("RegExpMatchArray", &.{}) catch return null;
+            const nullable = self.store.unionOf(&.{ rma, tymod.ID_NULL }) catch rma;
+            const regexp_ty = self.store.unionOf(&.{ tymod.ID_STRING, self.store.typeRef("RegExp", &.{}) catch tymod.ID_ANY }) catch tymod.ID_ANY;
+            return self.makeNamedFn(&.{regexp_ty}, &.{"regexp"}, &.{false}, nullable);
+        }
+        // matchAll(regexp): never (rarely used in corpus; keep simple)
+        if (std.mem.eql(u8, name, "matchAll")) {
+            const rma = self.store.typeRef("RegExpMatchArray", &.{}) catch return null;
+            const nullable = self.store.unionOf(&.{ rma, tymod.ID_NULL }) catch rma;
             return self.makeNullaryFn(nullable);
         }
         return null;
