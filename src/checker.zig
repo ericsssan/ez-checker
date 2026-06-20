@@ -16288,7 +16288,28 @@ pub const Checker = struct {
         const cond_data = self.ast_ref.extraData(ast.Conditional, @intFromEnum(data.rhs));
         const a = self.typeOf(cond_data.consequent);
         const b = self.typeOf(cond_data.alternate);
-        return self.store.unionOf(&.{ a, b }) catch tymod.ID_ANY;
+        const ty = self.store.unionOf(&.{ a, b }) catch tymod.ID_ANY;
+        // TypeScript: `undefined <: void`, so `void | undefined → void` in expression
+        // result types (not type annotations).  Strip `undefined` when `void` is present.
+        return self.dropUndefinedIfVoid(ty);
+    }
+
+    fn dropUndefinedIfVoid(self: *Checker, ty: TypeId) TypeId {
+        const t = self.store.get(ty);
+        if (t.kind != .union_t) return ty;
+        const members = self.store.idsOf(t.list_data);
+        var has_void = false;
+        for (members) |m| if (m.eq(tymod.ID_VOID)) { has_void = true; break; };
+        if (!has_void) return ty;
+        var buf: [32]TypeId = undefined;
+        var n: usize = 0;
+        for (members) |m| {
+            if (m.eq(tymod.ID_UNDEFINED)) continue;
+            if (n < buf.len) { buf[n] = m; n += 1; }
+        }
+        if (n == 0) return tymod.ID_VOID;
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch ty;
     }
 
     fn inferLogical(self: *Checker, node: NodeIndex) TypeId {
