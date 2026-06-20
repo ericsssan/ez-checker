@@ -19814,6 +19814,18 @@ pub const Checker = struct {
                 if (idx < elems.len) return self.peelRestElem(elems[idx]);
                 return tymod.ID_UNDEFINED;
             }
+            // String literal key that represents an integer, e.g. tuple["1"] → tuple[1].
+            if (self.ast_ref.nodeTag(key_node) == .string_literal) {
+                const tok = self.ast_ref.nodeMainToken(key_node);
+                const raw = self.ast_ref.tokenText(tok);
+                if (raw.len >= 3) { // at least "N"
+                    const inner = raw[1 .. raw.len - 1];
+                    if (std.fmt.parseInt(usize, inner, 10)) |idx| {
+                        if (idx < elems.len) return self.peelRestElem(elems[idx]);
+                        return tymod.ID_UNDEFINED;
+                    } else |_| {}
+                }
+            }
             // Non-numeric index (symbol, variable, etc.) → union of all
             // element types, widened from literals to their base types.
             var buf: [32]TypeId = undefined;
