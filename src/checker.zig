@@ -22620,9 +22620,7 @@ pub const Checker = struct {
             .boolean => return self.store.get(val_ty).kind == .boolean_literal,
             .union_t => {
                 for (self.store.idsOf(t.list_data)) |m| {
-                    const mk = self.store.get(m).kind;
-                    if ((mk == .string_literal or mk == .number_literal or mk == .boolean_literal) and
-                        tymod.isAssignableTo(&self.store, val_ty, m)) return true;
+                    if (self.typeExpectsLiteral(m, val_ty)) return true;
                 }
                 return false;
             },
