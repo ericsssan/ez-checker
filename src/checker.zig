@@ -16291,7 +16291,13 @@ pub const Checker = struct {
         const ty = self.store.unionOf(&.{ a, b }) catch tymod.ID_ANY;
         // TypeScript: `undefined <: void`, so `void | undefined → void` in expression
         // result types (not type annotations).  Strip `undefined` when `void` is present.
-        return self.dropUndefinedIfVoid(ty);
+        const ty2 = self.dropUndefinedIfVoid(ty);
+        // Without strictNullChecks, null and undefined are subtypes of all other types:
+        // strip them from computed ternary results when non-null members remain.
+        if (self.checker_opts.strict_null_checks_explicit_off) {
+            return self.dropNullUndefinedIfNonNullPresent(ty2);
+        }
+        return ty2;
     }
 
     fn dropUndefinedIfVoid(self: *Checker, ty: TypeId) TypeId {
@@ -16308,6 +16314,23 @@ pub const Checker = struct {
             if (n < buf.len) { buf[n] = m; n += 1; }
         }
         if (n == 0) return tymod.ID_VOID;
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch ty;
+    }
+
+    fn dropNullUndefinedIfNonNullPresent(self: *Checker, ty: TypeId) TypeId {
+        const t = self.store.get(ty);
+        if (t.kind != .union_t) return ty;
+        const members = self.store.idsOf(t.list_data);
+        var buf: [32]TypeId = undefined;
+        var n: usize = 0;
+        var dropped = false;
+        for (members) |m| {
+            const mk = self.store.get(m).kind;
+            if (mk == .null_t or mk == .undefined_t) { dropped = true; continue; }
+            if (n < buf.len) { buf[n] = m; n += 1; }
+        }
+        if (!dropped or n == 0) return ty; // nothing dropped, or only null/undefined
         if (n == 1) return buf[0];
         return self.store.unionOf(buf[0..n]) catch ty;
     }
