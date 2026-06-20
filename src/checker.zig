@@ -19843,7 +19843,14 @@ pub const Checker = struct {
             if (raw.len >= 2) {
                 const name = self.extractPropName(raw);
                 for (self.store.propsOf(obj.object_props)) |p| {
-                    if (std.mem.eql(u8, p.name, name)) return p.type_id;
+                    if (std.mem.eql(u8, p.name, name)) {
+                        if (p.optional and !self.checker_opts.strict_null_checks_explicit_off and
+                            !self.typeContainsUndefined(p.type_id))
+                        {
+                            return self.store.unionOf(&.{ p.type_id, tymod.ID_UNDEFINED }) catch p.type_id;
+                        }
+                        return p.type_id;
+                    }
                 }
             }
         }
