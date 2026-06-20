@@ -15944,12 +15944,29 @@ pub const Checker = struct {
         const data = self.ast_ref.nodeData(ty_node);
         const slice = self.directRange(data.lhs, data.rhs) orelse return tymod.ID_UNKNOWN;
         var buf: [16]TypeId = undefined;
-        const n = @min(slice.len, buf.len);
+        var n: usize = 0;
+        const limit = @min(slice.len, buf.len);
         var i: usize = 0;
-        while (i < n) : (i += 1) {
+        while (i < limit) : (i += 1) {
             const m: NodeIndex = @enumFromInt(slice[i]);
-            buf[i] = self.resolveTypeNode(m);
+            buf[n] = self.resolveTypeNode(m);
+            n += 1;
         }
+        // Without strictNullChecks (explicitly disabled), null and undefined
+        // are subtypes of every type, so `T | undefined` = T and `T | null` = T.
+        // Drop them from the union when other members remain.
+        if (self.checker_opts.strict_null_checks_explicit_off) {
+            var filtered_n: usize = 0;
+            for (buf[0..n]) |member| {
+                const mt = self.store.get(member);
+                if (mt.kind == .null_t or mt.kind == .undefined_t) continue;
+                buf[filtered_n] = member;
+                filtered_n += 1;
+            }
+            if (filtered_n > 0) n = filtered_n;
+        }
+        if (n == 0) return tymod.ID_UNKNOWN;
+        if (n == 1) return buf[0];
         return self.store.unionOf(buf[0..n]) catch tymod.ID_UNKNOWN;
     }
 
