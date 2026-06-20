@@ -149,8 +149,16 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                         try buf.appendSlice(gpa, "\\0");
                     }
                 } else if (byte < 0x20) {
-                    // Encode C0 control characters as \uXXXX (uppercase hex, matching tsc)
-                    try buf.print(gpa, "\\u{X:0>4}", .{byte});
+                    // Named escape sequences for common control chars (matching tsc output)
+                    switch (byte) {
+                        0x08 => try buf.appendSlice(gpa, "\\b"),
+                        0x09 => try buf.appendSlice(gpa, "\\t"),
+                        0x0A => try buf.appendSlice(gpa, "\\n"),
+                        0x0B => try buf.appendSlice(gpa, "\\v"),
+                        0x0C => try buf.appendSlice(gpa, "\\f"),
+                        0x0D => try buf.appendSlice(gpa, "\\r"),
+                        else => try buf.print(gpa, "\\u{X:0>4}", .{byte}),
+                    }
                 } else if (byte == '"') {
                     try buf.appendSlice(gpa, "\\\"");
                 } else if (byte == '\\') {
