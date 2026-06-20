@@ -19919,7 +19919,16 @@ pub const Checker = struct {
         // sentinel prop stashed by `resolveTypeLiteral`.
         if (obj2.kind == .object_t) {
             for (self.store.propsOf(obj2.object_props)) |p| {
-                if (std.mem.eql(u8, p.name, "[]")) return p.type_id;
+                if (std.mem.eql(u8, p.name, "[]")) {
+                    // Optional mapped-type index signatures (e.g. `{ [k in E]?: string }`)
+                    // yield `T | undefined` on access.
+                    if (p.optional and !self.checker_opts.strict_null_checks_explicit_off and
+                        !self.typeContainsUndefined(p.type_id))
+                    {
+                        return self.store.unionOf(&.{ p.type_id, tymod.ID_UNDEFINED }) catch p.type_id;
+                    }
+                    return p.type_id;
+                }
             }
         }
         // Type reference (Promise / Array / etc.): resolve to the
