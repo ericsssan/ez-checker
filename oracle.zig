@@ -267,7 +267,7 @@ fn parseJsx(val: []const u8) CompilerOpts.Jsx {
 
 fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8, source_rel_path: []const u8) CompilerOpts {
     const full_path = std.fmt.allocPrint(arena, "{s}/{s}", .{ ts_root_dir, source_rel_path }) catch return .{};
-    const content = std.Io.Dir.cwd().readFileAlloc(io, full_path, arena, std.Io.Limit.limited(64 * 1024)) catch return .{};
+    const content = std.Io.Dir.cwd().readFileAlloc(io, full_path, arena, std.Io.Limit.limited(512 * 1024)) catch return .{};
     var opts = CompilerOpts{};
     var it = std.mem.splitScalar(u8, content, '\n');
     while (it.next()) |raw| {

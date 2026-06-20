@@ -15570,19 +15570,23 @@ pub const Checker = struct {
                 if (self.ast_ref.nodeTag(param) != .ts_parameter_property) continue;
                 var binding = self.ast_ref.nodeData(param).lhs;
                 if (binding == .none) continue;
-                if (self.ast_ref.nodeTag(binding) == .assignment_pattern) {
+                // Track if the param has a default value — `public e = 10` makes the
+                // property required (type = T), whereas `public d?: T` makes it optional.
+                const has_default = self.ast_ref.nodeTag(binding) == .assignment_pattern;
+                if (has_default) {
                     binding = self.ast_ref.nodeData(binding).lhs;
                 }
                 if (self.ast_ref.nodeTag(binding) != .identifier) continue;
                 const prop_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(binding));
                 if (prop_name.len == 0) continue;
                 const prop_ty = self.paramDeclaredType(param);
+                const is_optional = !has_default and self.paramHasOptionalMarker(binding);
                 // Only add if not already present (explicit property_def takes precedence).
                 var already = false;
                 for (props.items) |existing| {
                     if (std.mem.eql(u8, existing.name, prop_name)) { already = true; break; }
                 }
-                if (!already) props.append(self.gpa, .{ .name = prop_name, .type_id = prop_ty }) catch {};
+                if (!already) props.append(self.gpa, .{ .name = prop_name, .type_id = prop_ty, .optional = is_optional }) catch {};
             }
             break; // only one constructor
         }
