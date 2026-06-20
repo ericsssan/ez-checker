@@ -16339,9 +16339,10 @@ pub const Checker = struct {
         if (self.store.get(a).kind == .type_param) return narrowed_b;
         // Use the LHS's canonical falsy representative as the short-circuit branch:
         // `number && b` → `0 | b`; `string && b` → `"" | b`; `boolean && b` → `false | b`.
-        // For unions, collect falsy-capable members. Falls back to `false` when no
-        // better representative exists (matches prior behaviour for boolean/unknown LHS).
+        // For unions, collect falsy-capable members. Returns `never` when no falsy
+        // part exists (function/object types are always truthy — skip the short-circuit).
         const falsy_a = self.falsyRepresentative(a);
+        if (falsy_a.eq(tymod.ID_NEVER)) return narrowed_b;
         return self.store.unionOf(&.{ falsy_a, narrowed_b }) catch tymod.ID_ANY;
     }
 
@@ -16357,28 +16358,36 @@ pub const Checker = struct {
             .number   => return self.store.numberLiteral(0) catch tymod.ID_NUMBER,
             .string   => return self.store.stringLiteral("") catch tymod.ID_STRING,
             .boolean  => return self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN,
-            .null_t, .undefined_t => return ty,
+            .null_t, .undefined_t, .void_t => return ty,
             .number_literal => {
                 const is_zero = t.literal_value == .number and t.literal_value.number == 0;
-                return if (is_zero) ty else self.store.booleanLiteral(false) catch ty;
+                // Non-zero numbers are always truthy — no falsy representative.
+                return if (is_zero) ty else tymod.ID_NEVER;
             },
             .string_literal => {
                 const is_empty = t.literal_value == .string and t.literal_value.string.len == 0;
-                return if (is_empty) ty else self.store.booleanLiteral(false) catch ty;
+                // Non-empty strings are always truthy — no falsy representative.
+                return if (is_empty) ty else tymod.ID_NEVER;
             },
-            .boolean_literal => return ty,
+            .boolean_literal => {
+                // `true` is always truthy; `false` is its own falsy representative.
+                return if (!t.literal_value.boolean) ty else tymod.ID_NEVER;
+            },
+            // Function types, object types, and arrays are always truthy in JS.
+            .function_t, .object_t, .array_t, .readonly_array_t, .tuple_t, .intersection_t,
+            .type_ref => return tymod.ID_NEVER,
             .union_t => {
                 var buf: [16]TypeId = undefined;
                 var n: usize = 0;
                 for (self.store.idsOf(t.list_data)) |m| {
                     const fp = self.falsyRepresentative(m);
+                    if (fp.eq(tymod.ID_NEVER)) continue; // always-truthy member
                     const already = for (buf[0..n]) |b| { if (b.eq(fp)) break true; } else false;
                     if (!already and n < buf.len) { buf[n] = fp; n += 1; }
                 }
+                if (n == 0) return tymod.ID_NEVER; // all members always truthy
                 if (n == 1) return buf[0];
-                if (n > 1) return self.store.unionOf(buf[0..n]) catch
-                    self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN;
-                return self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN;
+                return self.store.unionOf(buf[0..n]) catch tymod.ID_NEVER;
             },
             else => return self.store.booleanLiteral(false) catch tymod.ID_BOOLEAN,
         }
