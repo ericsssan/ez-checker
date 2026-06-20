@@ -9370,8 +9370,10 @@ pub const Checker = struct {
             } else {
                 ret_ty = self.inferBlockReturn(body_for_inference);
             }
-            // In non-strict mode, null/undefined return types widen to any (same rule as var decls).
-            if (!self.checker_opts.strict_null_checks) {
+            // In non-strict mode with noImplicitAny off, null/undefined body-inferred
+            // return types widen to any — TypeScript treats them as implicit any.
+            // Does NOT apply when noImplicitAny is on (tsc shows the actual type).
+            if (!self.checker_opts.strict_null_checks and !self.checker_opts.no_implicit_any) {
                 const ret_info = self.store.get(ret_ty);
                 if (ret_info.kind == .null_t or ret_info.kind == .undefined_t) ret_ty = tymod.ID_ANY;
             }
