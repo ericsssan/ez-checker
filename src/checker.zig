@@ -13844,7 +13844,7 @@ pub const Checker = struct {
     /// positional argument, the argument type is assignable to the parameter
     /// type (any/unknown on either side is always compatible).  Falls back to
     /// index 0 when nothing matches or when the function is not overloaded.
-    fn pickOverload(self: *Checker, sigs: []const tymod.Signature, arg_types: []const TypeId) usize {
+    fn pickOverload(self: *Checker, sigs: []const tymod.Signature, arg_types: []const TypeId) ?usize {
         if (sigs.len <= 1) return 0;
         outer: for (sigs, 0..) |sig, si| {
             const params = self.store.signatureParamsOf(sig);
@@ -13862,6 +13862,12 @@ pub const Checker = struct {
             }
             return si;
         }
+        // Fallback: no overload matched. Return null only when sig[0] (the
+        // conventional default) itself can't accommodate the actual arg count —
+        // in that case returning its return type would be actively wrong.  When
+        // sig[0] has enough params, use it as the best-effort result (index 0).
+        const sig0_params = self.store.signatureParamsOf(sigs[0]);
+        if (arg_types.len > sig0_params.len) return null;
         return 0;
     }
 
@@ -16679,11 +16685,11 @@ pub const Checker = struct {
             const sig_range = t.signatures;
             const sig_count = sig_range.end - sig_range.start;
             if (sig_count > 0) {
-                const best: usize = blk: {
-                    if (sig_count == 1) break :blk 0;
-                    const args_range = self.safeSubRange(data.rhs) orelse break :blk 0;
+                const best_opt: ?usize = blk: {
+                    if (sig_count == 1) break :blk @as(?usize, 0);
+                    const args_range = self.safeSubRange(data.rhs) orelse break :blk @as(?usize, 0);
                     const extra = self.ast_ref.extra_data;
-                    if (args_range.start > extra.len or args_range.end > extra.len) break :blk 0;
+                    if (args_range.start > extra.len or args_range.end > extra.len) break :blk @as(?usize, 0);
                     const args_slice = extra[args_range.start..args_range.end];
                     var arg_types_buf: [16]TypeId = undefined;
                     var argc: usize = 0;
@@ -16696,8 +16702,14 @@ pub const Checker = struct {
                     const sigs = self.store.signaturesOf(sig_range);
                     break :blk self.pickOverload(sigs, arg_types_buf[0..argc]);
                 };
-                const sigs = self.store.signaturesOf(sig_range);
-                result = sigs[best].return_type;
+                if (best_opt) |best| {
+                    const sigs = self.store.signaturesOf(sig_range);
+                    result = sigs[best].return_type;
+                } else {
+                    // No overload matched the argument types — return `any` so the
+                    // call site is a gap rather than a wrong concrete type.
+                    result = tymod.ID_ANY;
+                }
             }
         }
         // Generic call-site inference — if the callee is a generic
@@ -20952,7 +20964,18 @@ pub const Checker = struct {
         const args = self.store.idsOf(t.list_data);
         if (std.mem.eql(u8, t.name, "Array") or std.mem.eql(u8, t.name, "ReadonlyArray")) {
             const elem = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
-            return self.arrayPrototypeProperty(name, elem);
+            const r = self.arrayPrototypeProperty(name, elem);
+            // When user has declared interface Array<T> / ReadonlyArray<T>, the correct
+            // output for reduce/reduceRight is lib overloads merged with user's overloads
+            // (declaration merging). Until merging is implemented, return any so the
+            // member access stays a gap rather than exposing partial lib-only overloads.
+            if (!r.eq(tymod.ID_ANY) and
+                self.decl_index.hasType(t.name) and
+                (std.mem.eql(u8, name, "reduce") or std.mem.eql(u8, name, "reduceRight")))
+            {
+                return tymod.ID_ANY;
+            }
+            return r;
         }
         if (std.mem.eql(u8, t.name, "Promise")) {
             const inner = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
@@ -21808,6 +21831,10 @@ pub const Checker = struct {
                 tymod.ID_VOID,
             ) orelse tymod.ID_ANY;
         }
+        // reduce/reduceRight: 3-overload form matching lib.es5
+        if (std.mem.eql(u8, name, "reduce") or std.mem.eql(u8, name, "reduceRight")) {
+            return self.makeReduceArrayFn(elem);
+        }
         return tymod.ID_ANY;
     }
 
@@ -22057,6 +22084,57 @@ pub const Checker = struct {
             .rest_param_index = 0,
         };
         return self.store.functionType(sig) catch self.makeNullaryFn(tymod.ID_NUMBER);
+    }
+
+    /// Build the 3-overload reduce/reduceRight type for Array<T>:
+    ///   (callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T): T
+    ///   (callbackfn: (previousValue: T, currentValue: T, currentIndex: number, array: T[]) => T, initialValue: T): T
+    ///   <U>(callbackfn: (previousValue: U, currentValue: T, currentIndex: number, array: T[]) => U, initialValue: U): U
+    fn makeReduceArrayFn(self: *Checker, elem: TypeId) TypeId {
+        const arr_t = self.store.arrayOf(elem) catch return tymod.ID_ANY;
+        // callback for overloads 1 & 2: (previousValue: T, ...) => T
+        const cb_t = self.makeNamedFn(
+            &.{ elem, elem, tymod.ID_NUMBER, arr_t },
+            &.{ "previousValue", "currentValue", "currentIndex", "array" },
+            &.{ false, false, false, false },
+            elem,
+        ) orelse return tymod.ID_ANY;
+        // sig1: (callbackfn: cb_t) => T
+        const pr1 = self.store.appendSignatureParamsFull(
+            &.{cb_t}, &.{"callbackfn"}, &.{false},
+        ) catch return tymod.ID_ANY;
+        const sig1 = tymod.Signature{ .params_start = pr1.start, .params_end = pr1.end, .return_type = elem };
+        // sig2: (callbackfn: cb_t, initialValue: T) => T
+        const pr2 = self.store.appendSignatureParamsFull(
+            &.{ cb_t, elem }, &.{ "callbackfn", "initialValue" }, &.{ false, false },
+        ) catch return tymod.ID_ANY;
+        const sig2 = tymod.Signature{ .params_start = pr2.start, .params_end = pr2.end, .return_type = elem };
+        // sig3: <U>(callbackfn: (previousValue: U, currentValue: T, ...) => U, initialValue: U) => U
+        const u_t = self.store.add(.{ .kind = .type_param, .name = "U" }) catch return tymod.ID_ANY;
+        const cb_u = self.makeNamedFn(
+            &.{ u_t, elem, tymod.ID_NUMBER, arr_t },
+            &.{ "previousValue", "currentValue", "currentIndex", "array" },
+            &.{ false, false, false, false },
+            u_t,
+        ) orelse return tymod.ID_ANY;
+        const pr3 = self.store.appendSignatureParamsFull(
+            &.{ cb_u, u_t }, &.{ "callbackfn", "initialValue" }, &.{ false, false },
+        ) catch return tymod.ID_ANY;
+        var sig3 = tymod.Signature{ .params_start = pr3.start, .params_end = pr3.end, .return_type = u_t };
+        sig3.type_param_fp = 0xDEAD_0001; // distinct fingerprint for the <U> sig
+        const sig_list = self.store.appendSignatures(&.{ sig1, sig2, sig3 }) catch return tymod.ID_ANY;
+        const fn_ty = self.store.add(.{
+            .kind = .function_t,
+            .signatures = sig_list,
+            .is_overload_set = true,
+        }) catch return tymod.ID_ANY;
+        // Register <U> prefix on the 3rd signature slot so the printer renders it.
+        const sig3_slot: u32 = sig_list.start + 2;
+        if (!self.sig_type_params.contains(sig3_slot)) {
+            const dup = self.gpa.dupe(u8, "<U>") catch return fn_ty;
+            self.sig_type_params.put(self.gpa, sig3_slot, dup) catch self.gpa.free(dup);
+        }
+        return fn_ty;
     }
 
     /// A function's explicit `this: T` parameter type, or null when absent.
