@@ -273,7 +273,10 @@ fn parseJsx(val: []const u8) CompilerOpts.Jsx {
 
 fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8, source_rel_path: []const u8) CompilerOpts {
     const full_path = std.fmt.allocPrint(arena, "{s}/{s}", .{ ts_root_dir, source_rel_path }) catch return .{};
-    const content = std.Io.Dir.cwd().readFileAlloc(io, full_path, arena, std.Io.Limit.limited(512 * 1024)) catch return .{};
+    const raw_content = std.Io.Dir.cwd().readFileAlloc(io, full_path, arena, std.Io.Limit.limited(512 * 1024)) catch return .{};
+    // Strip UTF-8 BOM (EF BB BF) if present — many TypeScript test files include it,
+    // which would otherwise cause the leading `//` check to fail on the first line.
+    const content = if (std.mem.startsWith(u8, raw_content, "\xEF\xBB\xBF")) raw_content[3..] else raw_content;
     var opts = CompilerOpts{};
     var it = std.mem.splitScalar(u8, content, '\n');
     while (it.next()) |raw| {
