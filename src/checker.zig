@@ -668,6 +668,13 @@ pub const Checker = struct {
     typeof_names: [32][]const u8 = undefined,
     typeof_n: u8 = 0,
 
+    /// Names of functions whose VALUE TYPE is currently being built (inside
+    /// functionTypeFromFnDecl / buildFunctionTypeG).  When `resolveTypeofType`
+    /// is called for a name that appears here, the function is being built
+    /// right now — return the opaque `typeof name` ref to avoid circular
+    /// expansion and the one-extra-nesting `() => () => typeof fn` artifact.
+    typeof_building: std.StringHashMapUnmanaged(void) = .empty,
+
     /// Bounded stack of type-parameter names currently being resolved by
     /// `resolveTypeParameterConstraint`. Breaks self-referential constraints
     /// like `<T extends null extends T ? any : never>`, where resolving T's
@@ -985,6 +992,7 @@ pub const Checker = struct {
             self.evolving_assign_index.deinit(self.gpa);
         }
         self.evolving_in_progress.deinit(self.gpa);
+        self.typeof_building.deinit(self.gpa);
         if (self.node_seg.len > 0) self.gpa.free(self.node_seg);
         self.seg_reach_set.deinit(self.gpa);
         self.seg_worklist.deinit(self.gpa);
@@ -8814,6 +8822,20 @@ pub const Checker = struct {
         if (inner_tag != .identifier and inner_tag != .ts_type_reference) return tymod.ID_UNKNOWN;
         const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(inner));
         if (name.len == 0) return tymod.ID_UNKNOWN;
+        // If the function whose value type `typeof name` refers to is currently
+        // being built (via functionTypeFromFnDecl), return the opaque alias
+        // immediately.  This prevents the extra nesting `() => () => typeof fn`
+        // that would arise from re-entering the function type builder.
+        // tsc renders self-referential function return types as `typeof fn`.
+        if (self.typeof_building.contains(name)) {
+            const disp = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return tymod.ID_UNKNOWN;
+            const r = self.store.typeRef(disp, &.{}) catch {
+                self.gpa.free(disp);
+                return tymod.ID_UNKNOWN;
+            };
+            self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
+            return r;
+        }
         // Cycle break: a `typeof name` that re-enters while already resolving the
         // same name (self/mutually-recursive function types) resolves to unknown.
         for (self.typeof_names[0..self.typeof_n]) |n| {
@@ -9227,7 +9249,17 @@ pub const Checker = struct {
         // A plain function DECLARATION is never contextually typed; reset so a
         // nested decl inside a contextually-typed arrow doesn't inherit it.
         self.contextual_arrow_return = if (is_fn_expr) self.arrowContextualReturn(fn_node) else null;
+        // Mark the function's name as "currently being built" so that
+        // resolveTypeofType("fn") inside our own annotation (e.g. `(): typeof fn`)
+        // returns the opaque alias immediately rather than re-entering and adding
+        // an extra wrapping level.
+        const fname_tok: []const u8 = if (fd.name != .none)
+            self.ast_ref.tokenText(self.ast_ref.nodeMainToken(fd.name))
+        else
+            "";
+        if (fname_tok.len > 0) self.typeof_building.put(self.gpa, fname_tok, {}) catch {};
         const result = self.buildFunctionTypeG(fd.params, fd.params_end, fd.return_type, fd.body, is_async, is_generator, fd.type_params, fd.type_params_end);
+        if (fname_tok.len > 0) _ = self.typeof_building.remove(fname_tok);
         self.contextual_arrow_return = saved_ctx_ret;
         // JS constructor function: a NAMED function whose body assigns to
         // `this.<prop>` is treated by tsc as a class-like constructor — its
