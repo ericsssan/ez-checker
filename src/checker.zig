@@ -2411,6 +2411,9 @@ pub const Checker = struct {
             if ((bkind == .namespace_decl or bkind == .class_decl or bkind == .enum_decl) and
                 !self.identifierInTypePosition(node))
             {
+                // Assigning to a class/namespace/enum is an error; tsc returns
+                // `any` for the LHS identifier (including through parentheses).
+                if (self.identifierIsAssignLhs(node)) return tymod.ID_ANY;
                 if (bkind == .namespace_decl or bkind == .enum_decl) {
                     const tok = self.ast_ref.nodeMainToken(node);
                     const ns_name = self.ast_ref.tokenText(tok);
@@ -20306,6 +20309,26 @@ pub const Checker = struct {
     }
 
     /// True when `node` is the direct target (LHS) of a simple `=` assignment.
+    /// True when `node` is the LHS of any assignment operator (simple or
+    /// compound), possibly through parentheses.  Used to detect write targets
+    /// that are class/namespace/enum names — tsc returns `any` there.
+    fn identifierIsAssignLhs(self: *Checker, node: NodeIndex) bool {
+        var n = node;
+        var guard: u8 = 0;
+        while (guard < 4) : (guard += 1) {
+            const ni = n.toInt();
+            if (ni >= self.semantic.parent_indices.len) return false;
+            const pidx = self.semantic.parent_indices[ni];
+            if (pidx == @intFromEnum(NodeIndex.none)) return false;
+            const parent: NodeIndex = @enumFromInt(pidx);
+            const ptag = self.ast_ref.nodeTag(parent);
+            if (isAssignTag(ptag)) return @intFromEnum(self.ast_ref.nodeData(parent).lhs) == ni;
+            if (ptag == .grouping_expr) { n = parent; continue; }
+            return false;
+        }
+        return false;
+    }
+
     /// Compound assignments (`+=`, `&&=`, …) read the target first, so tsc shows
     /// the READ (getter) type for those — only a plain `=` exposes the setter
     /// (write) type at a divergent accessor.
