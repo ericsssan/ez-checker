@@ -6220,10 +6220,11 @@ pub const Checker = struct {
                         }
                         break :blk false;
                     };
-                    // In non-strict mode, null/undefined initializers widen to any
-                    // for ALL declaration kinds (const z = null → any).
-                    if (!self.checker_opts.strict_null_checks and !is_as_const) {
-                        if (t.kind == .null_t or t.kind == .undefined_t) return tymod.ID_ANY;
+                    // null/undefined initializers widen to any:
+                    //   - Non-strict mode: all declaration kinds (const z = null → any).
+                    //   - Strict mode: only let/var (evolving-type CFA pattern).
+                    if (!is_as_const and (t.kind == .null_t or t.kind == .undefined_t)) {
+                        if (!self.checker_opts.strict_null_checks or is_mutable) return tymod.ID_ANY;
                     }
                     if (is_mutable and !is_as_const) {
                         // Enum members widen member-wise on let/var: FRESH
@@ -6427,6 +6428,18 @@ pub const Checker = struct {
                             else => raw,
                         };
                         if (widened_prim != raw) return widened_prim;
+
+                        // Arrays of null/undefined widen to any[] on let/var in non-strict mode.
+                        // In strict mode, undefined[] stays as-is (non-widening undefined).
+                        if (t.kind == .array_t and !self.checker_opts.strict_null_checks) {
+                            const elems = self.store.idsOf(t.list_data);
+                            if (elems.len == 1) {
+                                const et = self.store.get(elems[0]);
+                                if (et.kind == .null_t or et.kind == .undefined_t) {
+                                    return self.store.arrayOf(tymod.ID_ANY) catch raw;
+                                }
+                            }
+                        }
 
                         // Handle object literals with literal properties
                         if (t.kind == .object_t) {
@@ -20163,6 +20176,17 @@ pub const Checker = struct {
         if (obj.kind == .union_t or obj.kind == .intersection_t) {
             for (self.store.idsOf(obj.list_data)) |m| {
                 const t = self.inferComputedMember(m, key_node, obj_node);
+                if (!tymod.isUnknown(&self.store, t)) return t;
+            }
+        }
+        // Primitive type (`string`, `number`, `boolean`, etc.) with a string-literal
+        // key: treat `str["length"]` exactly like `str.length` by routing through
+        // the apparent-type member lookup (which knows about String.prototype etc.).
+        if (obj.kind == .string or obj.kind == .number or obj.kind == .boolean or
+            obj.kind == .bigint or obj.kind == .symbol)
+        {
+            if (self.stringLiteralKeyName(key_node)) |kn| {
+                const t = self.memberOnApparentType(obj_ty, kn, obj_node);
                 if (!tymod.isUnknown(&self.store, t)) return t;
             }
         }
