@@ -16223,12 +16223,41 @@ pub const Checker = struct {
             const data = self.ast_ref.nodeData(src);
             const empty_slice: []const u32 = &.{};
             const slice: []const u32 = self.directRange(data.lhs, data.rhs) orelse empty_slice;
-            var buf: [32]TypeId = undefined;
-            const n = @min(slice.len, buf.len);
-            var i: usize = 0;
-            while (i < n) : (i += 1) {
-                const elem: NodeIndex = @enumFromInt(slice[i]);
-                buf[i] = if (elem == .none) tymod.ID_UNDEFINED else self.inferAsConst(elem);
+            var buf: [64]TypeId = undefined;
+            var n: usize = 0;
+            for (slice) |raw| {
+                if (n >= buf.len) break;
+                const elem: NodeIndex = @enumFromInt(raw);
+                if (elem == .none) {
+                    buf[n] = tymod.ID_UNDEFINED;
+                    n += 1;
+                } else if (self.ast_ref.nodeTag(elem) == .spread_element) {
+                    // Spread under as-const: expand if source is a tuple literal,
+                    // otherwise add the element type as a rest element.
+                    const inner = self.ast_ref.nodeData(elem).lhs;
+                    if (inner == .none) continue;
+                    const inner_const = self.inferAsConst(inner);
+                    const ict = self.store.get(inner_const);
+                    if (ict.kind == .tuple_t) {
+                        for (self.store.idsOf(ict.list_data)) |e| {
+                            if (n >= buf.len) break;
+                            buf[n] = e;
+                            n += 1;
+                        }
+                    } else if (ict.kind == .array_t or ict.kind == .readonly_array_t) {
+                        const elems = self.store.idsOf(ict.list_data);
+                        const el_ty = if (elems.len > 0) elems[0] else tymod.ID_ANY;
+                        const rest_ty = self.store.add(.{ .kind = .rest_t, .list_data = self.store.appendTypeIds(&.{el_ty}) catch return tymod.ID_UNKNOWN }) catch return tymod.ID_UNKNOWN;
+                        buf[n] = rest_ty;
+                        n += 1;
+                    } else {
+                        buf[n] = inner_const;
+                        n += 1;
+                    }
+                } else {
+                    buf[n] = self.inferAsConst(elem);
+                    n += 1;
+                }
             }
             const list = self.store.appendTypeIds(buf[0..n]) catch return tymod.ID_UNKNOWN;
             return self.store.add(.{ .kind = .tuple_t, .list_data = list, .name = "readonly" }) catch tymod.ID_UNKNOWN;
@@ -18348,6 +18377,12 @@ pub const Checker = struct {
     }
 
     fn inferArrayLiteral(self: *Checker, node: NodeIndex) TypeId {
+        // An array literal directly under `as const` / `<const>` is typed as
+        // a readonly tuple with literal-type elements.
+        if (self.nodeIsAsConstOperand(node)) {
+            const cty = self.inferAsConst(node);
+            if (!cty.eq(tymod.ID_UNKNOWN)) return cty;
+        }
         const data = self.ast_ref.nodeData(node);
         const slice = self.directRange(data.lhs, data.rhs) orelse {
             const elem = self.emptyArrayElem(node);
@@ -18711,12 +18746,21 @@ pub const Checker = struct {
         const pidx = parents[ni];
         if (pidx == @intFromEnum(NodeIndex.none) or pidx >= self.ast_ref.nodes.len) return false;
         const parent: NodeIndex = @enumFromInt(pidx);
-        if (self.ast_ref.nodeTag(parent) != .ts_as_expr) return false;
+        const parent_tag = self.ast_ref.nodeTag(parent);
         const as_data = self.ast_ref.nodeData(parent);
-        if (as_data.lhs != node) return false; // must be the operand, not the type
-        if (as_data.rhs == .none or self.ast_ref.nodeTag(as_data.rhs) != .ts_type_reference) return false;
-        const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(as_data.rhs));
-        return std.mem.eql(u8, cname, "const");
+        if (parent_tag == .ts_as_expr) {
+            if (as_data.lhs != node) return false;
+            if (as_data.rhs == .none or self.ast_ref.nodeTag(as_data.rhs) != .ts_type_reference) return false;
+            const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(as_data.rhs));
+            return std.mem.eql(u8, cname, "const");
+        }
+        if (parent_tag == .ts_type_assertion) {
+            if (as_data.rhs != node) return false; // rhs is the operand for <T>expr
+            if (as_data.lhs == .none or self.ast_ref.nodeTag(as_data.lhs) != .ts_type_reference) return false;
+            const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(as_data.lhs));
+            return std.mem.eql(u8, cname, "const");
+        }
+        return false;
     }
 
     /// True when `node` itself is `expr as const` or `<const>expr`.
