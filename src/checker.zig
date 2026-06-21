@@ -2587,9 +2587,11 @@ pub const Checker = struct {
                 var flow = self.narrowConstEnumAtUse(sym, node, base) orelse base;
                 // Reaching-definitions flow narrowing (`x = 42; x` → number).
                 flow = self.flowNarrowByAssignments(sym, node, flow) orelse flow;
-                // Compound assignment LHS (`a ^= b`): tsc reports the declared
-                // type, not the narrowed flow type. Skip narrowAtUse for these.
-                if (self.isAnyAssignLhs(node) and !self.isPlainAssignTarget(node))
+                // Assignment LHS: tsc reports the declared/flow type, not the
+                // CFA-narrowed type. For `a = b`, `a` is a write target (its
+                // type is the declared write type, not narrowed by prior
+                // conditions). Same applies to compound assignments (`a ^= b`).
+                if (self.isAnyAssignLhs(node))
                     return flow;
                 return self.narrowAtUse(node, sym, flow);
             }
