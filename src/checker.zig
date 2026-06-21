@@ -1771,10 +1771,44 @@ pub const Checker = struct {
     fn literalBigint(self: *Checker, node: NodeIndex) TypeId {
         const tok = self.ast_ref.nodeMainToken(node);
         const raw = self.ast_ref.tokenText(tok);
-        // Trim the trailing 'n' suffix.
         if (raw.len < 2 or raw[raw.len - 1] != 'n') return tymod.ID_BIGINT;
-        const value = raw[0 .. raw.len - 1];
-        return self.store.bigintLiteral(value) catch tymod.ID_BIGINT;
+        const digits = raw[0 .. raw.len - 1]; // strip trailing 'n'
+        // TypeScript always displays BigInt literals in decimal; normalise non-decimal
+        // bases and digit-separated literals (0b101n→5n, 0o567n→375n, 123_456n→123456n).
+        const norm = normaliseBigintDigits(digits, self.gpa) catch {
+            return self.store.bigintLiteral(digits) catch tymod.ID_BIGINT;
+        };
+        return self.store.bigintLiteral(norm) catch tymod.ID_BIGINT;
+    }
+
+    // Convert a BigInt literal's digit string (no trailing 'n') to canonical decimal.
+    // Falls back to the original string on overflow (values > 128 bits) or parse error.
+    fn normaliseBigintDigits(digits: []const u8, gpa: std.mem.Allocator) ![]const u8 {
+        // Strip numeric separators ('_') to get the raw digit string.
+        var stripped: []const u8 = digits;
+        const has_sep = std.mem.indexOfScalar(u8, digits, '_') != null;
+        if (has_sep) {
+            var buf = try gpa.alloc(u8, digits.len);
+            var n: usize = 0;
+            for (digits) |c| if (c != '_') { buf[n] = c; n += 1; };
+            stripped = buf[0..n];
+        }
+        // Detect base prefix.
+        const base: u8, const body: []const u8 = blk: {
+            if (stripped.len > 2 and stripped[0] == '0') {
+                switch (stripped[1]) {
+                    'b', 'B' => break :blk .{ 2, stripped[2..] },
+                    'o', 'O' => break :blk .{ 8, stripped[2..] },
+                    'x', 'X' => break :blk .{ 16, stripped[2..] },
+                    else => {},
+                }
+            }
+            break :blk .{ 10, stripped }; // already decimal
+        };
+        if (base == 10) return stripped; // decimal (stripped of '_')
+        // Parse as u128 and format as decimal.  Values > 128 bits fall back.
+        const v = std.fmt.parseInt(u128, body, base) catch return stripped;
+        return std.fmt.allocPrint(gpa, "{}", .{v});
     }
 
     fn literalBoolean(self: *Checker, node: NodeIndex) TypeId {
