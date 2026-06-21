@@ -650,6 +650,13 @@ pub const Checker = struct {
     building_classes: [32]NodeIndex = undefined,
     building_n: u8 = 0,
 
+    /// Bounded stack of object-literal nodes whose structural `this` type is
+    /// currently being computed by `objectLiteralStructuralThisType`.  Guards
+    /// against infinite recursion when a method in the literal accesses `this`
+    /// while we scan the literal's own members to build the partial type.
+    building_objlits: [8]NodeIndex = undefined,
+    building_objlit_n: u8 = 0,
+
     /// Bounded stack of names currently being resolved by `resolveTypeofType`.
     /// Breaks `typeof`-recursion: `declare function f(): typeof f` and its
     /// overloaded/mutually-recursive cousins reference their own value type,
@@ -19217,6 +19224,20 @@ pub const Checker = struct {
                     }
                 }
             }
+            // this.prop inside an object-literal method: scan the literal's own members.
+            if (self.ast_ref.nodeTag(obj_node) == .this_expr) {
+                if (self.thisHostObjectLiteral(obj_node)) |objlit| {
+                    if ((self.ast_ref.nodeTag(node) == .member_expr or
+                        self.ast_ref.nodeTag(node) == .optional_member_expr) and
+                        data.rhs != .none)
+                    {
+                        const prop_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.rhs));
+                        if (prop_name.len > 0) {
+                            if (self.objectLiteralDataPropLookup(objlit, prop_name)) |pt| return pt;
+                        }
+                    }
+                }
+            }
             return tymod.ID_ANY;
         }
         const tag = self.ast_ref.nodeTag(node);
@@ -23250,6 +23271,139 @@ pub const Checker = struct {
         // member against the literal's shape — not modeled; leave `this` `any`.
         if (self.store.get(stripped).kind == .union_t) return null;
         return stripped;
+    }
+
+    /// Look up a member by name directly in an object literal's own property
+    /// and method definitions.  Used by `inferMember` to resolve `this.prop`
+    /// inside object-literal methods when `this` is untyped (`any`).
+    ///
+    /// Rules:
+    ///   - Data properties (`.property`, `.shorthand_property`): widened value type.
+    ///   - Method shorthands (`.method_def`): declared function type built from
+    ///     params + explicit return annotation only.  Methods without an explicit
+    ///     return annotation are skipped (return null) to avoid body recursion and
+    ///     incorrect `() => any` in the lookup result.
+    ///   - Getters (`.getter_def`): explicit return annotation only; unannotated
+    ///     getters are skipped.
+    ///   - Fn-expression property values (`.property` + fn_expr rhs): same as
+    ///     method shorthands — declared type, annotation required, body skipped.
+    ///   - All other members (setters, computed, spread) → null (fall through).
+    ///
+    /// Re-entrancy guard: if `objectLiteralDataPropLookup` is already active for
+    /// the same object literal (e.g. a property value itself uses `this`), returns
+    /// null to break the cycle.
+    fn objectLiteralDataPropLookup(self: *Checker, objlit: NodeIndex, prop_name: []const u8) ?TypeId {
+        // Only fire when the object literal is the direct initializer of a `let/const/var`
+        // declarator (with or without type annotation).  Call-argument objects, `as const`
+        // operands, return-statement objects, and objects nested in properties all have
+        // different `this` semantics and must stay `any`.
+        const parents = self.semantic.parent_indices;
+        const oidx = @intFromEnum(objlit);
+        if (oidx >= parents.len) return null;
+        const pi = parents[oidx];
+        if (pi == @intFromEnum(NodeIndex.none)) return null;
+        const decl_node: NodeIndex = @enumFromInt(pi);
+        if (self.ast_ref.nodeTag(decl_node) != .declarator) return null;
+        // When the contextual type is a union (e.g. `let xyz: LikeA | LikeB = {…}`),
+        // `objectLiteralThisType` falls back to `any` but `this.prop` should reflect
+        // the UNION MEMBER types (e.g. `LikeA.x = "x"`, not the literal `'x'` value).
+        // Looking up the member in the union is not currently modeled, so bail and leave
+        // `this.member` as `any` — a gap, not a wrong.
+        if (self.objectLiteralContextualType(objlit)) |ct| {
+            if (self.store.get(self.stripNullishForLookup(ct)).kind == .union_t) return null;
+        }
+
+        for (self.building_objlits[0..self.building_objlit_n]) |b| {
+            if (b == objlit) return null;
+        }
+        if (self.building_objlit_n >= self.building_objlits.len) return null;
+        self.building_objlits[self.building_objlit_n] = objlit;
+        self.building_objlit_n += 1;
+        defer self.building_objlit_n -= 1;
+
+        const data = self.ast_ref.nodeData(objlit);
+        const slice = self.directRange(data.lhs, data.rhs) orelse return null;
+
+        for (slice) |raw| {
+            const m: NodeIndex = @enumFromInt(raw);
+            const mt = self.ast_ref.nodeTag(m);
+            const md = self.ast_ref.nodeData(m);
+            switch (mt) {
+                .property => {
+                    if (md.lhs == .none) continue;
+                    const key = self.objectMemberKey(md.lhs) orelse continue;
+                    if (!std.mem.eql(u8, key, prop_name)) continue;
+                    if (md.rhs == .none) return null;
+                    const rhs_tag = self.ast_ref.nodeTag(md.rhs);
+                    const is_fn_val = rhs_tag == .fn_expr or rhs_tag == .async_fn_expr or
+                        rhs_tag == .generator_fn_expr or rhs_tag == .async_generator_fn_expr;
+                    if (is_fn_val) {
+                        // `prop: function() {}` — declared fn type, annotation-only.
+                        const fn_data = self.ast_ref.nodeData(md.rhs);
+                        const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(fn_data.lhs));
+                        if (fd.return_type == .none) return null; // no annotation → skip
+                        const fn_is_async = rhs_tag == .async_fn_expr or rhs_tag == .async_generator_fn_expr;
+                        const fn_is_gen = rhs_tag == .generator_fn_expr or rhs_tag == .async_generator_fn_expr;
+                        return self.buildFunctionTypeG(
+                            fd.params, fd.params_end, fd.return_type, NodeIndex.none,
+                            fn_is_async, fn_is_gen, fd.type_params, fd.type_params_end,
+                        );
+                    }
+                    const val_ty = self.typeOf(md.rhs);
+                    const vt = self.store.get(val_ty).kind;
+                    return switch (vt) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        .bigint_literal => tymod.ID_BIGINT,
+                        else => val_ty,
+                    };
+                },
+                .shorthand_property => {
+                    if (md.lhs == .none) continue;
+                    const key = self.staticPropertyKey(md.lhs) orelse continue;
+                    if (!std.mem.eql(u8, key, prop_name)) continue;
+                    const val_ty = self.typeOf(md.lhs);
+                    const vt = self.store.get(val_ty).kind;
+                    return switch (vt) {
+                        .string_literal => tymod.ID_STRING,
+                        .number_literal => tymod.ID_NUMBER,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        .bigint_literal => tymod.ID_BIGINT,
+                        else => val_ty,
+                    };
+                },
+                .method_def, .computed_method_def => {
+                    if (md.lhs == .none or md.rhs == .none) continue;
+                    const key = self.staticPropertyKey(md.lhs) orelse continue;
+                    if (!std.mem.eql(u8, key, prop_name)) continue;
+                    const method_data = self.ast_ref.extraData(ast.MethodData, @intFromEnum(md.rhs));
+                    // Skip methods without explicit return annotation to avoid `() => any` wrongs.
+                    if (method_data.return_type == .none) return null;
+                    const m_async = (method_data.modifiers & ast.ModifierBit.@"async") != 0;
+                    const m_gen = (method_data.modifiers & ast.ModifierBit.generator) != 0;
+                    return self.buildFunctionTypeG(
+                        method_data.params_start, method_data.params_end,
+                        method_data.return_type, NodeIndex.none,
+                        m_async, m_gen,
+                        method_data.type_params, method_data.type_params_end,
+                    );
+                },
+                .getter_def => {
+                    if (md.lhs == .none or md.rhs == .none) continue;
+                    const key = self.objectMemberKey(md.lhs) orelse continue;
+                    if (!std.mem.eql(u8, key, prop_name)) continue;
+                    const method_data = self.ast_ref.extraData(ast.MethodData, @intFromEnum(md.rhs));
+                    if (method_data.return_type == .none) return null;
+                    const ret_node = self.ast_ref.nodeData(method_data.return_type).lhs;
+                    const ret_ty = self.resolveTypeNode(ret_node);
+                    if (ret_ty.eq(tymod.ID_UNKNOWN) or ret_ty.eq(tymod.ID_ANY)) return null;
+                    return ret_ty;
+                },
+                else => {},
+            }
+        }
+        return null;
     }
 
     /// When `this_node`'s enclosing object-literal method corresponds to a
