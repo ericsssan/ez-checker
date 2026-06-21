@@ -16557,6 +16557,11 @@ pub const Checker = struct {
         // `T && T` is `NonNullable<T>`, not `false | NonNullable<T>`.
         const narrowed_b = self.tryNarrowExprByCondition(data.lhs, data.rhs, b) orelse b;
         if (self.store.get(a).kind == .type_param) return narrowed_b;
+        // With `@strict: false` (old TypeScript non-strict mode), boolean/number/string
+        // in the LHS of `&&` do not contribute a falsy literal to the result type —
+        // tsc returns just the RHS. `boolean && X` → X (not `false | X`), etc.
+        // In default or strict mode, we preserve the `false | X` shape.
+        if (self.checker_opts.strict_explicitly_false) return narrowed_b;
         // Use the LHS's canonical falsy representative as the short-circuit branch:
         // `number && b` → `0 | b`; `string && b` → `"" | b`; `boolean && b` → `false | b`.
         // For unions, collect falsy-capable members. Returns `never` when no falsy
