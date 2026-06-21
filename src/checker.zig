@@ -2744,6 +2744,8 @@ pub const Checker = struct {
                 "NumberConstructor"
             else if (std.mem.eql(u8, name, "Boolean"))
                 "BooleanConstructor"
+            else if (std.mem.eql(u8, name, "BigInt"))
+                "BigIntConstructor"
             else
                 null;
             if (named_form) |nf| return self.store.typeRef(nf, &.{}) catch t;
@@ -12985,6 +12987,9 @@ pub const Checker = struct {
         if ((std.mem.eql(u8, name, "Array") or std.mem.eql(u8, name, "ReadonlyArray")) and !self.decl_index.hasType(name)) {
             const elem = self.firstTypeArg(ty_node);
             const inner = if (elem == .none) tymod.ID_ANY else self.resolveTypeNode(elem);
+            if (std.mem.eql(u8, name, "ReadonlyArray")) {
+                return self.store.readonlyArrayOf(inner) catch tymod.ID_ANY;
+            }
             return self.store.arrayOf(inner) catch tymod.ID_ANY;
         }
         if (std.mem.eql(u8, name, "any")) return tymod.ID_ANY;
@@ -16794,6 +16799,12 @@ pub const Checker = struct {
             if (std.mem.eql(u8, cname, "fetch") and self.symbolForIdentRef(callee) == null) {
                 const resp = self.store.typeRef("Response", &.{}) catch return tymod.ID_ANY;
                 return self.store.typeRef("Promise", &.{resp}) catch tymod.ID_ANY;
+            }
+            // `BigInt(x)` → bigint (the global BigInt displays as BigIntConstructor
+            // but calling it as a function produces a bigint primitive).
+            // `new BigInt(x)` is an error; tsc gives `any`.
+            if (std.mem.eql(u8, cname, "BigInt") and self.symbolForIdentRef(callee) == null) {
+                return if (self.ast_ref.nodeTag(node) == .new_expr) tymod.ID_ANY else tymod.ID_BIGINT;
             }
         }
         // `Object.create(...)` is typed `any` by the lib — surface that so
