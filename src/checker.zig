@@ -2777,6 +2777,16 @@ pub const Checker = struct {
             return self.store.typeRef("(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>", &.{}) catch tymod.ID_ANY;
         }
         if (self.global_value_types.get(name)) |t| {
+            // Namespace-value globals (Temporal, Intl) map to `typeof X`. In a
+            // type annotation (`: Temporal.Instant`) the identifier is a type-space
+            // reference; tsc returns `any`. Only guard typeof-X forms (not
+            // constructor globals like DateConstructor / ArrayConstructor).
+            {
+                const stored = self.store.get(t);
+                if (stored.kind == .type_ref and
+                    std.mem.startsWith(u8, stored.name, "typeof ") and
+                    self.identifierInTypePosition(node)) return tymod.ID_ANY;
+            }
             // Several globals appear as named constructor/singleton types in tsc's
             // oracle rather than their structural forms. Return typeRef lazily (not
             // at setup) to avoid seeding the intern map early and exposing latent
