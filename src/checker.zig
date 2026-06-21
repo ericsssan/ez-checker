@@ -2746,6 +2746,8 @@ pub const Checker = struct {
                 "BooleanConstructor"
             else if (std.mem.eql(u8, name, "BigInt"))
                 "BigIntConstructor"
+            else if (std.mem.eql(u8, name, "window"))
+                "Window & typeof globalThis"
             else
                 null;
             if (named_form) |nf| return self.store.typeRef(nf, &.{}) catch t;
