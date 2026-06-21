@@ -4050,7 +4050,27 @@ pub const Checker = struct {
                     // Use annotation if present.
                     const ann = self.ast_ref.nodeData(data.lhs).rhs;
                     if (ann != .none and self.ast_ref.nodeTag(ann) == .ts_type_annotation) {
-                        return self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs);
+                        const ty_inner = self.ast_ref.nodeData(ann).lhs;
+                        // Mark the binding name in typeof_building so that
+                        // `typeof name` inside a structural annotation (object
+                        // type, function type, etc.) returns an opaque alias
+                        // rather than recursively expanding.  Excluded for
+                        // direct `typeof name` and type-reference annotations
+                        // (same list as in declaredTypeAtBinding).
+                        const ti_tag = self.ast_ref.nodeTag(ty_inner);
+                        const ann_blocks_mark_search = (ti_tag == .ts_typeof_type or
+                            ti_tag == .ts_type_reference or
+                            ti_tag == .ts_union_type or
+                            ti_tag == .ts_intersection_type or
+                            ti_tag == .ts_array_type or
+                            ti_tag == .ts_tuple_type or
+                            ti_tag == .ts_indexed_access_type or
+                            ti_tag == .ts_conditional_type or
+                            ti_tag == .ts_keyof_type);
+                        if (!ann_blocks_mark_search) self.typeof_building.put(self.gpa, name, {}) catch {};
+                        const result = self.resolveTypeNode(ty_inner);
+                        if (!ann_blocks_mark_search) _ = self.typeof_building.remove(name);
+                        return result;
                     }
                     if (data.rhs == .none) {
                         // Explicit declaration with no annotation and no initializer
