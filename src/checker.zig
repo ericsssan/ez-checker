@@ -2553,6 +2553,10 @@ pub const Checker = struct {
                 var flow = self.narrowConstEnumAtUse(sym, node, base) orelse base;
                 // Reaching-definitions flow narrowing (`x = 42; x` → number).
                 flow = self.flowNarrowByAssignments(sym, node, flow) orelse flow;
+                // Compound assignment LHS (`a ^= b`): tsc reports the declared
+                // type, not the narrowed flow type. Skip narrowAtUse for these.
+                if (self.isAnyAssignLhs(node) and !self.isPlainAssignTarget(node))
+                    return flow;
                 return self.narrowAtUse(node, sym, flow);
             }
             // Symbol resolves but has no declared type — distinguish between
@@ -5680,8 +5684,7 @@ pub const Checker = struct {
 
     /// True when `node` is the target of a *plain* `=` assignment (a pure
     /// write).  TypeScript reports the binding's declared (evolved) type at
-    /// such a target, not the flow type — whereas a compound-assignment target
-    /// (`node += …`) is a read-modify-write and gets the flow type like a read.
+    /// such a target, not the flow type.
     fn isPlainAssignTarget(self: *Checker, node: NodeIndex) bool {
         const ni = node.toInt();
         if (ni >= self.semantic.parent_indices.len) return false;
@@ -5689,6 +5692,20 @@ pub const Checker = struct {
         if (pidx == @intFromEnum(NodeIndex.none)) return false;
         const parent: NodeIndex = @enumFromInt(pidx);
         if (self.ast_ref.nodeTag(parent) != .assign) return false;
+        return @intFromEnum(self.ast_ref.nodeData(parent).lhs) == ni;
+    }
+
+    /// True when `node` is the LHS of ANY assignment operator (plain or
+    /// compound). TypeScript reports the declared type at the LHS of compound
+    /// assignments (`a ^= b`, `a += b`, …) — not the narrowed flow type —
+    /// matching the same semantics as plain assignment targets.
+    fn isAnyAssignLhs(self: *Checker, node: NodeIndex) bool {
+        const ni = node.toInt();
+        if (ni >= self.semantic.parent_indices.len) return false;
+        const pidx = self.semantic.parent_indices[ni];
+        if (pidx == @intFromEnum(NodeIndex.none)) return false;
+        const parent: NodeIndex = @enumFromInt(pidx);
+        if (!isAssignTag(self.ast_ref.nodeTag(parent))) return false;
         return @intFromEnum(self.ast_ref.nodeData(parent).lhs) == ni;
     }
 
@@ -5800,7 +5817,7 @@ pub const Checker = struct {
         const list = self.evolving_assign_index.get(symid) orelse return null;
         if (list.items.len == 0) return null;
         if (self.evolving_in_progress.contains(symid)) return null;
-        if (self.isPlainAssignTarget(use_node)) return null;
+        if (self.isAnyAssignLhs(use_node)) return null;
         const cpr = if (self.semantic.code_path_result) |*c| c else return null;
 
         var reaches: [64]bool = undefined;
