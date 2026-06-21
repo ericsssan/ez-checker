@@ -18096,6 +18096,12 @@ pub const Checker = struct {
 
     fn classOrLibInstance(self: *Checker, callee_ident: NodeIndex, args: []const TypeId) ?TypeId {
         const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(callee_ident));
+        // `new Array()` → `any[]`, `new Array<T>()` → `T[]`.
+        // Without a type arg, tsc gives `any[]`, not the bare `Array` type_ref.
+        if (std.mem.eql(u8, name, "Array") and !self.decl_index.hasType(name)) {
+            const elem = if (args.len == 1) args[0] else tymod.ID_ANY;
+            return self.store.arrayOf(elem) catch null;
+        }
         // Built-in lib types — produce a type_ref carrying the args.
         if (std.mem.eql(u8, name, "Set") or std.mem.eql(u8, name, "Map") or
             std.mem.eql(u8, name, "Promise") or std.mem.eql(u8, name, "WeakSet") or
