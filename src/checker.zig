@@ -4843,7 +4843,8 @@ pub const Checker = struct {
     /// `x instanceof Foo` — inside truthy branch, narrow x to Foo.
     fn narrowInstanceof(self: *Checker, cmp: NodeIndex, sym: symbol_mod.SymbolId, ty: TypeId, negate: bool) TypeId {
         const data = self.ast_ref.nodeData(cmp);
-        if (!self.identifierBindsToSym(data.lhs, sym)) return ty;
+        // Also handles `(sym = expr) instanceof Ctor` — look through assignment.
+        if (self.symAssignOrIdent(data.lhs, sym) == .none) return ty;
         const rhs = data.rhs;
         if (self.ast_ref.nodeTag(rhs) != .identifier) return ty;
         const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(rhs));
@@ -5008,12 +5009,13 @@ pub const Checker = struct {
             return self.intersectNarrow(ty, narrowed.kind, narrowed.keep_only);
         }
         // Try `<sym> op <literal>` and `<literal> op <sym>`.
+        // Also handles `(sym = expr) op <literal>` — assignment in condition.
         var sym_side: NodeIndex = .none;
         var lit_side: NodeIndex = .none;
-        if (self.identifierBindsToSym(data.lhs, sym)) {
+        if (self.symAssignOrIdent(data.lhs, sym) != .none) {
             sym_side = data.lhs;
             lit_side = data.rhs;
-        } else if (self.identifierBindsToSym(data.rhs, sym)) {
+        } else if (self.symAssignOrIdent(data.rhs, sym) != .none) {
             sym_side = data.rhs;
             lit_side = data.lhs;
         } else {
@@ -5076,7 +5078,8 @@ pub const Checker = struct {
     fn tryTypeofNarrow(self: *Checker, typeof_side: NodeIndex, str_side: NodeIndex, sym: symbol_mod.SymbolId, is_neq: bool, negate: bool) ?TypeofNarrowSpec {
         if (self.ast_ref.nodeTag(typeof_side) != .typeof_expr) return null;
         const operand = self.ast_ref.nodeData(typeof_side).lhs;
-        if (!self.identifierBindsToSym(operand, sym)) return null;
+        // Also handles `typeof (sym = expr) === "number"` — look through assignment.
+        if (self.symAssignOrIdent(operand, sym) == .none) return null;
         const str_kind = self.typeofStringValue(str_side) orelse return null;
         const keep_only = (!is_neq) != negate;
         return .{ .kind = str_kind, .keep_only = keep_only };
@@ -5300,6 +5303,21 @@ pub const Checker = struct {
         if (self.ast_ref.nodeTag(node) != .identifier) return false;
         const s = self.symbolForIdentRef(node) orelse return false;
         return s.toInt() == sym.toInt();
+    }
+
+    /// Returns the sym-bound identifier inside `node`, looking through grouping
+    /// parentheses and a plain assignment: `sym` directly, `(sym)`, or `(sym = expr)`.
+    /// Used in narrowing so `(foo = getFoo()) !== null` narrows `foo`.
+    fn symAssignOrIdent(self: *Checker, node: NodeIndex, sym: symbol_mod.SymbolId) NodeIndex {
+        var n = node;
+        // Unwrap grouping parentheses.
+        while (self.ast_ref.nodeTag(n) == .grouping_expr) n = self.ast_ref.nodeData(n).lhs;
+        if (self.identifierBindsToSym(n, sym)) return n;
+        if (self.ast_ref.nodeTag(n) == .assign) {
+            const lhs = self.ast_ref.nodeData(n).lhs;
+            if (self.identifierBindsToSym(lhs, sym)) return lhs;
+        }
+        return .none;
     }
 
     /// Check if `node` is `<sym>.propName` (member_expr with sym as object).
