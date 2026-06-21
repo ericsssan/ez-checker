@@ -71,6 +71,10 @@ pub const CheckerOpts = struct {
     /// JSX element expression has type `JSX.Element`; under `preserve` / unset
     /// it stays `any`.
     jsx_react_mode: bool = false,
+    /// Name of the JSX factory / react namespace from `@jsxFactory` or
+    /// `@reactNamespace` test pragma.  Null → default "React".  Used by
+    /// `jsxFactoryIsAnyStub` to know which binding to inspect.
+    jsx_factory_name: ?[]const u8 = null,
     /// True for `.js`/`.jsx` source files, where JSDoc `@param`/`@type`/
     /// `@returns` annotations supply types (in `.ts` they're ignored).
     is_js_file: bool = false,
@@ -2037,6 +2041,9 @@ pub const Checker = struct {
     /// makes the element `any` rather than `JSX.Element`.
     fn jsxFactoryIsAnyStub(self: *Checker) bool {
         if (self.jsx_factory_any_cache) |v| return v;
+        // Factory name: from @jsxFactory/@reactNamespace pragma (passed via
+        // CheckerOpts.jsx_factory_name); default "React".
+        const factory_name = self.checker_opts.jsx_factory_name orelse "React";
         var result = false;
         const parents = self.semantic.parent_indices;
         const total: u32 = @intCast(self.ast_ref.nodes.len);
@@ -2044,8 +2051,8 @@ pub const Checker = struct {
         while (i < total) : (i += 1) {
             const ni: NodeIndex = @enumFromInt(i);
             if (self.ast_ref.nodeTag(ni) != .identifier) continue;
-            if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni)), "React")) continue;
-            // Must be a declarator BINDING (`(const|var) React …`), not a use.
+            if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni)), factory_name)) continue;
+            // Must be a declarator BINDING (`(const|var) X …`), not a use.
             if (i >= parents.len) continue;
             const pi = parents[i];
             if (pi == @intFromEnum(NodeIndex.none)) continue;
@@ -2070,6 +2077,7 @@ pub const Checker = struct {
         self.jsx_factory_any_cache = result;
         return result;
     }
+
 
     /// Type of a JSX element/fragment expression — `JSX.Element` under a
     /// React-style jsx mode, otherwise `any` (preserve mode / no JSX namespace,

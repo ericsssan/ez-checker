@@ -90,6 +90,10 @@ const CompilerOpts = struct {
     target: Target = .es5,
     module: Module = .none,
     jsx: Jsx = .none,
+    /// Root identifier of the JSX factory from `@jsxFactory` or `@reactNamespace`.
+    /// E.g. `@jsxFactory: h.createElement` → "h", `@reactNamespace: vdom` → "vdom".
+    /// Null when neither pragma is set (defaults to "React" in the checker).
+    jsx_factory_name: ?[]const u8 = null,
     check_js: bool = false,
     allow_js: bool = false,
     use_define_for_class_fields: bool = false,
@@ -132,6 +136,7 @@ const CompilerOpts = struct {
             // explicit `preserve` they stay `any`.  Default (unset) behaves
             // React-style, matching how tsc's baselines record .tsx files.
             .jsx_react_mode = self.jsx != .preserve,
+            .jsx_factory_name = self.jsx_factory_name,
             .use_define_for_class_fields = self.use_define_for_class_fields,
             .target = switch (self.target) {
                 .es5    => .es5,
@@ -307,6 +312,12 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
             opts.module = parseModule(val);
         } else if (ci(key, "jsx")) {
             opts.jsx = parseJsx(val);
+        } else if (ci(key, "jsxFactory")) {
+            // Extract the root identifier: "@jsxFactory: h.createElement" → "h"
+            const dot = std.mem.indexOfScalar(u8, val, '.') orelse val.len;
+            opts.jsx_factory_name = val[0..dot];
+        } else if (ci(key, "reactNamespace")) {
+            opts.jsx_factory_name = val;
         } else if (ci(key, "checkJs")) {
             opts.check_js = isTrue(val);
         } else if (ci(key, "allowJs")) {
