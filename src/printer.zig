@@ -671,7 +671,12 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                 var mbuf: std.ArrayList(u8) = .empty;
                 defer mbuf.deinit(gpa);
                 const mt = c.store.get(m);
-                const needs_parens = mt.kind == .function_t and !mt.is_overload_set and mt.alias_name.len == 0;
+                // Function types in a union: `() => T | U` reads as `() => (T | U)`, so
+                // wrap in parens: `(() => T) | U`. Likewise, intersection types `A & B | C`
+                // parse ambiguously — tsc renders `(A & B) | C`.
+                const needs_parens = mt.alias_name.len == 0 and
+                    ((mt.kind == .function_t and !mt.is_overload_set) or
+                     mt.kind == .intersection_t);
                 if (needs_parens) try mbuf.appendSlice(gpa, "(");
                 try typeToStringInner(c, m, &mbuf, depth + 1);
                 if (needs_parens) try mbuf.appendSlice(gpa, ")");
