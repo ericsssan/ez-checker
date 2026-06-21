@@ -16539,29 +16539,41 @@ pub const Checker = struct {
             // even when X's instance type is a named lib ref (Error/URL/…) that
             // alwaysTruthy can't see through. `new Error() || 'x'` is `Error`.
             if (self.ast_ref.nodeTag(data.lhs) == .new_expr) return a;
-            if (self.alwaysTruthy(a)) return a;
             if (self.alwaysFalsy(a)) return b;
+            if (self.checker_opts.strict_explicitly_false) {
+                // @strict:false (pre-strict-null-checks) semantics: don't short-circuit
+                // on always-truthy LHS; instead strip all falsy literals from LHS, then
+                // strip null/undefined from the final result (null was assignable everywhere
+                // so it disappears from union types in old TS).
+                const truthy_a = self.stripFalsyMembers(a);
+                const combined = self.store.unionOf(&.{ truthy_a, b }) catch tymod.ID_ANY;
+                return self.stripNullishUnion(combined);
+            }
+            if (self.alwaysTruthy(a)) return a;
             const a_stripped = self.stripNullishUnion(a);
             return self.store.unionOf(&.{ a_stripped, b }) catch tymod.ID_ANY;
         }
         // `a && b` evaluates to `a` when falsy, else `b`.  A statically-falsy LHS
         // short-circuits to `a` (RHS unreachable — `false && p()` is just `false`,
         // not `false | Promise`); a statically-truthy LHS evaluates to `b`.
-        // `any && b` → `any`; tsc propagates `any` through logical operators.
-        if (tymod.isAny(&self.store, a)) return a;
+        // Under @strict:false (old non-strict mode), tsc returns just the RHS for all
+        // non-always-falsy LHS types including `any`. In default/strict mode, `any && b`
+        // → `any` (any propagates through logical operators).
+        if (!self.checker_opts.strict_explicitly_false and tymod.isAny(&self.store, a)) return a;
         if (self.alwaysFalsy(a)) return a;
         if (self.alwaysTruthy(a)) return b;
+        // With `@strict: false` (old TypeScript non-strict mode), boolean/number/string
+        // in the LHS of `&&` do not contribute a falsy literal to the result type —
+        // tsc returns just the (unnarrowed) RHS. `boolean && X` → X (not `false | X`),
+        // `any && X` → X, etc. CFA narrowing is also skipped: `bool && bool` → bool,
+        // not `bool && (bool narrowed to true) = true`.
+        if (self.checker_opts.strict_explicitly_false) return b;
         // For `a && b`, narrow b by the condition a.
         // When LHS is a type parameter, TypeScript does not propagate a falsy
         // constituent — `T && number` is `number`, not `false | number`, and
         // `T && T` is `NonNullable<T>`, not `false | NonNullable<T>`.
         const narrowed_b = self.tryNarrowExprByCondition(data.lhs, data.rhs, b) orelse b;
         if (self.store.get(a).kind == .type_param) return narrowed_b;
-        // With `@strict: false` (old TypeScript non-strict mode), boolean/number/string
-        // in the LHS of `&&` do not contribute a falsy literal to the result type —
-        // tsc returns just the RHS. `boolean && X` → X (not `false | X`), etc.
-        // In default or strict mode, we preserve the `false | X` shape.
-        if (self.checker_opts.strict_explicitly_false) return narrowed_b;
         // Use the LHS's canonical falsy representative as the short-circuit branch:
         // `number && b` → `0 | b`; `string && b` → `"" | b`; `boolean && b` → `false | b`.
         // For unions, collect falsy-capable members. Returns `never` when no falsy
@@ -16841,6 +16853,37 @@ pub const Checker = struct {
             },
             else => false,
         };
+    }
+
+    // Strip always-falsy literals from a type for the non-strict `||` LHS.
+    // - null/undefined/void → NEVER
+    // - boolean → true (false is the falsy half)
+    // - false/0/"" literals → NEVER; other literals kept
+    // - unions: filter each member; number/string base types kept as-is
+    fn stripFalsyMembers(self: *Checker, id: TypeId) TypeId {
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .null_t, .undefined_t, .void_t => return tymod.ID_NEVER,
+            .boolean => return self.store.booleanLiteral(true) catch tymod.ID_BOOLEAN,
+            .boolean_literal => return if (!t.literal_value.boolean) tymod.ID_NEVER else id,
+            .number_literal => return if (t.literal_value.number == 0) tymod.ID_NEVER else id,
+            .string_literal => return if (t.literal_value.string.len == 0) tymod.ID_NEVER else id,
+            .union_t => {
+                var buf: [32]TypeId = undefined;
+                var n: usize = 0;
+                for (self.store.idsOf(t.list_data)) |m| {
+                    const s = self.stripFalsyMembers(m);
+                    if (s.eq(tymod.ID_NEVER)) continue;
+                    if (n >= buf.len) return id;
+                    buf[n] = s;
+                    n += 1;
+                }
+                if (n == 0) return tymod.ID_NEVER;
+                if (n == 1) return buf[0];
+                return self.store.unionOf(buf[0..n]) catch id;
+            },
+            else => return id,
+        }
     }
 
     fn stripNullishUnion(self: *Checker, id: TypeId) TypeId {
