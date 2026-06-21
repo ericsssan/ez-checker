@@ -22463,23 +22463,47 @@ pub const Checker = struct {
         const cdata_node = self.ast_ref.nodeData(class_decl);
         if (cdata_node.lhs == .none) return null;
         const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(cdata_node.lhs));
-        if (cd.body == .none) return null;
-        const body_data = self.ast_ref.nodeData(cd.body);
-        const slice = self.directRange(body_data.lhs, body_data.rhs) orelse return null;
-        for (slice) |raw| {
-            const m: NodeIndex = @enumFromInt(raw);
-            if (self.ast_ref.nodeTag(m) != .property_def) continue;
-            if (self.classMemberIsStatic(m)) continue;
-            const mdata = self.ast_ref.nodeData(m);
-            if (mdata.lhs == .none or mdata.rhs == .none) continue;
-            const ktag = self.ast_ref.nodeTag(mdata.lhs);
-            if (ktag != .identifier and ktag != .property_ident) continue;
-            const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
-            if (!std.mem.eql(u8, key, prop_name)) continue;
-            const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(mdata.rhs));
-            if (pd.type_annotation == .none) return null;
-            const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
-            return self.resolveTypeNode(ty_node);
+        if (cd.body != .none) {
+            const body_data = self.ast_ref.nodeData(cd.body);
+            if (self.directRange(body_data.lhs, body_data.rhs)) |slice| {
+                for (slice) |raw| {
+                    const m: NodeIndex = @enumFromInt(raw);
+                    if (self.ast_ref.nodeTag(m) != .property_def) continue;
+                    if (self.classMemberIsStatic(m)) continue;
+                    const mdata = self.ast_ref.nodeData(m);
+                    if (mdata.lhs == .none or mdata.rhs == .none) continue;
+                    const ktag = self.ast_ref.nodeTag(mdata.lhs);
+                    if (ktag != .identifier and ktag != .property_ident) continue;
+                    const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
+                    if (!std.mem.eql(u8, key, prop_name)) continue;
+                    const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(mdata.rhs));
+                    if (pd.type_annotation == .none) return null;
+                    const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
+                    return self.resolveTypeNode(ty_node);
+                }
+            }
+        }
+        // Not found in the direct body — check the superclass chain.
+        // The super is typically already built; resolveDeclaredType returns
+        // ID_UNKNOWN (sentinel) if it is also mid-build, so no infinite loop.
+        if (cd.super_class != .none) {
+            var sc = cd.super_class;
+            while (self.ast_ref.nodeTag(sc) == .grouping_expr or
+                self.ast_ref.nodeTag(sc) == .ts_instantiation_expr)
+            {
+                sc = self.ast_ref.nodeData(sc).lhs;
+            }
+            if (self.ast_ref.nodeTag(sc) == .identifier) {
+                const parent_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(sc));
+                if (parent_name.len > 0) {
+                    if (self.resolveDeclaredType(parent_name)) |parent_ty| {
+                        if (!parent_ty.eq(tymod.ID_UNKNOWN) and !tymod.isAny(&self.store, parent_ty)) {
+                            const t = self.memberOnApparentType(parent_ty, prop_name, node);
+                            if (!tymod.isUnknown(&self.store, t) and !tymod.isAny(&self.store, t)) return t;
+                        }
+                    }
+                }
+            }
         }
         return null;
     }
