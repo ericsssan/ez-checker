@@ -291,11 +291,33 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
         const colon = std.mem.indexOfScalar(u8, rest, ':') orelse continue;
         const key = std.mem.trim(u8, rest[0..colon], " ");
         const val = std.mem.trim(u8, rest[colon + 1 ..], " ");
-        // Stop at filename splits — options after belong to individual files.
         // TypeScript test directive keys are case-insensitive (`@noImplicitAny`
         // and `@noimplicitany` are equivalent).
         const ci = std.ascii.eqlIgnoreCase;
-        if (ci(key, "filename")) break;
+        if (ci(key, "filename")) {
+            // Per-file directives follow @filename; only @reactNamespace and @jsxFactory
+            // are carried forward (they identify the JSX stub; tsxReactEmitNesting is the
+            // only conformance test placing these after @filename).
+            while (it.next()) |raw2| {
+                const line2 = std.mem.trim(u8, raw2, " \r");
+                if (line2.len == 0) continue;
+                if (!std.mem.startsWith(u8, line2, "//")) break;
+                const after2 = std.mem.trim(u8, line2[2..], " ");
+                if (after2.len == 0 or after2[0] != '@') break;
+                const rest2 = after2[1..];
+                const colon2 = std.mem.indexOfScalar(u8, rest2, ':') orelse continue;
+                const key2 = std.mem.trim(u8, rest2[0..colon2], " ");
+                const val2 = std.mem.trim(u8, rest2[colon2 + 1 ..], " ");
+                if (ci(key2, "filename")) continue;
+                if (ci(key2, "reactNamespace")) {
+                    opts.jsx_factory_name = val2;
+                } else if (ci(key2, "jsxFactory")) {
+                    const dot2 = std.mem.indexOfScalar(u8, val2, '.') orelse val2.len;
+                    opts.jsx_factory_name = val2[0..dot2];
+                }
+            }
+            break;
+        }
         if (ci(key, "strict")) {
             opts.strict = isTrue(val);
             if (!opts.strict) opts.strict_explicitly_false = true;
