@@ -22822,6 +22822,20 @@ pub const Checker = struct {
                 .method_def, .computed_method_def, .getter_def, .setter_def,
                 .computed_getter_def, .computed_setter_def, .constructor_def,
                 .property_def => {
+                    // super() in a non-constructor is invalid; tsc returns `any`.
+                    // Note: parser tags constructor WITH body as method_def, so
+                    // detect by key name rather than node tag.
+                    const is_constructor = blk: {
+                        const ptag = self.ast_ref.nodeTag(pn);
+                        if (ptag == .constructor_def) break :blk true;
+                        if (ptag != .method_def) break :blk false;
+                        const key = self.ast_ref.nodeData(pn).lhs;
+                        if (key == .none) break :blk false;
+                        if (self.ast_ref.nodeTag(key) != .identifier) break :blk false;
+                        break :blk std.mem.eql(u8, self.ast_ref.tokenText(
+                            self.ast_ref.nodeMainToken(key)), "constructor");
+                    };
+                    if (is_call and !is_constructor) return tymod.ID_ANY;
                     const is_static = self.classMemberIsStatic(pn) or is_call;
                     var q = parents[p];
                     while (q != NONE) : (q = parents[q]) {
