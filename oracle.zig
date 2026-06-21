@@ -207,7 +207,8 @@ fn applyVariantOverrides(opts: *CompilerOpts, filename: []const u8) void {
         else if (std.mem.eql(u8, key, "strict")) {
             opts.strict = isTrue(val);
             opts.strict_set = true;
-            if (!opts.strict) opts.strict_explicitly_false = true;
+            // reset: parseSourceOpts may have set it from multi-value "true, false"
+            opts.strict_explicitly_false = !opts.strict;
         }
         else if (std.mem.eql(u8, key, "strictNullChecks")) {
             opts.strict_null_checks = isTrue(val);
