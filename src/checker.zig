@@ -2985,16 +2985,24 @@ pub const Checker = struct {
                 const is_optional = ptag == .optional_member_expr;
                 const in_chain = is_optional or self.calleeIsInOptionalChain(pdata.lhs);
                 const lookup_ty = if (in_chain) self.stripNullishForLookup(obj_ty) else obj_ty;
+                // For `o2?.b!.c`: the `!` strips undefined from `o2?.b`, so obj_ty is
+                // non-nullish, but the chain root `o2` IS nullish. Use the pre-assertion
+                // type for the optional-undefined check so `undefined` propagates through.
+                const nullcheck_ty = blk: {
+                    if (in_chain and self.ast_ref.nodeTag(pdata.lhs) == .ts_non_null_expr)
+                        break :blk self.typeOf(self.ast_ref.nodeData(pdata.lhs).lhs);
+                    break :blk obj_ty;
+                };
                 // The property token of a simple `=` assignment target carries the
                 // setter (write) type for a divergent accessor (see inferMember).
                 if (self.nodeIsSimpleAssignTarget(parent)) {
                     const rtag = self.ast_ref.nodeTag(pdata.lhs);
                     const ro_any = rtag != .this_expr and rtag != .super_expr;
                     if (self.memberWriteType(lookup_ty, prop_name, pdata.lhs, ro_any)) |wt|
-                        return self.maybeAddOptionalUndefined(wt, obj_ty, in_chain);
+                        return self.maybeAddOptionalUndefined(wt, nullcheck_ty, in_chain);
                 }
                 const inner = self.memberOnApparentType(lookup_ty, prop_name, pdata.lhs);
-                const result = self.maybeAddOptionalUndefined(inner, obj_ty, in_chain);
+                const result = self.maybeAddOptionalUndefined(inner, nullcheck_ty, in_chain);
                 // Apply the same flow narrowing the full member expression gets
                 // (keyed on the parent member access), so the property-key node
                 // matches `obj.prop`'s narrowed type rather than the raw one.
@@ -17733,7 +17741,7 @@ pub const Checker = struct {
                 .member_expr, .computed_member_expr, .call_expr => {
                     cur = self.ast_ref.nodeData(cur).lhs;
                 },
-                .grouping_expr => {
+                .grouping_expr, .ts_non_null_expr => {
                     cur = self.ast_ref.nodeData(cur).lhs;
                 },
                 else => return false,
@@ -19189,12 +19197,19 @@ pub const Checker = struct {
         // step in the chain used `?.`, the receiver type carries `|
         // undefined` and we need to strip it before lookup.
         const in_chain = is_optional or self.calleeIsInOptionalChain(data.lhs);
+        // For `a?.b!.c`: the `!` strips undefined from `a?.b`, so obj_ty is non-nullish.
+        // Use the pre-assertion type so undefined propagates through the chain correctly.
+        const nullcheck_ty = blk: {
+            if (in_chain and self.ast_ref.nodeTag(data.lhs) == .ts_non_null_expr)
+                break :blk self.typeOf(self.ast_ref.nodeData(data.lhs).lhs);
+            break :blk obj_ty;
+        };
         // Computed member: `obj[idx]`.  Handles array/tuple element access
         // and string-literal key indexing into object types.
         if (tag == .computed_member_expr or tag == .optional_computed_member_expr) {
             const lookup_obj = if (in_chain) self.stripNullishForLookup(obj_ty) else obj_ty;
             const inner = self.inferComputedMember(lookup_obj, data.rhs, data.lhs);
-            return self.maybeAddOptionalUndefined(inner, obj_ty, in_chain);
+            return self.maybeAddOptionalUndefined(inner, nullcheck_ty, in_chain);
         }
         const prop_name: []const u8 = switch (tag) {
             .member_expr, .optional_member_expr => blk: {
@@ -19220,7 +19235,7 @@ pub const Checker = struct {
                 const obj_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(obj_node));
                 if (self.namespace_import_map.get(obj_name)) |mod_spec| {
                     if (self.inferMemberOnNamespace(mod_spec, prop_name)) |resolved| {
-                        return self.maybeAddOptionalUndefined(resolved, obj_ty, in_chain);
+                        return self.maybeAddOptionalUndefined(resolved, nullcheck_ty, in_chain);
                     }
                 }
             }
@@ -19243,7 +19258,7 @@ pub const Checker = struct {
                             .boolean_literal => tymod.ID_BOOLEAN,
                             else => raw,
                         };
-                        return self.maybeAddOptionalUndefined(widened, obj_ty, in_chain);
+                        return self.maybeAddOptionalUndefined(widened, nullcheck_ty, in_chain);
                     }
                 }
             }
@@ -19253,7 +19268,7 @@ pub const Checker = struct {
         // → the member's static side, displayed `typeof <Ns>.<prop>`.
         if (self.typeofRootName(lookup_ty)) |ns_root| {
             if (self.localNamespaceMemberValue(ns_root, prop_name, node)) |resolved|
-                return self.maybeAddOptionalUndefined(resolved, obj_ty, in_chain);
+                return self.maybeAddOptionalUndefined(resolved, nullcheck_ty, in_chain);
         }
         // Simple `=` assignment target: a divergent get/set accessor exposes its
         // setter (write) type here, not the getter type used for reads.
@@ -19261,10 +19276,10 @@ pub const Checker = struct {
             const rtag = self.ast_ref.nodeTag(data.lhs);
             const ro_any = rtag != .this_expr and rtag != .super_expr;
             if (self.memberWriteType(lookup_ty, prop_name, data.lhs, ro_any)) |wt|
-                return self.maybeAddOptionalUndefined(wt, obj_ty, in_chain);
+                return self.maybeAddOptionalUndefined(wt, nullcheck_ty, in_chain);
         }
         const inner = self.memberOnApparentType(lookup_ty, prop_name, data.lhs);
-        const result = self.maybeAddOptionalUndefined(inner, obj_ty, in_chain);
+        const result = self.maybeAddOptionalUndefined(inner, nullcheck_ty, in_chain);
         return self.narrowMemberAtUse(node, result);
     }
 
