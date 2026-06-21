@@ -6327,9 +6327,31 @@ pub const Checker = struct {
             const bd = self.ast_ref.nodeData(node);
             if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
                 const ty_node = self.ast_ref.nodeData(bd.rhs).lhs;
+                // Mark the binding name in typeof_building so that any `typeof name`
+                // inside this annotation resolves to the opaque alias (not expanded).
+                // Only mark for structural annotations (object/function/tuple types) —
+                // skip when the annotation is a direct `typeof name` (circular error →
+                // should resolve to unknown → any) or a type reference / alias (which
+                // might itself expand to `typeof name`, creating the same circular issue).
+                const ty_node_tag = self.ast_ref.nodeTag(ty_node);
+                const ann_blocks_mark = (ty_node_tag == .ts_typeof_type or
+                    ty_node_tag == .ts_type_reference or
+                    ty_node_tag == .ts_union_type or
+                    ty_node_tag == .ts_intersection_type or
+                    ty_node_tag == .ts_array_type or
+                    ty_node_tag == .ts_tuple_type or
+                    ty_node_tag == .ts_indexed_access_type or
+                    ty_node_tag == .ts_conditional_type or
+                    ty_node_tag == .ts_keyof_type);
+                const bn: []const u8 = if (!ann_blocks_mark and self.ast_ref.nodeTag(node) == .identifier)
+                    self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node))
+                else
+                    "";
+                if (bn.len > 0) self.typeof_building.put(self.gpa, bn, {}) catch {};
                 self.type_pos_depth += 1;
                 var ty = self.resolveTypeNode(ty_node);
                 self.type_pos_depth -= 1;
+                if (bn.len > 0) _ = self.typeof_building.remove(bn);
                 // Catch-clause parameter: TypeScript permits ONLY `any` /
                 // `unknown` here; any other annotation is a type error and the
                 // variable falls back to the catch default (`any` — or
@@ -17314,6 +17336,23 @@ pub const Checker = struct {
             }
         }
         if (callee_unresolved and result.eq(tymod.ID_UNKNOWN)) return tymod.ID_ANY;
+        // Self-recursive return type expansion: `function f(): typeof f { return f; }`
+        // stores an opaque `typeof f` as the return type.  Expand it once when the
+        // `typeof X` name matches the callee so `f()` shows `() => typeof f`, not
+        // just "typeof f".  Restricted to callee-name matches to avoid over-expanding
+        // non-recursive `typeof y` return types.
+        if (self.ast_ref.nodeTag(callee) == .identifier) {
+            const rt = self.store.get(result);
+            if (rt.kind == .type_ref and std.mem.startsWith(u8, rt.name, "typeof ")) {
+                const inner = rt.name["typeof ".len..];
+                const callee_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(callee));
+                if (std.mem.eql(u8, inner, callee_name)) {
+                    if (self.typeOfNameByAstSearch(inner, .none)) |expanded| {
+                        if (!expanded.eq(result)) result = expanded;
+                    }
+                }
+            }
+        }
         return result;
     }
 
