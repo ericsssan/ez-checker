@@ -19857,7 +19857,21 @@ pub const Checker = struct {
                 return self.maybeAddOptionalUndefined(wt, nullcheck_ty, in_chain);
         }
         const inner = self.memberOnApparentType(lookup_ty, prop_name, data.lhs);
-        const result = self.maybeAddOptionalUndefined(inner, nullcheck_ty, in_chain);
+        // Expand opaque `typeof name` property types one level (e.g. g.x where
+        // g: {x: typeof g} should yield {x: typeof g}, not the opaque alias).
+        const expanded_inner = blk: {
+            const it = self.store.get(inner);
+            if (it.kind == .type_ref and std.mem.startsWith(u8, it.name, "typeof ")) {
+                const inner_name = it.name["typeof ".len..];
+                if (!self.typeof_building.contains(inner_name)) {
+                    if (self.typeOfNameByAstSearch(inner_name, .none)) |ex| {
+                        if (!ex.eq(inner)) break :blk ex;
+                    }
+                }
+            }
+            break :blk inner;
+        };
+        const result = self.maybeAddOptionalUndefined(expanded_inner, nullcheck_ty, in_chain);
         return self.narrowMemberAtUse(node, result);
     }
 
