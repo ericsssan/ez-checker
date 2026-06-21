@@ -3955,7 +3955,39 @@ pub const Checker = struct {
         if (data.rhs == .none) return tymod.ID_ANY;
         const init_ty = self.typeOf(data.rhs);
         if (init_ty.eq(tymod.ID_UNKNOWN) or init_ty.eq(tymod.ID_ERROR)) return tymod.ID_ANY;
+        // Non-strict mode: array literals of all-null/undefined widen at the variable level.
+        if (self.checker_opts.strict_explicitly_false)
+            return self.widenNullUndefinedForDecl(init_ty);
         return init_ty;
+    }
+
+    /// In non-strict mode, TypeScript widens array types whose element types are
+    /// exclusively null/undefined to any[] at variable-declaration sites.
+    /// E.g. null[] → any[], (null|undefined)[] → any[], undefined[][] → any[][].
+    fn widenNullUndefinedForDecl(self: *Checker, ty: TypeId) TypeId {
+        const t = self.store.get(ty);
+        switch (t.kind) {
+            .null_t, .undefined_t => return tymod.ID_ANY,
+            .array_t => {
+                const elem = self.store.idsOf(t.list_data)[0];
+                const widened = self.widenNullUndefinedForDecl(elem);
+                if (widened.eq(elem)) return ty;
+                return self.store.arrayOf(widened) catch ty;
+            },
+            .union_t => {
+                const members = self.store.idsOf(t.list_data);
+                var buf: [32]TypeId = undefined;
+                if (members.len > buf.len) return ty;
+                var any_changed = false;
+                for (members, 0..) |m, i| {
+                    buf[i] = self.widenNullUndefinedForDecl(m);
+                    if (!buf[i].eq(m)) any_changed = true;
+                }
+                if (!any_changed) return ty;
+                return self.store.unionOf(buf[0..members.len]) catch ty;
+            },
+            else => return ty,
+        }
     }
 
     /// The declarator of variable `name` in the innermost namespace scope
@@ -4118,8 +4150,9 @@ pub const Checker = struct {
                 },
                 .logical_or => {
                     // `cond || use` — `use` runs only when cond is falsy.
+                    // tsc does NOT apply this narrowing in non-strict mode.
                     const data = self.ast_ref.nodeData(pn);
-                    if (self.descendsFrom(node, data.rhs)) {
+                    if (!self.checker_opts.strict_explicitly_false and self.descendsFrom(node, data.rhs)) {
                         ty = self.applyNarrowing(data.lhs, sym, ty, true);
                     }
                 },
@@ -4202,8 +4235,45 @@ pub const Checker = struct {
             return self.narrowDiscriminantProp(ty, prop_name, label, true);
         }
         // `switch (x) { case 1: }` — keep the union member matching the label.
+        // For fall-through stacked cases (`case "a": case "b": body`), union each label's
+        // narrowing so the body sees `"a" | "b"`.
         if (self.identifierBindsToSym(disc, sym)) {
-            return self.narrowToCaseLiteral(ty, label);
+            const clauses = self.safeSubRange(self.ast_ref.nodeData(sw).rhs) orelse
+                return self.narrowToCaseLiteral(ty, label);
+            const extra = self.ast_ref.extra_data;
+            if (clauses.end > extra.len) return self.narrowToCaseLiteral(ty, label);
+            const cl = extra[clauses.start..clauses.end];
+            const ci2: u32 = @intFromEnum(case_node);
+            var k: usize = cl.len;
+            for (cl, 0..) |c, i| {
+                if (c == ci2) { k = i; break; }
+            }
+            if (k == cl.len) return self.narrowToCaseLiteral(ty, label);
+            // Walk back over empty-body preceding cases.
+            var first = k;
+            while (first > 0) {
+                const prev: NodeIndex = @enumFromInt(cl[first - 1]);
+                if (self.ast_ref.nodeTag(prev) != .switch_case) break;
+                const pb = self.safeSubRange(self.ast_ref.nodeData(prev).rhs);
+                const empty = pb == null or pb.?.start == pb.?.end;
+                if (!empty) break;
+                first -= 1;
+            }
+            if (first == k) return self.narrowToCaseLiteral(ty, label); // single case
+            // Union all stacked labels' narrowings.
+            var buf: [16]TypeId = undefined;
+            var n: usize = 0;
+            var i = first;
+            while (i <= k and n < buf.len) : (i += 1) {
+                const clause: NodeIndex = @enumFromInt(cl[i]);
+                const lab = self.ast_ref.nodeData(clause).lhs;
+                if (lab == .none) continue;
+                buf[n] = self.narrowToCaseLiteral(ty, lab);
+                n += 1;
+            }
+            if (n == 0) return self.narrowToCaseLiteral(ty, label);
+            if (n == 1) return buf[0];
+            return self.store.unionOf(buf[0..n]) catch self.narrowToCaseLiteral(ty, label);
         }
         return ty;
     }
@@ -4316,6 +4386,10 @@ pub const Checker = struct {
             else => return ty,
         }
         const t = self.store.get(ty);
+        // Wide primitives narrow to the matching literal:
+        // `string === "foo"` → `"foo"`, `boolean === true` → `true`.
+        // `number`/`bigint` don't narrow this way (kept for number-literal widening consistency).
+        if (t.kind == .string and lt.kind == .string_literal) return label_ty;
         // `boolean` is the finite domain `true | false`, so it narrows to the
         // matching literal; other wide primitives (`number`, `case 3:`) don't.
         if (ty.eq(tymod.ID_BOOLEAN) and lt.kind == .boolean_literal) return label_ty;
@@ -4664,20 +4738,51 @@ pub const Checker = struct {
                 const lty = self.applyNarrowing(data.lhs, sym, ty, neg);
                 return self.applyNarrowing(data.rhs, sym, lty, neg);
             },
-            // Logical-or: when the condition is in a "negated" (falsy) context,
-            // both sides are falsy so we narrow by both.  In truthy context,
-            // only the alternative `if (!a || !b)` forms narrow, which we can't
-            // easily handle here — leave ty unchanged for the truthy case.
+            // Logical-or in falsy context: both sides must be falsy, narrow by each.
+            // In truthy context: either side may be truthy, so the narrowed type is the
+            // UNION of each side's narrowing — `if (s === "a" || s === "b")` gives "a" | "b".
             .logical_or => {
+                const data = self.ast_ref.nodeData(t);
                 if (neg) {
-                    const data = self.ast_ref.nodeData(t);
                     const lty = self.applyNarrowing(data.lhs, sym, ty, neg);
                     return self.applyNarrowing(data.rhs, sym, lty, neg);
                 }
-                return ty;
+                // Truthy: union each side's narrowing, intersected back with the base.
+                const lty = self.applyNarrowing(data.lhs, sym, ty, false);
+                const rty = self.applyNarrowing(data.rhs, sym, ty, false);
+                if (lty.eq(ty) and rty.eq(ty)) return ty; // neither side narrows
+                if (lty.eq(ty)) return rty; // only rhs narrows
+                if (rty.eq(ty)) return lty; // only lhs narrows
+                // Both sides narrow — union their results.
+                return self.store.unionOf(&.{ lty, rty }) catch ty;
             },
             // Type predicate calls: `isFoo(x)` → narrow x to Foo.
             .call_expr, .optional_call_expr => return self.applyPredicateNarrowing(t, sym, ty, neg),
+            // `if (x &&= expr)` / `if (x ||= expr)` / `if (x ??= expr)`: when sym is the
+            // LHS of the assignment-expression, narrow by truthiness of the
+            // post-assignment type (= expression type of the operator node).
+            .logical_and_assign => {
+                const data = self.ast_ref.nodeData(t);
+                if (self.identifierBindsToSym(data.lhs, sym)) {
+                    const assign_ty = self.typeOf(t);
+                    return self.narrowTruthy(assign_ty, neg);
+                }
+                // In the truthy branch of `if (x &&= y)`, y is also narrowed to its
+                // truthy part: x&&=y is truthy iff y was truthy (since x was truthy
+                // and thus y was evaluated).
+                if (!neg and self.identifierBindsToSym(data.rhs, sym)) {
+                    return self.narrowTruthy(ty, false);
+                }
+                return ty;
+            },
+            .logical_or_assign, .nullish_assign => {
+                const data = self.ast_ref.nodeData(t);
+                if (self.identifierBindsToSym(data.lhs, sym)) {
+                    const assign_ty = self.typeOf(t);
+                    return self.narrowTruthy(assign_ty, neg);
+                }
+                return ty;
+            },
             else => return ty,
         }
     }
@@ -5021,7 +5126,11 @@ pub const Checker = struct {
         const t = self.store.get(ty);
         if (t.kind != .union_t) {
             if (keep_only) {
-                if (typeIsKindOf(t.kind, kind)) return ty;
+                if (typeIsKindOf(t.kind, kind)) {
+                    // `typeof x === "undefined"` on a void narrows to undefined, not void.
+                    if (kind == .undefined_t and t.kind == .void_t) return tymod.ID_UNDEFINED;
+                    return ty;
+                }
                 // A CONCRETE primitive that isn't `kind` is impossible → never
                 // (`x: string; typeof x === 'number'` is never). Broad types
                 // (any/unknown/{}) and abstract refs narrow to the typeof bucket.
@@ -5117,7 +5226,12 @@ pub const Checker = struct {
         const t = self.store.get(ty);
         if (t.kind != .union_t) {
             const matches = self.idMatchesNarrowable(ty, kind);
-            if (keep_only) return if (matches) ty else tymod.ID_NEVER;
+            if (keep_only) {
+                if (!matches) return tymod.ID_NEVER;
+                // `typeof x === "undefined"` on a void type → tsc gives undefined.
+                if (kind == .undefined_t and self.store.get(ty).kind == .void_t) return tymod.ID_UNDEFINED;
+                return ty;
+            }
             return if (matches) tymod.ID_NEVER else ty;
         }
         var buf: [16]TypeId = undefined;
@@ -5126,7 +5240,11 @@ pub const Checker = struct {
             const matches = self.idMatchesNarrowable(m, kind);
             if ((keep_only and matches) or (!keep_only and !matches)) {
                 if (n >= buf.len) return ty;
-                buf[n] = m;
+                // `typeof x === "undefined"` keeps void members as undefined, not void.
+                buf[n] = if (keep_only and kind == .undefined_t and self.store.get(m).kind == .void_t)
+                    tymod.ID_UNDEFINED
+                else
+                    m;
                 n += 1;
             }
         }
@@ -5151,7 +5269,8 @@ pub const Checker = struct {
             .bigint => id.eq(tymod.ID_BIGINT),
             .symbol => id.eq(tymod.ID_SYMBOL),
             .object => id.eq(tymod.ID_OBJECT_KW),
-            .function => k == .function_t,
+            // Also match the named `Function` type-ref (typeof x === "function" keeps Function).
+            .function => k == .function_t or (k == .type_ref and std.mem.eql(u8, self.store.get(id).name, "Function")),
             .none => false,
         };
     }
@@ -5635,7 +5754,8 @@ pub const Checker = struct {
         var best: ?usize = null;
         var best_pos: u32 = 0;
         for (writes, 0..) |w, i| {
-            if (w.seg != seg or w.pos >= bound or w.op != .assign) continue;
+            if (w.seg != seg or w.pos >= bound) continue;
+            if (w.op != .assign and w.op != .nullish_assign and w.op != .logical_or_assign) continue;
             if (self.nodeWithin(use_node, w.assign)) continue; // read is in this write's RHS
             if (best == null or w.pos > best_pos) {
                 best = i;
@@ -5760,7 +5880,10 @@ pub const Checker = struct {
                 tymod.ID_BIGINT
             else
                 tymod.ID_NUMBER,
-            .logical_and_assign, .logical_or_assign, .nullish_assign => tymod.ID_ANY,
+            .logical_and_assign => tymod.ID_ANY,
+            // `a ??= b` and `a ||= b`: the post-assignment type is the expression
+            // type of the ??=/||= node itself (non-null/truthy part of lhs, or rhs).
+            .logical_or_assign, .nullish_assign => self.typeOf(w.assign),
             else => if (isBigintish(&self.store, r)) tymod.ID_BIGINT else tymod.ID_NUMBER,
         };
     }
@@ -5866,12 +5989,13 @@ pub const Checker = struct {
 
         self.evolving_in_progress.put(self.gpa, symid, {}) catch return null;
         defer _ = self.evolving_in_progress.remove(symid);
-        // Type of each reaching PLAIN write; bail on any compound op.
+        // Type of each reaching write; allow ??= and ||= (their post-assignment type
+        // is computable) but bail on other compound ops (+=, &&=, etc.).
         var wtypes: [64]TypeId = undefined;
         var wn: usize = 0;
         for (writes, 0..) |w, i| {
             if (!reaches[i]) continue;
-            if (w.op != .assign) return null;
+            if (w.op != .assign and w.op != .nullish_assign and w.op != .logical_or_assign) return null;
             const wt = self.evolvingWriteType(w);
             if (tymod.isAny(&self.store, wt) or wt.eq(tymod.ID_UNKNOWN)) return null;
             if (wn >= wtypes.len) return null;
@@ -6340,6 +6464,12 @@ pub const Checker = struct {
                     //   - Strict mode: only let/var (evolving-type CFA pattern).
                     if (!is_as_const and (t.kind == .null_t or t.kind == .undefined_t)) {
                         if (!self.checker_opts.strict_null_checks or is_mutable) return tymod.ID_ANY;
+                    }
+                    // Non-strict: arrays whose element types are entirely null/undefined widen
+                    // to any[] (recursively). E.g. null[] → any[], undefined[][] → any[][].
+                    if (!is_as_const and self.checker_opts.strict_explicitly_false) {
+                        const widened = self.widenNullUndefinedForDecl(raw);
+                        if (!widened.eq(raw)) return widened;
                     }
                     if (is_mutable and !is_as_const) {
                         // Enum members widen member-wise on let/var: FRESH
@@ -16581,7 +16711,10 @@ pub const Checker = struct {
                 // were implicitly assignable everywhere in old TS and disappear from unions;
                 // void is a real constituent (e.g. `boolean || void → true | void`).
                 const truthy_a = self.stripFalsyMembers(a);
-                const combined = self.store.unionOf(&.{ truthy_a, b }) catch tymod.ID_ANY;
+                // Sort members so primitives appear before object/named types (tsc order).
+                var or_members: [2]TypeId = .{ truthy_a, b };
+                sortUnionByTypePriority(&self.store, &or_members);
+                const combined = self.store.unionOf(&or_members) catch tymod.ID_ANY;
                 return self.stripNullAndUndefined(combined);
             }
             if (self.alwaysTruthy(a)) return a;
@@ -18752,16 +18885,32 @@ pub const Checker = struct {
             }
             n_used += 1;
         }
-        // With strictNullChecks, trailing holes also inject undefined into the element type.
-        if (pending_holes > 0 and !self.checker_opts.strict_null_checks_explicit_off and n_used > 0 and n_used < buf.len) {
-            buf[n_used] = tymod.ID_UNDEFINED;
-            n_used += 1;
-        }
+        // Trailing holes (elisions at end of array literal) do NOT inject undefined —
+        // TypeScript ignores them for element type inference. Only internal holes do.
+        // Note: a trailing comma is NOT a hole in TypeScript's grammar.
         // If ALL elements were holes (or empty), treat as empty array.
         if (n_used == 0) {
             const elem = self.emptyArrayElem(node);
             if (tymod.isAny(&self.store, elem)) return tymod.ID_ANY;
             return self.store.arrayOf(elem) catch tymod.ID_ANY;
+        }
+        // Non-strict: null/undefined in arrays widen away when other element types exist.
+        // `[1, null]` → `number[]` not `(null | number)[]`; `[undefined, null]` → `null[]`.
+        if (self.checker_opts.strict_explicitly_false) non_strict_null_strip: {
+            var has_non_null = false;
+            for (buf[0..n_used]) |m| {
+                const mk = self.store.get(m).kind;
+                if (mk != .null_t and mk != .undefined_t) { has_non_null = true; break; }
+            }
+            if (!has_non_null) break :non_strict_null_strip;
+            var w: usize = 0;
+            for (buf[0..n_used]) |m| {
+                const mk = self.store.get(m).kind;
+                if (mk == .null_t or mk == .undefined_t) continue;
+                buf[w] = m;
+                w += 1;
+            }
+            n_used = w;
         }
         // For homogeneous primitive-literal arrays (all string, all number, all boolean,
         // all bigint), tsc returns T[] not a tuple. Widen and return T[].
@@ -24077,8 +24226,8 @@ fn typePriorityForSort(store: *const tymod.TypeStore, id: tymod.TypeId) u8 {
         .bigint, .bigint_literal => 2,
         .boolean, .boolean_literal => 3,
         .symbol => 4,
+        .void_t => 5,
         else => 10,
-        .void_t => 13,
         .null_t => 14,
         .undefined_t => 15,
         .never => 16,

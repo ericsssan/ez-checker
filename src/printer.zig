@@ -645,7 +645,13 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                         else => break false,
                     }
                 } else true;
-                if (has_complex or all_literals) {
+                const all_non_nullish_prim = members.len > 2 and for (members) |m| {
+                    switch (c.store.get(m).kind) {
+                        .string, .number, .boolean, .bigint, .symbol => {},
+                        else => break false,
+                    }
+                } else true;
+                if (has_complex or all_literals or all_non_nullish_prim) {
                     try buf.appendSlice(gpa, t.alias_name);
                     return;
                 }

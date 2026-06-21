@@ -490,3 +490,168 @@ test "SKIP contextual literal - trace node 35" {
     defer gpa.free(s35);
     std.debug.print("node 35 'type' = {s}\n", .{s35});
 }
+
+test "super in constructor vs method" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\class Base { x = 1; }
+        \\class Derived extends Base {
+        \\    constructor(public p: number) {
+        \\        console.log('hi');
+        \\        super();
+        \\    }
+        \\    method() {
+        \\        super();
+        \\    }
+        \\}
+    ;
+    var lex = try parser.Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try parser.Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try parser.semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    var checker = try Checker.init(gpa, &ast, &sem, .{});
+    defer checker.deinit();
+
+    std.debug.print("\n=== super in ctor/method ===\n", .{});
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        if (tag != .super_expr) { n += 1; continue; }
+        const span = ast.nodeSpan(ni);
+        const pidx = if (ni.toInt() < sem.parent_indices.len) sem.parent_indices[ni.toInt()] else 0xFFFF;
+        const ty = checker.typeOf(ni);
+        const ty_str = checker.typeToString(ty) catch "?";
+        defer gpa.free(ty_str);
+        std.debug.print("super at byte {d}: parent={d} ({s}) ty={s}\n", .{
+            span.start, pidx,
+            if (pidx < ast.nodes.len) @tagName(ast.nodeTag(@enumFromInt(pidx))) else "oob",
+            ty_str,
+        });
+        // walk parents
+        var p = pidx;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        while (p != NONE and p < sem.parent_indices.len) : (p = sem.parent_indices[p]) {
+            std.debug.print("  -> node {d} tag={s}\n", .{ p, @tagName(ast.nodeTag(@enumFromInt(p))) });
+            if (p == 0) break;
+        }
+        n += 1;
+    }
+}
+
+test "declare var jsx factory" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\declare var vdom: any;
+        \\const x = (<div />);
+    ;
+    var lex = try parser.Lexer.tokenizeWithLanguage(gpa, src, .tsx);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try parser.Parser.parseWithLanguage(gpa, src, tokens.slice(), .tsx, true);
+    defer ast.deinit(gpa);
+    var sem = try parser.semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    std.debug.print("\n=== declare var vdom: any AST ===\n", .{});
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        const span = ast.nodeSpan(ni);
+        if (span.end > src.len or span.end <= span.start) { n += 1; continue; }
+        const text = src[span.start..@min(span.end, span.start + 25)];
+        const pidx = if (ni.toInt() < sem.parent_indices.len) sem.parent_indices[ni.toInt()] else 0xFFFF;
+        const data = ast.nodeData(ni);
+        std.debug.print("n{d}: tag={s} parent={d}({s}) data=(lhs={d},rhs={d}) text='{s}'\n", .{
+            n, @tagName(tag), pidx,
+            if (pidx < ast.nodes.len) @tagName(ast.nodeTag(@enumFromInt(pidx))) else "?",
+            @intFromEnum(data.lhs), @intFromEnum(data.rhs),
+            text,
+        });
+        n += 1;
+    }
+}
+
+test "reactNamespaceJSXEmit jsx type" {
+    const gpa = std.testing.allocator;
+    const src =
+        \\declare var myReactLib: any;
+        \\declare var foo: any;
+        \\declare var Bar: any;
+        \\<foo data/>;
+    ;
+    var lex = try parser.Lexer.tokenizeWithLanguage(gpa, src, .tsx);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try parser.Parser.parseWithLanguage(gpa, src, tokens.slice(), .tsx, true);
+    defer ast.deinit(gpa);
+    var sem = try parser.semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    var checker = try Checker.init(gpa, &ast, &sem, .{
+        .jsx_react_mode = true,
+        .jsx_factory_name = "myReactLib",
+    });
+    defer checker.deinit();
+    std.debug.print("\n=== reactNamespaceJSXEmit ===\n", .{});
+    std.debug.print("jsx_factory_any_cache={?}\n", .{checker.jsx_factory_any_cache});
+    std.debug.print("jsx_element_declared_cache={?}\n", .{checker.jsx_element_declared_cache});
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        if (tag != .jsx_self_closing and tag != .jsx_element and tag != .jsx_fragment) continue;
+        const ty = checker.typeOf(ni);
+        const tystr = try checker.typeToString(ty);
+        defer gpa.free(tystr);
+        std.debug.print("jsx node {d}: {s} = {s}\n", .{ n, @tagName(tag), tystr });
+    }
+}
+
+test "array literal with holes strict false" {
+    const gpa = std.testing.allocator;
+    const src = "var a0 = [,, 2, 3, 4];";
+    var lex = try parser.Lexer.tokenizeWithLanguage(gpa, src, .ts);
+    defer lex.deinit(gpa);
+    var tokens = lex.tokens;
+    var ast = try parser.Parser.parseWithLanguage(gpa, src, tokens.slice(), .ts, true);
+    defer ast.deinit(gpa);
+    var sem = try parser.semantic.SemanticAnalyzer.analyzeWithOptions(gpa, &ast, .{
+        .is_module = true,
+        .build_parents = true,
+    });
+    defer sem.deinit(gpa);
+    // strict_null_checks_explicit_off = true (like @strict: false)
+    var checker = try Checker.init(gpa, &ast, &sem, .{
+        .strict_null_checks = false,
+        .strict_null_checks_explicit_off = true,
+    });
+    defer checker.deinit();
+    std.debug.print("\n=== array holes strict:false ===\n", .{});
+    var n: u32 = 1;
+    while (n < ast.nodes.len) : (n += 1) {
+        const ni: NodeIndex = @enumFromInt(n);
+        const tag = ast.nodeTag(ni);
+        if (tag != .identifier and tag != .array_literal) continue;
+        const span = ast.nodeSpan(ni);
+        if (span.end > src.len or span.end <= span.start) continue;
+        const text = src[span.start..@min(span.end, src.len)];
+        const ty = checker.typeOf(ni);
+        const tystr = try checker.typeToString(ty);
+        defer gpa.free(tystr);
+        std.debug.print("node {d} {s} '{s}' = {s}\n", .{ n, @tagName(tag), text, tystr });
+    }
+}
+
+
