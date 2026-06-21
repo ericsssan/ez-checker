@@ -2572,10 +2572,13 @@ pub const Checker = struct {
                 // we don't fall through to typeOfNameByAstSearch and find a hoisted var.
                 if (self.bindingIsCatchParam(node)) return ty;
             }
-            // Catch param with no annotation → always `any` at the declaration site.
-            // Must precede typeOfNameByAstSearch so hoisted `var` inside the catch body
-            // doesn't shadow the catch parameter.
-            if (bd.rhs == .none and self.bindingIsCatchParam(node)) return tymod.ID_ANY;
+            // Catch param with no annotation: `unknown` by default (TypeScript's
+            // useUnknownInCatchVariables behavior), `any` only when @strict:false
+            // explicitly opts out.  Must precede typeOfNameByAstSearch so a hoisted
+            // `var` inside the catch body doesn't shadow the catch parameter.
+            if (bd.rhs == .none and self.bindingIsCatchParam(node)) {
+                return if (!self.checker_opts.strict_explicitly_false) tymod.ID_UNKNOWN else tymod.ID_ANY;
+            }
         }
         // Rest / defaulted parameter declaration sites (`...args`, `a = 3`)
         // also have no reference-table symbol — resolve via the binding
@@ -21374,6 +21377,29 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, "callee")) return self.store.typeRef("Function", &.{}) catch null;
             return tymod.ID_ANY;
         }
+        // Typed array instances (Int8Array…Float64Array) — ES5/ES2015 lib types.
+        // BigInt64Array/BigUint64Array intentionally excluded: their lib availability
+        // is target-dependent and tsc returns `any` for members when the lib is absent.
+        if (eqAny(t.name, &.{
+            "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
+            "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
+        })) {
+            if (std.mem.eql(u8, name, "toLocaleString")) {
+                const str_arr = self.store.arrayOf(tymod.ID_STRING) catch return self.makeNullaryFn(tymod.ID_STRING);
+                const locales = self.store.unionOf(&.{ tymod.ID_STRING, str_arr }) catch return self.makeNullaryFn(tymod.ID_STRING);
+                const nfo = self.store.typeRef("Intl.NumberFormatOptions", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+                const pr1 = self.store.appendSignatureParamsFull(&.{}, &.{}, &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+                const pr2 = self.store.appendSignatureParamsFull(&.{ locales, nfo }, &.{ "locales", "options" }, &.{ true, true }) catch return self.makeNullaryFn(tymod.ID_STRING);
+                const sigs = [_]tymod.Signature{
+                    .{ .params_start = pr1.start, .params_end = pr1.end, .return_type = tymod.ID_STRING },
+                    .{ .params_start = pr2.start, .params_end = pr2.end, .return_type = tymod.ID_STRING },
+                };
+                const sl = self.store.appendSignatures(&sigs) catch return self.makeNullaryFn(tymod.ID_STRING);
+                return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch self.makeNullaryFn(tymod.ID_STRING);
+            }
+            if (std.mem.eql(u8, name, "toString") or std.mem.eql(u8, name, "join"))
+                return self.makeNullaryFn(tymod.ID_STRING);
+        }
         return null;
     }
 
@@ -22001,7 +22027,17 @@ pub const Checker = struct {
         }
         // toLocaleString: overloaded in ES2020+ with locales/options params.
         if (std.mem.eql(u8, name, "toLocaleString")) {
-            return self.store.typeRef("{ (): string; (locales: string | string[], options?: Intl.NumberFormatOptions & Intl.DateTimeFormatOptions): string; }", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const str_arr = self.store.arrayOf(tymod.ID_STRING) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const locales = self.store.unionOf(&.{ tymod.ID_STRING, str_arr }) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const opts = self.store.typeRef("Intl.NumberFormatOptions & Intl.DateTimeFormatOptions", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const pr1 = self.store.appendSignatureParamsFull(&.{}, &.{}, &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const pr2 = self.store.appendSignatureParamsFull(&.{ locales, opts }, &.{ "locales", "options" }, &.{ false, true }) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const sigs = [_]tymod.Signature{
+                .{ .params_start = pr1.start, .params_end = pr1.end, .return_type = tymod.ID_STRING },
+                .{ .params_start = pr2.start, .params_end = pr2.end, .return_type = tymod.ID_STRING },
+            };
+            const sl = self.store.appendSignatures(&sigs) catch return self.makeNullaryFn(tymod.ID_STRING);
+            return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch self.makeNullaryFn(tymod.ID_STRING);
         }
         // join: (separator?: string) => string
         if (std.mem.eql(u8, name, "join")) {
