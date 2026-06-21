@@ -2215,6 +2215,47 @@ pub const Checker = struct {
     }
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
+        // Unannotated parameter in a type-only signature (interface method /
+        // call / construct signature).  Without an annotation, `typeOfNameByAstSearch`
+        // (the final fallback below) would find any outer variable with the same name
+        // and return its type instead of `any`.  Intercept here and return `any`
+        // directly.  Only fires when the parameter has NO type annotation — annotated
+        // params (including optional `x?: T`) use the normal path, which already
+        // produces the correct `T | undefined` result via `declaredTypeForSymbol`.
+        type_sig_param: {
+            // Cheap filter: annotated params are handled correctly by the normal path.
+            if (self.paramHasAnnotation(node)) break :type_sig_param;
+            const parents = self.semantic.parent_indices;
+            const ni = node.toInt();
+            if (ni >= parents.len) break :type_sig_param;
+            const pidx = parents[ni];
+            const NONE: u32 = @intFromEnum(NodeIndex.none);
+            if (pidx == NONE or pidx >= self.ast_ref.nodes.len) break :type_sig_param;
+            const pn: NodeIndex = @enumFromInt(pidx);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .ts_method_signature, .ts_call_signature, .ts_construct_signature => {
+                    const pdata = self.ast_ref.nodeData(pn);
+                    if (pdata.lhs == .none) break :type_sig_param;
+                    const sd = self.ast_ref.extraData(ast.InterfaceSigData, @intFromEnum(pdata.lhs));
+                    if (sd.params_start >= sd.params_end or sd.params_end > self.ast_ref.extra_data.len)
+                        break :type_sig_param;
+                    for (self.ast_ref.extra_data[sd.params_start..sd.params_end]) |raw| {
+                        if (raw == node.toInt()) return tymod.ID_ANY;
+                    }
+                },
+                .ts_function_type, .ts_constructor_type => {
+                    const pdata = self.ast_ref.nodeData(pn);
+                    if (pdata.lhs == .none) break :type_sig_param;
+                    const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(pdata.lhs));
+                    if (fd.params >= fd.params_end or fd.params_end > self.ast_ref.extra_data.len)
+                        break :type_sig_param;
+                    for (self.ast_ref.extra_data[fd.params..fd.params_end]) |raw| {
+                        if (raw == node.toInt()) return tymod.ID_ANY;
+                    }
+                },
+                else => {},
+            }
+        }
         // The own name of a NAMED function expression (`function named() {…}`):
         // at its declaration site tsc types it as the function's type (the name
         // is in scope inside the body for self-reference).  No reference symbol
