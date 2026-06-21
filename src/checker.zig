@@ -16543,11 +16543,12 @@ pub const Checker = struct {
             if (self.checker_opts.strict_explicitly_false) {
                 // @strict:false (pre-strict-null-checks) semantics: don't short-circuit
                 // on always-truthy LHS; instead strip all falsy literals from LHS, then
-                // strip null/undefined from the final result (null was assignable everywhere
-                // so it disappears from union types in old TS).
+                // strip null/undefined (but NOT void) from the final result. null/undefined
+                // were implicitly assignable everywhere in old TS and disappear from unions;
+                // void is a real constituent (e.g. `boolean || void → true | void`).
                 const truthy_a = self.stripFalsyMembers(a);
                 const combined = self.store.unionOf(&.{ truthy_a, b }) catch tymod.ID_ANY;
-                return self.stripNullishUnion(combined);
+                return self.stripNullAndUndefined(combined);
             }
             if (self.alwaysTruthy(a)) return a;
             const a_stripped = self.stripNullishUnion(a);
@@ -16884,6 +16885,27 @@ pub const Checker = struct {
             },
             else => return id,
         }
+    }
+
+    // Like stripNullishUnion but keeps void — used in @strict:false `||` results.
+    fn stripNullAndUndefined(self: *Checker, id: TypeId) TypeId {
+        const t = self.store.get(id);
+        if (t.kind != .union_t) {
+            if (t.kind == .null_t or t.kind == .undefined_t) return tymod.ID_NEVER;
+            return id;
+        }
+        var buf: [16]TypeId = undefined;
+        var n: usize = 0;
+        for (self.store.idsOf(t.list_data)) |m| {
+            const mk = self.store.get(m).kind;
+            if (mk == .null_t or mk == .undefined_t) continue;
+            if (n >= buf.len) return id;
+            buf[n] = m;
+            n += 1;
+        }
+        if (n == 0) return tymod.ID_NEVER;
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch id;
     }
 
     fn stripNullishUnion(self: *Checker, id: TypeId) TypeId {
