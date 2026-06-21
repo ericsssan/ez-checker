@@ -16628,7 +16628,14 @@ pub const Checker = struct {
         const cond_data = self.ast_ref.extraData(ast.Conditional, @intFromEnum(data.rhs));
         const a = self.typeOf(cond_data.consequent);
         const b = self.typeOf(cond_data.alternate);
-        const ty = self.store.unionOf(&.{ a, b }) catch tymod.ID_ANY;
+        // tsc normalizes ternary result unions: null/undefined go at the end.
+        // E.g. `null ? null : fn` → `fn | null`, not `null | fn`.
+        const a_nullish = self.store.get(a).kind == .null_t or self.store.get(a).kind == .undefined_t;
+        const b_nullish = self.store.get(b).kind == .null_t or self.store.get(b).kind == .undefined_t;
+        const ty = if (a_nullish and !b_nullish)
+            self.store.unionOf(&.{ b, a }) catch tymod.ID_ANY
+        else
+            self.store.unionOf(&.{ a, b }) catch tymod.ID_ANY;
         // TypeScript: `undefined <: void`, so `void | undefined → void` in expression
         // result types (not type annotations).  Strip `undefined` when `void` is present.
         const ty2 = self.dropUndefinedIfVoid(ty);
