@@ -16261,17 +16261,25 @@ pub const Checker = struct {
     }
 
     fn inferNonNull(self: *Checker, node: NodeIndex) TypeId {
-        const inner = self.typeOf(self.ast_ref.nodeData(node).lhs);
+        const inner_node = self.ast_ref.nodeData(node).lhs;
+        const inner = self.typeOf(inner_node);
+        // When `!` is applied to an optional chain result (e.g. `o?.f()!`), TypeScript
+        // preserves the chain-propagated `undefined`; only `null` is stripped.
+        // Unlike calleeIsInOptionalChain, we do NOT walk through ts_non_null_expr here —
+        // a nested `!` seals the chain so the outer `!` can strip undefined normally.
+        const in_opt_chain = self.directChildInOptionalChain(inner_node);
         const t = self.store.get(inner);
         switch (t.kind) {
-            .null_t, .undefined_t => return tymod.ID_NEVER,
+            .null_t => return tymod.ID_NEVER,
+            .undefined_t => return if (in_opt_chain) inner else tymod.ID_NEVER,
             .union_t => {
                 const members = self.store.idsOf(t.list_data);
                 var buf: [16]TypeId = undefined;
                 var n: usize = 0;
                 for (members) |m| {
                     const mk = self.store.get(m).kind;
-                    if (mk == .null_t or mk == .undefined_t) continue;
+                    if (mk == .null_t) continue;
+                    if (mk == .undefined_t and !in_opt_chain) continue;
                     if (n < buf.len) { buf[n] = m; n += 1; }
                 }
                 if (n == 0) return tymod.ID_NEVER;
@@ -16280,6 +16288,26 @@ pub const Checker = struct {
             },
             else => return inner,
         }
+    }
+
+    /// Like calleeIsInOptionalChain but does NOT walk through ts_non_null_expr.
+    /// Used by inferNonNull: a `!` inside the chain seals it, so the outer `!`
+    /// should not see through it.
+    fn directChildInOptionalChain(self: *Checker, node: NodeIndex) bool {
+        var cur = node;
+        while (cur != .none) {
+            const tag = self.ast_ref.nodeTag(cur);
+            switch (tag) {
+                .optional_member_expr,
+                .optional_computed_member_expr,
+                .optional_call_expr => return true,
+                .member_expr, .computed_member_expr, .call_expr, .grouping_expr => {
+                    cur = self.ast_ref.nodeData(cur).lhs;
+                },
+                else => return false,
+            }
+        }
+        return false;
     }
 
     fn inferSequence(self: *Checker, node: NodeIndex) TypeId {
