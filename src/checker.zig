@@ -22548,6 +22548,25 @@ pub const Checker = struct {
             }
             return null;
         }
+        // Not found in own body — walk the superclass static chain.
+        if (cd.super_class != .none) {
+            var sc = cd.super_class;
+            while (self.ast_ref.nodeTag(sc) == .grouping_expr or
+                self.ast_ref.nodeTag(sc) == .ts_instantiation_expr)
+            {
+                sc = self.ast_ref.nodeData(sc).lhs;
+            }
+            if (self.ast_ref.nodeTag(sc) == .identifier) {
+                const parent_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(sc));
+                if (parent_name.len > 0) {
+                    if (self.decl_index.primaryDecl(parent_name)) |parent_decl| {
+                        if (self.ast_ref.nodeTag(parent_decl) == .class_decl) {
+                            return self.classStaticDirectPropLookup(parent_decl, prop_name);
+                        }
+                    }
+                }
+            }
+        }
         return null;
     }
 
