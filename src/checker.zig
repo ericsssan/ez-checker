@@ -18416,18 +18416,22 @@ pub const Checker = struct {
         const n = @min(slice.len, buf.len);
         var has_spread = false;
         var has_real_elem = false;
-        // Holes pending flush: leading/trailing holes are ignored; only holes between
-        // two real elements add `undefined`. `pending_holes` counts holes seen after
-        // the last real element — flushed when the next real element arrives.
+        // Holes pending flush: with strictNullChecks, all holes (leading, internal,
+        // trailing) add `undefined` to the element type. In non-strict mode, only
+        // internal holes (between two real elements) add `undefined`.
         var pending_holes: usize = 0;
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const elem_node: NodeIndex = @enumFromInt(slice[i]);
             if (elem_node == .none) {
-                if (has_real_elem) pending_holes += 1;
+                // With strictNullChecks, track leading holes too; without it, only
+                // holes after the first real element contribute undefined.
+                if (has_real_elem or !self.checker_opts.strict_null_checks_explicit_off) {
+                    pending_holes += 1;
+                }
                 continue;
             }
-            // Flush pending holes — they are now confirmed internal holes.
+            // Flush pending holes — they are now confirmed non-trailing holes.
             if (pending_holes > 0) {
                 const slots = @min(pending_holes, buf.len - n_used);
                 for (0..slots) |_| { buf[n_used] = tymod.ID_UNDEFINED; n_used += 1; }
@@ -18452,7 +18456,12 @@ pub const Checker = struct {
             }
             n_used += 1;
         }
-        // If ALL elements were holes, treat as empty array.
+        // With strictNullChecks, trailing holes also inject undefined into the element type.
+        if (pending_holes > 0 and !self.checker_opts.strict_null_checks_explicit_off and n_used > 0 and n_used < buf.len) {
+            buf[n_used] = tymod.ID_UNDEFINED;
+            n_used += 1;
+        }
+        // If ALL elements were holes (or empty), treat as empty array.
         if (n_used == 0) {
             const elem = self.emptyArrayElem(node);
             if (tymod.isAny(&self.store, elem)) return tymod.ID_ANY;
