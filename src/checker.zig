@@ -22167,6 +22167,29 @@ pub const Checker = struct {
                 return self.makeNamedFn(&.{tymod.ID_NUMBER}, &.{"index"}, &.{false}, ret);
             }
         }
+        // BigInt64Array / BigUint64Array instances (lib.es2020+).  Element type
+        // is bigint; toLocaleString is a single overload with optional locales.
+        if (eqAny(t.name, &.{ "BigInt64Array", "BigUint64Array" }) and
+            @intFromEnum(self.checker_opts.target) >= @intFromEnum(CheckerOpts.Target.es2020))
+        {
+            if (std.mem.eql(u8, name, "toLocaleString")) {
+                const str_arr = self.store.arrayOf(tymod.ID_STRING) catch return self.makeNullaryFn(tymod.ID_STRING);
+                const locales = self.store.unionOf(&.{ tymod.ID_STRING, str_arr }) catch return self.makeNullaryFn(tymod.ID_STRING);
+                const nfo = self.store.typeRef("Intl.NumberFormatOptions", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+                return self.makeNamedFn(&.{ locales, nfo }, &.{ "locales", "options" }, &.{ true, true }, tymod.ID_STRING);
+            }
+            if (std.mem.eql(u8, name, "toString") or std.mem.eql(u8, name, "join")) return self.makeNullaryFn(tymod.ID_STRING);
+            if (std.mem.eql(u8, name, "subarray")) {
+                return self.makeNamedFn(&.{ tymod.ID_NUMBER, tymod.ID_NUMBER }, &.{ "begin", "end" }, &.{ true, true }, ref_ty);
+            }
+            if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(ref_ty);
+            if (std.mem.eql(u8, name, "at") and
+                @intFromEnum(self.checker_opts.target) >= @intFromEnum(CheckerOpts.Target.es2022))
+            {
+                const ret = self.store.unionOf(&.{ tymod.ID_BIGINT, tymod.ID_UNDEFINED }) catch tymod.ID_BIGINT;
+                return self.makeNamedFn(&.{tymod.ID_NUMBER}, &.{"index"}, &.{false}, ret);
+            }
+        }
         return null;
     }
 
