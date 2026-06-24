@@ -22518,6 +22518,13 @@ pub const Checker = struct {
             }
             return null;
         }
+        if (std.mem.eql(u8, owner, "Intl.ListFormat")) {
+            if (std.mem.eql(u8, name, "format")) {
+                const iter = self.store.typeRef("Iterable<string>", &.{}) catch return null;
+                return self.makeNamedFn(&.{iter}, &.{"list"}, &.{false}, tymod.ID_STRING);
+            }
+            return null;
+        }
         return null;
     }
 
