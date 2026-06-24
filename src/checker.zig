@@ -22423,6 +22423,78 @@ pub const Checker = struct {
             const opts = self.tempRef(opts_name) orelse return null;
             return self.makeNamedFn(&.{ locales, opts }, &.{ "locales", "options" }, &.{ true, true }, tymod.ID_STRING);
         }
+        // `with` is self-returning: `(xLike: Temporal.PartialTemporalLike<…>,
+        // options?: …) => Self`.  Param name, Like-object and options type vary
+        // per owner; Duration takes no options.
+        if (std.mem.eql(u8, name, "with")) {
+            const WithSpec = struct { owner: []const u8, pname: []const u8, like: []const u8, opts: ?[]const u8 };
+            const with_specs = [_]WithSpec{
+                .{ .owner = "Temporal.PlainDate", .pname = "dateLike", .like = "Temporal.PartialTemporalLike<Temporal.DateLikeObject>", .opts = "Temporal.OverflowOptions" },
+                .{ .owner = "Temporal.PlainDateTime", .pname = "dateTimeLike", .like = "Temporal.PartialTemporalLike<Temporal.DateTimeLikeObject>", .opts = "Temporal.OverflowOptions" },
+                .{ .owner = "Temporal.PlainTime", .pname = "timeLike", .like = "Temporal.PartialTemporalLike<Temporal.TimeLikeObject>", .opts = "Temporal.OverflowOptions" },
+                .{ .owner = "Temporal.PlainYearMonth", .pname = "yearMonthLike", .like = "Temporal.PartialTemporalLike<Temporal.YearMonthLikeObject>", .opts = "Temporal.OverflowOptions" },
+                .{ .owner = "Temporal.PlainMonthDay", .pname = "monthDayLike", .like = "Temporal.PartialTemporalLike<Temporal.DateLikeObject>", .opts = "Temporal.OverflowOptions" },
+                .{ .owner = "Temporal.ZonedDateTime", .pname = "zonedDateTimeLike", .like = "Temporal.PartialTemporalLike<Temporal.ZonedDateTimeLikeObject>", .opts = "Temporal.ZonedDateTimeFromOptions" },
+                .{ .owner = "Temporal.Duration", .pname = "durationLike", .like = "Temporal.PartialTemporalLike<Temporal.DurationLikeObject>", .opts = null },
+            };
+            for (with_specs) |s| {
+                if (!std.mem.eql(u8, owner, s.owner)) continue;
+                const like_t = self.tempRef(s.like) orelse return null;
+                const ret_t = self.tempRef(s.owner) orelse return null;
+                if (s.opts) |o| {
+                    const opt_t = self.tempRef(o) orelse return null;
+                    return self.makeNamedFn(&.{ like_t, opt_t }, &.{ s.pname, "options" }, &.{ false, true }, ret_t);
+                }
+                return self.makeNamedFn(&.{like_t}, &.{s.pname}, &.{false}, ret_t);
+            }
+        }
+        // `round` is self-returning with a 2-overload shape:
+        // `{ (roundTo: Temporal.PluralizeUnit<U>): Self; (roundTo: <Opts>): Self; }`.
+        // U is TimeUnit for Instant/PlainTime, `"day" | TimeUnit` for the rest;
+        // <Opts> is DurationRoundingOptions for Duration, RoundingOptions<U> else.
+        if (std.mem.eql(u8, name, "round")) {
+            const RoundSpec = struct { owner: []const u8, unit: []const u8, opts: []const u8 };
+            const round_specs = [_]RoundSpec{
+                .{ .owner = "Temporal.Instant", .unit = "Temporal.PluralizeUnit<Temporal.TimeUnit>", .opts = "Temporal.RoundingOptions<Temporal.TimeUnit>" },
+                .{ .owner = "Temporal.PlainTime", .unit = "Temporal.PluralizeUnit<Temporal.TimeUnit>", .opts = "Temporal.RoundingOptions<Temporal.TimeUnit>" },
+                .{ .owner = "Temporal.PlainDateTime", .unit = "Temporal.PluralizeUnit<\"day\" | Temporal.TimeUnit>", .opts = "Temporal.RoundingOptions<\"day\" | Temporal.TimeUnit>" },
+                .{ .owner = "Temporal.ZonedDateTime", .unit = "Temporal.PluralizeUnit<\"day\" | Temporal.TimeUnit>", .opts = "Temporal.RoundingOptions<\"day\" | Temporal.TimeUnit>" },
+                .{ .owner = "Temporal.Duration", .unit = "Temporal.PluralizeUnit<\"day\" | Temporal.TimeUnit>", .opts = "Temporal.DurationRoundingOptions" },
+            };
+            for (round_specs) |s| {
+                if (!std.mem.eql(u8, owner, s.owner)) continue;
+                const ret_t = self.tempRef(s.owner) orelse return null;
+                const pu = self.tempRef(s.unit) orelse return null;
+                const ro = self.tempRef(s.opts) orelse return null;
+                const pr1 = self.store.appendSignatureParamsFull(&.{pu}, &.{"roundTo"}, &.{false}) catch return null;
+                const pr2 = self.store.appendSignatureParamsFull(&.{ro}, &.{"roundTo"}, &.{false}) catch return null;
+                const sigs = [_]tymod.Signature{
+                    .{ .params_start = pr1.start, .params_end = pr1.end, .return_type = ret_t },
+                    .{ .params_start = pr2.start, .params_end = pr2.end, .return_type = ret_t },
+                };
+                const sl = self.store.appendSignatures(&sigs) catch return null;
+                return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch null;
+            }
+        }
+        // withCalendar / withPlainTime / withTimeZone — self-returning single-sig.
+        // (PlainDate's withCalendar param is `calendarLike`, the others `calendar`.)
+        {
+            const WSpec = struct { name: []const u8, owner: []const u8, pname: []const u8, ptype: []const u8, opt: bool };
+            const wspecs = [_]WSpec{
+                .{ .name = "withCalendar", .owner = "Temporal.PlainDate", .pname = "calendarLike", .ptype = "Temporal.CalendarLike", .opt = false },
+                .{ .name = "withCalendar", .owner = "Temporal.PlainDateTime", .pname = "calendar", .ptype = "Temporal.CalendarLike", .opt = false },
+                .{ .name = "withCalendar", .owner = "Temporal.ZonedDateTime", .pname = "calendar", .ptype = "Temporal.CalendarLike", .opt = false },
+                .{ .name = "withPlainTime", .owner = "Temporal.PlainDateTime", .pname = "plainTime", .ptype = "Temporal.PlainTimeLike", .opt = true },
+                .{ .name = "withPlainTime", .owner = "Temporal.ZonedDateTime", .pname = "plainTime", .ptype = "Temporal.PlainTimeLike", .opt = true },
+                .{ .name = "withTimeZone", .owner = "Temporal.ZonedDateTime", .pname = "timeZone", .ptype = "Temporal.TimeZoneLike", .opt = false },
+            };
+            for (wspecs) |s| {
+                if (!std.mem.eql(u8, name, s.name) or !std.mem.eql(u8, owner, s.owner)) continue;
+                const pt = self.tempRef(s.ptype) orelse return null;
+                const ret_t = self.tempRef(s.owner) orelse return null;
+                return self.makeNamedFn(&.{pt}, &.{s.pname}, &.{s.opt}, ret_t);
+            }
+        }
         if (std.mem.eql(u8, owner, "Temporal.Instant")) {
             if (std.mem.eql(u8, name, "epochNanoseconds")) return tymod.ID_BIGINT;
             if (std.mem.eql(u8, name, "epochMilliseconds")) return tymod.ID_NUMBER;
