@@ -21986,6 +21986,18 @@ pub const Checker = struct {
             }
             if (std.mem.eql(u8, name, "prototype")) return self.store.typeRef("Date", &.{}) catch null;
         }
+        // URL static object-URL helpers (lib.dom).
+        if (std.mem.eql(u8, t.name, "URLConstructor")) {
+            if (std.mem.eql(u8, name, "createObjectURL")) {
+                const blob = self.store.typeRef("Blob", &.{}) catch return null;
+                const ms = self.store.typeRef("MediaSource", &.{}) catch return null;
+                const arg = self.store.unionOf(&.{ blob, ms }) catch return null;
+                return self.makeNamedFn(&.{arg}, &.{"obj"}, &.{false}, tymod.ID_STRING);
+            }
+            if (std.mem.eql(u8, name, "revokeObjectURL")) {
+                return self.makeNamedFn(&.{tymod.ID_STRING}, &.{"url"}, &.{false}, tymod.ID_VOID);
+            }
+        }
         // Date.prototype essentials.
         if (std.mem.eql(u8, t.name, "Date")) {
             if (eqAny(name, &.{ "getTime", "getFullYear", "getMonth", "getDate", "getDay", "getHours", "getMinutes", "getSeconds", "getMilliseconds", "getTimezoneOffset", "getUTCFullYear", "getUTCMonth", "getUTCDate", "getUTCDay", "getUTCHours", "getUTCMinutes", "getUTCSeconds", "getUTCMilliseconds", "valueOf", "setTime" })) {
