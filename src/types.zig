@@ -1304,6 +1304,39 @@ pub fn isAnyArray(store: *const TypeStore, id: TypeId) bool {
     }
 }
 
+/// The declared constraint of a generic type parameter: `T extends string`
+/// → the `string` TypeId.  Returns null for an unconstrained parameter
+/// (`<T>`) or any non-`type_param` type.  The constraint is stored as the
+/// sole element of the `type_param` entry's `list_data` (see
+/// `TypeStore.typeParam`).
+pub fn typeParamConstraint(store: *const TypeStore, id: TypeId) ?TypeId {
+    const t = store.get(id);
+    if (t.kind != .type_param) return null;
+    const ids = store.idsOf(t.list_data);
+    if (ids.len == 0) return null;
+    return ids[0];
+}
+
+/// The "apparent type" whose KIND should drive type-aware rule dispatch.
+/// A constrained type parameter presents as its constraint, transitively
+/// (`U extends T`, `T extends string` → `string`); an unconstrained
+/// parameter and every non-`type_param` type are returned unchanged.
+///
+/// Centralises the `T extends C` → `C` resolution so callers
+/// (`typeIdKind`, the strict-boolean / no-unnecessary-condition rules, …)
+/// classify a constrained parameter by its constraint instead of treating
+/// it as `any`.  A cycle guard bounds pathological self-referential chains.
+pub fn apparentType(store: *const TypeStore, id: TypeId) TypeId {
+    var cur = id;
+    var guard: u8 = 0;
+    while (guard < 16) : (guard += 1) {
+        const c = typeParamConstraint(store, cur) orelse return cur;
+        if (c.eq(cur)) return cur;
+        cur = c;
+    }
+    return cur;
+}
+
 pub fn containsUnknown(store: *const TypeStore, id: TypeId) bool {
     if (isUnknown(store, id)) return true;
     const t = store.get(id);
@@ -1434,5 +1467,28 @@ test "TypeStore array of any flagged by containsAny" {
     const arr_any = try store.arrayOf(ID_ANY);
     try std.testing.expect(!isAny(&store, arr_any));
     try std.testing.expect(containsAny(&store, arr_any));
+}
+
+test "typeParamConstraint / apparentType resolve constrained type params" {
+    var store = try TypeStore.init(std.testing.allocator);
+    defer store.deinit();
+
+    // `T extends string` → constraint is string; apparent type is string.
+    const t_str = try store.typeParam("T", ID_STRING);
+    try std.testing.expect(typeParamConstraint(&store, t_str).?.eq(ID_STRING));
+    try std.testing.expect(apparentType(&store, t_str).eq(ID_STRING));
+
+    // Unconstrained `T` → no constraint; apparent type is the param itself.
+    const t_free = try store.typeParam("T", .none);
+    try std.testing.expect(typeParamConstraint(&store, t_free) == null);
+    try std.testing.expect(apparentType(&store, t_free).eq(t_free));
+
+    // Transitive: `U extends T extends string` resolves through to string.
+    const u_t = try store.typeParam("U", t_str);
+    try std.testing.expect(apparentType(&store, u_t).eq(ID_STRING));
+
+    // Non-type_param types pass through unchanged.
+    try std.testing.expect(typeParamConstraint(&store, ID_NUMBER) == null);
+    try std.testing.expect(apparentType(&store, ID_NUMBER).eq(ID_NUMBER));
 }
 
