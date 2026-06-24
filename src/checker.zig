@@ -22081,6 +22081,15 @@ pub const Checker = struct {
             }
             // `valueOf` returns the array itself: `() => Self`.
             if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(ref_ty);
+            // `at(index: number) => number | undefined` (lib.es2022+; every
+            // standard typed array has number elements).  Older targets lack
+            // `at`, so tsc types it `any` — leave those alone.
+            if (std.mem.eql(u8, name, "at") and
+                @intFromEnum(self.checker_opts.target) >= @intFromEnum(CheckerOpts.Target.es2022))
+            {
+                const ret = self.store.unionOf(&.{ tymod.ID_NUMBER, tymod.ID_UNDEFINED }) catch tymod.ID_NUMBER;
+                return self.makeNamedFn(&.{tymod.ID_NUMBER}, &.{"index"}, &.{false}, ret);
+            }
         }
         return null;
     }
