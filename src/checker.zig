@@ -21858,6 +21858,20 @@ pub const Checker = struct {
         const t = self.store.get(ref_ty);
         if (t.kind != .type_ref) return null;
         const args = self.store.idsOf(t.list_data);
+        // Wrapper-object types (`Number`/`String`/`Boolean`) expose the same
+        // instance methods as the primitives — route to the primitive prototype
+        // handlers so `x: T extends Number; x.toFixed()` and `n: Number;
+        // n.valueOf()` resolve.  Skip when the user redeclared the interface.
+        if (!self.decl_index.hasType(t.name)) {
+            if (std.mem.eql(u8, t.name, "Number")) {
+                if (self.numberPrototypeProperty(name)) |ty| return ty;
+            } else if (std.mem.eql(u8, t.name, "String")) {
+                if (self.stringPrototypeProperty(name)) |ty| return ty;
+            } else if (std.mem.eql(u8, t.name, "Boolean")) {
+                if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(tymod.ID_BOOLEAN);
+                if (std.mem.eql(u8, name, "toString")) return self.makeNullaryFn(tymod.ID_STRING);
+            }
+        }
         if (std.mem.eql(u8, t.name, "Array") or std.mem.eql(u8, t.name, "ReadonlyArray")) {
             const elem = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
             const r = self.arrayPrototypeProperty(name, elem);
