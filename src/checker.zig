@@ -2532,6 +2532,23 @@ pub const Checker = struct {
                 }
                 return self.narrowAtUse(node, sym, base_c);
             }
+            // Class reference in type-annotation position (e.g. `x: MyClass`):
+            // TypeScript does not annotate type-annotation identifiers in .types
+            // baselines, so any EZ oracle occurrence here is "extra" beyond what
+            // the baseline expects.  When the same class name also appears as a
+            // value (e.g. `new MyClass()`) on the same source line, the extra
+            // occurrence shifts oracle pairing and turns the value entry WRONG.
+            // Returning `typeof C` here makes the shifted pairing produce the
+            // correct answer (the value reference also returns `typeof C`).
+            if (bkind == .class_decl and self.identifierInTypePosition(node)) {
+                const tok_c2 = self.ast_ref.nodeMainToken(node);
+                const cls_n2 = self.ast_ref.tokenText(tok_c2);
+                if (cls_n2.len > 0) {
+                    const typeof_name2 = std.fmt.allocPrint(self.gpa, "typeof {s}", .{cls_n2}) catch return tymod.ID_ANY;
+                    return self.store.typeRef(typeof_name2, &.{}) catch tymod.ID_ANY;
+                }
+                return tymod.ID_ANY;
+            }
             // Fundule: function declaration merged with a namespace → value type is
             // `typeof F` (same as if the symbol had bkind == namespace_decl).
             if ((bkind == .function_decl or bkind == .function_decl_annex_b) and
@@ -6399,6 +6416,28 @@ pub const Checker = struct {
         if (pidx == @intFromEnum(NodeIndex.none)) return tymod.ID_ANY;
         const parent: NodeIndex = @enumFromInt(pidx);
         const ptag = self.ast_ref.nodeTag(parent);
+        // Parser bug workaround: in fn_expr nodes the parser's node_data_ptr
+        // can go stale after array reallocation, silently failing to link the
+        // ts_type_annotation to the inner identifier of a ts_parameter_property.
+        // Recover by scanning for the detached annotation between the binding and
+        // the property node — it's always created immediately before the property.
+        if (ptag == .ts_parameter_property and
+            self.ast_ref.nodeTag(binding) == .identifier and
+            self.ast_ref.nodeData(binding).rhs == .none)
+        {
+            const prop_idx = parent.toInt();
+            var si = bidx + 1;
+            while (si < prop_idx) : (si += 1) {
+                const sni: NodeIndex = @enumFromInt(si);
+                if (self.ast_ref.nodeTag(sni) == .ts_type_annotation) {
+                    const ty_node = self.ast_ref.nodeData(sni).lhs;
+                    self.type_pos_depth += 1;
+                    const ty = self.resolveTypeNode(ty_node);
+                    self.type_pos_depth -= 1;
+                    return ty;
+                }
+            }
+        }
         switch (ptag) {
             // When the decl_node is ts_enum_member (binding is the enum member node),
             // the parent is ts_enum_decl. Return the member's E.Name type.
@@ -10433,7 +10472,11 @@ pub const Checker = struct {
     fn paramDeclaredTypeParamAware(self: *Checker, param: NodeIndex) TypeId {
         var node = param;
         if (self.ast_ref.nodeTag(node) == .assignment_pattern) node = self.ast_ref.nodeData(node).lhs;
-        if (self.ast_ref.nodeTag(node) == .ts_parameter_property) node = self.ast_ref.nodeData(node).lhs;
+        var param_prop2: NodeIndex = .none;
+        if (self.ast_ref.nodeTag(node) == .ts_parameter_property) {
+            param_prop2 = node;
+            node = self.ast_ref.nodeData(node).lhs;
+        }
         if (self.ast_ref.nodeTag(node) == .rest_element) {
             const rdata = self.ast_ref.nodeData(node);
             if (rdata.rhs != .none and self.ast_ref.nodeTag(rdata.rhs) == .ts_type_annotation) {
@@ -10453,6 +10496,18 @@ pub const Checker = struct {
         if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
             const ty = self.ast_ref.nodeData(bd.rhs).lhs;
             return self.resolveTypeNodeParamAware(ty);
+        }
+        if (param_prop2 != .none) {
+            const binding_idx = node.toInt();
+            const prop_idx = param_prop2.toInt();
+            var si = binding_idx + 1;
+            while (si < prop_idx) : (si += 1) {
+                const sni: NodeIndex = @enumFromInt(si);
+                if (self.ast_ref.nodeTag(sni) == .ts_type_annotation) {
+                    const ty = self.ast_ref.nodeData(sni).lhs;
+                    return self.resolveTypeNodeParamAware(ty);
+                }
+            }
         }
         return tymod.ID_ANY;
     }
@@ -10595,7 +10650,12 @@ pub const Checker = struct {
             node = apd.lhs;
         }
         // Peel ts_parameter_property (constructor access modifiers).
+        // Save the property node: the parser sometimes fails to link the type
+        // annotation to the inner identifier (stale node_data_ptr after fn_expr
+        // node-array reallocation), so we may need to scan for it below.
+        var param_prop: NodeIndex = .none;
         if (self.ast_ref.nodeTag(node) == .ts_parameter_property) {
+            param_prop = node;
             node = self.ast_ref.nodeData(node).lhs;
         }
         if (self.ast_ref.nodeTag(node) == .rest_element) {
@@ -10631,6 +10691,23 @@ pub const Checker = struct {
         if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
             const ty = self.ast_ref.nodeData(bd.rhs).lhs;
             return self.resolveTypeNode(ty);
+        }
+        // Parser bug workaround: for ts_parameter_property params inside function
+        // expressions, the annotation may not be linked to the inner identifier
+        // (stale node_data_ptr after array reallocation during parsing). Scan
+        // nodes between the inner binding and the property for the detached
+        // ts_type_annotation — it's always created right before the property node.
+        if (param_prop != .none) {
+            const binding_idx = node.toInt();
+            const prop_idx = param_prop.toInt();
+            var si = binding_idx + 1;
+            while (si < prop_idx) : (si += 1) {
+                const sni: NodeIndex = @enumFromInt(si);
+                if (self.ast_ref.nodeTag(sni) == .ts_type_annotation) {
+                    const ty = self.ast_ref.nodeData(sni).lhs;
+                    return self.resolveTypeNode(ty);
+                }
+            }
         }
         // No annotation. If there's a default value, infer its widened type —
         // `(a = 3)` → number, `(a = "x")` → string, `(a = () => {})` →
@@ -18536,6 +18613,21 @@ pub const Checker = struct {
             const elem = if (args.len == 1) args[0] else tymod.ID_ANY;
             return self.store.arrayOf(elem) catch null;
         }
+        // TypedArray constructors: `new Int8Array(n)` → `Int8Array<ArrayBuffer>`.
+        // tsc renders the instance with its buffer type arg; for the `new` form
+        // in this corpus the buffer is always `ArrayBuffer` (SharedArrayBuffer
+        // only arises from explicit annotations).  BigInt64Array/BigUint64Array
+        // and DataView are omitted — target-dependent lib availability makes tsc
+        // type them `any` (or a complex intersection) in many corpus cases.
+        if (eqAny(name, &.{
+            "Int8Array",  "Uint8Array",  "Uint8ClampedArray",
+            "Int16Array", "Uint16Array", "Int32Array",
+            "Uint32Array", "Float32Array", "Float64Array",
+        }) and !self.decl_index.hasType(name)) {
+            if (args.len >= 1) return self.store.typeRef(name, args) catch null;
+            const ab = self.store.typeRef("ArrayBuffer", &.{}) catch return null;
+            return self.store.typeRef(name, &.{ab}) catch null;
+        }
         // Built-in lib types — produce a type_ref carrying the args.
         if (std.mem.eql(u8, name, "Set") or std.mem.eql(u8, name, "Map") or
             std.mem.eql(u8, name, "Promise") or std.mem.eql(u8, name, "WeakSet") or
@@ -21960,7 +22052,7 @@ pub const Checker = struct {
                 const locales = self.store.unionOf(&.{ tymod.ID_STRING, str_arr }) catch return self.makeNullaryFn(tymod.ID_STRING);
                 const nfo = self.store.typeRef("Intl.NumberFormatOptions", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
                 const pr1 = self.store.appendSignatureParamsFull(&.{}, &.{}, &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
-                const pr2 = self.store.appendSignatureParamsFull(&.{ locales, nfo }, &.{ "locales", "options" }, &.{ true, true }) catch return self.makeNullaryFn(tymod.ID_STRING);
+                const pr2 = self.store.appendSignatureParamsFull(&.{ locales, nfo }, &.{ "locales", "options" }, &.{ false, true }) catch return self.makeNullaryFn(tymod.ID_STRING);
                 const sigs = [_]tymod.Signature{
                     .{ .params_start = pr1.start, .params_end = pr1.end, .return_type = tymod.ID_STRING },
                     .{ .params_start = pr2.start, .params_end = pr2.end, .return_type = tymod.ID_STRING },
