@@ -1156,6 +1156,16 @@ pub const Checker = struct {
             .string_literal => self.moduleNameLiteralType(node) orelse self.literalString(node),
             .number_literal => self.literalNumber(node),
             .bigint_literal => self.literalBigint(node),
+            // Negative literal type in a queried position (`field: -1`): the
+            // parser encodes `-1`/`-1n` as a ts_type_reference whose main_token
+            // is `-`.  resolveTypeRef already reconstructs the signed literal;
+            // other ts_type_reference shapes aren't value expressions → `any`.
+            .ts_type_reference => blk: {
+                const mt = self.ast_ref.nodeMainToken(node);
+                const nm = self.ast_ref.tokenText(mt);
+                if (nm.len == 1 and nm[0] == '-') break :blk self.resolveTypeRef(node);
+                break :blk tymod.ID_ANY;
+            },
             .boolean_literal => self.literalBoolean(node),
             .null_literal => tymod.ID_NULL,
             .regex_literal => self.regexpRefType(),
