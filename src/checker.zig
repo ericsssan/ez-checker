@@ -12868,6 +12868,13 @@ pub const Checker = struct {
             inline for (typed_arrays) |ta| {
                 try self.global_value_types.put(self.gpa, ta, try self.store.typeRef(ta ++ "Constructor", &.{}));
             }
+            // BigInt64Array / BigUint64Array — lib.es2020+; older targets lack
+            // them (tsc types the bare global `any`).
+            if (@intFromEnum(self.checker_opts.target) >= @intFromEnum(CheckerOpts.Target.es2020)) {
+                inline for (.{ "BigInt64Array", "BigUint64Array" }) |ta| {
+                    try self.global_value_types.put(self.gpa, ta, try self.store.typeRef(ta ++ "Constructor", &.{}));
+                }
+            }
         }
 
         // DOM singleton globals (lib.dom.d.ts) — named type_refs so member
@@ -13422,6 +13429,20 @@ pub const Checker = struct {
         }
         if (std.mem.eql(u8, name, "false")) {
             return self.store.add(.{ .kind = .boolean_literal, .literal_value = .{ .boolean = false } }) catch tymod.ID_BOOLEAN;
+        }
+        // A bare `BigInt64Array`/`BigUint64Array` annotation expands to its
+        // default type arg: `BigInt64Array<ArrayBufferLike>` (es2020 lib).  The
+        // `new` form infers `<ArrayBuffer>` separately (classOrLibInstance).
+        if (eqAny(name, &.{ "BigInt64Array", "BigUint64Array" }) and
+            !self.decl_index.hasType(name) and
+            @intFromEnum(self.checker_opts.target) >= @intFromEnum(CheckerOpts.Target.es2020))
+        {
+            var ta_buf: [8]TypeId = undefined;
+            const ta = self.collectTypeArgs(ty_node, &ta_buf);
+            if (ta.len == 0) {
+                const abl = self.store.typeRef("ArrayBufferLike", &.{}) catch return tymod.ID_ANY;
+                return self.store.typeRef(name, &.{abl}) catch tymod.ID_ANY;
+            }
         }
         // Map common built-ins to canonical types so containsAny on
         // `Array<any>` flags correctly without resolving the lib. A user that
@@ -18640,14 +18661,17 @@ pub const Checker = struct {
         // TypedArray constructors: `new Int8Array(n)` → `Int8Array<ArrayBuffer>`.
         // tsc renders the instance with its buffer type arg; for the `new` form
         // in this corpus the buffer is always `ArrayBuffer` (SharedArrayBuffer
-        // only arises from explicit annotations).  BigInt64Array/BigUint64Array
-        // and DataView are omitted — target-dependent lib availability makes tsc
-        // type them `any` (or a complex intersection) in many corpus cases.
-        if (eqAny(name, &.{
+        // only arises from explicit annotations).  DataView is omitted (complex
+        // intersection); BigInt64Array/BigUint64Array are es2020+ only (older
+        // targets lack the lib → tsc types them `any`).
+        const is_std_ta = eqAny(name, &.{
             "Int8Array",  "Uint8Array",  "Uint8ClampedArray",
             "Int16Array", "Uint16Array", "Int32Array",
             "Uint32Array", "Float32Array", "Float64Array",
-        }) and !self.decl_index.hasType(name)) {
+        });
+        const is_bigint_ta = eqAny(name, &.{ "BigInt64Array", "BigUint64Array" }) and
+            @intFromEnum(self.checker_opts.target) >= @intFromEnum(CheckerOpts.Target.es2020);
+        if ((is_std_ta or is_bigint_ta) and !self.decl_index.hasType(name)) {
             if (args.len >= 1) return self.store.typeRef(name, args) catch null;
             const ab = self.store.typeRef("ArrayBuffer", &.{}) catch return null;
             return self.store.typeRef(name, &.{ab}) catch null;
