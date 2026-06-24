@@ -22079,6 +22079,11 @@ pub const Checker = struct {
         {
             if (self.temporalProperty(t.name, name)) |ty| return ty;
         }
+        // Intl instance types: `Intl.NumberFormat` / `Intl.DateTimeFormat`
+        // instance member access (.format / .resolvedOptions / …).
+        if (std.mem.startsWith(u8, t.name, "Intl.")) {
+            if (self.intlInstanceProperty(t.name, name)) |ty| return ty;
+        }
         // Intl namespace: `Intl.NumberFormat` (value) → `Intl.NumberFormatConstructor`.
         if (std.mem.eql(u8, t.name, "typeof Intl")) {
             if (self.intlProperty(name)) |ty| return ty;
@@ -22489,6 +22494,29 @@ pub const Checker = struct {
             const owned = self.gpa.dupe(u8, ctor) catch return null;
             self.string_pool.append(self.gpa, owned) catch {};
             return self.store.typeRef(owned, &.{}) catch null;
+        }
+        return null;
+    }
+
+    /// `Intl.NumberFormat` / `Intl.DateTimeFormat` instance members.  `format` is
+    /// deliberately omitted for NumberFormat: its overload set depends on the
+    /// es2023.intl LIB (StringNumericLiteral), which isn't derivable from @target
+    /// (intlNumberFormatES2023 is @target es2022 + @lib es2023.intl).
+    fn intlInstanceProperty(self: *Checker, owner: []const u8, name: []const u8) ?TypeId {
+        if (std.mem.eql(u8, owner, "Intl.NumberFormat")) {
+            if (std.mem.eql(u8, name, "resolvedOptions"))
+                return self.makeNullaryFn(self.store.typeRef("Intl.ResolvedNumberFormatOptions", &.{}) catch return null);
+            return null;
+        }
+        if (std.mem.eql(u8, owner, "Intl.DateTimeFormat")) {
+            if (std.mem.eql(u8, name, "resolvedOptions"))
+                return self.makeNullaryFn(self.store.typeRef("Intl.ResolvedDateTimeFormatOptions", &.{}) catch return null);
+            if (std.mem.eql(u8, name, "format")) {
+                const date_t = self.store.typeRef("Date", &.{}) catch return null;
+                const date_num = self.store.unionOf(&.{ date_t, tymod.ID_NUMBER }) catch return null;
+                return self.makeNamedFn(&.{date_num}, &.{"date"}, &.{true}, tymod.ID_STRING);
+            }
+            return null;
         }
         return null;
     }
