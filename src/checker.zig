@@ -21367,6 +21367,14 @@ pub const Checker = struct {
         if (obj.kind == .number or obj.kind == .number_literal) {
             if (self.numberPrototypeProperty(prop_name)) |ty| return ty;
         }
+        // BigInt prototype (lib.es2020+).  At older targets the bigint lib is
+        // absent, so `bigintVal.valueOf()`/`toString()`/`toLocaleString()` fall
+        // back to the Object.prototype shapes — leave those to the normal path.
+        if ((obj.kind == .bigint or obj.kind == .bigint_literal) and
+            @intFromEnum(self.checker_opts.target) >= @intFromEnum(CheckerOpts.Target.es2020))
+        {
+            if (self.bigintPrototypeProperty(prop_name)) |ty| return ty;
+        }
         // Function.prototype apply/call/bind on a callable value.  A construct
         // signature selects the NewableFunction overloads.
         if (obj.kind == .function_t and !self.bindCallApplyTPCollision(obj_node)) {
@@ -22992,6 +23000,20 @@ pub const Checker = struct {
             return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch self.makeNullaryFn(tymod.ID_STRING);
         }
         if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(tymod.ID_NUMBER);
+        return null;
+    }
+
+    /// lib.es2020 BigInt.prototype: `toString(radix?: number) => string`,
+    /// `valueOf() => bigint`, `toLocaleString(locales?, options?) => string`.
+    fn bigintPrototypeProperty(self: *Checker, name: []const u8) ?TypeId {
+        if (std.mem.eql(u8, name, "toString"))
+            return self.makeNamedOptionalFn(tymod.ID_NUMBER, "radix", tymod.ID_STRING);
+        if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(tymod.ID_BIGINT);
+        if (std.mem.eql(u8, name, "toLocaleString")) {
+            const locales = self.store.typeRef("Intl.LocalesArgument", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const opts = self.store.typeRef("BigIntToLocaleStringOptions", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            return self.makeNamedFn(&.{ locales, opts }, &.{ "locales", "options" }, &.{ true, true }, tymod.ID_STRING);
+        }
         return null;
     }
 
