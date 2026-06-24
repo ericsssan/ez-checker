@@ -22810,11 +22810,17 @@ pub const Checker = struct {
         // length / indexOf / lastIndexOf return numbers.
         if (std.mem.eql(u8, name, "length")) return tymod.ID_NUMBER;
         // T | undefined returners (without callback).
-        if (std.mem.eql(u8, name, "shift") or std.mem.eql(u8, name, "pop") or
-            std.mem.eql(u8, name, "at"))
-        {
+        if (std.mem.eql(u8, name, "shift") or std.mem.eql(u8, name, "pop")) {
             const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_UNKNOWN;
             return self.makeNullaryFn(opt);
+        }
+        // at(index: number): T | undefined — lib.es2022+.  At older targets
+        // `at` is absent, so the member stays `any` (the not-found sentinel).
+        if (std.mem.eql(u8, name, "at")) {
+            if (@intFromEnum(self.checker_opts.target) < @intFromEnum(CheckerOpts.Target.es2022))
+                return tymod.ID_ANY;
+            const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_ANY;
+            return self.makeNamedFn(&.{tymod.ID_NUMBER}, &.{"index"}, &.{false}, opt) orelse tymod.ID_ANY;
         }
         // find/findLast: (predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => T | undefined
         if (std.mem.eql(u8, name, "find") or std.mem.eql(u8, name, "findLast")) {
@@ -22935,8 +22941,11 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "charCodeAt")) return named.one(self, N, "index", false, N);
         if (std.mem.eql(u8, name, "codePointAt"))
             return named.one(self, N, "pos", false, self.store.unionOf(&.{ N, tymod.ID_UNDEFINED }) catch N);
-        if (std.mem.eql(u8, name, "at"))
+        if (std.mem.eql(u8, name, "at")) {
+            // lib.es2022+; older targets lack `String.prototype.at` → `any`.
+            if (@intFromEnum(self.checker_opts.target) < @intFromEnum(CheckerOpts.Target.es2022)) return null;
             return named.one(self, N, "index", false, self.store.unionOf(&.{ S, tymod.ID_UNDEFINED }) catch S);
+        }
         if (std.mem.eql(u8, name, "substring")) return named.two(self, N, "start", false, N, "end", true, S);
         if (std.mem.eql(u8, name, "slice")) return named.two(self, N, "start", true, N, "end", true, S);
         if (std.mem.eql(u8, name, "substr")) return named.two(self, N, "from", false, N, "length", true, S);
