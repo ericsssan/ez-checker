@@ -2592,7 +2592,8 @@ pub const Checker = struct {
             // element writes regardless of noImplicitAny (the flag only governs
             // the implicit-any error, not the inferred type), so this is not
             // gated on no_implicit_any.
-            if ((bkind == .@"var" or bkind == .let) and
+            if ((bkind == .@"var" or bkind == .let or
+                (bkind == .@"const" and self.checker_opts.is_js_file)) and
                 (base.eq(tymod.ID_ANY) or base.eq(tymod.ID_UNKNOWN) or self.isEmptyArrayType(base)))
             {
                 if (self.inferEvolvingArrayType(sym, node)) |arr| {
@@ -5635,7 +5636,11 @@ pub const Checker = struct {
             const sid = sym_col[ri];
             if (@intFromEnum(sid) == @intFromEnum(symbol_mod.SymbolId.none)) continue;
             const bkind = self.semantic.symbols.getBindingKind(sid);
-            if (bkind != .@"var" and bkind != .let) continue;
+            // `const arr = []` evolves only in JS files: `const arr = []; arr[i]
+            // = …` infers `any[]` in checkJs.  In TS a `const` empty array is a
+            // fixed `never[]`/`any[]` that must not pick up element writes.
+            const evolving_const = bkind == .@"const" and self.checker_opts.is_js_file;
+            if (bkind != .@"var" and bkind != .let and !evolving_const) continue;
             const node: NodeIndex = node_col[ri];
             const valn = self.assignedValueOf(node) orelse continue;
             // A *non-empty* array-literal write (`x = [5, "hello"]`, `x = [true]`)
