@@ -22540,6 +22540,12 @@ pub const Checker = struct {
             }
             return null;
         }
+        // `era` / `eraYear` are optional calendar properties on every
+        // calendar-date type (including PlainYearMonth).
+        if (eqAny(owner, &.{ "Temporal.PlainDate", "Temporal.PlainDateTime", "Temporal.ZonedDateTime", "Temporal.PlainYearMonth" })) {
+            if (std.mem.eql(u8, name, "era")) return self.store.unionOf(&.{ tymod.ID_STRING, tymod.ID_UNDEFINED }) catch return null;
+            if (std.mem.eql(u8, name, "eraYear")) return self.store.unionOf(&.{ tymod.ID_NUMBER, tymod.ID_UNDEFINED }) catch return null;
+        }
         // Shared calendar-date properties.
         const is_date_like = eqAny(owner, &.{ "Temporal.PlainDate", "Temporal.PlainDateTime", "Temporal.ZonedDateTime" });
         const is_time_like = eqAny(owner, &.{ "Temporal.PlainTime", "Temporal.PlainDateTime", "Temporal.ZonedDateTime" });
