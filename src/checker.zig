@@ -21913,6 +21913,13 @@ pub const Checker = struct {
                 if (std.mem.eql(u8, name, "toString")) return self.makeNullaryFn(tymod.ID_STRING);
             }
         }
+        // URL instances (`new URL(...)`) — string accessors + toString/toJSON.
+        if (std.mem.eql(u8, t.name, "URL") and !self.decl_index.hasType("URL")) {
+            if (eqAny(name, &.{ "toString", "toJSON" })) return self.makeNullaryFn(tymod.ID_STRING);
+            if (eqAny(name, &.{ "href", "origin", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash" }))
+                return tymod.ID_STRING;
+            if (std.mem.eql(u8, name, "searchParams")) return self.store.typeRef("URLSearchParams", &.{}) catch tymod.ID_STRING;
+        }
         if (std.mem.eql(u8, t.name, "Array") or std.mem.eql(u8, t.name, "ReadonlyArray")) {
             const elem = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
             const r = self.arrayPrototypeProperty(name, elem);
