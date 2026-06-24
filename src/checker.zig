@@ -17320,6 +17320,15 @@ pub const Checker = struct {
             if (std.mem.eql(u8, cname, "BigInt") and self.symbolForIdentRef(callee) == null) {
                 return if (self.ast_ref.nodeTag(node) == .new_expr) tymod.ID_ANY else tymod.ID_BIGINT;
             }
+            // The wrapper globals called AS FUNCTIONS produce the primitive:
+            // `String(x)` → string, `Number(x)` → number, `Boolean(x)` → boolean.
+            // `new String(x)` etc. construct the wrapper object (handled by the
+            // new-expr path), so exclude `new`.  Only the unshadowed global.
+            if (self.ast_ref.nodeTag(node) != .new_expr and self.symbolForIdentRef(callee) == null) {
+                if (std.mem.eql(u8, cname, "String")) return tymod.ID_STRING;
+                if (std.mem.eql(u8, cname, "Number")) return tymod.ID_NUMBER;
+                if (std.mem.eql(u8, cname, "Boolean")) return tymod.ID_BOOLEAN;
+            }
         }
         // `Object.create(...)` is typed `any` by the lib — surface that so
         // no-unsafe-return / -assignment flag returning or assigning it.
