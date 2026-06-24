@@ -22406,6 +22406,23 @@ pub const Checker = struct {
             }
         }
         // Instance members.
+        // `toLocaleString` is universal across Temporal instance types:
+        // `(locales?: Intl.LocalesArgument, options?: <Opts>) => string`, where
+        // <Opts> is DurationFormatOptions for Duration, DateTimeFormatOptions
+        // for the date/time types.
+        if (std.mem.eql(u8, name, "toLocaleString") and eqAny(owner, &.{
+            "Temporal.Instant",        "Temporal.ZonedDateTime", "Temporal.PlainDate",
+            "Temporal.PlainTime",      "Temporal.PlainDateTime",  "Temporal.PlainYearMonth",
+            "Temporal.PlainMonthDay",  "Temporal.Duration",
+        })) {
+            const opts_name: []const u8 = if (std.mem.eql(u8, owner, "Temporal.Duration"))
+                "Intl.DurationFormatOptions"
+            else
+                "Intl.DateTimeFormatOptions";
+            const locales = self.tempRef("Intl.LocalesArgument") orelse return null;
+            const opts = self.tempRef(opts_name) orelse return null;
+            return self.makeNamedFn(&.{ locales, opts }, &.{ "locales", "options" }, &.{ true, true }, tymod.ID_STRING);
+        }
         if (std.mem.eql(u8, owner, "Temporal.Instant")) {
             if (std.mem.eql(u8, name, "epochNanoseconds")) return tymod.ID_BIGINT;
             if (std.mem.eql(u8, name, "epochMilliseconds")) return tymod.ID_NUMBER;
