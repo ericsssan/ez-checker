@@ -22318,6 +22318,21 @@ pub const Checker = struct {
         return self.makeNullaryFn(ret_t);
     }
 
+    /// Two-overload function `{ (p1: A): R; (p2: B): R; }` — both overloads share
+    /// the return type `ret`; `a`/`b` are Temporal type_ref display names.
+    fn temp2OverloadFn(self: *Checker, p1: []const u8, a: []const u8, p2: []const u8, b: []const u8, ret: TypeId) ?TypeId {
+        const at = self.tempRef(a) orelse return null;
+        const bt = self.tempRef(b) orelse return null;
+        const pr1 = self.store.appendSignatureParamsFull(&.{at}, &.{p1}, &.{false}) catch return null;
+        const pr2 = self.store.appendSignatureParamsFull(&.{bt}, &.{p2}, &.{false}) catch return null;
+        const sigs = [_]tymod.Signature{
+            .{ .params_start = pr1.start, .params_end = pr1.end, .return_type = ret },
+            .{ .params_start = pr2.start, .params_end = pr2.end, .return_type = ret },
+        };
+        const sl = self.store.appendSignatures(&sigs) catch return null;
+        return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch null;
+    }
+
     /// `(timeZone[?]: TimeZoneLike) => X`.
     fn tempTimeZoneFn(self: *Checker, ret: []const u8, optional: bool) ?TypeId {
         const tz = self.tempRef("Temporal.TimeZoneLike") orelse return null;
@@ -22517,6 +22532,12 @@ pub const Checker = struct {
             if (eqAny(name, &.{ "abs", "negated" })) return self.tempNullaryFn("Temporal.Duration");
             if (std.mem.eql(u8, name, "toString")) return self.tempToStringFn("Temporal.DurationToStringOptions");
             if (std.mem.eql(u8, name, "toJSON")) return self.makeNullaryFn(tymod.ID_STRING);
+            if (std.mem.eql(u8, name, "total")) {
+                return self.temp2OverloadFn(
+                    "totalOf", "Temporal.PluralizeUnit<\"day\" | Temporal.TimeUnit>",
+                    "totalOf", "Temporal.DurationTotalOptions", tymod.ID_NUMBER,
+                );
+            }
             return null;
         }
         // Shared calendar-date properties.
@@ -22537,6 +22558,13 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, "toString")) return self.tempToStringFn("Temporal.PlainDateToStringOptions");
             if (std.mem.eql(u8, name, "toPlainYearMonth")) return self.tempNullaryFn("Temporal.PlainYearMonth");
             if (std.mem.eql(u8, name, "toPlainMonthDay")) return self.tempNullaryFn("Temporal.PlainMonthDay");
+            if (std.mem.eql(u8, name, "toZonedDateTime")) {
+                const ret = self.tempRef("Temporal.ZonedDateTime") orelse return null;
+                return self.temp2OverloadFn(
+                    "timeZone", "Temporal.TimeZoneLike",
+                    "item", "Temporal.PlainDateToZonedDateTimeOptions", ret,
+                );
+            }
             if (std.mem.eql(u8, name, "toPlainDateTime")) {
                 const ptl = self.tempRef("Temporal.PlainTimeLike") orelse return null;
                 const ret = self.tempRef("Temporal.PlainDateTime") orelse return null;
@@ -22606,18 +22634,36 @@ pub const Checker = struct {
                 const ret = self.tempRef("Temporal.ZonedDateTime") orelse return null;
                 return self.makeNamedFn(&.{ptl}, &.{"plainTime"}, &.{true}, ret);
             }
+            if (std.mem.eql(u8, name, "getTimeZoneTransition")) {
+                const zdt = self.tempRef("Temporal.ZonedDateTime") orelse return null;
+                const ret = self.store.unionOf(&.{ zdt, tymod.ID_NULL }) catch return null;
+                return self.temp2OverloadFn(
+                    "direction", "\"next\" | \"previous\"",
+                    "direction", "Temporal.TransitionOptions", ret,
+                );
+            }
             return null;
         }
         if (std.mem.eql(u8, owner, "Temporal.PlainYearMonth")) {
             if (eqAny(name, &.{ "add", "subtract" })) return self.tempAddFn("Temporal.PlainYearMonth", true);
             if (eqAny(name, &.{ "until", "since" })) return self.tempUntilFn("Temporal.PlainYearMonthLike", "Temporal.DateUnit");
             if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.PlainYearMonthLike");
+            if (std.mem.eql(u8, name, "toPlainDate")) {
+                const item = self.tempRef("Temporal.PlainYearMonthToPlainDateOptions") orelse return null;
+                const ret = self.tempRef("Temporal.PlainDate") orelse return null;
+                return self.makeNamedFn(&.{item}, &.{"item"}, &.{false}, ret);
+            }
             return null;
         }
         if (std.mem.eql(u8, owner, "Temporal.PlainMonthDay")) {
             if (std.mem.eql(u8, name, "monthCode")) return tymod.ID_STRING;
             if (std.mem.eql(u8, name, "day")) return tymod.ID_NUMBER;
             if (std.mem.eql(u8, name, "equals")) return self.tempEqualsFn("Temporal.PlainMonthDayLike");
+            if (std.mem.eql(u8, name, "toPlainDate")) {
+                const item = self.tempRef("Temporal.PlainMonthDayToPlainDateOptions") orelse return null;
+                const ret = self.tempRef("Temporal.PlainDate") orelse return null;
+                return self.makeNamedFn(&.{item}, &.{"item"}, &.{false}, ret);
+            }
             return null;
         }
         return null;
