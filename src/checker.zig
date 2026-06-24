@@ -22067,6 +22067,12 @@ pub const Checker = struct {
             }
             if (std.mem.eql(u8, name, "toString") or std.mem.eql(u8, name, "join"))
                 return self.makeNullaryFn(tymod.ID_STRING);
+            // `subarray` is self-returning: `(begin?: number, end?: number) => Self`.
+            if (std.mem.eql(u8, name, "subarray")) {
+                return self.makeNamedFn(&.{ tymod.ID_NUMBER, tymod.ID_NUMBER }, &.{ "begin", "end" }, &.{ true, true }, ref_ty);
+            }
+            // `valueOf` returns the array itself: `() => Self`.
+            if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(ref_ty);
         }
         return null;
     }
