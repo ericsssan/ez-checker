@@ -2695,10 +2695,17 @@ pub const Checker = struct {
             if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
                 const ty = self.declaredTypeAtBinding(node);
                 if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
-                // Catch param with `:unknown` annotation: declaredTypeAtBinding returns
-                // ID_UNKNOWN (valid), but the guard above skips it. Return it here so
-                // we don't fall through to typeOfNameByAstSearch and find a hoisted var.
-                if (self.bindingIsCatchParam(node)) return ty;
+                // An explicit `: unknown` annotation (or a catch param) resolves
+                // to `unknown` legitimately — declaredTypeAtBinding returns
+                // ID_UNKNOWN, but the guard above skips it.  Return it so we don't
+                // fall through to typeOfNameByAstSearch (→ a hoisted var or `any`).
+                // Restricted to the literal `unknown` keyword so an UNRESOLVED
+                // type-ref annotation (also ID_UNKNOWN) still falls back.
+                const ann = self.ast_ref.nodeData(bd.rhs).lhs;
+                const ann_is_unknown = ann != .none and
+                    self.ast_ref.nodeTag(ann) == .ts_type_reference and
+                    std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ann)), "unknown");
+                if (ann_is_unknown or self.bindingIsCatchParam(node)) return ty;
             }
             // Catch param with no annotation: `unknown` by default (TypeScript's
             // useUnknownInCatchVariables behavior), `any` only when @strict:false
