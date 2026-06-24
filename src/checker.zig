@@ -12789,7 +12789,7 @@ pub const Checker = struct {
         try self.global_value_types.put(self.gpa, "FinalizationRegistry", try self.store.typeRef("FinalizationRegistry", &.{}));
         try self.global_value_types.put(self.gpa, "Symbol",  try self.store.typeRef("SymbolConstructor",  &.{}));
         try self.global_value_types.put(self.gpa, "Proxy",   try self.store.typeRef("ProxyConstructor",   &.{}));
-        try self.global_value_types.put(self.gpa, "Reflect", try self.store.typeRef("Reflect",             &.{}));
+        try self.global_value_types.put(self.gpa, "Reflect", try self.store.typeRef("typeof Reflect",      &.{}));
         try self.global_value_types.put(self.gpa, "Date",    try self.store.typeRef("DateConstructor",    &.{}));
         try self.global_value_types.put(self.gpa, "RegExp",  try self.store.typeRef("RegExpConstructor",  &.{}));
         try self.global_value_types.put(self.gpa, "URL",     try self.store.typeRef("URLConstructor",     &.{}));
@@ -21943,7 +21943,7 @@ pub const Checker = struct {
         // stable displays.  `set`/`defineProperty`/`get`/`apply`/`construct`
         // are omitted (generic overload sets or `any` returns tsc prints
         // differently).
-        if (std.mem.eql(u8, t.name, "Reflect")) {
+        if (std.mem.eql(u8, t.name, "typeof Reflect")) {
             const pkey = self.store.typeRef("PropertyKey", &.{}) catch return null;
             if (eqAny(name, &.{ "isExtensible", "preventExtensions" })) {
                 return self.makeNamedFn(&.{tymod.ID_OBJECT_KW}, &.{"target"}, &.{false}, tymod.ID_BOOLEAN);
