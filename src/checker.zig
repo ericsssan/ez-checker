@@ -23041,6 +23041,19 @@ pub const Checker = struct {
             const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_ANY;
             return self.makeNamedFn(&.{tymod.ID_NUMBER}, &.{"index"}, &.{false}, opt) orelse tymod.ID_ANY;
         }
+        // keys/values/entries: array iterator helpers (lib.es2015+).  keys →
+        // ArrayIterator<number>, values → ArrayIterator<T>, entries →
+        // ArrayIterator<[number, T]>.  Below es2015 lib they're absent → `any`.
+        if (eqAny(name, &.{ "keys", "values", "entries" })) {
+            if (@intFromEnum(self.checker_opts.lib) < @intFromEnum(CheckerOpts.Target.es2015)) return tymod.ID_ANY;
+            if (std.mem.eql(u8, name, "keys")) return self.makeNullaryFn(self.store.typeRef("ArrayIterator", &.{tymod.ID_NUMBER}) catch return tymod.ID_ANY);
+            // values/entries carry the element type; skip when it's the
+            // `undefined` sentinel of an empty/evolving array (tsc has `any`).
+            if (elem.eq(tymod.ID_UNDEFINED)) return tymod.ID_ANY;
+            if (std.mem.eql(u8, name, "values")) return self.makeNullaryFn(self.store.typeRef("ArrayIterator", &.{elem}) catch return tymod.ID_ANY);
+            const tup = self.store.tupleOf(&.{ tymod.ID_NUMBER, elem }) catch return tymod.ID_ANY;
+            return self.makeNullaryFn(self.store.typeRef("ArrayIterator", &.{tup}) catch return tymod.ID_ANY);
+        }
         // find/findLast: (predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => T | undefined
         if (std.mem.eql(u8, name, "find") or std.mem.eql(u8, name, "findLast")) {
             const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_UNKNOWN;
