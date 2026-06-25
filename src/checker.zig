@@ -22119,9 +22119,13 @@ pub const Checker = struct {
             if (eqAny(name, &.{ "getTime", "getFullYear", "getMonth", "getDate", "getDay", "getHours", "getMinutes", "getSeconds", "getMilliseconds", "getTimezoneOffset", "getUTCFullYear", "getUTCMonth", "getUTCDate", "getUTCDay", "getUTCHours", "getUTCMinutes", "getUTCSeconds", "getUTCMilliseconds", "valueOf", "setTime" })) {
                 return self.makeNullaryFn(tymod.ID_NUMBER);
             }
-            if (eqAny(name, &.{ "toISOString", "toUTCString", "toDateString", "toTimeString", "toJSON", "toLocaleDateString", "toLocaleTimeString" })) {
+            if (eqAny(name, &.{ "toISOString", "toUTCString", "toDateString", "toTimeString", "toJSON" })) {
                 return self.makeNullaryFn(tymod.ID_STRING);
             }
+            // toLocaleString/Date/Time: overload set grows with the lib — base
+            // `(): string` (es5), `+ (locales?: string|string[], options?)` (es2015),
+            // `+ (locales?: Intl.LocalesArgument, options?)` (es2020).
+            if (eqAny(name, &.{ "toLocaleString", "toLocaleDateString", "toLocaleTimeString" })) return self.dateToLocaleFn();
             if (std.mem.eql(u8, name, "toTemporalInstant")) return self.tempNullaryFn("Temporal.Instant");
         }
         // Temporal namespace (lib.esnext) — curated from the corpus surface.
@@ -22578,6 +22582,35 @@ pub const Checker = struct {
             return null;
         }
         return null;
+    }
+
+    /// Date `toLocaleString`/`toLocaleDateString`/`toLocaleTimeString` — a
+    /// lib-gated overload set returning string (see call site).
+    fn dateToLocaleFn(self: *Checker) ?TypeId {
+        const lib = @intFromEnum(self.checker_opts.lib);
+        if (lib < @intFromEnum(CheckerOpts.Target.es2015)) return self.makeNullaryFn(tymod.ID_STRING);
+        const str_arr = self.store.arrayOf(tymod.ID_STRING) catch return null;
+        const locales1 = self.store.unionOf(&.{ tymod.ID_STRING, str_arr }) catch return null;
+        const dtfo = self.store.typeRef("Intl.DateTimeFormatOptions", &.{}) catch return null;
+        const p0 = self.store.appendSignatureParamsFull(&.{}, &.{}, &.{}) catch return null;
+        const p1 = self.store.appendSignatureParamsFull(&.{ locales1, dtfo }, &.{ "locales", "options" }, &.{ true, true }) catch return null;
+        if (lib < @intFromEnum(CheckerOpts.Target.es2020)) {
+            const sigs = [_]tymod.Signature{
+                .{ .params_start = p0.start, .params_end = p0.end, .return_type = tymod.ID_STRING },
+                .{ .params_start = p1.start, .params_end = p1.end, .return_type = tymod.ID_STRING },
+            };
+            const sl = self.store.appendSignatures(&sigs) catch return null;
+            return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch return null;
+        }
+        const la = self.store.typeRef("Intl.LocalesArgument", &.{}) catch return null;
+        const p2 = self.store.appendSignatureParamsFull(&.{ la, dtfo }, &.{ "locales", "options" }, &.{ true, true }) catch return null;
+        const sigs = [_]tymod.Signature{
+            .{ .params_start = p0.start, .params_end = p0.end, .return_type = tymod.ID_STRING },
+            .{ .params_start = p1.start, .params_end = p1.end, .return_type = tymod.ID_STRING },
+            .{ .params_start = p2.start, .params_end = p2.end, .return_type = tymod.ID_STRING },
+        };
+        const sl = self.store.appendSignatures(&sigs) catch return null;
+        return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = true }) catch return null;
     }
 
     fn temporalProperty(self: *Checker, owner: []const u8, name: []const u8) ?TypeId {
