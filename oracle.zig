@@ -88,6 +88,10 @@ const CompilerOpts = struct {
     no_unchecked_indexed_access: bool = false,
     exact_optional_property_types: bool = false,
     target: Target = .es5,
+    /// `@lib` base ES level (highest full `esXXXX` token; partials like
+    /// `es2023.intl` and non-ES libs like `dom` are ignored).  Null when `@lib`
+    /// is absent → the checker falls back to `target`.
+    lib: ?Target = null,
     module: Module = .none,
     jsx: Jsx = .none,
     /// Root identifier of the JSX factory from `@jsxFactory` or `@reactNamespace`.
@@ -139,6 +143,20 @@ const CompilerOpts = struct {
             .jsx_factory_name = self.jsx_factory_name,
             .use_define_for_class_fields = self.use_define_for_class_fields,
             .target = switch (self.target) {
+                .es5    => .es5,
+                .es2015 => .es2015,
+                .es2016 => .es2016,
+                .es2017 => .es2017,
+                .es2018 => .es2018,
+                .es2019 => .es2019,
+                .es2020 => .es2020,
+                .es2021 => .es2021,
+                .es2022 => .es2022,
+                .es2023 => .es2023,
+                .esnext => .esnext,
+                .none   => .es5,
+            },
+            .lib = switch (self.lib orelse self.target) {
                 .es5    => .es5,
                 .es2015 => .es2015,
                 .es2016 => .es2016,
@@ -209,6 +227,7 @@ fn applyVariantOverrides(opts: *CompilerOpts, filename: []const u8) void {
         const val = std.mem.trim(u8, pair[eq + 1 ..], " ");
         if (std.mem.eql(u8, key, "module")) opts.module = parseModule(val)
         else if (std.mem.eql(u8, key, "target")) opts.target = parseTarget(val)
+        else if (std.mem.eql(u8, key, "lib")) opts.lib = parseLib(val)
         else if (std.mem.eql(u8, key, "strict")) {
             opts.strict = isTrue(val);
             opts.strict_set = true;
@@ -244,6 +263,20 @@ fn parseTarget(val: []const u8) CompilerOpts.Target {
     if (std.ascii.eqlIgnoreCase(lower, "es2023")) return .es2023;
     if (std.ascii.eqlIgnoreCase(lower, "esnext")) return .esnext;
     return .none;
+}
+
+/// `@lib` is a comma-separated list (`es2022,es2023.intl,dom`).  Return the
+/// highest FULL `esXXXX` token (partials like `es2023.intl` and non-ES libs
+/// like `dom` are not matched by parseTarget → skipped); null if none present.
+fn parseLib(val: []const u8) ?CompilerOpts.Target {
+    var it = std.mem.tokenizeScalar(u8, val, ',');
+    var best: ?CompilerOpts.Target = null;
+    while (it.next()) |raw| {
+        const t = parseTarget(std.mem.trim(u8, raw, " "));
+        if (t == .none) continue;
+        if (best == null or @intFromEnum(t) > @intFromEnum(best.?)) best = t;
+    }
+    return best;
 }
 
 fn parseModule(val: []const u8) CompilerOpts.Module {
@@ -333,6 +366,8 @@ fn parseSourceOpts(io: std.Io, arena: std.mem.Allocator, ts_root_dir: []const u8
             opts.exact_optional_property_types = isTrue(val);
         } else if (ci(key, "target")) {
             opts.target = parseTarget(val);
+        } else if (ci(key, "lib")) {
+            opts.lib = parseLib(val);
         } else if (ci(key, "module")) {
             opts.module = parseModule(val);
         } else if (ci(key, "jsx")) {

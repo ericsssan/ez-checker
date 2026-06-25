@@ -92,6 +92,12 @@ pub const CheckerOpts = struct {
     /// resolution.  Empty when none were provided.
     package_jsons: []const PackageJsonFile = &.{},
     target: Target = .es5,
+    /// Effective library level (`@lib`), defaulting to `target` when `@lib` is
+    /// absent.  Distinct from `target`: a test may compile to ES6 (`target`) but
+    /// against only the ES5 lib (`@lib: es5`), so library globals like Map/Set
+    /// are unavailable even though the emit target supports them.  Gate library
+    /// FEATURE availability (vs syntax/emit) on this, not `target`.
+    lib: Target = .esnext,
     /// Module resolution strategy.  Affects import resolution rules —
     /// notably, node16/nodenext require explicit .js/.mjs/.cjs extensions
     /// on relative imports; without them the import is unresolvable → `any`.
@@ -21943,12 +21949,20 @@ pub const Checker = struct {
         // in ES5 lib) and a well-formed `Set<T>` (1 arg); a bare/malformed
         // receiver is left a gap rather than exposed as a wrong method type.
         // WeakSet excluded: its element arg is under-resolved (symbol vs object).
-        const es2015 = @intFromEnum(self.checker_opts.target) >= @intFromEnum(CheckerOpts.Target.es2015);
+        // Library availability gates on the effective @lib (not the emit target):
+        // Map/Set exist from the es2015 lib onward.
+        const es2015 = @intFromEnum(self.checker_opts.lib) >= @intFromEnum(CheckerOpts.Target.es2015);
         if (std.mem.eql(u8, t.name, "Set") and args.len >= 1 and es2015 and !self.decl_index.hasType("Set")) {
             const elem = args[0];
             if (eqAny(name, &.{ "has", "delete" })) return self.makeNamedFn(&.{elem}, &.{"value"}, &.{false}, tymod.ID_BOOLEAN);
             if (std.mem.eql(u8, name, "add")) return self.makeNamedFn(&.{elem}, &.{"value"}, &.{false}, ref_ty);
+            if (std.mem.eql(u8, name, "clear")) return self.makeNullaryFn(tymod.ID_VOID);
             if (std.mem.eql(u8, name, "size")) return tymod.ID_NUMBER;
+            if (eqAny(name, &.{ "keys", "values" })) return self.makeNullaryFn(self.store.typeRef("SetIterator", &.{elem}) catch return null);
+            if (std.mem.eql(u8, name, "entries")) {
+                const tup = self.store.tupleOf(&.{ elem, elem }) catch return null;
+                return self.makeNullaryFn(self.store.typeRef("SetIterator", &.{tup}) catch return null);
+            }
         }
         // Map instances — `set` is self-returning; `get` → V | undefined.  Gated
         // on es2015+ and a well-formed `Map<K,V>` (2 args).  WeakMap excluded.
@@ -21961,7 +21975,14 @@ pub const Checker = struct {
                 return self.makeNamedFn(&.{key}, &.{"key"}, &.{false}, ret);
             }
             if (std.mem.eql(u8, name, "set")) return self.makeNamedFn(&.{ key, val }, &.{ "key", "value" }, &.{ false, false }, ref_ty);
+            if (std.mem.eql(u8, name, "clear")) return self.makeNullaryFn(tymod.ID_VOID);
             if (std.mem.eql(u8, name, "size")) return tymod.ID_NUMBER;
+            if (std.mem.eql(u8, name, "keys")) return self.makeNullaryFn(self.store.typeRef("MapIterator", &.{key}) catch return null);
+            if (std.mem.eql(u8, name, "values")) return self.makeNullaryFn(self.store.typeRef("MapIterator", &.{val}) catch return null);
+            if (std.mem.eql(u8, name, "entries")) {
+                const tup = self.store.tupleOf(&.{ key, val }) catch return null;
+                return self.makeNullaryFn(self.store.typeRef("MapIterator", &.{tup}) catch return null);
+            }
         }
         if (std.mem.eql(u8, t.name, "Promise")) {
             const inner = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
