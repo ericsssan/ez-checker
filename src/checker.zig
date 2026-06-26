@@ -1196,40 +1196,67 @@ pub const Checker = struct {
     /// / nested array pattern); plain identifiers, rest elements, object patterns,
     /// and empty-array defaults (`= []`, whose `never[]` widening is strict-mode
     /// dependent) all bail — leaving those contexts unchanged.
+    /// Type of a binding element/property VALUE: a hole → undefined, a nested
+    /// pattern → its structural type, `target = default` → widened default
+    /// type.  Returns null (bail) for a plain identifier (no structural type),
+    /// a rest element, or an empty-array default `= []` (never[] is
+    /// strict-dependent).
+    fn bindingElementValueType(self: *Checker, el: NodeIndex, depth: u8) ?TypeId {
+        if (el == .none) return tymod.ID_UNDEFINED; // elision hole
+        switch (self.ast_ref.nodeTag(el)) {
+            .assignment_pattern => {
+                const ad = self.ast_ref.nodeData(el);
+                const lt = self.ast_ref.nodeTag(ad.lhs);
+                if (lt == .array_pattern or lt == .object_pattern)
+                    return self.bindingPatternStructuralType(ad.lhs, depth + 1);
+                if (ad.rhs == .none) return null;
+                const w = self.widenLiteralKind(self.typeOf(ad.rhs));
+                if (self.isEmptyTuple(w)) return null;
+                return w;
+            },
+            .array_pattern, .object_pattern => return self.bindingPatternStructuralType(el, depth + 1),
+            else => return null, // plain identifier / rest → bail
+        }
+    }
+
     fn bindingPatternStructuralType(self: *Checker, node: NodeIndex, depth: u8) ?TypeId {
-        if (depth > 8 or self.ast_ref.nodeTag(node) != .array_pattern) return null;
+        if (depth > 8) return null;
+        const tag = self.ast_ref.nodeTag(node);
         const d = self.ast_ref.nodeData(node);
         const slice = self.directRange(d.lhs, d.rhs) orelse return null;
-        if (slice.len == 0 or slice.len > 16) return null;
-        var elems: [16]TypeId = undefined;
-        for (slice, 0..) |raw, i| {
-            const el: NodeIndex = @enumFromInt(raw);
-            if (el == .none) {
-                elems[i] = tymod.ID_UNDEFINED; // elision hole
-                continue;
-            }
-            switch (self.ast_ref.nodeTag(el)) {
-                .assignment_pattern => {
-                    const ad = self.ast_ref.nodeData(el);
-                    if (self.ast_ref.nodeTag(ad.lhs) == .array_pattern) {
-                        elems[i] = self.bindingPatternStructuralType(ad.lhs, depth + 1) orelse return null;
-                    } else if (ad.rhs != .none) {
-                        const w = self.widenLiteralKind(self.typeOf(ad.rhs));
-                        if (self.isEmptyTuple(w)) return null; // `= []` → never[] (strict-dependent); bail
-                        elems[i] = w;
-                    } else return null;
-                },
-                .array_pattern => elems[i] = self.bindingPatternStructuralType(el, depth + 1) orelse return null,
-                else => return null, // plain identifier / rest / object pattern → bail
-            }
+        if (slice.len == 0 or slice.len > 24) return null;
+        if (tag == .array_pattern) {
+            var elems: [24]TypeId = undefined;
+            for (slice, 0..) |raw, i| elems[i] = self.bindingElementValueType(@enumFromInt(raw), depth) orelse return null;
+            return self.store.tupleOf(elems[0..slice.len]) catch null;
         }
-        return self.store.tupleOf(elems[0..slice.len]) catch null;
+        if (tag == .object_pattern) {
+            var props: [24]tymod.ObjectProp = undefined;
+            for (slice, 0..) |raw, i| {
+                const prop: NodeIndex = @enumFromInt(raw);
+                const pd = self.ast_ref.nodeData(prop);
+                const valnode: NodeIndex = switch (self.ast_ref.nodeTag(prop)) {
+                    .property => pd.rhs, // key: value
+                    .shorthand_property => pd.lhs, // { x } / { x = default }
+                    else => return null, // rest / computed → bail
+                };
+                const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(prop));
+                if (key.len == 0) return null;
+                // A property with a default (`{ name: x = d }`) is OPTIONAL: the
+                // member may be absent and the default supplies it (`name?:`).
+                const has_default = self.ast_ref.nodeTag(valnode) == .assignment_pattern;
+                props[i] = .{ .name = key, .type_id = self.bindingElementValueType(valnode, depth) orelse return null, .optional = has_default };
+            }
+            const list = self.store.appendObjectProps(props[0..slice.len]) catch return null;
+            return self.store.add(.{ .kind = .object_t, .object_props = list }) catch null;
+        }
+        return null;
     }
 
     fn inferExpr(self: *Checker, node: NodeIndex) TypeId {
         const t = self.ast_ref.nodeTag(node);
         return switch (t) {
-            .array_pattern => if (self.arrayPatternIsBinding(node))
+            .array_pattern, .object_pattern => if (self.arrayPatternIsBinding(node))
                 (self.bindingPatternStructuralType(node, 0) orelse tymod.ID_ANY)
             else
                 tymod.ID_ANY,
