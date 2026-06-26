@@ -24457,6 +24457,19 @@ pub const Checker = struct {
             if (std.mem.eql(u8, key, "trailingZeroDisplay")) return self.litUnion(&.{ "auto", "stripIfInteger" });
             if (std.mem.eql(u8, key, "roundingMode")) return self.litUnion(&.{ "ceil", "floor", "expand", "trunc", "halfCeil", "halfFloor", "halfExpand", "halfTrunc", "halfEven" });
         }
+        if (std.mem.eql(u8, type_name, "Intl.DateTimeFormatOptions")) {
+            if (std.mem.eql(u8, key, "weekday") or std.mem.eql(u8, key, "era")) return self.litUnion(&.{ "long", "short", "narrow" });
+            if (std.mem.eql(u8, key, "year") or std.mem.eql(u8, key, "day") or
+                std.mem.eql(u8, key, "hour") or std.mem.eql(u8, key, "minute") or std.mem.eql(u8, key, "second"))
+                return self.litUnion(&.{ "numeric", "2-digit" });
+            if (std.mem.eql(u8, key, "month")) return self.litUnion(&.{ "numeric", "2-digit", "long", "short", "narrow" });
+            if (std.mem.eql(u8, key, "dayPeriod")) return self.litUnion(&.{ "narrow", "short", "long" });
+            if (std.mem.eql(u8, key, "hourCycle")) return self.litUnion(&.{ "h11", "h12", "h23", "h24" });
+            if (std.mem.eql(u8, key, "formatMatcher")) return self.litUnion(&.{ "best fit", "basic" });
+            if (std.mem.eql(u8, key, "localeMatcher")) return self.litUnion(&.{ "best fit", "lookup" });
+            if (std.mem.eql(u8, key, "dateStyle") or std.mem.eql(u8, key, "timeStyle")) return self.litUnion(&.{ "full", "long", "medium", "short" });
+            if (std.mem.eql(u8, key, "timeZoneName")) return self.litUnion(&.{ "short", "long", "shortOffset", "longOffset", "shortGeneric", "longGeneric" });
+        }
         return null;
     }
 
