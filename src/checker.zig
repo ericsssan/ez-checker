@@ -24462,7 +24462,7 @@ pub const Checker = struct {
     }
 
     fn litUnion(self: *Checker, vals: []const []const u8) ?TypeId {
-        var buf: [16]TypeId = undefined;
+        var buf: [32]TypeId = undefined; // Temporal unit unions reach 21 members
         if (vals.len == 0 or vals.len > buf.len) return null;
         for (vals, 0..) |v, i| buf[i] = self.store.stringLiteral(v) catch return null;
         return self.store.unionOf(buf[0..vals.len]) catch null;
