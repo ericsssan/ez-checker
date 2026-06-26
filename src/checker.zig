@@ -24434,6 +24434,32 @@ pub const Checker = struct {
         return null;
     }
 
+    fn litUnion(self: *Checker, vals: []const []const u8) ?TypeId {
+        var buf: [16]TypeId = undefined;
+        if (vals.len == 0 or vals.len > buf.len) return null;
+        for (vals, 0..) |v, i| buf[i] = self.store.stringLiteral(v) catch return null;
+        return self.store.unionOf(buf[0..vals.len]) catch null;
+    }
+
+    /// Literal-union member types of the curated lib OPTION interfaces (modeled
+    /// only enough to drive contextual literal PRESERVATION — `new
+    /// Intl.NumberFormat("en", { style: "currency" })` keeps `"currency"`).
+    fn optionTypePropType(self: *Checker, type_name: []const u8, key: []const u8) ?TypeId {
+        if (std.mem.eql(u8, type_name, "Intl.NumberFormatOptions")) {
+            if (std.mem.eql(u8, key, "style")) return self.litUnion(&.{ "decimal", "currency", "percent", "unit" });
+            if (std.mem.eql(u8, key, "currencyDisplay")) return self.litUnion(&.{ "code", "symbol", "narrowSymbol", "name" });
+            if (std.mem.eql(u8, key, "currencySign")) return self.litUnion(&.{ "standard", "accounting" });
+            if (std.mem.eql(u8, key, "notation")) return self.litUnion(&.{ "standard", "scientific", "engineering", "compact" });
+            if (std.mem.eql(u8, key, "compactDisplay")) return self.litUnion(&.{ "short", "long" });
+            if (std.mem.eql(u8, key, "signDisplay")) return self.litUnion(&.{ "auto", "never", "always", "exceptZero", "negative" });
+            if (std.mem.eql(u8, key, "unitDisplay")) return self.litUnion(&.{ "long", "short", "narrow" });
+            if (std.mem.eql(u8, key, "roundingPriority")) return self.litUnion(&.{ "auto", "morePrecision", "lessPrecision" });
+            if (std.mem.eql(u8, key, "trailingZeroDisplay")) return self.litUnion(&.{ "auto", "stripIfInteger" });
+            if (std.mem.eql(u8, key, "roundingMode")) return self.litUnion(&.{ "ceil", "floor", "expand", "trunc", "halfCeil", "halfFloor", "halfExpand", "halfTrunc", "halfEven" });
+        }
+        return null;
+    }
+
     fn objectPropExpectedType(self: *Checker, obj_ty: TypeId, key: []const u8) ?TypeId {
         const t = self.store.get(obj_ty);
         if (t.kind == .object_t) {
@@ -24475,6 +24501,9 @@ pub const Checker = struct {
         if (t.kind == .type_ref) {
             const m = self.memberOnApparentType(obj_ty, key, .none);
             if (!tymod.isUnknown(&self.store, m) and !tymod.isAny(&self.store, m)) return m;
+            // Curated lib option interface (Intl.NumberFormatOptions, …) whose
+            // literal-union members aren't structurally modeled.
+            if (self.optionTypePropType(t.name, key)) |pt| return pt;
         }
         return null;
     }
