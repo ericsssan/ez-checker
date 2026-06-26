@@ -1201,25 +1201,40 @@ pub const Checker = struct {
     /// type.  Returns null (bail) for a plain identifier (no structural type),
     /// a rest element, or an empty-array default `= []` (never[] is
     /// strict-dependent).
-    fn bindingElementValueType(self: *Checker, el: NodeIndex, depth: u8) ?TypeId {
+    fn ctxUsable(c: ?TypeId) ?TypeId {
+        const t = c orelse return null;
+        if (t.eq(tymod.ID_ANY) or t.eq(tymod.ID_UNKNOWN)) return null;
+        return t;
+    }
+
+    /// `ctx` is the contextual type for this slot — the corresponding member /
+    /// element of the iterable element type (for `for (const {a} of xs)` etc.),
+    /// or null.  A default takes precedence; a no-default plain identifier reads
+    /// its type from `ctx` (and bails when there's no usable context).
+    fn bindingElementValueType(self: *Checker, el: NodeIndex, ctx: ?TypeId, depth: u8) ?TypeId {
         if (el == .none) return tymod.ID_UNDEFINED; // elision hole
         switch (self.ast_ref.nodeTag(el)) {
             .assignment_pattern => {
                 const ad = self.ast_ref.nodeData(el);
                 const lt = self.ast_ref.nodeTag(ad.lhs);
                 if (lt == .array_pattern or lt == .object_pattern)
-                    return self.bindingPatternStructuralType(ad.lhs, depth + 1);
+                    return self.bindingPatternStructuralType(ad.lhs, ctx, depth + 1);
                 if (ad.rhs == .none) return null;
-                const w = self.widenLiteralKind(self.typeOf(ad.rhs));
-                if (self.isEmptyTuple(w)) return null;
-                return w;
+                const dt = self.typeOf(ad.rhs);
+                if (self.isEmptyTuple(dt)) return null;
+                // A member-expression default (`= E.x` enum member) keeps its own
+                // type (`E`, not the widened `number`); literal defaults widen.
+                const rt = self.ast_ref.nodeTag(ad.rhs);
+                if (rt == .member_expr or rt == .optional_member_expr) return dt;
+                return self.widenLiteralKind(dt);
             },
-            .array_pattern, .object_pattern => return self.bindingPatternStructuralType(el, depth + 1),
-            else => return null, // plain identifier / rest → bail
+            .array_pattern, .object_pattern => return self.bindingPatternStructuralType(el, ctx, depth + 1),
+            .identifier => return ctxUsable(ctx), // no-default binding → contextual element type
+            else => return null, // rest → bail
         }
     }
 
-    fn bindingPatternStructuralType(self: *Checker, node: NodeIndex, depth: u8) ?TypeId {
+    fn bindingPatternStructuralType(self: *Checker, node: NodeIndex, elem_ctx: ?TypeId, depth: u8) ?TypeId {
         if (depth > 8) return null;
         const tag = self.ast_ref.nodeTag(node);
         const d = self.ast_ref.nodeData(node);
@@ -1227,7 +1242,16 @@ pub const Checker = struct {
         if (slice.len == 0 or slice.len > 24) return null;
         if (tag == .array_pattern) {
             var elems: [24]TypeId = undefined;
-            for (slice, 0..) |raw, i| elems[i] = self.bindingElementValueType(@enumFromInt(raw), depth) orelse return null;
+            for (slice, 0..) |raw, i| {
+                // Array no-default slots use contextual element types ONLY when
+                // the element is a clean TUPLE (positional) — an array-typed or
+                // over-resolved iterable element is unreliable here, so bail.
+                const slot_ctx: ?TypeId = if (ctxUsable(elem_ctx)) |e|
+                    (if (self.store.get(e).kind == .tuple_t) self.tupleOrArrayElement(e, i) else null)
+                else
+                    null;
+                elems[i] = self.bindingElementValueType(@enumFromInt(raw), slot_ctx, depth) orelse return null;
+            }
             return self.store.tupleOf(elems[0..slice.len]) catch null;
         }
         if (tag == .object_pattern) {
@@ -1242,10 +1266,11 @@ pub const Checker = struct {
                 };
                 const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(prop));
                 if (key.len == 0) return null;
+                const slot_ctx: ?TypeId = if (ctxUsable(elem_ctx)) |e| self.memberOnApparentType(e, key, node) else null;
                 // A property with a default (`{ name: x = d }`) is OPTIONAL: the
                 // member may be absent and the default supplies it (`name?:`).
                 const has_default = self.ast_ref.nodeTag(valnode) == .assignment_pattern;
-                props[i] = .{ .name = key, .type_id = self.bindingElementValueType(valnode, depth) orelse return null, .optional = has_default };
+                props[i] = .{ .name = key, .type_id = self.bindingElementValueType(valnode, slot_ctx, depth) orelse return null, .optional = has_default };
             }
             const list = self.store.appendObjectProps(props[0..slice.len]) catch return null;
             return self.store.add(.{ .kind = .object_t, .object_props = list }) catch null;
@@ -1257,7 +1282,7 @@ pub const Checker = struct {
         const t = self.ast_ref.nodeTag(node);
         return switch (t) {
             .array_pattern, .object_pattern => if (self.arrayPatternIsBinding(node))
-                (self.bindingPatternStructuralType(node, 0) orelse tymod.ID_ANY)
+                (self.bindingPatternStructuralType(node, self.forOfBindingElementType(node), 0) orelse tymod.ID_ANY)
             else
                 tymod.ID_ANY,
             .string_literal => self.moduleNameLiteralType(node) orelse self.literalString(node),
