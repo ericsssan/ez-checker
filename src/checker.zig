@@ -17885,6 +17885,20 @@ pub const Checker = struct {
     /// parameters spreading each trailing arg against the rest element).  Fills
     /// `names`/`bindings` (unbound entries stay `TypeId.none`).  Returns the
     /// type-param count, or 0 if the callee isn't a generic fn decl we resolve.
+    /// True when a `ts_type_parameter` carries the `const` modifier (`<const T>`).
+    /// The parser discards the modifier (typescript.zig), so detect it by
+    /// scanning back from the name token past any `in`/`out` variance modifiers.
+    fn typeParamIsConst(self: *Checker, tp_node: NodeIndex) bool {
+        var t: u32 = self.ast_ref.nodeMainToken(tp_node);
+        while (t > 0) {
+            t -= 1;
+            const txt = self.ast_ref.tokenText(t);
+            if (std.mem.eql(u8, txt, "in") or std.mem.eql(u8, txt, "out")) continue;
+            return std.mem.eql(u8, txt, "const");
+        }
+        return false;
+    }
+
     fn collectCallBindings(
         self: *Checker,
         callee: NodeIndex,
@@ -17897,17 +17911,24 @@ pub const Checker = struct {
         if (fd.type_params_end <= fd.type_params) return 0;
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
         var tp_count: usize = 0;
+        var const_mask = std.mem.zeroes([8]bool);
         if (fd.type_params_end <= ext_len) {
             for (self.ast_ref.extra_data[fd.type_params..fd.type_params_end]) |raw| {
                 if (tp_count >= names.len) break;
                 const tp_node: NodeIndex = @enumFromInt(raw);
                 if (self.ast_ref.nodeTag(tp_node) != .ts_type_parameter) continue;
                 names[tp_count] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
+                const_mask[tp_count] = self.typeParamIsConst(tp_node);
                 tp_count += 1;
             }
         }
         if (tp_count == 0) return 0;
-        for (0..tp_count) |b| bindings[b] = TypeId.none;
+        // A `const` type param (`<const T>`) preserves literals on inference — a
+        // feature the parser DISCARDS the modifier for, so we can't compute the
+        // const form.  Pre-bind it to `unknown` so it stays UNINFERRED (an honest
+        // gap) instead of being bound to the widened arg type (a wrong) by the
+        // forward/return matching below.  An explicit type arg still overrides.
+        for (0..tp_count) |b| bindings[b] = if (const_mask[b]) tymod.ID_UNKNOWN else TypeId.none;
         // Explicit type args (`fn<T>(x)` via ts_instantiation_expr).
         {
             var c = callee;
@@ -18342,6 +18363,22 @@ pub const Checker = struct {
     /// matches one of `names`.  When found and not yet bound, set
     /// `bindings[i]` to `arg_ty`.  Recurses through unions /
     /// intersections / arrays / `Foo<T>` type args.
+    /// Whether it's safe to unify a function-type param's RETURN against the
+    /// arg's return `ret_id`.  Unsafe when `ret_id` is generic (mentions a type
+    /// param — leaks bare params), a union (over-unions, inferTupleFromBinding
+    /// Pattern), or a bare reference to one of the inference type params.
+    fn returnUnifySafe(self: *Checker, ret_id: TypeId, names: []const []const u8) bool {
+        const t = self.store.get(ret_id);
+        if (t.kind == .union_t) return false;
+        if (self.typeMentionsTypeParam(ret_id)) return false;
+        if (t.kind == .type_ref or t.kind == .type_param) {
+            for (names) |n| {
+                if (n.len != 0 and std.mem.eql(u8, n, t.name)) return false;
+            }
+        }
+        return true;
+    }
+
     fn matchTypeParam(
         self: *Checker,
         param_node: NodeIndex,
@@ -18465,9 +18502,20 @@ pub const Checker = struct {
                     self.matchTypeParam(pty_node, param_type_ids[pi], names, bindings);
                 }
             }
-            // Match return type annotation against the arg's return type.
-            if (fd.return_type != .none) {
-                self.matchTypeParam(fd.return_type, ret_id, names, bindings);
+            // Match return type annotation against the arg's return type.  A
+            // ts_function_type/ts_constructor_type stores its return in fd.body
+            // (the parser reuses that field for type-position fns), NOT
+            // fd.return_type — see resolveFunctionType.
+            // Skip when the arg's return is itself a bare type parameter:
+            // matching a param-return against a generic return binds param→param
+            // and leaks bare params (contextualSignatureInstantiation, etc.).
+            const rnode = if (fd.body != .none) fd.body else fd.return_type;
+            // Don't recurse into a curried/nested function return (`(x:T)=>(y:S)=>U`,
+            // inferentialTypingWithFunctionTypeZip) — it leaks bare params.
+            const rtag = self.ast_ref.nodeTag(rnode);
+            const ret_is_fn = rtag == .ts_function_type or rtag == .ts_constructor_type;
+            if (rnode != .none and !ret_is_fn and self.returnUnifySafe(ret_id, names)) {
+                self.matchTypeParam(rnode, ret_id, names, bindings);
             }
             return;
         }
