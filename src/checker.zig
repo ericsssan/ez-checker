@@ -18165,34 +18165,75 @@ pub const Checker = struct {
         return ty_node;
     }
 
+    /// The default-type NODE of the callee's type parameter `idx` (`<T = D>` →
+    /// the `D` node), or null when it has no default.
+    fn calleeTypeParamDefaultNode(self: *Checker, callee: NodeIndex, idx: usize) ?NodeIndex {
+        const fn_decl = self.findCalleeFnDecl(callee) orelse return null;
+        const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(self.ast_ref.nodeData(fn_decl).lhs));
+        if (fd.type_params_end <= fd.type_params) return null;
+        const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+        if (fd.type_params_end > ext_len) return null;
+        var tp_i: usize = 0;
+        for (self.ast_ref.extra_data[fd.type_params..fd.type_params_end]) |raw| {
+            const tp_node: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(tp_node) != .ts_type_parameter) continue;
+            if (tp_i == idx) {
+                const def = self.ast_ref.nodeData(tp_node).rhs; // rhs = default (or .none)
+                return if (def == .none) null else def;
+            }
+            tp_i += 1;
+        }
+        return null;
+    }
+
+    /// True when `id` is still a bare reference to one of the type parameters in
+    /// `names` (an unresolved self/forward-referential default like `f<T = T>`).
+    fn isUnresolvedTypeParam(self: *Checker, id: TypeId, names: []const []const u8) bool {
+        const t = self.store.get(id);
+        const nm = switch (t.kind) {
+            .type_param, .type_ref => t.name,
+            else => return false,
+        };
+        for (names) |n| {
+            if (n.len != 0 and std.mem.eql(u8, n, nm)) return true;
+        }
+        return false;
+    }
+
     fn inferGenericReturn(self: *Checker, callee: NodeIndex, call: NodeIndex, return_ty: TypeId) ?TypeId {
         var names_buf: [8][]const u8 = undefined;
         var bindings_buf: [8]TypeId = undefined;
         const tp_count = self.collectCallBindings(callee, call, &names_buf, &bindings_buf);
         if (tp_count == 0) return null;
-        var any_bound = false;
-        for (bindings_buf[0..tp_count]) |b| {
-            if (!b.eq(TypeId.none)) { any_bound = true; break; }
-        }
-        if (!any_bound) return null;
         // TypeScript widens literal type params only when the return type is a
         // tuple (e.g. `tuple2(1,"s"):[T0,T1]` → `[number,string]`).
         // For `f<T>(x:T):T`, the literal `1` is preserved as-is.
         const ret_is_tuple = self.store.get(return_ty).kind == .tuple_t;
-        for (bindings_buf[0..tp_count]) |*b| {
-            if (b.eq(TypeId.none)) {
-                b.* = tymod.ID_UNKNOWN;
+        // Resolve each type param in index order. Bound-from-args → keep (widening
+        // literals in tuple returns). Unbound → its DEFAULT, resolved with the
+        // earlier (already-resolved) params substituted in (`f<T=A, U=T>` → U=A);
+        // a default that stays a generic param (`f<T=T>` self-ref) → unknown; no
+        // default at all → unknown (`f<T>(): T` called bare → unknown).
+        for (0..tp_count) |i| {
+            if (!bindings_buf[i].eq(TypeId.none)) {
+                if (ret_is_tuple) {
+                    bindings_buf[i] = switch (self.store.get(bindings_buf[i]).kind) {
+                        .number_literal => tymod.ID_NUMBER,
+                        .string_literal => tymod.ID_STRING,
+                        .boolean_literal => tymod.ID_BOOLEAN,
+                        .bigint_literal => tymod.ID_BIGINT,
+                        else => bindings_buf[i],
+                    };
+                }
                 continue;
             }
-            if (ret_is_tuple) {
-                const bk = self.store.get(b.*).kind;
-                b.* = switch (bk) {
-                    .number_literal => tymod.ID_NUMBER,
-                    .string_literal => tymod.ID_STRING,
-                    .boolean_literal => tymod.ID_BOOLEAN,
-                    .bigint_literal => tymod.ID_BIGINT,
-                    else => b.*,
-                };
+            if (self.calleeTypeParamDefaultNode(callee, i)) |def_node| {
+                var def_ty = self.resolveTypeNode(def_node);
+                if (i > 0) def_ty = self.substituteTypeId(def_ty, names_buf[0..i], bindings_buf[0..i]);
+                if (self.isUnresolvedTypeParam(def_ty, names_buf[0..tp_count])) def_ty = tymod.ID_UNKNOWN;
+                bindings_buf[i] = def_ty;
+            } else {
+                bindings_buf[i] = tymod.ID_UNKNOWN;
             }
         }
         return self.substituteTypeId(return_ty, names_buf[0..tp_count], bindings_buf[0..tp_count]);
