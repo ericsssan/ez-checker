@@ -23225,7 +23225,9 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "toLocaleString")) {
             const str_arr = self.store.arrayOf(tymod.ID_STRING) catch return self.makeNullaryFn(tymod.ID_STRING);
             const locales = self.store.unionOf(&.{ tymod.ID_STRING, str_arr }) catch return self.makeNullaryFn(tymod.ID_STRING);
-            const opts = self.store.typeRef("Intl.NumberFormatOptions & Intl.DateTimeFormatOptions", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const nfo = self.store.typeRef("Intl.NumberFormatOptions", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const dtfo = self.store.typeRef("Intl.DateTimeFormatOptions", &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
+            const opts = self.store.intersectionOf(&.{ nfo, dtfo }) catch return self.makeNullaryFn(tymod.ID_STRING);
             const pr1 = self.store.appendSignatureParamsFull(&.{}, &.{}, &.{}) catch return self.makeNullaryFn(tymod.ID_STRING);
             const pr2 = self.store.appendSignatureParamsFull(&.{ locales, opts }, &.{ "locales", "options" }, &.{ false, true }) catch return self.makeNullaryFn(tymod.ID_STRING);
             const sigs = [_]tymod.Signature{
@@ -23975,6 +23977,13 @@ pub const Checker = struct {
         // When the expected type is a union (e.g. `X | Y`), preserve the literal
         // if ANY member expects it — e.g. passing `{type:'y'}` to `(bar: X | Y) => void`.
         if (ct.kind == .union_t) {
+            for (self.store.idsOf(ct.list_data)) |m| {
+                if (self.contextualPropExpectsLiteral(m, prop_name, val_ty)) return true;
+            }
+        }
+        // Intersection (`A & B`, e.g. NumberFormatOptions & DateTimeFormatOptions
+        // for Array.toLocaleString options): preserve if ANY member expects it.
+        if (ct.kind == .intersection_t) {
             for (self.store.idsOf(ct.list_data)) |m| {
                 if (self.contextualPropExpectsLiteral(m, prop_name, val_ty)) return true;
             }
