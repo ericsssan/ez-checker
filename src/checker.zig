@@ -1156,9 +1156,83 @@ pub const Checker = struct {
 
     // ── Expression inference ──────────────────────────────
 
+    fn widenLiteralKind(self: *Checker, id: TypeId) TypeId {
+        return switch (self.store.get(id).kind) {
+            .string_literal => tymod.ID_STRING,
+            .number_literal => tymod.ID_NUMBER,
+            .boolean_literal => tymod.ID_BOOLEAN,
+            .bigint_literal => tymod.ID_BIGINT,
+            else => id,
+        };
+    }
+
+    fn isEmptyTuple(self: *Checker, id: TypeId) bool {
+        const t = self.store.get(id);
+        return t.kind == .tuple_t and self.store.idsOf(t.list_data).len == 0;
+    }
+
+    /// An array binding PATTERN in a declaration (`var`/`let`/`const`/`for-of`
+    /// binding) — NOT an assignment target (`[a] = x`, whose type is the RHS).
+    fn arrayPatternIsBinding(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var guard: u8 = 0;
+        while (p != NONE and p < parents.len and p < self.ast_ref.nodes.len and guard < 10) : (guard += 1) {
+            switch (self.ast_ref.nodeTag(@enumFromInt(p))) {
+                .array_pattern, .object_pattern, .assignment_pattern => {}, // pattern wrapper — keep walking
+                .declarator, .var_decl, .let_decl, .const_decl, .for_of_stmt, .for_in_stmt => return true,
+                else => return false, // assignment target (`.assign`) / param / other → not a binding decl
+            }
+            p = parents[p];
+        }
+        return false;
+    }
+
+    /// Structural type of an array binding PATTERN built from its own shape —
+    /// holes → `undefined`, `x = default` → widened default type, nested patterns
+    /// recurse — rendered as a tuple (`[, nameA = "noName"]` → `[undefined,
+    /// string]`).  Returns null unless EVERY element is structural (hole / default
+    /// / nested array pattern); plain identifiers, rest elements, object patterns,
+    /// and empty-array defaults (`= []`, whose `never[]` widening is strict-mode
+    /// dependent) all bail — leaving those contexts unchanged.
+    fn bindingPatternStructuralType(self: *Checker, node: NodeIndex, depth: u8) ?TypeId {
+        if (depth > 8 or self.ast_ref.nodeTag(node) != .array_pattern) return null;
+        const d = self.ast_ref.nodeData(node);
+        const slice = self.directRange(d.lhs, d.rhs) orelse return null;
+        if (slice.len == 0 or slice.len > 16) return null;
+        var elems: [16]TypeId = undefined;
+        for (slice, 0..) |raw, i| {
+            const el: NodeIndex = @enumFromInt(raw);
+            if (el == .none) {
+                elems[i] = tymod.ID_UNDEFINED; // elision hole
+                continue;
+            }
+            switch (self.ast_ref.nodeTag(el)) {
+                .assignment_pattern => {
+                    const ad = self.ast_ref.nodeData(el);
+                    if (self.ast_ref.nodeTag(ad.lhs) == .array_pattern) {
+                        elems[i] = self.bindingPatternStructuralType(ad.lhs, depth + 1) orelse return null;
+                    } else if (ad.rhs != .none) {
+                        const w = self.widenLiteralKind(self.typeOf(ad.rhs));
+                        if (self.isEmptyTuple(w)) return null; // `= []` → never[] (strict-dependent); bail
+                        elems[i] = w;
+                    } else return null;
+                },
+                .array_pattern => elems[i] = self.bindingPatternStructuralType(el, depth + 1) orelse return null,
+                else => return null, // plain identifier / rest / object pattern → bail
+            }
+        }
+        return self.store.tupleOf(elems[0..slice.len]) catch null;
+    }
+
     fn inferExpr(self: *Checker, node: NodeIndex) TypeId {
         const t = self.ast_ref.nodeTag(node);
         return switch (t) {
+            .array_pattern => if (self.arrayPatternIsBinding(node))
+                (self.bindingPatternStructuralType(node, 0) orelse tymod.ID_ANY)
+            else
+                tymod.ID_ANY,
             .string_literal => self.moduleNameLiteralType(node) orelse self.literalString(node),
             .number_literal => self.literalNumber(node),
             .bigint_literal => self.literalBigint(node),
