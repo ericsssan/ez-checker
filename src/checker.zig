@@ -24470,6 +24470,16 @@ pub const Checker = struct {
             if (std.mem.eql(u8, key, "dateStyle") or std.mem.eql(u8, key, "timeStyle")) return self.litUnion(&.{ "full", "long", "medium", "short" });
             if (std.mem.eql(u8, key, "timeZoneName")) return self.litUnion(&.{ "short", "long", "shortOffset", "longOffset", "shortGeneric", "longGeneric" });
         }
+        // Temporal option interfaces are generic (`Temporal.RoundingOptions<U>`),
+        // so match by the `Temporal.` prefix.
+        if (std.mem.startsWith(u8, type_name, "Temporal.")) {
+            if (std.mem.eql(u8, key, "smallestUnit") or std.mem.eql(u8, key, "largestUnit") or std.mem.eql(u8, key, "unit"))
+                return self.litUnion(&.{ "year", "month", "week", "day", "hour", "minute", "second", "millisecond", "microsecond", "nanosecond", "years", "months", "weeks", "days", "hours", "minutes", "seconds", "milliseconds", "microseconds", "nanoseconds", "auto" });
+            if (std.mem.eql(u8, key, "roundingMode")) return self.litUnion(&.{ "ceil", "floor", "expand", "trunc", "halfCeil", "halfFloor", "halfExpand", "halfTrunc", "halfEven" });
+            if (std.mem.eql(u8, key, "overflow")) return self.litUnion(&.{ "constrain", "reject" });
+            if (std.mem.eql(u8, key, "disambiguation")) return self.litUnion(&.{ "compatible", "earlier", "later", "reject" });
+            if (std.mem.eql(u8, key, "offset")) return self.litUnion(&.{ "prefer", "use", "ignore", "reject" });
+        }
         return null;
     }
 
