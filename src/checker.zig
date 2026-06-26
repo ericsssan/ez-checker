@@ -24392,6 +24392,24 @@ pub const Checker = struct {
         if (ct.kind != .function_t) return null;
         const sigs = self.store.signaturesOf(ct.signatures);
         if (sigs.len == 0) return null;
+        // Overload set + object-literal arg: union the param types at this
+        // position across overloads, so a literal option survives whenever ANY
+        // overload's param expects it (`toLocaleString()` vs `(locales, options)`).
+        // Restricted to object literals to leave callback param typing untouched.
+        if (ct.is_overload_set and sigs.len > 1 and self.ast_ref.nodeTag(arg) == .object_literal) {
+            var buf: [8]TypeId = undefined;
+            var n: usize = 0;
+            for (sigs) |s| {
+                const ps = self.store.signatureParamsOf(s);
+                if (ai < ps.len and n < buf.len) {
+                    buf[n] = ps[ai];
+                    n += 1;
+                }
+            }
+            if (n == 0) return null;
+            if (n == 1) return self.nonNullExpected(buf[0]);
+            return self.nonNullExpected(self.store.unionOf(buf[0..n]) catch return null);
+        }
         const params = self.store.signatureParamsOf(sigs[0]);
         if (ai >= params.len) return null;
         return self.nonNullExpected(params[ai]);
