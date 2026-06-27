@@ -1141,7 +1141,15 @@ pub const Checker = struct {
         // of poisoning the method's whole return type to `any`.
         const poisoned_by_class_build = self.building_n > 0 and
             (computed.eq(tymod.ID_ANY) or computed.eq(tymod.ID_UNKNOWN));
-        if (self.evolving_in_progress.count() == 0 and !poisoned_by_class_build) {
+        // A context-sensitive function literal typed DURING a pass-2 re-typing
+        // (`infer_pass2_depth > 0`) may be incomplete/context-polluted — its
+        // params depend on the enclosing call's provisional bindings.  Leave it
+        // uncached so the later standalone query recomputes against the real
+        // contextual type (the nested-callback resolver).  Narrow enough not to
+        // disturb the recursion guard (the in-progress `ID_ANY` still breaks
+        // cycles; only the post-computation persist is suppressed).
+        const cs_in_pass2 = self.infer_pass2_depth > 0;
+        if (self.evolving_in_progress.count() == 0 and !poisoned_by_class_build and !cs_in_pass2) {
             self.node_types[idx] = computed;
         } else {
             self.node_types[idx] = TypeId.none;
@@ -24685,6 +24693,23 @@ pub const Checker = struct {
             self.nested_ctx_depth -= 1;
             if (inst) |it| {
                 if (!self.typeMentionsTypeParam(it)) return it;
+            }
+        }
+        // THIS call is itself nested in an enclosing generic call (e.g. the inner
+        // `wrap` of `arrayize(wrap(s=>…))`): its OWN type params flow from the
+        // outer contextual type.  Resolve `ai`'s param TOP-DOWN (pure type-level)
+        // so a contextually-typed callback arg gets concrete param types.
+        if (self.typeMentionsTypeParam(ctx) and self.nested_ctx_depth < 3 and
+            self.enclosingCallArg(call_node) != null)
+        {
+            self.nested_ctx_depth += 1;
+            const top: ?TypeId = if (self.nestedCallExpectedType(call_node, 0)) |cexp|
+                self.instantiateParamFromExpectedReturn(call_node, cexp, @intCast(ai))
+            else
+                null;
+            self.nested_ctx_depth -= 1;
+            if (top) |t| {
+                if (!self.typeMentionsTypeParam(t)) return t;
             }
         }
         return ctx;
