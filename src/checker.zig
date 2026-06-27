@@ -18015,11 +18015,14 @@ pub const Checker = struct {
         // step that lets `wrap(s => s.length)` resolve to `Mapper<string,number>`.
         {
             var some_bound = false;
-            var some_unbound = false;
             for (bindings[0..tp_count]) |b| {
-                if (b.eq(TypeId.none)) some_unbound = true else some_bound = true;
+                if (!b.eq(TypeId.none)) some_bound = true;
             }
-            if (some_bound and some_unbound and self.infer_pass2_depth < 3) {
+            // Run even when ALL params are bound: besides binding any still-open
+            // return-side params, this step RE-TYPES each deferred context-
+            // sensitive callback under the fixed context so its params resolve
+            // (`s` → `T=string` in `wrap(s=>s.length)`), updating its node type.
+            if (some_bound and self.infer_pass2_depth < 3) {
                 const frame_start = self.infer_ctx_names.items.len;
                 // Snapshot the already-fixed bindings: pass 2 may ONLY fill the
                 // still-unbound params, never override a fixed one (a
