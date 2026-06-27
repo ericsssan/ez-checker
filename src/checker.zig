@@ -17978,6 +17978,10 @@ pub const Checker = struct {
                     self.matchContextSensitiveReturn(@enumFromInt(arg_raw), param_ty_node, names[0..tp_count], bindings[0..tp_count]);
                 continue;
             }
+            // Defer a call whose own args are context-sensitive (`arrayize(wrap(
+            // s=>…))`) — typing it now (params still open) gives bare params; it's
+            // re-typed in pass 2 under the fixed context.
+            if (self.argIsContextSensitiveCall(@enumFromInt(arg_raw), 0)) continue;
             const arg_ty = self.typeOf(@enumFromInt(arg_raw));
             // For the rest param each trailing arg matches the rest ELEMENT.
             const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
@@ -18043,11 +18047,16 @@ pub const Checker = struct {
                 for (arg_nodes, 0..) |arg_raw, ai| {
                     const pidx = if (ai < params.len) ai else rest_pi;
                     if (pidx == std.math.maxInt(usize) or pidx >= params.len) continue;
-                    if (!self.argIsContextSensitiveFn(@enumFromInt(arg_raw))) continue;
-                    if (self.arrowAnnotatedReturnType(@enumFromInt(arg_raw)) != null) continue;
+                    const arg_node: NodeIndex = @enumFromInt(arg_raw);
+                    // Deferred context-sensitive arrows AND nested calls (re-typed
+                    // under the now-fixed context so `arrayize(wrap(s=>…))`'s inner
+                    // wrap sees the outer T=string).
+                    const is_cs_fn = self.argIsContextSensitiveFn(arg_node) and
+                        self.arrowAnnotatedReturnType(arg_node) == null;
+                    if (!is_cs_fn and !self.argIsContextSensitiveCall(arg_node, 0)) continue;
                     const param: NodeIndex = @enumFromInt(params[pidx]);
                     const param_ty_node = self.paramAnnotationNode(param) orelse continue;
-                    const arg_ty = self.typeOf(@enumFromInt(arg_raw));
+                    const arg_ty = self.typeOf(arg_node);
                     const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
                     self.matchTypeParam(match_node, arg_ty, names[0..tp_count], bindings[0..tp_count]);
                 }
@@ -18145,6 +18154,25 @@ pub const Checker = struct {
     /// True when `arg` is a context-sensitive function literal — an
     /// arrow/function expression with at least one UN-annotated parameter,
     /// whose param types are therefore implicit `any` until contextually typed.
+    /// A CALL/new whose own arguments (recursively) contain a context-sensitive
+    /// function literal — `wrap(s => s.length)`, `arrayize(wrap(s => …))`.  Such
+    /// a call's inference depends on the ENCLOSING call's fixed type params, so
+    /// it must be DEFERRED to pass 2 (like a bare context-sensitive arrow) rather
+    /// than typed forward in pass 1 with the type params still open.
+    fn argIsContextSensitiveCall(self: *Checker, arg: NodeIndex, depth: u8) bool {
+        if (depth > 4) return false;
+        switch (self.ast_ref.nodeTag(arg)) {
+            .call_expr, .optional_call_expr, .new_expr => {},
+            else => return false,
+        }
+        for (self.callArguments(arg)) |inner_raw| {
+            const inner: NodeIndex = @enumFromInt(inner_raw);
+            if (self.argIsContextSensitiveFn(inner)) return true;
+            if (self.argIsContextSensitiveCall(inner, depth + 1)) return true;
+        }
+        return false;
+    }
+
     fn argIsContextSensitiveFn(self: *Checker, arg: NodeIndex) bool {
         var ps: u32 = 0;
         var pe: u32 = 0;
@@ -24513,7 +24541,12 @@ pub const Checker = struct {
         }
         const params = self.store.signatureParamsOf(sigs[0]);
         if (ai >= params.len) return null;
-        return self.nonNullExpected(params[ai]);
+        // Substitute the ENCLOSING generic call's provisionally-bound type params
+        // (pass-2 infer_ctx) so a nested call's expected type is concrete:
+        // `arrayize(wrap(s=>…))`'s `wrap` sees `Mapper<string,number>`, not the
+        // generic `Mapper<T,U>`.  No-op when no inference context is active.
+        const e = self.nonNullExpected(params[ai]) orelse return null;
+        return self.substituteThroughInferCtx(e);
     }
 
     /// Return-type annotation of the function enclosing `from_node`.
