@@ -2417,6 +2417,78 @@ pub const Checker = struct {
         return self.scopeTaggedRef(name, args_buf[0..count], parent) catch null;
     }
 
+    /// True when `class_node` (a class_expr) is the RHS of a CommonJS export
+    /// assignment — `module.exports = class C {…}`, `exports = class C {…}`, or
+    /// `exports.X = class C {…}`.  tsc names such a binding by its module import
+    /// type (`typeof import("…")`), not the local class name, so the class-expr
+    /// name site must not be resolved to a local `typeof C`.
+    fn classExprIsCommonjsExport(self: *Checker, class_node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const ni = class_node.toInt();
+        if (ni >= parents.len) return false;
+        const p = parents[ni];
+        if (p == @intFromEnum(NodeIndex.none) or p >= self.ast_ref.nodes.len) return false;
+        const pn: NodeIndex = @enumFromInt(p);
+        if (self.ast_ref.nodeTag(pn) != .assign) return false;
+        const pd = self.ast_ref.nodeData(pn);
+        if (pd.rhs != class_node or pd.lhs == .none) return false;
+        switch (self.ast_ref.nodeTag(pd.lhs)) {
+            .identifier => return std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd.lhs)), "exports"),
+            .member_expr => {
+                const obj = self.ast_ref.nodeData(pd.lhs).lhs;
+                if (obj == .none or self.ast_ref.nodeTag(obj) != .identifier) return false;
+                const objn = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(obj));
+                return std.mem.eql(u8, objn, "module") or std.mem.eql(u8, objn, "exports");
+            },
+            else => return false,
+        }
+    }
+
+    /// True when a class expression extends a base that is NOT a concrete,
+    /// nameable class — a value parameter (`class C extends SuperClass` where
+    /// `SuperClass` is a generic param), a mixin application (`extends Mixin(x)`),
+    /// or another non-class expression.  tsc renders such a class's constructor
+    /// as a `{ new(...): C; … } & T` intersection, so its name site must NOT
+    /// resolve to `typeof C`.  A class extending a known class or built-in
+    /// (`extends Base`, `extends Number`) keeps `typeof C`.
+    ///
+    /// `ClassData.super_class` is unreliable for class expressions in es-parser
+    /// v0.2.13 (often `.none` despite an `extends`), so the heritage clause is
+    /// located by scanning tokens: the `kw_extends` outside any `<…>` type-param
+    /// list, between the `class` keyword and the body's opening brace.
+    fn classExprExtendsNonClass(self: *Checker, class_node: NodeIndex, cd: ast.ClassData) bool {
+        if (cd.body == .none) return false;
+        const start = self.ast_ref.nodeMainToken(class_node);
+        const body_tok = self.ast_ref.nodeMainToken(cd.body);
+        if (body_tok <= start) return false;
+        var depth: i32 = 0;
+        var ext_tok: ?u32 = null;
+        var t = start;
+        while (t < body_tok) : (t += 1) {
+            switch (self.ast_ref.tokenTag(t)) {
+                .less_than => depth += 1,
+                .greater_than => depth -= 1,
+                .greater_greater => depth -= 2,
+                .greater_greater_greater => depth -= 3,
+                .kw_extends => if (depth == 0) {
+                    ext_tok = t;
+                    break;
+                },
+                else => {},
+            }
+        }
+        const et = ext_tok orelse return false; // no heritage clause
+        const base = et + 1;
+        if (base >= body_tok) return false;
+        // Non-identifier base (`extends (…)`, member expr) → not a plain class.
+        if (self.ast_ref.tokenTag(base) != .identifier) return true;
+        // `extends X(…)` — a mixin application call.
+        if (base + 1 < body_tok and self.ast_ref.tokenTag(base + 1) == .l_paren) return true;
+        // `extends X` — keep `typeof C` only when X names a known class/built-in;
+        // an unknown base (e.g. a value parameter) is mixin-like.
+        return !self.known_type_names.contains(self.ast_ref.tokenText(base));
+    }
+
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
         // Unannotated parameter in a type-only signature (interface method /
         // call / construct signature).  Without an annotation, `typeOfNameByAstSearch`
@@ -2498,6 +2570,99 @@ pub const Checker = struct {
             const ns_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
             const spec = self.namespace_import_map.get(ns_name) orelse break :ns_decl;
             if (self.namespaceImportBindingType(ns_name, spec)) |t| return t;
+        }
+        // An in-body REFERENCE to a class EXPRESSION's own name
+        // (`(class C { … C … })`): the name is in scope only inside the class body
+        // for self-reference, but es-parser v0.2.13 emits no symbol for it, so
+        // `symbolForIdentRef` misses and the reference falls through to `any`.  A
+        // value-position reference to the class is its constructor, `typeof C`.
+        // The class-expr name shadows any outer same-named binding inside the body,
+        // so this must win over `symbolForIdentRef` below.
+        //
+        // Restricted to in-body references (node != the name-declaration slot): the
+        // NAME SITE itself is context-dependent — clean class exprs render `typeof C`
+        // there, but mixins (`class C extends Base`) render a `{ new(...): C } & T`
+        // intersection, `export =`/`module.exports =` exprs render `typeof
+        // import("…")`, and parse-error recovery renders bare `C`.  Those are
+        // handled (or left to the normal path) elsewhere; firing here only for
+        // genuine references avoids emitting a wrong `typeof C` at the name site.
+        class_expr_self: {
+            if (self.identifierInTypePosition(node)) break :class_expr_self;
+            const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+            if (name.len == 0) break :class_expr_self;
+            const parents = self.semantic.parent_indices;
+            const NONE: u32 = @intFromEnum(NodeIndex.none);
+            // An object-literal property KEY (`{ C: … }`) is not a value reference
+            // to the class — leave it to the normal property-key path.  (Shorthand
+            // `{ C }` is a `.shorthand_property` and a computed key `{ [C]: … }` is a
+            // `.computed_property`; both ARE references, so neither matches here.)
+            if (node.toInt() < parents.len) {
+                const knp = parents[node.toInt()];
+                if (knp != NONE and knp < self.ast_ref.nodes.len and
+                    self.ast_ref.nodeTag(@enumFromInt(knp)) == .property)
+                {
+                    const kpd = self.ast_ref.nodeData(@enumFromInt(knp));
+                    if (kpd.lhs == node and kpd.rhs != .none) break :class_expr_self;
+                }
+            }
+            var p: u32 = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+            var guard: u32 = 0;
+            while (p != NONE and p < self.ast_ref.nodes.len) : (p = parents[p]) {
+                guard += 1;
+                if (guard > 128) break;
+                if (self.ast_ref.nodeTag(@enumFromInt(p)) != .class_expr) continue;
+                const pdata = self.ast_ref.nodeData(@enumFromInt(p));
+                if (pdata.lhs == .none) continue;
+                const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(pdata.lhs));
+                if (cd.name == .none) continue;
+                // Does this identifier refer to class_expr `p`'s own name?  The
+                // name-declaration slot matches by node identity; an in-body
+                // reference matches by text.
+                const is_name_site = (cd.name == node);
+                if (!is_name_site) {
+                    const cname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+                    if (!std.mem.eql(u8, cname, name)) continue; // unrelated; keep walking
+                }
+                // Skip the cases tsc renders as something other than `typeof C`,
+                // leaving them to the normal path:
+                //   * mixin (`class C extends Base`) → `{ new(...): C; … } & T`
+                //   * CommonJS export (`module.exports = class C`) → `typeof import("…")`
+                if (self.classExprExtendsNonClass(@enumFromInt(p), cd)) break :class_expr_self;
+                if (self.classExprIsCommonjsExport(@enumFromInt(p))) break :class_expr_self;
+                //   * a statement-position class_expr from parse-error / decorator
+                //     recovery is a declaration-like `class C {}` → bare `C`.  A
+                //     genuine class expression sits in a value position (declarator
+                //     init, assignment RHS, grouping, argument, …); one whose
+                //     parent is a statement container (`root`/`block_stmt`/
+                //     `expression_stmt`) is a misparsed declaration.
+                const cpp = parents[p];
+                if (cpp != NONE and cpp < self.ast_ref.nodes.len) switch (self.ast_ref.nodeTag(@enumFromInt(cpp))) {
+                    .expression_stmt, .root, .block_stmt => break :class_expr_self,
+                    else => {},
+                };
+                // An inner binding that shadows the class name
+                // (`class C { m() { let C = …; return C; } }`) resolves through the
+                // normal symbol path; defer to it when this reference binds to a
+                // declaration that lives INSIDE this class expression's subtree.
+                // (An OUTER same-named binding is correctly shadowed by the class
+                // name, so this must keep firing for it — hence the descendant test
+                // rather than "any resolved symbol".)
+                if (self.symbolForIdentRef(node)) |sym| {
+                    const decl = self.semantic.symbols.getDeclNode(sym);
+                    if (decl != .none and decl != cd.name) {
+                        var dp: u32 = decl.toInt();
+                        var dg: u32 = 0;
+                        while (dp != NONE and dp < self.ast_ref.nodes.len and dg <= 256) : (dp = parents[dp]) {
+                            dg += 1;
+                            if (dp == p) break :class_expr_self; // shadowing inner binding
+                        }
+                    }
+                }
+                // Assigning to the class binding is an error; tsc returns `any`.
+                if (self.identifierIsAssignLhs(node)) return tymod.ID_ANY;
+                const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return tymod.ID_ANY;
+                return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
+            }
         }
         if (self.symbolForIdentRef(node)) |sym| {
             // Namespace or class identifier in value position → `typeof Name`.
