@@ -8504,6 +8504,83 @@ pub const Checker = struct {
     /// Generic contextual typing for arrow/fn-expr callbacks.
     /// `bar(x => ...)` where `bar(cb: (arg: Foo) => void)`: the arrow's
     /// `x` should get type `Foo` from the callee's signature.
+    /// If `node` is (through groupings) an ARGUMENT of an enclosing call, return
+    /// that call and the argument slot. Null when it's the callee or not in a call.
+    fn enclosingCallArg(self: *Checker, node: NodeIndex) ?struct { call: NodeIndex, slot: u32 } {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var child = node;
+        var cur = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var guard: u8 = 0;
+        while (cur != NONE and guard < 6) : (guard += 1) {
+            const p: NodeIndex = @enumFromInt(cur);
+            switch (self.ast_ref.nodeTag(p)) {
+                .call_expr, .optional_call_expr, .new_expr => {
+                    for (self.callArguments(p), 0..) |raw, i| {
+                        if (raw == child.toInt()) return .{ .call = p, .slot = @intCast(i) };
+                    }
+                    return null; // the callee, not an arg
+                },
+                .grouping_expr => {},
+                else => return null,
+            }
+            child = p;
+            cur = if (p.toInt() < parents.len) parents[p.toInt()] else NONE;
+        }
+        return null;
+    }
+
+    /// Bind `call`'s type params by unifying its RETURN annotation against the
+    /// contextual `expected` type, then substitute them into the `param_slot`-th
+    /// parameter's annotation.  Pure TYPE-LEVEL (no typeOf on the args) — so it
+    /// drives nested contextual inference without the re-entrant cache pollution.
+    fn instantiateParamFromExpectedReturn(self: *Checker, call: NodeIndex, expected: TypeId, param_slot: u32) ?TypeId {
+        const callee = self.ast_ref.nodeData(call).lhs;
+        if (callee == .none) return null;
+        const fn_decl = self.findCalleeFnDecl(callee) orelse return null;
+        const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(self.ast_ref.nodeData(fn_decl).lhs));
+        const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+        if (fd.type_params >= fd.type_params_end or fd.type_params_end > ext_len) return null;
+        if (fd.params_end > ext_len or fd.return_type == .none) return null;
+        var names: [8][]const u8 = undefined;
+        var bindings: [8]TypeId = undefined;
+        var tp: usize = 0;
+        for (self.ast_ref.extra_data[fd.type_params..fd.type_params_end]) |raw| {
+            if (tp >= names.len) break;
+            const tpn: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(tpn) != .ts_type_parameter) continue;
+            names[tp] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tpn));
+            bindings[tp] = TypeId.none;
+            tp += 1;
+        }
+        if (tp == 0) return null;
+        var ret_node = fd.return_type;
+        if (self.ast_ref.nodeTag(ret_node) == .ts_type_annotation) ret_node = self.ast_ref.nodeData(ret_node).lhs;
+        if (ret_node == .none) return null;
+        self.matchTypeParam(ret_node, expected, names[0..tp], bindings[0..tp]);
+        for (bindings[0..tp]) |*b| {
+            if (b.eq(TypeId.none)) b.* = tymod.ID_UNKNOWN;
+        }
+        const params = self.ast_ref.extra_data[fd.params..fd.params_end];
+        if (param_slot >= params.len) return null;
+        const param: NodeIndex = @enumFromInt(params[param_slot]);
+        const param_node = self.paramAnnotationNode(param) orelse return null;
+        return self.resolveTypeNodeWithSubst(param_node, names[0..tp], bindings[0..tp]);
+    }
+
+    /// The contextual (expected) type of `call`, propagated TOP-DOWN through any
+    /// enclosing generic calls: `arrayize(wrap(s=>…))`'s `wrap` gets
+    /// `Mapper<string,number>` by resolving arrayize from f3's annotation first.
+    fn nestedCallExpectedType(self: *Checker, call: NodeIndex, depth: u8) ?TypeId {
+        if (depth > 4) return null;
+        if (self.enclosingCallArg(call)) |ec| {
+            if (self.nestedCallExpectedType(ec.call, depth + 1)) |outer| {
+                if (self.instantiateParamFromExpectedReturn(ec.call, outer, ec.slot)) |r| return r;
+            }
+        }
+        return self.expectedTypeOf(call);
+    }
+
     fn contextualCallbackParamType(self: *Checker, binding: NodeIndex) ?TypeId {
         const parents = self.semantic.parent_indices;
         const bidx = binding.toInt();
@@ -8641,7 +8718,12 @@ pub const Checker = struct {
         // parameter from the call's inferred type arguments (forward + backward
         // inference via inferGenericParamType), then re-extract our slot — so
         // `s` gets the inferred `T` instead of a bare, suppressed type param.
-        if (self.typeMentionsTypeParam(result) and self.cb_instantiate_depth < 2 and arg_slot >= 0) {
+        // DIRECT call (`wrap(s=>…)` not nested in another generic call): infer
+        // its type args forward+backward.  Nested calls use the top-down resolver
+        // below (inferGenericParamType re-enters typeOf and pollutes the cache).
+        if (self.typeMentionsTypeParam(result) and self.cb_instantiate_depth < 2 and arg_slot >= 0 and
+            self.enclosingCallArg(call_node) == null)
+        {
             self.cb_instantiate_depth += 1;
             const inst = self.inferGenericParamType(call_node, @intCast(arg_slot));
             self.cb_instantiate_depth -= 1;
@@ -8658,6 +8740,29 @@ pub const Checker = struct {
                 }
             }
         }
+        // NESTED generic call (`arrayize(wrap(s=>…))`): the immediate call can't
+        // infer its own type params — they flow from the OUTER call's contextual
+        // type.  Resolve TOP-DOWN from the outermost contextual type (pure
+        // type-level, no re-entrant typeOf), then take this slot's param.
+        if (self.typeMentionsTypeParam(result) and arg_slot >= 0 and self.cb_instantiate_depth < 3) {
+            self.cb_instantiate_depth += 1;
+            const nested: ?TypeId = if (self.nestedCallExpectedType(call_node, 0)) |wrap_exp|
+                self.instantiateParamFromExpectedReturn(call_node, wrap_exp, @intCast(arg_slot))
+            else
+                null;
+            self.cb_instantiate_depth -= 1;
+            if (nested) |ce| {
+                const ct2 = self.store.get(ce);
+                if (ct2.kind == .function_t) {
+                    const sigs2 = self.store.signaturesOf(ct2.signatures);
+                    if (sigs2.len > 0) {
+                        const ps2 = self.store.signatureParamsOf(sigs2[0]);
+                        const psl: usize = @intCast(param_slot);
+                        if (psl < ps2.len and !self.typeMentionsTypeParam(ps2[psl])) return ps2[psl];
+                    }
+                }
+            }
+        }
         return result;
     }
 
@@ -8666,12 +8771,30 @@ pub const Checker = struct {
         return self.typeMentionsTypeParamDepth(id, 0);
     }
 
+    fn nameIsKnownTypeParam(self: *Checker, name: []const u8) bool {
+        if (name.len == 0) return false;
+        for (self.type_param_nodes.items) |ni| {
+            if (std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni)), name)) return true;
+        }
+        return false;
+    }
+
     fn typeMentionsTypeParamDepth(self: *Checker, id: TypeId, depth: u8) bool {
         if (depth > 4) return false;
         const t = self.store.get(id);
         switch (t.kind) {
             .type_param => return true,
-            .array_t, .readonly_array_t, .tuple_t, .union_t, .intersection_t, .type_ref => {
+            .type_ref => {
+                const args = self.store.idsOf(t.list_data);
+                // A bare named `type_ref` matching a declared type param IS a
+                // param reference (the representation duality).
+                if (args.len == 0 and self.nameIsKnownTypeParam(t.name)) return true;
+                for (args) |m| {
+                    if (self.typeMentionsTypeParamDepth(m, depth + 1)) return true;
+                }
+                return false;
+            },
+            .array_t, .readonly_array_t, .tuple_t, .union_t, .intersection_t => {
                 for (self.store.idsOf(t.list_data)) |m| {
                     if (self.typeMentionsTypeParamDepth(m, depth + 1)) return true;
                 }
