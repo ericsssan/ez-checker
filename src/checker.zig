@@ -889,6 +889,9 @@ pub const Checker = struct {
     /// enclosing call's inferred type arguments (contextualCallbackParamType →
     /// inferGenericParamType → collectCallBindings), so the chain can't loop.
     cb_instantiate_depth: u8 = 0,
+    // Recursion guard for resolving a NESTED context-sensitive call's expected
+    // type by instantiating the enclosing call's type params.
+    nested_ctx_depth: u8 = 0,
 
     /// Active inference context: a flat stack of provisional type-parameter
     /// bindings (name → TypeId) established while a generic call fixes its type
@@ -24546,7 +24549,22 @@ pub const Checker = struct {
         // `arrayize(wrap(s=>…))`'s `wrap` sees `Mapper<string,number>`, not the
         // generic `Mapper<T,U>`.  No-op when no inference context is active.
         const e = self.nonNullExpected(params[ai]) orelse return null;
-        return self.substituteThroughInferCtx(e);
+        const ctx = self.substituteThroughInferCtx(e);
+        // A NESTED context-sensitive call (`arrayize(wrap(s=>…))`): its expected
+        // type still mentions the OUTER call's type params (no active infer_ctx in
+        // a standalone query), so instantiate them from the outer call's OWN
+        // inference, making the inner call's expected type concrete.  Scoped to
+        // context-sensitive call args — instantiating a value arg's expected type
+        // would be circular (its own type infers the param).
+        if (self.nested_ctx_depth < 3 and self.argIsContextSensitiveCall(arg, 0)) {
+            self.nested_ctx_depth += 1;
+            const inst = self.inferGenericParamType(call_node, @intCast(ai));
+            self.nested_ctx_depth -= 1;
+            if (inst) |it| {
+                if (!self.typeMentionsTypeParam(it)) return it;
+            }
+        }
+        return ctx;
     }
 
     /// Return-type annotation of the function enclosing `from_node`.
