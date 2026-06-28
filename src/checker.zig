@@ -723,6 +723,9 @@ pub const Checker = struct {
     /// Inline `/** @satisfies {T} */ (expr)` → the expr node's contextual type
     /// string (keyed by the operand expression node, grouping peeled).
     jsdoc_satisfies: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
+    /// `@typedef {T} Name` (incl. `{Object}` + `@property` form) → the resolved
+    /// structural TypeId, so `parseJsdocType("Name")` resolves it (JS files).
+    jsdoc_typedefs: std.StringHashMapUnmanaged(TypeId) = .empty,
     jsdoc_built: bool = false,
     jsdoc_type_depth: u8 = 0,
 
@@ -996,6 +999,7 @@ pub const Checker = struct {
         self.jsdoc_returns.deinit(self.gpa);
         self.jsdoc_vars.deinit(self.gpa);
         self.jsdoc_satisfies.deinit(self.gpa);
+        self.jsdoc_typedefs.deinit(self.gpa);
         {
             var cit = self.type_cache.keyIterator();
             while (cit.next()) |k| self.gpa.free(k.*);
@@ -7796,6 +7800,24 @@ pub const Checker = struct {
                 while (j + 1 < src.len and !(src[j] == '*' and src[j + 1] == '/')) : (j += 1) {}
                 const block_end = @min(j + 2, src.len);
                 const block = src[block_start..block_end];
+                // `@typedef {T} Name` — register Name as a structural alias so the
+                // `@satisfies` path can resolve it. `{Object}` + `@property` builds
+                // an object type; an inline `{T}` parses T directly.  We do NOT
+                // `continue` — the same block may also carry `@param`/`@type` that
+                // attachJsdoc must still process (checkJsdocTypedefInParamTag1).
+                if (std.mem.indexOf(u8, block, "@typedef")) |tdx| {
+                    const after = block[tdx + "@typedef".len ..];
+                    if (jsdocTagType(after)) |ts| {
+                        const name = jsdocParamName(after);
+                        if (name.len > 0) {
+                            const ty = if (std.mem.eql(u8, ts, "Object") or std.mem.eql(u8, ts, "object"))
+                                self.buildJsdocTypedefObject(block)
+                            else
+                                self.parseJsdocType(ts);
+                            self.jsdoc_typedefs.put(self.gpa, name, ty) catch {};
+                        }
+                    }
+                }
                 // Inline `/** @satisfies {T} */ (expr)` binds to the OPERAND
                 // expression (contextual type), not a declaration.
                 if (std.mem.indexOf(u8, block, "@satisfies")) |sidx| {
@@ -7816,6 +7838,52 @@ pub const Checker = struct {
                 i = block_end;
             } else i += 1;
         }
+    }
+
+    /// Build the object type for a `@typedef {Object} Name` block from its
+    /// `@property {T} prop` lines (`[prop]` marks an optional member).
+    fn buildJsdocTypedefObject(self: *Checker, block: []const u8) TypeId {
+        var props_buf: [32]tymod.ObjectProp = undefined;
+        var n: usize = 0;
+        var content = block;
+        if (std.mem.startsWith(u8, content, "/**")) content = content[3..];
+        if (std.mem.endsWith(u8, content, "*/")) content = content[0 .. content.len - 2];
+        var it = std.mem.splitScalar(u8, content, '\n');
+        while (it.next()) |raw_line| {
+            const line = std.mem.trim(u8, raw_line, " \t\r*");
+            if (!std.mem.startsWith(u8, line, "@property") and !std.mem.startsWith(u8, line, "@prop")) continue;
+            const after = line[std.mem.indexOfScalar(u8, line, ' ') orelse line.len ..];
+            const ts = jsdocTagType(after) orelse continue;
+            const pname = jsdocParamName(after);
+            // Nested `@property {T} obj.prop` documents a sub-prop — skip.
+            if (pname.len == 0 or std.mem.indexOfScalar(u8, pname, '.') != null) continue;
+            if (n >= props_buf.len) break;
+            // `[name]` (after the `{T}`) marks the member optional.
+            var rest = after;
+            while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
+            if (rest.len > 0 and rest[0] == '{') {
+                var depth: usize = 0;
+                for (rest, 0..) |c, k| {
+                    if (c == '{') depth += 1 else if (c == '}') {
+                        depth -= 1;
+                        if (depth == 0) {
+                            rest = rest[k + 1 ..];
+                            break;
+                        }
+                    }
+                }
+            }
+            while (rest.len > 0 and (rest[0] == ' ' or rest[0] == '\t')) rest = rest[1..];
+            const optional = rest.len > 0 and rest[0] == '[';
+            var vty = self.parseJsdocType(ts);
+            if (optional and !self.typeContainsUndefined(vty))
+                vty = self.store.unionOf(&.{ vty, tymod.ID_UNDEFINED }) catch vty;
+            props_buf[n] = .{ .name = pname, .type_id = vty, .optional = optional };
+            n += 1;
+        }
+        if (n == 0) return tymod.ID_OBJECT_KW;
+        const list = self.store.appendObjectProps(props_buf[0..n]) catch return tymod.ID_ANY;
+        return self.store.add(.{ .kind = .object_t, .object_props = list }) catch tymod.ID_ANY;
     }
 
     /// First declaration-like node whose span starts at/after `pos` (and is the
@@ -8114,6 +8182,9 @@ pub const Checker = struct {
         if (std.mem.eql(u8, s, "WeakSet")) return self.store.typeRef("WeakSet", &.{tymod.ID_ANY}) catch tymod.ID_ANY;
         if (std.mem.eql(u8, s, "WeakMap")) return self.store.typeRef("WeakMap", &.{ tymod.ID_ANY, tymod.ID_ANY }) catch tymod.ID_ANY;
         if (std.mem.eql(u8, s, "ReadonlyArray")) return self.store.typeRef("ReadonlyArray", &.{tymod.ID_ANY}) catch tymod.ID_ANY;
+        // NB: a `@typedef`-registered name stays a `type_ref` here so `@type`/
+        // `@param` display keeps the alias NAME (matching tsc); structural
+        // resolution happens only in the `@satisfies` contextual path.
         if (jsdocLooksLikeName(s)) return self.store.typeRef(s, &.{}) catch tymod.ID_ANY;
         return tymod.ID_ANY;
     }
@@ -25124,7 +25195,13 @@ pub const Checker = struct {
         // expression's contextual type (preserves literals, types callback params).
         if (self.checker_opts.is_js_file) {
             if (!self.jsdoc_built) self.buildJsdoc();
-            if (self.jsdoc_satisfies.get(node.toInt())) |ts| return self.parseJsdocType(ts);
+            if (self.jsdoc_satisfies.get(node.toInt())) |ts| {
+                // A bare `@satisfies {Typedef}` resolves to the alias's STRUCTURE
+                // (the contextual type must expose props/literals); inline types
+                // (`{a:T}`, `[T,U]`) parse directly.
+                if (self.jsdoc_typedefs.get(std.mem.trim(u8, ts, " \t\r\n"))) |st| return st;
+                return self.parseJsdocType(ts);
+            }
         }
         return self.expectedTypeOfD(node, 0);
     }
