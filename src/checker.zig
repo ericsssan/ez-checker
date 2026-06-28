@@ -3667,7 +3667,13 @@ pub const Checker = struct {
             break :blk std.mem.eql(u8, cname, "const");
         };
         const val_ty = self.typeOf(pdata.rhs);
-        if (is_as_const) return val_ty;
+        // In `as const` context the key's value keeps its DEEP const form — a nested
+        // object/array value isn't directly under `as const`, so `typeOf` would widen
+        // it (`z: { a: { b: 42 } }` → `{ a: { b: number } }`).  Use inferAsConst.
+        if (is_as_const) {
+            const cf = self.inferAsConst(pdata.rhs);
+            return if (cf.eq(tymod.ID_UNKNOWN)) val_ty else cf;
+        }
         // If the value is a type assertion (`0 as 0`, `"a" as "a"`), preserve the
         // asserted literal type — TypeScript does not widen explicitly-asserted types.
         const rhs_tag = self.ast_ref.nodeTag(pdata.rhs);
