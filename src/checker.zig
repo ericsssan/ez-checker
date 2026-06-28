@@ -12714,8 +12714,14 @@ pub const Checker = struct {
         var i: usize = 0;
         while (i < key_count) : (i += 1) {
             const t = self.propertyTypeOfTypeId(obj_ty, key_buf[i]) orelse continue;
+            // Indexed access on an OPTIONAL property includes `| undefined`
+            // (`Test["testy"]` where `testy?: string` → `string | undefined`).
+            const pt = if (self.propertyIsOptionalInType(obj_ty, key_buf[i]))
+                (self.store.unionOf(&.{ t, tymod.ID_UNDEFINED }) catch t)
+            else
+                t;
             if (member_n < member_buf.len) {
-                member_buf[member_n] = t;
+                member_buf[member_n] = pt;
                 member_n += 1;
             }
         }
@@ -12734,6 +12740,11 @@ pub const Checker = struct {
                 if (std.mem.eql(u8, p.name, key)) return p.optional;
             }
         }
+        if (t.kind == .type_ref and self.store.idsOf(t.list_data).len == 0) {
+            if (self.resolveDeclaredType(t.name)) |r| {
+                if (!r.eq(obj_ty)) return self.propertyIsOptionalInType(r, key);
+            }
+        }
         return false;
     }
 
@@ -12750,6 +12761,13 @@ pub const Checker = struct {
         if (t.kind == .union_t or t.kind == .intersection_t) {
             for (self.store.idsOf(t.list_data)) |m| {
                 if (self.propertyTypeOfTypeId(m, key)) |r| return r;
+            }
+        }
+        // A bare interface/alias reference (`Test` in `Test["testy"]`) — resolve
+        // it structurally so the indexed-access lookup finds the property.
+        if (t.kind == .type_ref and self.store.idsOf(t.list_data).len == 0) {
+            if (self.resolveDeclaredType(t.name)) |r| {
+                if (!r.eq(obj_ty)) return self.propertyTypeOfTypeId(r, key);
             }
         }
         return null;
