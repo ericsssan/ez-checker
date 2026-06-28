@@ -3001,6 +3001,59 @@ pub const Checker = struct {
         {
             const bd = self.ast_ref.nodeData(node);
             if (bd.rhs != .none and self.ast_ref.nodeTag(bd.rhs) == .ts_type_annotation) {
+                // A `var` declared more than once IN THE SAME SCOPE merges: tsc
+                // types EVERY binding site by the FIRST declaration (`var x: A;
+                // var x: B` → both `x` are `A`).  If this annotated binding is a
+                // declarator that is not the first of ≥2 same-scope declarations,
+                // defer to the first's type.  Same-scope ONLY (no walk-up) so an
+                // inner binding shadowing an outer same-named var is untouched.
+                redecl: {
+                    const parents_r = self.semantic.parent_indices;
+                    const ni_r = node.toInt();
+                    if (ni_r >= parents_r.len) break :redecl;
+                    const pi_r = parents_r[ni_r];
+                    if (pi_r == @intFromEnum(NodeIndex.none)) break :redecl;
+                    if (self.ast_ref.nodeTag(@enumFromInt(pi_r)) != .declarator) break :redecl;
+                    // ONLY `var` merges: it is function-scoped and legally
+                    // redeclarable.  `let`/`const` are block-scoped — two same-named
+                    // ones in different blocks of a function are distinct bindings,
+                    // so they must NOT be merged by the function-scope check below.
+                    const declkind_r = parents_r[pi_r];
+                    if (declkind_r == @intFromEnum(NodeIndex.none)) break :redecl;
+                    if (self.ast_ref.nodeTag(@enumFromInt(declkind_r)) != .var_decl) break :redecl;
+                    var lb_r: [192]u8 = undefined;
+                    const key_r = self.scope_tree.namespaceScopeKey(node, &lb_r);
+                    const group = self.symbol_table.valueDecls(name, key_r) orelse break :redecl;
+                    // namespaceScopeKey is namespace-level, so the group spans every
+                    // function in this namespace; restrict to declarators sharing this
+                    // binding's enclosing FUNCTION (the actual `var` scope).
+                    const my_scope = self.enclosingVarScopeNode(node);
+                    if (my_scope == .none) break :redecl;
+                    // tsc types the merged var by the first declaration carrying an
+                    // explicit annotation (`var p = n; var p: string` → `string`,
+                    // not the source-first `var p = n`).  Find the first ANNOTATED
+                    // same-scope declarator.
+                    var first_anno: NodeIndex = .none;
+                    var ndecl: u32 = 0;
+                    for (group.items) |d| {
+                        if (self.ast_ref.nodeTag(d) != .declarator) continue;
+                        if (self.enclosingVarScopeNode(d) != my_scope) continue;
+                        ndecl += 1;
+                        if (first_anno != .none) continue;
+                        const b = self.ast_ref.nodeData(d).lhs;
+                        if (b == .none or self.ast_ref.nodeTag(b) != .identifier) continue;
+                        const bdd = self.ast_ref.nodeData(b);
+                        if (bdd.rhs != .none and self.ast_ref.nodeTag(bdd.rhs) == .ts_type_annotation) first_anno = d;
+                    }
+                    if (ndecl < 2 or first_anno == .none or first_anno.toInt() == pi_r) break :redecl;
+                    // Resolve the first declaration via its BINDING (not the
+                    // declarator) so the canonical annotation path — including the
+                    // self-recursive `typeof name` guard — applies.
+                    const first_binding = self.ast_ref.nodeData(first_anno).lhs;
+                    if (first_binding == .none) break :redecl;
+                    const merged = self.declaredTypeAtBinding(first_binding);
+                    if (!merged.eq(tymod.ID_UNKNOWN)) return merged;
+                }
                 const ty = self.declaredTypeAtBinding(node);
                 if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
                 // An explicit `: unknown` annotation (or a catch param) resolves
@@ -25440,6 +25493,32 @@ pub const Checker = struct {
 
     /// Returns the nearest enclosing non-arrow function node, or .none.
     /// Arrow functions are transparent for `arguments` (they inherit from outer scope).
+    /// The nearest enclosing var-scope boundary (any function INCLUDING arrows,
+    /// or the module/program top level) — `var` is function-scoped, so two
+    /// declarators merge only when this is identical for both.
+    fn enclosingVarScopeNode(self: *Checker, node: NodeIndex) NodeIndex {
+        const parents = self.semantic.parent_indices;
+        const nidx = node.toInt();
+        if (nidx >= parents.len) return .none;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = parents[nidx];
+        var last: NodeIndex = .none;
+        while (p != NONE) : (p = parents[p]) {
+            const pn: NodeIndex = @enumFromInt(p);
+            last = pn;
+            switch (self.ast_ref.nodeTag(pn)) {
+                .arrow_fn, .async_arrow_fn,
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                .method_def, .computed_method_def, .getter_def, .setter_def,
+                .computed_getter_def, .computed_setter_def, .constructor_def,
+                .ts_module_decl, .ts_namespace_decl => return pn,
+                else => {},
+            }
+        }
+        return last; // top-level: the outermost ancestor (program), shared by all module-scope vars
+    }
+
     fn enclosingNonArrowFunction(self: *Checker, node: NodeIndex) NodeIndex {
         const parents = self.semantic.parent_indices;
         const nidx = node.toInt();
