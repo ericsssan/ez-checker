@@ -720,6 +720,9 @@ pub const Checker = struct {
     jsdoc_params: std.AutoHashMapUnmanaged(u32, std.ArrayListUnmanaged(JsdocParam)) = .empty,
     jsdoc_returns: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     jsdoc_vars: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
+    /// Inline `/** @satisfies {T} */ (expr)` → the expr node's contextual type
+    /// string (keyed by the operand expression node, grouping peeled).
+    jsdoc_satisfies: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
     jsdoc_built: bool = false,
     jsdoc_type_depth: u8 = 0,
 
@@ -992,6 +995,7 @@ pub const Checker = struct {
         self.jsdoc_params.deinit(self.gpa);
         self.jsdoc_returns.deinit(self.gpa);
         self.jsdoc_vars.deinit(self.gpa);
+        self.jsdoc_satisfies.deinit(self.gpa);
         {
             var cit = self.type_cache.keyIterator();
             while (cit.next()) |k| self.gpa.free(k.*);
@@ -7792,6 +7796,16 @@ pub const Checker = struct {
                 while (j + 1 < src.len and !(src[j] == '*' and src[j + 1] == '/')) : (j += 1) {}
                 const block_end = @min(j + 2, src.len);
                 const block = src[block_start..block_end];
+                // Inline `/** @satisfies {T} */ (expr)` binds to the OPERAND
+                // expression (contextual type), not a declaration.
+                if (std.mem.indexOf(u8, block, "@satisfies")) |sidx| {
+                    if (jsdocTagType(block[sidx + "@satisfies".len ..])) |ty_str| {
+                        if (self.exprAfterPos(block_end)) |expr|
+                            self.jsdoc_satisfies.put(self.gpa, expr.toInt(), ty_str) catch {};
+                    }
+                    i = block_end;
+                    continue;
+                }
                 // The declaration this block documents starts at the next token
                 // after the block (skipping trivia).
                 const decl_node = self.declAfterPos(block_end) orelse {
@@ -7827,6 +7841,30 @@ pub const Checker = struct {
             }
         }
         return if (best == .none) null else best;
+    }
+
+    /// First node whose span starts at/after `pos` (closest; ties → outermost),
+    /// with grouping peeled — the operand of an inline `/** @satisfies */ (expr)`.
+    fn exprAfterPos(self: *Checker, pos: usize) ?NodeIndex {
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var best: NodeIndex = .none;
+        var best_start: usize = std.math.maxInt(usize);
+        var best_span: usize = 0;
+        var n: u32 = 1;
+        while (n < total) : (n += 1) {
+            const ni: NodeIndex = @enumFromInt(n);
+            const span = self.ast_ref.nodeSpan(ni);
+            if (span.end <= span.start or span.start < pos) continue;
+            const sp = span.end - span.start;
+            if (span.start < best_start or (span.start == best_start and sp > best_span)) {
+                best_start = span.start;
+                best_span = sp;
+                best = ni;
+            }
+        }
+        if (best == .none) return null;
+        while (self.ast_ref.nodeTag(best) == .grouping_expr) best = self.ast_ref.nodeData(best).lhs;
+        return best;
     }
 
     /// Parse the `@param`/`@returns`/`@type` tags out of a JSDoc block and
@@ -7987,6 +8025,46 @@ pub const Checker = struct {
         if (s.len >= 2 and s[s.len - 1] == ']' and s[s.len - 2] == '[') {
             const elem = self.parseJsdocType(s[0 .. s.len - 2]);
             return self.store.arrayOf(elem) catch tymod.ID_ANY;
+        }
+        // Tuple `[T, U, …]` (top-level comma split, bracket-aware).
+        if (s.len >= 2 and s[0] == '[' and s[s.len - 1] == ']') {
+            const inner = std.mem.trim(u8, s[1 .. s.len - 1], " \t\r\n");
+            var buf: [16]TypeId = undefined;
+            var n: usize = 0;
+            var start: usize = 0;
+            var depth: usize = 0;
+            var k: usize = 0;
+            while (k <= inner.len) : (k += 1) {
+                const at_end = (k == inner.len);
+                if (!at_end) switch (inner[k]) {
+                    '[', '{', '(', '<' => depth += 1,
+                    ']', '}', ')', '>' => if (depth > 0) {
+                        depth -= 1;
+                    },
+                    else => {},
+                };
+                if (at_end or (inner[k] == ',' and depth == 0)) {
+                    if (n >= buf.len) break;
+                    const part = std.mem.trim(u8, inner[start..k], " \t\r\n");
+                    if (part.len > 0) {
+                        const et = self.parseJsdocType(part);
+                        // Only commit to a tuple when EVERY element resolves to a
+                        // concrete type — an unresolved element (optional `T?`→any,
+                        // a type param, an unknown name) would make a partial tuple
+                        // that's WRONG; fall back to `any` (an honest gap) instead.
+                        switch (self.store.get(et).kind) {
+                            .any, .unknown, .type_ref, .type_param => return tymod.ID_ANY,
+                            else => {},
+                        }
+                        buf[n] = et;
+                        n += 1;
+                    }
+                    start = k + 1;
+                }
+            }
+            if (n == 0) return tymod.ID_ANY;
+            const list = self.store.appendTypeIds(buf[0..n]) catch return tymod.ID_ANY;
+            return self.store.add(.{ .kind = .tuple_t, .list_data = list, .name = "" }) catch tymod.ID_ANY;
         }
         // Object literal `{a: T, b: U}`.
         if (s[0] == '{' and s[s.len - 1] == '}') {
@@ -25042,6 +25120,12 @@ pub const Checker = struct {
     // conditional). Drives literal preservation and array→tuple inference.
 
     fn expectedTypeOf(self: *Checker, node: NodeIndex) ?TypeId {
+        // Inline JSDoc `/** @satisfies {T} */ (expr)` (JS files): T is the
+        // expression's contextual type (preserves literals, types callback params).
+        if (self.checker_opts.is_js_file) {
+            if (!self.jsdoc_built) self.buildJsdoc();
+            if (self.jsdoc_satisfies.get(node.toInt())) |ts| return self.parseJsdocType(ts);
+        }
         return self.expectedTypeOfD(node, 0);
     }
 
