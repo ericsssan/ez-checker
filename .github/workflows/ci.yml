@@ -19,7 +19,7 @@ jobs:
       # (microsoft/TypeScript), so it must be checked out. fetch-depth: 1 keeps
       # the (large) submodule clone shallow.
       - name: Checkout (with TypeScript corpus submodule)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           submodules: recursive
           fetch-depth: 1
