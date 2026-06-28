@@ -11933,6 +11933,26 @@ pub const Checker = struct {
             // substituting standalone function types regresses contextual
             // `(x: T) => T` (depth-0 generic inference where resolveTypeNode→any).
             .ts_type_literal => return self.substituteTypeId(self.resolveTypeNode(ty_node), keys, vals),
+            .ts_function_type, .ts_constructor_type => {
+                // resolveTypeNode keeps a type param symbolic in a function type
+                // (`(x: T) => T`), so substituting the active bindings recovers
+                // `(x: string) => string`.  BUT skip params still bound to `unknown`
+                // (unresolved inference — `foo<T extends "foo">(f)` where the callback
+                // doesn't pin T): substituting T→unknown prematurely blocks the correct
+                // constraint-default (`"foo"`) resolution downstream.
+                var fk: [8][]const u8 = undefined;
+                var fv: [8]TypeId = undefined;
+                var fn_n: usize = 0;
+                for (keys, vals) |k, v| {
+                    if (tymod.isUnknown(&self.store, v)) continue;
+                    if (fn_n >= fk.len) break;
+                    fk[fn_n] = k;
+                    fv[fn_n] = v;
+                    fn_n += 1;
+                }
+                if (fn_n == 0) return self.resolveTypeNode(ty_node);
+                return self.substituteTypeId(self.resolveTypeNode(ty_node), fk[0..fn_n], fv[0..fn_n]);
+            },
             else => return self.resolveTypeNode(ty_node),
         }
     }
