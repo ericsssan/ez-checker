@@ -889,6 +889,12 @@ pub const Checker = struct {
     /// enclosing call's inferred type arguments (contextualCallbackParamType →
     /// inferGenericParamType → collectCallBindings), so the chain can't loop.
     cb_instantiate_depth: u8 = 0,
+    /// Recursion guard for TypeId-level computed-alias evaluation
+    /// (`evalComputedAlias`).  A self-referential mapped/conditional alias
+    /// (`DeepReadonly<T> = { [P in keyof T]: DeepReadonly<T[P]> }`) would recurse
+    /// to the resolve-depth limit × per-key branching — bounded but catastrophically
+    /// slow.  Cap shallow so recursive aliases DEFER (stay symbolic) instead.
+    computed_eval_depth: u8 = 0,
     // Recursion guard for resolving a NESTED context-sensitive call's expected
     // type by instantiating the enclosing call's type params.
     nested_ctx_depth: u8 = 0,
@@ -11825,6 +11831,15 @@ pub const Checker = struct {
                 for (keys, vals) |k, v| {
                     if (std.mem.eql(u8, k, nm)) return v;
                 }
+                // Type args that depend on the active subst (`Proxy<T[P]>` while
+                // evaluating `Proxify<Shape>`): resolve each arg WITH the subst and
+                // re-instantiate the alias, so `T[P]` becomes the concrete property
+                // type rather than a leaked symbolic `T[P]`.  Gated to active
+                // computed-alias evaluation — outside it the plain resolveTypeNode
+                // is correct and the arg re-threading is pure (expensive) overhead.
+                if (self.computed_eval_depth > 0) {
+                    if (self.resolveTypeRefArgsWithSubst(ty_node, nm, keys, vals)) |t| return t;
+                }
                 return self.resolveTypeNode(ty_node);
             },
             .ts_conditional_type => return self.resolveConditionalTypeWithSubst(ty_node, keys, vals),
@@ -11896,6 +11911,28 @@ pub const Checker = struct {
                 const list = self.store.appendTypeIds(buf[0..n]) catch return tymod.ID_UNKNOWN;
                 return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch tymod.ID_UNKNOWN;
             },
+            .ts_mapped_type => {
+                // Gated to active computed-alias evaluation (where the eager
+                // object eval is wanted); at depth 0 the pre-existing symbolic
+                // path is correct and avoids regressions.
+                if (self.computed_eval_depth > 0) {
+                    if (self.resolveMappedTypeWithSubst(ty_node, keys, vals)) |m| return m;
+                }
+                return self.resolveTypeNode(ty_node);
+            },
+            .ts_indexed_access_type => {
+                if (self.computed_eval_depth > 0) {
+                    if (self.resolveIndexedAccessWithSubst(ty_node, keys, vals)) |m| return m;
+                }
+                return self.resolveTypeNode(ty_node);
+            },
+            // Object literal types: resolve normally, then substitute the active
+            // type params into the RESULT (recursing through method members) so an
+            // alias body like `Proxy<T> = { get(): T }` doesn't leak T when
+            // instantiated as `Proxy<string>`.  Scoped to object literals —
+            // substituting standalone function types regresses contextual
+            // `(x: T) => T` (depth-0 generic inference where resolveTypeNode→any).
+            .ts_type_literal => return self.substituteTypeId(self.resolveTypeNode(ty_node), keys, vals),
             else => return self.resolveTypeNode(ty_node),
         }
     }
@@ -12225,10 +12262,7 @@ pub const Checker = struct {
         var n = ty_node;
         while (self.ast_ref.nodeTag(n) == .ts_parenthesized_type) n = self.ast_ref.nodeData(n).lhs;
         return switch (self.ast_ref.nodeTag(n)) {
-            // NOTE: ts_mapped_type excluded for now — the mapped-type evaluator is
-            // not yet accurate enough to evaluate eagerly (regresses mappedTypes*),
-            // so mapped aliases stay symbolic until that evaluator is hardened.
-            .ts_conditional_type, .ts_indexed_access_type, .ts_keyof_type => true,
+            .ts_conditional_type, .ts_mapped_type, .ts_indexed_access_type, .ts_keyof_type => true,
             else => false,
         };
     }
@@ -12240,6 +12274,11 @@ pub const Checker = struct {
     /// `resolveConditionalAliasWithArgs` (which works from an AST ref node), so a
     /// computed alias instantiated via call-site substitution still evaluates.
     fn evalComputedAlias(self: *Checker, name: []const u8, args: []const TypeId) ?TypeId {
+        // Recursive/self-referential computed aliases defer rather than expand to
+        // the resolve-depth limit (slow + tsc keeps them symbolic anyway).
+        if (self.computed_eval_depth >= 4) return null;
+        self.computed_eval_depth += 1;
+        defer self.computed_eval_depth -= 1;
         const decl = self.decl_index.primaryDecl(name) orelse return null;
         if (self.ast_ref.nodeTag(decl) != .ts_type_alias_decl) return null;
         const d = self.ast_ref.nodeData(decl);
@@ -12259,6 +12298,20 @@ pub const Checker = struct {
             if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) return null;
             keys_buf[i] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
             vals_buf[i] = args[i];
+        }
+        // A MAPPED body must EVALUATE to a concrete object or DEFER — never fall
+        // back to the opaque `{ [P in keyof T]?: T[P]; }` display (that's what tsc
+        // keeps the *alias* name `Partial<T>` for).  Call the mapped evaluator
+        // directly and propagate its null so the caller keeps the symbolic alias.
+        var body = ad.type_node;
+        while (self.ast_ref.nodeTag(body) == .ts_parenthesized_type) body = self.ast_ref.nodeData(body).lhs;
+        if (self.ast_ref.nodeTag(body) == .ts_mapped_type) {
+            // A mapped alias EVALUATES its body (so member access works) but tsc
+            // DISPLAYS it by name (`Proxify<Shape>`, not the expanded object) —
+            // unlike a conditional, which expands.  Tag the evaluated object with
+            // the alias display.  Null (generic key set) defers to the symbolic alias.
+            const m = self.resolveMappedTypeWithSubst(body, keys_buf[0..n], vals_buf[0..n]) orelse return null;
+            return self.tagUtilityAlias(m, name, args[0..n]);
         }
         return self.resolveTypeNodeWithSubst(ad.type_node, keys_buf[0..n], vals_buf[0..n]);
     }
@@ -12763,8 +12816,9 @@ pub const Checker = struct {
                 if (self.propertyTypeOfTypeId(m, key)) |r| return r;
             }
         }
-        // A bare interface/alias reference (`Test` in `Test["testy"]`) — resolve
-        // it structurally so the indexed-access lookup finds the property.
+        // A bare interface/alias reference (`Test` in `Test["testy"]`, `Shape` in
+        // a mapped `T[P]` over `T=Shape`) — resolve it structurally so the lookup
+        // finds the property.
         if (t.kind == .type_ref and self.store.idsOf(t.list_data).len == 0) {
             if (self.resolveDeclaredType(t.name)) |r| {
                 if (!r.eq(obj_ty)) return self.propertyTypeOfTypeId(r, key);
@@ -12945,6 +12999,118 @@ pub const Checker = struct {
         }
         const list = self.store.appendObjectProps(props_buf[0..prop_count]) catch return tymod.ID_UNKNOWN;
         return self.store.add(.{ .kind = .object_t, .object_props = list }) catch tymod.ID_UNKNOWN;
+    }
+
+    /// Enumerate the string-literal key names of a resolved TypeId — a single
+    /// `string_literal` or a union of them (`keyof {a;b}` → `"a" | "b"`).  Returns
+    /// null when any member isn't a string literal (a generic / non-enumerable key
+    /// set, which must stay symbolic).
+    fn stringLiteralNamesOfType(self: *Checker, id: TypeId, out: *[16][]const u8, start: usize) ?usize {
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .string_literal => {
+                if (start >= out.len) return null;
+                out[start] = t.literal_value.string;
+                return start + 1;
+            },
+            .union_t => {
+                var n = start;
+                for (self.store.idsOf(t.list_data)) |m| {
+                    n = self.stringLiteralNamesOfType(m, out, n) orelse return null;
+                }
+                return n;
+            },
+            else => return null,
+        }
+    }
+
+    /// Substitution-aware mapped-type evaluation.  Unlike `resolveMappedType`,
+    /// this threads the outer `keys`/`vals` (so `T` in `{ [K in keyof T]: T[K] }`
+    /// is the substituted concrete type) AND evaluates the value type PER KEY with
+    /// the key param bound to each concrete key — so `T[K]` yields that property's
+    /// type, not one shared value.  Returns null to defer (generic key set, `as`
+    /// remapping, etc.) so the caller keeps the symbolic mapped-type display.
+    fn resolveMappedTypeWithSubst(self: *Checker, ty_node: NodeIndex, keys: []const []const u8, vals: []const TypeId) ?TypeId {
+        // Bound recursion (a self-referential mapped type defers) AND mark active
+        // evaluation so nested type-ref args (`Box<T[K]>`) get the subst threaded
+        // (the `computed_eval_depth > 0` gate in the type_ref case).
+        if (self.computed_eval_depth >= 4) return null;
+        self.computed_eval_depth += 1;
+        defer self.computed_eval_depth -= 1;
+        const data = self.ast_ref.nodeData(ty_node);
+        const slice = self.directRange(data.lhs, data.rhs) orelse return null;
+        if (slice.len < 4) return null;
+        const key_param: NodeIndex = @enumFromInt(slice[0]);
+        const constraint: NodeIndex = @enumFromInt(slice[1]);
+        const as_type: NodeIndex = @enumFromInt(slice[2]);
+        const value_type: NodeIndex = @enumFromInt(slice[3]);
+        if (constraint == .none or value_type == .none) return null;
+        if (as_type != .none) return null; // key remapping — defer
+        const kp_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(key_param));
+        if (kp_name.len == 0 or keys.len >= 7) return null;
+        // The key set: `keyof T` over concrete T → a union of string literals.
+        const key_set = self.resolveTypeNodeWithSubst(constraint, keys, vals);
+        var names_buf: [16][]const u8 = undefined;
+        const nkeys = self.stringLiteralNamesOfType(key_set, &names_buf, 0) orelse return null;
+        const mods = self.mappedTypeModifiers(ty_node);
+        // Extend the substitution with the key param (bound per key below).
+        var ekeys_buf: [8][]const u8 = undefined;
+        var evals_buf: [8]TypeId = undefined;
+        @memcpy(ekeys_buf[0..keys.len], keys);
+        @memcpy(evals_buf[0..vals.len], vals);
+        ekeys_buf[keys.len] = kp_name;
+        var props_buf: [16]tymod.ObjectProp = undefined;
+        var pc: usize = 0;
+        for (names_buf[0..nkeys]) |name| {
+            if (pc >= props_buf.len) break;
+            evals_buf[vals.len] = self.store.stringLiteral(name) catch continue;
+            const vty = self.resolveTypeNodeWithSubst(value_type, ekeys_buf[0 .. keys.len + 1], evals_buf[0 .. vals.len + 1]);
+            props_buf[pc] = .{
+                .name = name,
+                .type_id = vty,
+                .optional = mods.is_optional,
+                .readonly = mods.is_readonly,
+            };
+            pc += 1;
+        }
+        const list = self.store.appendObjectProps(props_buf[0..pc]) catch return null;
+        return self.store.add(.{ .kind = .object_t, .object_props = list }) catch null;
+    }
+
+    /// Substitution-aware indexed access `Obj[Index]`.  Evaluates to the property
+    /// type(s) when `Index` resolves to concrete string-literal key(s); element
+    /// type for array/tuple objects.  Returns null to defer (symbolic / generic).
+    fn resolveIndexedAccessWithSubst(self: *Checker, ty_node: NodeIndex, keys: []const []const u8, vals: []const TypeId) ?TypeId {
+        const data = self.ast_ref.nodeData(ty_node);
+        if (data.lhs == .none or data.rhs == .none) return null;
+        const obj_ty = self.resolveTypeNodeWithSubst(data.lhs, keys, vals);
+        const idx_ty = self.resolveTypeNodeWithSubst(data.rhs, keys, vals);
+        var key_buf: [16][]const u8 = undefined;
+        if (self.stringLiteralNamesOfType(idx_ty, &key_buf, 0)) |nk| {
+            if (nk == 0) return null;
+            var member_buf: [16]TypeId = undefined;
+            var mn: usize = 0;
+            for (key_buf[0..nk]) |k| {
+                const pt = self.propertyTypeOfTypeId(obj_ty, k) orelse return null;
+                if (mn < member_buf.len) {
+                    member_buf[mn] = pt;
+                    mn += 1;
+                }
+            }
+            if (mn == 0) return null;
+            if (mn == 1) return member_buf[0];
+            return self.store.unionOf(member_buf[0..mn]) catch null;
+        }
+        // Numeric index over array/tuple → element type.
+        const ot = self.store.get(obj_ty);
+        if (ot.kind == .array_t or ot.kind == .readonly_array_t) {
+            const elems = self.store.idsOf(ot.list_data);
+            if (elems.len > 0) return elems[0];
+        } else if (ot.kind == .tuple_t) {
+            const elems = self.store.idsOf(ot.list_data);
+            if (elems.len > 0) return self.store.unionOf(elems) catch null;
+        }
+        return null;
     }
 
     /// Walk `node` collecting any string-literal type members it
@@ -13896,6 +14062,61 @@ pub const Checker = struct {
         buf.append(self.gpa, '>') catch return id;
         const display = self.gpa.dupe(u8, buf.items) catch return id;
         return self.tagAliasArgs(id, display, args);
+    }
+
+    /// For a `type_ref` with type args evaluated under an active substitution
+    /// (`Proxy<T[P]>` while mapping `Proxify<Shape>`): resolve each type arg WITH
+    /// the subst and re-instantiate the user alias, so a key-dependent arg becomes
+    /// concrete (`Proxy<string>`) instead of a leaked symbolic `T[P]`.  A plain
+    /// alias keeps its name (`Proxy<string>`); a computed alias returns its
+    /// evaluated body.  Returns null when no arg depends on the subst (defer to
+    /// plain resolveTypeNode) or `nm` isn't a user type alias.
+    fn resolveTypeRefArgsWithSubst(self: *Checker, ty_node: NodeIndex, nm: []const u8, keys: []const []const u8, vals: []const TypeId) ?TypeId {
+        const d = self.ast_ref.nodeData(ty_node);
+        const arg_range = self.safeSubRange(d.rhs) orelse return null;
+        if (arg_range.end <= arg_range.start) return null;
+        const arg_nodes = self.ast_ref.extra_data[arg_range.start..arg_range.end];
+        var arg_buf: [8]TypeId = undefined;
+        const argc = @min(arg_nodes.len, arg_buf.len);
+        var changed = false;
+        for (arg_nodes[0..argc], 0..) |raw, i| {
+            const an: NodeIndex = @enumFromInt(raw);
+            const subst = self.resolveTypeNodeWithSubst(an, keys, vals);
+            arg_buf[i] = subst;
+            if (!subst.eq(self.resolveTypeNode(an))) changed = true;
+        }
+        if (!changed) return null;
+        const decl = self.decl_index.primaryDecl(nm) orelse return null;
+        const dtag = self.ast_ref.nodeTag(decl);
+        const tpr = self.typeParamsRangeOf(decl) orelse return null;
+        if (tpr.end <= tpr.start or tpr.end > self.ast_ref.extra_data.len) return null;
+        var pk: [8][]const u8 = undefined;
+        var pv: [8]TypeId = undefined;
+        const pn = @min(@min(tpr.end - tpr.start, @as(u32, @intCast(argc))), pk.len);
+        if (pn == 0) return null;
+        var i: u32 = 0;
+        while (i < pn) : (i += 1) {
+            const tp: NodeIndex = @enumFromInt(self.ast_ref.extra_data[tpr.start + i]);
+            if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) return null;
+            pk[i] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+            pv[i] = arg_buf[i];
+        }
+        if (dtag == .ts_type_alias_decl) {
+            const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
+            const body = self.resolveTypeNodeWithSubst(ad.type_node, pk[0..pn], pv[0..pn]);
+            // A computed alias (conditional/mapped/…) evaluates to its body; a
+            // plain alias keeps its display name (`Proxy<string>`).
+            if (self.aliasBodyIsComputed(ad.type_node)) return body;
+            return self.tagUtilityAlias(body, nm, arg_buf[0..pn]);
+        }
+        if (dtag == .class_decl or dtag == .ts_interface_decl) {
+            // A class/interface keeps its name (`Box<boolean>`); instantiate its
+            // structural body with the resolved args so member access works.
+            const body0 = self.resolveDeclaredType(nm) orelse return null;
+            const body = self.substituteTypeId(body0, pk[0..pn], pv[0..pn]);
+            return self.tagUtilityAlias(body, nm, arg_buf[0..pn]);
+        }
+        return null;
     }
 
 
