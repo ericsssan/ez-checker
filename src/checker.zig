@@ -12042,6 +12042,61 @@ pub const Checker = struct {
         }
     }
 
+    /// Resolve a bare (arg-less) interface/alias type_ref to its structural form.
+    fn resolveBareTypeRef(self: *Checker, id: TypeId) TypeId {
+        const t = self.store.get(id);
+        if (t.kind == .type_ref and self.store.idsOf(t.list_data).len == 0) {
+            if (self.resolveDeclaredType(t.name)) |r| {
+                if (!r.eq(id)) return r;
+            }
+        }
+        return id;
+    }
+
+    /// Conservative structural assignability for conditional `extends` checks:
+    /// returns `.yes` ONLY when assignability is confirmed — resolving bare
+    /// interface refs and honoring INDEX-SIGNATURE targets (`{fields:{id:{}}}`
+    /// extends `{fields:{[k:string]:Entry}}`) — and `.unknown` otherwise.  NEVER
+    /// `.no`, so it can only ADD definite-true conditionals; it cannot flip one to
+    /// the false branch (avoids the broad regression from `structuralAssignable`).
+    fn condExtendsAssignable(self: *Checker, source: TypeId, target: TypeId, depth: u8) AssignResult {
+        if (depth > 6) return .unknown;
+        if (source.eq(target)) return .yes;
+        if (target.eq(tymod.ID_ANY) or target.eq(tymod.ID_UNKNOWN)) return .yes;
+        const s_id = self.resolveBareTypeRef(source);
+        const t_id = self.resolveBareTypeRef(target);
+        if (s_id.eq(t_id)) return .yes;
+        const s = self.store.get(s_id);
+        const t = self.store.get(t_id);
+        if (s.kind == .object_t and t.kind == .object_t) {
+            const s_props = self.store.propsOf(s.object_props);
+            for (self.store.propsOf(t.object_props)) |tp| {
+                const tp_is_index = tp.name.len > 0 and tp.name[0] == '[';
+                if (tp_is_index) {
+                    // Index signature: every NAMED source prop value must be assignable.
+                    for (s_props) |sp| {
+                        if (sp.name.len > 0 and sp.name[0] == '[') continue;
+                        if (self.condExtendsAssignable(sp.type_id, tp.type_id, depth + 1) != .yes) return .unknown;
+                    }
+                } else {
+                    var found = false;
+                    for (s_props) |sp| {
+                        if (std.mem.eql(u8, sp.name, tp.name)) {
+                            found = true;
+                            if (self.condExtendsAssignable(sp.type_id, tp.type_id, depth + 1) != .yes) return .unknown;
+                            break;
+                        }
+                    }
+                    if (!found and !tp.optional) return .unknown; // can't confirm — don't claim `.no`
+                }
+            }
+            return .yes;
+        }
+        // Other shapes: defer to simpleAssignable but never propagate its `.no`.
+        const r = self.simpleAssignable(s_id, t_id);
+        return if (r == .no) .unknown else r;
+    }
+
     /// Try to match `check_ty` against `extends_node`, capturing any
     /// `infer V` bindings along the way.  Returns .yes/.no/.unknown.
     fn matchConditionalExtends(
@@ -12181,7 +12236,11 @@ pub const Checker = struct {
 
         // General case: resolve the extends type with substitution and compare.
         const extends_ty = self.resolveTypeNodeWithSubst(n, keys, vals);
-        return self.simpleAssignable(check_ty, extends_ty);
+        const simple = self.simpleAssignable(check_ty, extends_ty);
+        if (simple != .unknown) return simple;
+        // simpleAssignable bails on objects → try the conservative structural check
+        // (index-sig targets, bare interface refs); yes-or-unknown only.
+        return self.condExtendsAssignable(check_ty, extends_ty, 0);
     }
 
     /// Distribute `T extends U ? A : B` over each member of a union check type.
@@ -14124,9 +14183,17 @@ pub const Checker = struct {
         if (dtag == .ts_type_alias_decl) {
             const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
             const body = self.resolveTypeNodeWithSubst(ad.type_node, pk[0..pn], pv[0..pn]);
-            // A computed alias (conditional/mapped/…) evaluates to its body; a
-            // plain alias keeps its display name (`Proxy<string>`).
-            if (self.aliasBodyIsComputed(ad.type_node)) return body;
+            if (self.aliasBodyIsComputed(ad.type_node)) {
+                // A MAPPED alias keeps its display name (`Fields<{…}>`, `Proxify<Shape>`)
+                // while evaluating the body underneath; conditional/indexed/keyof
+                // aliases EXPAND to the evaluated result.
+                var bn = ad.type_node;
+                while (self.ast_ref.nodeTag(bn) == .ts_parenthesized_type) bn = self.ast_ref.nodeData(bn).lhs;
+                if (self.ast_ref.nodeTag(bn) == .ts_mapped_type)
+                    return self.tagUtilityAlias(body, nm, arg_buf[0..pn]);
+                return body;
+            }
+            // A plain alias keeps its display name (`Proxy<string>`).
             return self.tagUtilityAlias(body, nm, arg_buf[0..pn]);
         }
         if (dtag == .class_decl or dtag == .ts_interface_decl) {
