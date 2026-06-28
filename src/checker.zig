@@ -18725,6 +18725,38 @@ pub const Checker = struct {
             // s=>…))`) — typing it now (params still open) gives bare params; it's
             // re-typed in pass 2 under the fixed context.
             if (self.argIsContextSensitiveCall(@enumFromInt(arg_raw), 0)) continue;
+            // `<const T>` matched DIRECTLY by a bare `x: T`: bind T to the CONST FORM
+            // of the arg (literals preserved + readonly) rather than the widened
+            // type (`f<const T>({a:"x"})` → `{ readonly a: "x" }`, not `{ a: string }`).
+            var did_const_bind = false;
+            const_bind: {
+                // Rest params (`...args: T`) need the readonly TUPLE of all rest
+                // args (+ spread expansion) — not one arg's const form; defer them.
+                if (pidx == rest_pi) break :const_bind;
+                // Array-literal args: the const form is a readonly tuple, but the
+                // readonly depends on T's constraint (`<const T extends unknown[]>`
+                // wants a MUTABLE tuple) — defer until constraint reconciliation.
+                {
+                    var an = @as(NodeIndex, @enumFromInt(arg_raw));
+                    while (self.ast_ref.nodeTag(an) == .grouping_expr) an = self.ast_ref.nodeData(an).lhs;
+                    if (self.ast_ref.nodeTag(an) == .array_literal) break :const_bind;
+                }
+                var ptn = param_ty_node;
+                while (self.ast_ref.nodeTag(ptn) == .ts_parenthesized_type) ptn = self.ast_ref.nodeData(ptn).lhs;
+                if (self.ast_ref.nodeTag(ptn) != .ts_type_reference) break :const_bind;
+                if (self.ast_ref.nodeData(ptn).rhs != .none) break :const_bind; // not a bare ref
+                const pname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ptn));
+                for (names[0..tp_count], 0..) |nm, i| {
+                    if (!const_mask[i] or !std.mem.eql(u8, nm, pname)) continue;
+                    const cf = self.inferAsConst(@enumFromInt(arg_raw));
+                    if (!cf.eq(tymod.ID_UNKNOWN)) {
+                        bindings[i] = cf;
+                        did_const_bind = true;
+                    }
+                    break;
+                }
+            }
+            if (did_const_bind) continue;
             const arg_ty = self.typeOf(@enumFromInt(arg_raw));
             // For the rest param each trailing arg matches the rest ELEMENT.
             const match_node = if (pidx == rest_pi) self.restElementMatchNode(param_ty_node) else param_ty_node;
