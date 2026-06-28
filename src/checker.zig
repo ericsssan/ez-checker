@@ -18726,6 +18726,44 @@ pub const Checker = struct {
         // context-sensitive callback args below and for the backward pass.
         const call_expected = self.expectedTypeOf(call);
         const arg_nodes = self.callArguments(call);
+        // `...args: T` where T is a bare const param: bind T to the readonly (or
+        // mutable, per constraint) TUPLE of the rest args' const forms
+        // (`f6<const T extends readonly unknown[]>(1, 'b', {a:1})` →
+        // `readonly [1, "b", { readonly a: 1 }]`).  Spread args are deferred.
+        rest_const: {
+            if (rest_pi == std.math.maxInt(usize) or rest_pi >= params.len) break :rest_const;
+            const rest_param: NodeIndex = @enumFromInt(params[rest_pi]);
+            var rtn = self.paramAnnotationNode(rest_param) orelse break :rest_const;
+            while (self.ast_ref.nodeTag(rtn) == .ts_parenthesized_type) rtn = self.ast_ref.nodeData(rtn).lhs;
+            if (self.ast_ref.nodeTag(rtn) != .ts_type_reference) break :rest_const;
+            if (self.ast_ref.nodeData(rtn).rhs != .none) break :rest_const; // not a bare ref
+            const rname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(rtn));
+            var ci: usize = tp_count;
+            for (names[0..tp_count], 0..) |nm, i| {
+                if (const_mask[i] and std.mem.eql(u8, nm, rname)) { ci = i; break; }
+            }
+            if (ci == tp_count or arg_nodes.len <= rest_pi) break :rest_const;
+            // Mutable-array constraint: stripping `readonly` would need to recurse
+            // through NESTED arrays too (`{foo: unknown[]}` keeps `foo` mutable) —
+            // defer those; the readonly-constraint case (`readonly unknown[]`) is
+            // fully readonly and safe.
+            if (const_strip_ro[ci]) break :rest_const;
+            var tbuf: [32]TypeId = undefined;
+            var tn: usize = 0;
+            for (arg_nodes[rest_pi..]) |raw| {
+                if (tn >= tbuf.len) break :rest_const;
+                const an: NodeIndex = @enumFromInt(raw);
+                if (self.ast_ref.nodeTag(an) == .spread_element) break :rest_const; // defer spreads
+                const cf = self.inferAsConst(an);
+                if (cf.eq(tymod.ID_UNKNOWN)) break :rest_const;
+                tbuf[tn] = cf;
+                tn += 1;
+            }
+            if (tn == 0) break :rest_const;
+            const list = self.store.appendTypeIds(tbuf[0..tn]) catch break :rest_const;
+            const tname: []const u8 = if (const_strip_ro[ci]) "" else "readonly";
+            bindings[ci] = self.store.add(.{ .kind = .tuple_t, .list_data = list, .name = tname }) catch break :rest_const;
+        }
         // PASS 1 — non-context-sensitive args (and the param-INDEPENDENT
         // annotated return of context-sensitive callbacks).  A context-
         // sensitive function literal (un-annotated arrow/fn-expr) has
