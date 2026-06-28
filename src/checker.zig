@@ -18885,6 +18885,37 @@ pub const Checker = struct {
                 }
                 return;
             }
+            // `Record<K, T>` matched against an object literal type — infer K from
+            // the union of keys and T from the union of value types (`mapObject(rec,
+            // …)` where `obj: Record<K, T>` and `rec: { foo: string; … }`).  This
+            // fixes T forward so a context-sensitive callback param (`s => …`) binds.
+            if (std.mem.eql(u8, tname, "Record") and self.store.get(arg_ty).kind == .object_t) {
+                const data2 = self.ast_ref.nodeData(n);
+                if (data2.rhs != .none) {
+                    if (self.safeSubRange(data2.rhs)) |sr2| {
+                        const ta_nodes = self.ast_ref.extra_data[sr2.start..sr2.end];
+                        const props = self.store.propsOf(self.store.get(arg_ty).object_props);
+                        if (ta_nodes.len >= 2 and props.len > 0) {
+                            var kbuf: [32]TypeId = undefined;
+                            var vbuf: [32]TypeId = undefined;
+                            var pc: usize = 0;
+                            for (props) |p| {
+                                if (pc >= kbuf.len) break;
+                                kbuf[pc] = self.store.stringLiteral(p.name) catch continue;
+                                vbuf[pc] = p.type_id;
+                                pc += 1;
+                            }
+                            if (pc > 0) {
+                                const k_u = if (pc == 1) kbuf[0] else (self.store.unionOf(kbuf[0..pc]) catch kbuf[0]);
+                                const v_u = if (pc == 1) vbuf[0] else (self.store.unionOf(vbuf[0..pc]) catch vbuf[0]);
+                                self.matchTypeParam(@enumFromInt(ta_nodes[0]), k_u, names, bindings);
+                                self.matchTypeParam(@enumFromInt(ta_nodes[1]), v_u, names, bindings);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             const data = self.ast_ref.nodeData(n);
             if (data.rhs != .none) {
                 const sr = self.safeSubRange(data.rhs) orelse return;
