@@ -18642,6 +18642,19 @@ pub const Checker = struct {
         return false;
     }
 
+    /// True when a const-param constraint is a MUTABLE array (`unknown[]`,
+    /// `string[] | number[]`) — so an array const form must drop its `readonly`.
+    /// A `readonly` array / tuple / non-array constraint returns false (keep it).
+    fn constraintWantsMutableArray(self: *Checker, ty: TypeId) bool {
+        const t = self.store.get(ty);
+        if (t.kind == .array_t) return true;
+        if (t.kind == .union_t) {
+            for (self.store.idsOf(t.list_data)) |m|
+                if (self.store.get(m).kind == .array_t) return true;
+        }
+        return false;
+    }
+
     fn collectCallBindings(
         self: *Checker,
         callee: NodeIndex,
@@ -18655,6 +18668,10 @@ pub const Checker = struct {
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
         var tp_count: usize = 0;
         var const_mask = std.mem.zeroes([8]bool);
+        // For a const param whose constraint is a MUTABLE array (`<const T extends
+        // unknown[]>`), strip `readonly` from the array const form (tsc gives a
+        // mutable tuple); a `readonly unknown[]` constraint keeps it.
+        var const_strip_ro = std.mem.zeroes([8]bool);
         if (fd.type_params_end <= ext_len) {
             for (self.ast_ref.extra_data[fd.type_params..fd.type_params_end]) |raw| {
                 if (tp_count >= names.len) break;
@@ -18662,6 +18679,12 @@ pub const Checker = struct {
                 if (self.ast_ref.nodeTag(tp_node) != .ts_type_parameter) continue;
                 names[tp_count] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
                 const_mask[tp_count] = self.typeParamIsConst(tp_node);
+                if (const_mask[tp_count]) {
+                    // ts_type_parameter: lhs = constraint node (or .none).
+                    const cnode = self.ast_ref.nodeData(tp_node).lhs;
+                    if (cnode != .none)
+                        const_strip_ro[tp_count] = self.constraintWantsMutableArray(self.resolveTypeNode(cnode));
+                }
                 tp_count += 1;
             }
         }
@@ -18733,14 +18756,6 @@ pub const Checker = struct {
                 // Rest params (`...args: T`) need the readonly TUPLE of all rest
                 // args (+ spread expansion) — not one arg's const form; defer them.
                 if (pidx == rest_pi) break :const_bind;
-                // Array-literal args: the const form is a readonly tuple, but the
-                // readonly depends on T's constraint (`<const T extends unknown[]>`
-                // wants a MUTABLE tuple) — defer until constraint reconciliation.
-                {
-                    var an = @as(NodeIndex, @enumFromInt(arg_raw));
-                    while (self.ast_ref.nodeTag(an) == .grouping_expr) an = self.ast_ref.nodeData(an).lhs;
-                    if (self.ast_ref.nodeTag(an) == .array_literal) break :const_bind;
-                }
                 var ptn = param_ty_node;
                 while (self.ast_ref.nodeTag(ptn) == .ts_parenthesized_type) ptn = self.ast_ref.nodeData(ptn).lhs;
                 if (self.ast_ref.nodeTag(ptn) != .ts_type_reference) break :const_bind;
@@ -18748,7 +18763,14 @@ pub const Checker = struct {
                 const pname = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ptn));
                 for (names[0..tp_count], 0..) |nm, i| {
                     if (!const_mask[i] or !std.mem.eql(u8, nm, pname)) continue;
-                    const cf = self.inferAsConst(@enumFromInt(arg_raw));
+                    var cf = self.inferAsConst(@enumFromInt(arg_raw));
+                    // Mutable-array constraint (`<const T extends unknown[]>`): drop
+                    // the `readonly` from the tuple form → a MUTABLE tuple.
+                    if (const_strip_ro[i]) {
+                        const ct = self.store.get(cf);
+                        if (ct.kind == .tuple_t and std.mem.eql(u8, ct.name, "readonly"))
+                            cf = self.store.add(.{ .kind = .tuple_t, .list_data = ct.list_data, .name = "" }) catch cf;
+                    }
                     if (!cf.eq(tymod.ID_UNKNOWN)) {
                         bindings[i] = cf;
                         did_const_bind = true;
