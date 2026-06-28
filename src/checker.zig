@@ -15963,6 +15963,10 @@ pub const Checker = struct {
                 self.flattenInheritedProps(ext_name, 0, &seen, &seen_n, &props);
             }
         }
+        // Count of inherited (extends-clause) props: own body props override ONLY
+        // these, never same-body props (index signatures share a synthetic name
+        // and must not be deduped into each other).
+        const base_prop_count = props.items.len;
         // Call/construct signatures (`(): T` / `new (): T`) — kept on the
         // object's `.signatures` so the facade's getCallSignatures /
         // getConstructSignatures work (no-unsafe-call's `interface X extends
@@ -16004,6 +16008,20 @@ pub const Checker = struct {
                                 self.store.get(existing.type_id).kind == .function_t)
                             {
                                 existing.type_id = self.mergeFunctionTypes(existing.type_id, p.type_id);
+                                merged = true;
+                                break;
+                            }
+                        }
+                    }
+                    // An own property OVERRIDES an inherited (extends-clause) property
+                    // of the same name (`interface D extends Base { t: E.D }` over
+                    // `Base.t: NA["t"]`) — else the broader base type leaks and breaks
+                    // discriminant narrowing.  Only the inherited prefix is considered
+                    // (same-body props — e.g. paired index signatures — never merge).
+                    if (!merged and base_prop_count > 0) {
+                        for (props.items[0..base_prop_count]) |*existing| {
+                            if (std.mem.eql(u8, existing.name, p.name)) {
+                                existing.* = p;
                                 merged = true;
                                 break;
                             }
