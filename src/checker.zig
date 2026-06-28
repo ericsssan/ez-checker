@@ -12163,6 +12163,53 @@ pub const Checker = struct {
         return self.ast_ref.nodeTag(n) == .ts_conditional_type;
     }
 
+    /// True when an alias body is a COMPUTED type — conditional / mapped /
+    /// indexed-access / keyof.  tsc evaluates such an alias to its result when
+    /// the args are concrete (`ZeroOf<boolean|number>` → `0 | false`), whereas a
+    /// plain alias (`Box<T> = { v: T }`) keeps its name (`Box<string>`).
+    fn aliasBodyIsComputed(self: *Checker, ty_node: NodeIndex) bool {
+        if (ty_node == .none) return false;
+        var n = ty_node;
+        while (self.ast_ref.nodeTag(n) == .ts_parenthesized_type) n = self.ast_ref.nodeData(n).lhs;
+        return switch (self.ast_ref.nodeTag(n)) {
+            // NOTE: ts_mapped_type excluded for now — the mapped-type evaluator is
+            // not yet accurate enough to evaluate eagerly (regresses mappedTypes*),
+            // so mapped aliases stay symbolic until that evaluator is hardened.
+            .ts_conditional_type, .ts_indexed_access_type, .ts_keyof_type => true,
+            else => false,
+        };
+    }
+
+    /// Evaluate a reference to a computed alias (`Name`) with concrete TypeId
+    /// `args` — looks up the alias decl, binds its type params to `args`, and
+    /// evaluates the (conditional / mapped / indexed / keyof) body.  Returns null
+    /// when `Name` isn't a computed-body alias.  The TypeId-level counterpart of
+    /// `resolveConditionalAliasWithArgs` (which works from an AST ref node), so a
+    /// computed alias instantiated via call-site substitution still evaluates.
+    fn evalComputedAlias(self: *Checker, name: []const u8, args: []const TypeId) ?TypeId {
+        const decl = self.decl_index.primaryDecl(name) orelse return null;
+        if (self.ast_ref.nodeTag(decl) != .ts_type_alias_decl) return null;
+        const d = self.ast_ref.nodeData(decl);
+        if (d.lhs == .none) return null;
+        const ad = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(d.lhs));
+        if (!self.aliasBodyIsComputed(ad.type_node)) return null;
+        if (ad.type_params_end <= ad.type_params or
+            ad.type_params_end > self.ast_ref.extra_data.len) return null;
+        const tp_count = ad.type_params_end - ad.type_params;
+        var keys_buf: [8][]const u8 = undefined;
+        var vals_buf: [8]TypeId = undefined;
+        const n = @min(@min(tp_count, @as(u32, @intCast(args.len))), keys_buf.len);
+        if (n == 0) return null;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            const tp: NodeIndex = @enumFromInt(self.ast_ref.extra_data[ad.type_params + i]);
+            if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) return null;
+            keys_buf[i] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+            vals_buf[i] = args[i];
+        }
+        return self.resolveTypeNodeWithSubst(ad.type_node, keys_buf[0..n], vals_buf[0..n]);
+    }
+
     /// Resolve a conditional type alias by building the substitution map from
     /// the call-site type args and evaluating the body with resolveTypeNodeWithSubst.
     /// Returns null when there are no type params / args, or args don't match.
@@ -22235,6 +22282,14 @@ pub const Checker = struct {
             if (!changed) break :alias;
             const new_args = new_args_buf[0..aargs.len];
             const base = if (std.mem.indexOfScalar(u8, alias_name, '<')) |lt| alias_name[0..lt] else alias_name;
+            // A conditional/mapped alias whose args are now all CONCRETE evaluates
+            // to its computed result (`ZeroOf<boolean|number>` → `0 | false`)
+            // instead of staying the symbolic `Alias<args>`.  Deferred (kept
+            // symbolic) when any arg still mentions a free type param — matching tsc.
+            concrete: {
+                for (new_args) |a| if (self.typeMentionsTypeParam(a)) break :concrete;
+                if (self.evalComputedAlias(base, new_args)) |evaluated| return evaluated;
+            }
             const bare_id = self.store.add(bare) catch break :alias;
             const sub_body = self.substituteTypeId(bare_id, keys, vals);
             var buf: std.ArrayList(u8) = .empty;
