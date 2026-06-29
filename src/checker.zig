@@ -25429,8 +25429,40 @@ pub const Checker = struct {
             if (ctag == .call_expr or ctag == .optional_call_expr) {
                 if (self.ast_ref.nodeData(cpn).lhs != cur) return null; // fn must be the callee
                 const args = self.callArguments(cpn);
-                if (pidx >= args.len) return null;
-                const arg_ty = self.typeOf(@enumFromInt(args[pidx]));
+                // Effective positional arg type at pidx, expanding a spread of a
+                // FIXED tuple (`(function(a,b,c){})(...t1)`, t1:[number,boolean,
+                // string]) so a,b,c align to the tuple's elements.  Non-tuple /
+                // variadic spreads keep the legacy one-arg-one-position behavior.
+                var eff: usize = 0;
+                var found: ?TypeId = null;
+                pos: for (args) |raw_arg| {
+                    const an: NodeIndex = @enumFromInt(raw_arg);
+                    if (self.ast_ref.nodeTag(an) == .spread_element) {
+                        const sty = self.store.get(self.typeOf(self.ast_ref.nodeData(an).lhs));
+                        if (sty.kind == .tuple_t) {
+                            const elems = self.store.idsOf(sty.list_data);
+                            var variadic = false;
+                            for (elems) |e| switch (self.store.get(e).kind) {
+                                .array_t, .readonly_array_t => variadic = true,
+                                else => {},
+                            };
+                            if (!variadic) {
+                                if (pidx >= eff and pidx < eff + elems.len) {
+                                    found = elems[pidx - eff];
+                                    break :pos;
+                                }
+                                eff += elems.len;
+                                continue :pos;
+                            }
+                        }
+                    }
+                    if (eff == pidx) {
+                        found = self.typeOf(an);
+                        break :pos;
+                    }
+                    eff += 1;
+                }
+                const arg_ty = found orelse return null;
                 const widened = self.widenForParamDefault(arg_ty, 0);
                 // An optional param (`(j?) => …`) is `T | undefined` under
                 // strictNullChecks even when the call supplies the argument.
@@ -25512,6 +25544,35 @@ pub const Checker = struct {
         const cnames = self.store.signatureParamNamesOf(sigs[0]);
         const this_off: usize = if (cnames.len > 0 and std.mem.eql(u8, cnames[0], "this")) 1 else 0;
         const cidx = idx + this_off;
+        // Tuple-typed REST param in the contextual signature: align the callback's
+        // params positionally to the tuple's elements (`(...args:[number,boolean,
+        // string])` ⊢ `(a,b,c)=>…` → a:number, b:boolean, c:string; `(a,...x)` →
+        // x:[boolean,string]).  ez otherwise slots the whole tuple into param 0.
+        rest_tuple: {
+            const rpi = sigs[0].rest_param_index;
+            if (rpi == 0xFFFF or rpi >= cparams.len or cidx < rpi) break :rest_tuple;
+            const rt = self.store.get(cparams[rpi]);
+            if (rt.kind != .tuple_t) break :rest_tuple;
+            const elems = self.store.idsOf(rt.list_data);
+            // Variadic tuple (`[a, ...T[]]`) needs rest-element spreading; defer.
+            for (elems) |e| switch (self.store.get(e).kind) {
+                .array_t, .readonly_array_t => break :rest_tuple,
+                else => {},
+            };
+            const t_idx = cidx - rpi;
+            const cb_rest = blk: {
+                const pp = parents[param.toInt()];
+                break :blk pp != NONE and self.ast_ref.nodeTag(@enumFromInt(pp)) == .rest_element;
+            };
+            if (cb_rest) {
+                // `...x` captures the REMAINING tuple elements as a tuple.
+                const rem = if (t_idx < elems.len) elems[t_idx..] else elems[elems.len..];
+                const list = self.store.appendTypeIds(rem) catch break :rest_tuple;
+                return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch break :rest_tuple;
+            }
+            if (t_idx < elems.len) return self.nonNullExpected(elems[t_idx]);
+            return null; // positional param beyond the tuple
+        }
         if (cidx >= cparams.len) return null;
         const cty = cparams[cidx];
         // An uninstantiated type-param contextual type (`<T>(x: T) => …` not yet
