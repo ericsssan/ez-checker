@@ -25441,14 +25441,22 @@ pub const Checker = struct {
                         const sty = self.store.get(self.typeOf(self.ast_ref.nodeData(an).lhs));
                         if (sty.kind == .tuple_t) {
                             const elems = self.store.idsOf(sty.list_data);
-                            var variadic = false;
-                            for (elems) |e| switch (self.store.get(e).kind) {
-                                .array_t, .readonly_array_t => variadic = true,
-                                else => {},
+                            // A trailing `rest_t` (`[a, ...T[]]`) is allowed; a rest
+                            // elsewhere is unexpected (bail to the legacy path).
+                            var has_rest = false;
+                            var bad = false;
+                            for (elems, 0..) |e, ei| if (self.store.get(e).kind == .rest_t) {
+                                if (ei != elems.len - 1) bad = true;
+                                has_rest = true;
                             };
-                            if (!variadic) {
+                            if (!bad) {
                                 if (pidx >= eff and pidx < eff + elems.len) {
-                                    found = elems[pidx - eff];
+                                    const e = elems[pidx - eff];
+                                    found = if (self.store.get(e).kind == .rest_t) self.peelRestElem(e) else e;
+                                    break :pos;
+                                }
+                                if (has_rest and pidx >= eff + elems.len) {
+                                    found = self.peelRestElem(elems[elems.len - 1]);
                                     break :pos;
                                 }
                                 eff += elems.len;
@@ -25554,24 +25562,37 @@ pub const Checker = struct {
             const rt = self.store.get(cparams[rpi]);
             if (rt.kind != .tuple_t) break :rest_tuple;
             const elems = self.store.idsOf(rt.list_data);
-            // Variadic tuple (`[a, ...T[]]`) needs rest-element spreading; defer.
-            for (elems) |e| switch (self.store.get(e).kind) {
-                .array_t, .readonly_array_t => break :rest_tuple,
-                else => {},
-            };
+            // A variadic tuple (`[a, ...T[]]`) may have a trailing `rest_t`; it must
+            // be LAST (a rest elsewhere is unexpected — bail).
+            var has_rest = false;
+            for (elems, 0..) |e, ei| {
+                if (self.store.get(e).kind == .rest_t) {
+                    if (ei != elems.len - 1) break :rest_tuple;
+                    has_rest = true;
+                }
+            }
             const t_idx = cidx - rpi;
             const cb_rest = blk: {
                 const pp = parents[param.toInt()];
                 break :blk pp != NONE and self.ast_ref.nodeTag(@enumFromInt(pp)) == .rest_element;
             };
             if (cb_rest) {
-                // `...x` captures the REMAINING tuple elements as a tuple.
+                // `...x` captures the REMAINING tuple elements as a tuple (the
+                // trailing `rest_t` is kept → `[boolean, ...string[]]`).
                 const rem = if (t_idx < elems.len) elems[t_idx..] else elems[elems.len..];
                 const list = self.store.appendTypeIds(rem) catch break :rest_tuple;
                 return self.store.add(.{ .kind = .tuple_t, .list_data = list }) catch break :rest_tuple;
             }
-            if (t_idx < elems.len) return self.nonNullExpected(elems[t_idx]);
-            return null; // positional param beyond the tuple
+            if (t_idx < elems.len) {
+                const e = elems[t_idx];
+                // A `rest_t` element (`...string[]`) gives this param the rest's
+                // ELEMENT type (`string`), not the array.
+                if (self.store.get(e).kind == .rest_t) return self.nonNullExpected(self.peelRestElem(e));
+                return self.nonNullExpected(e);
+            }
+            // Positional param past the listed elements: covered by a trailing rest.
+            if (has_rest) return self.nonNullExpected(self.peelRestElem(elems[elems.len - 1]));
+            return null;
         }
         if (cidx >= cparams.len) return null;
         const cty = cparams[cidx];
