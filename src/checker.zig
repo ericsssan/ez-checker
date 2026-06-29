@@ -25733,15 +25733,31 @@ pub const Checker = struct {
             const members = self.store.idsOf(t.list_data);
             var buf: [16]TypeId = undefined;
             var n: usize = 0;
+            var missing = false; // some constituent lacks the property
+            var all_ref = true; // every constituent is a named type (interface/alias)
             for (members) |m| {
-                const pt = self.objectPropExpectedType(m, key) orelse return null;
-                if (n >= buf.len) break;
-                buf[n] = pt;
-                n += 1;
+                if (self.store.get(m).kind != .type_ref) all_ref = false;
+                if (self.objectPropExpectedType(m, key)) |pt| {
+                    if (n < buf.len) {
+                        buf[n] = pt;
+                        n += 1;
+                    }
+                } else missing = true;
             }
-            if (n == 0 or n != members.len) return null;
-            if (n == 1) return buf[0];
-            return self.store.unionOf(buf[0..n]) catch buf[0];
+            if (n == 0) return null;
+            if (!missing) {
+                // Property present in EVERY constituent → union all (existing).
+                if (n == 1) return buf[0];
+                return self.store.unionOf(buf[0..n]) catch buf[0];
+            }
+            // tsc: a union contextual type also has a property present in only SOME
+            // constituents (`methodOnlyInI1` under `I1 | I2`).  Restrict to a union
+            // of NAMED interfaces with a SINGLE-constituent FUNCTION value (the
+            // contextual param-typing target) — broader cases (object/mapped-type
+            // unions) risk feeding a half-resolved contextual type that's WRONG
+            // rather than an honest gap (contextualTypeFunctionObjectPropertyIntersection).
+            if (n == 1 and all_ref and self.store.get(buf[0]).kind == .function_t) return buf[0];
+            return null;
         }
         // Named interface / alias (`interface G { func(n: T): void }`): resolve
         // the member via apparent-type lookup so an object literal contextually
