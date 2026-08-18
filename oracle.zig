@@ -514,7 +514,35 @@ pub const SnapWriter = struct {
     }
 
     pub fn writeRow(sw: *SnapWriter, file: []const u8, sec_name: []const u8, line: u32, expr: []const u8, want: []const u8, got: []const u8, outcome: []const u8) void {
-        sw.buf.print(sw.gpa, "{s}\t{s}\t{d}\t{s}\t{s}\t{s}\t{s}\n", .{ file, sec_name, line, expr, want, got, outcome }) catch {};
+        sw.appendEscaped(file);
+        sw.buf.append(sw.gpa, '\t') catch {};
+        sw.appendEscaped(sec_name);
+        sw.buf.print(sw.gpa, "\t{d}\t", .{line}) catch {};
+        sw.appendEscaped(expr);
+        sw.buf.append(sw.gpa, '\t') catch {};
+        sw.appendEscaped(want);
+        sw.buf.append(sw.gpa, '\t') catch {};
+        sw.appendEscaped(got);
+        sw.buf.append(sw.gpa, '\t') catch {};
+        sw.appendEscaped(outcome);
+        sw.buf.append(sw.gpa, '\n') catch {};
+    }
+
+    /// A field's own tabs/newlines would split it into extra columns or extra
+    /// rows, which every consumer (the diff, awk one-liners) then skips as
+    /// malformed — silently dropping a few hundred multi-line expressions from
+    /// any comparison.  Write them as two-character escapes so one logical row
+    /// is always one line of exactly seven fields.
+    fn appendEscaped(sw: *SnapWriter, s: []const u8) void {
+        for (s) |c| {
+            const esc: ?[]const u8 = switch (c) {
+                '\t' => "\\t",
+                '\n' => "\\n",
+                '\r' => "\\r",
+                else => null,
+            };
+            if (esc) |e| sw.buf.appendSlice(sw.gpa, e) catch {} else sw.buf.append(sw.gpa, c) catch {};
+        }
     }
 };
 
@@ -744,6 +772,24 @@ fn parseTsvFields(line: []const u8, out: [][]const u8) bool {
     return i == out.len;
 }
 
+/// Join key for a snapshot row: `(file, section, line, expr)` plus the row's
+/// OCCURRENCE index among rows sharing that 4-tuple.
+///
+/// The 4-tuple ALONE IS NOT UNIQUE — 41k of the corpus's 657k rows share one
+/// (highest multiplicity: 391), since tsc's baseline scores the same expression
+/// text several times on a line.  Keying on it collapsed each duplicate group
+/// to its LAST row, so every other row in the group joined against the wrong
+/// sibling and the diff reported transitions that never happened: a display-only
+/// change came out as 811 correct→gap regressions and a net −8, where the truth
+/// was +192 correct with ZERO correct-losses.  Both sweeps enumerate rows in the
+/// same order, so the Nth occurrence in `before` is the Nth in `after`.
+fn snapJoinKey(aa: std.mem.Allocator, seen: *std.StringHashMap(u32), f: []const []const u8) ![]const u8 {
+    const base = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}\t{s}", .{ f[0], f[1], f[2], f[3] });
+    const gop = try seen.getOrPut(base);
+    if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 0;
+    return std.fmt.allocPrint(aa, "{s}\t#{d}", .{ base, gop.value_ptr.* });
+}
+
 fn runDiff(io: std.Io, gpa: std.mem.Allocator, before_path: []const u8, after_path: []const u8) !void {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -756,6 +802,7 @@ fn runDiff(io: std.Io, gpa: std.mem.Allocator, before_path: []const u8, after_pa
     var before_map = std.StringHashMap(BeforeRow).init(aa);
 
     {
+        var seen = std.StringHashMap(u32).init(aa);
         var it = std.mem.splitScalar(u8, before_bytes, '\n');
         _ = it.next(); // skip header
         while (it.next()) |raw| {
@@ -763,7 +810,7 @@ fn runDiff(io: std.Io, gpa: std.mem.Allocator, before_path: []const u8, after_pa
             if (line.len == 0) continue;
             var f: [7][]const u8 = undefined;
             if (!parseTsvFields(line, &f)) continue;
-            const key = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}\t{s}", .{ f[0], f[1], f[2], f[3] });
+            const key = try snapJoinKey(aa, &seen, &f);
             try before_map.put(key, .{ .got = f[5], .outcome = f[6] });
         }
     }
@@ -790,6 +837,7 @@ fn runDiff(io: std.Io, gpa: std.mem.Allocator, before_path: []const u8, after_pa
     var after_count: u64 = 0;
 
     {
+        var seen = std.StringHashMap(u32).init(aa);
         var it = std.mem.splitScalar(u8, after_bytes, '\n');
         _ = it.next(); // skip header
         while (it.next()) |raw| {
@@ -798,7 +846,7 @@ fn runDiff(io: std.Io, gpa: std.mem.Allocator, before_path: []const u8, after_pa
             var f: [7][]const u8 = undefined;
             if (!parseTsvFields(line, &f)) continue;
             after_count += 1;
-            const key = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}\t{s}", .{ f[0], f[1], f[2], f[3] });
+            const key = try snapJoinKey(aa, &seen, &f);
             if (before_map.get(key)) |br| {
                 matched_count += 1;
                 const tk = TransKey{ .before = br.outcome, .after = f[6] };
@@ -900,6 +948,7 @@ fn runDiffCat(
     const BeforeRow = struct { got: []const u8, outcome: []const u8 };
     var before_map = std.StringHashMap(BeforeRow).init(aa);
     {
+        var seen = std.StringHashMap(u32).init(aa);
         var it = std.mem.splitScalar(u8, before_bytes, '\n');
         _ = it.next();
         while (it.next()) |raw| {
@@ -907,7 +956,7 @@ fn runDiffCat(
             if (line.len == 0) continue;
             var f: [7][]const u8 = undefined;
             if (!parseTsvFields(line, &f)) continue;
-            const key = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}\t{s}", .{ f[0], f[1], f[2], f[3] });
+            const key = try snapJoinKey(aa, &seen, &f);
             try before_map.put(key, .{ .got = f[5], .outcome = f[6] });
         }
     }
@@ -917,6 +966,7 @@ fn runDiffCat(
     var total: u64 = 0;
 
     {
+        var seen = std.StringHashMap(u32).init(aa);
         var it = std.mem.splitScalar(u8, after_bytes, '\n');
         _ = it.next();
         while (it.next()) |raw| {
@@ -924,7 +974,7 @@ fn runDiffCat(
             if (line.len == 0) continue;
             var f: [7][]const u8 = undefined;
             if (!parseTsvFields(line, &f)) continue;
-            const key = try std.fmt.allocPrint(aa, "{s}\t{s}\t{s}\t{s}", .{ f[0], f[1], f[2], f[3] });
+            const key = try snapJoinKey(aa, &seen, &f);
             const br = before_map.get(key) orelse continue;
             // Skip unchanged transitions unless category filter is set
             if (dopts.cat_before == null and dopts.cat_after == null) {
