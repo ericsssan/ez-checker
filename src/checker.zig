@@ -6726,6 +6726,10 @@ pub const Checker = struct {
         }
 
         const any_arr = self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_ANY;
+        // Evolving arrays are a noImplicitAny feature.  With it OFF, `var x = []`
+        // is simply `any[]` and stays that way however it is written to — tsc
+        // never evolves the element type there.
+        if (!self.checker_opts.no_implicit_any) return any_arr;
         if (self.isEvolvingArrayOpTarget(use_node)) return any_arr;
         if (self.evolving_in_progress.contains(symid)) return any_arr;
 
