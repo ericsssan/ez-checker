@@ -6720,6 +6720,55 @@ pub const Checker = struct {
         return self.ast_ref.nodeData(parent).lhs == node;
     }
 
+    /// True for the scalar kinds a `typeof <var>` query is never displayed for:
+    /// tsc prints the primitive (`number`, `"a"`, `unique symbol`) rather than
+    /// the query.
+    fn typeofTargetIsScalar(self: *Checker, id: TypeId) bool {
+        const t = self.store.get(id);
+        return switch (t.kind) {
+            .any, .unknown, .never, .null_t, .undefined_t, .void_t,
+            .number, .string, .boolean, .bigint, .symbol, .error_t,
+            .string_literal, .number_literal, .bigint_literal, .boolean_literal,
+            => true,
+            // `const s = Symbol()` is modelled as the named ref `unique symbol`;
+            // tsc prints that, never `typeof s`.
+            .type_ref => std.mem.eql(u8, t.name, "unique symbol"),
+            // A union of scalars (`typeof fooOrBar` where it is `"foo" | "bar"`)
+            // is printed as the union, so it follows the same rule.
+            .union_t => for (self.store.idsOf(t.list_data)) |m| {
+                if (!self.typeofTargetIsScalar(m)) break false;
+            } else true,
+            else => false,
+        };
+    }
+
+    /// tsc renders a `typeof <var>` query differently depending on WHERE the
+    /// answer is asked for.  Inside a larger type it is kept verbatim —
+    /// `function foo3(x: typeof a)` displays as `foo3 : { (x: typeof a): any; … }`
+    /// — but as the declared type OF the binding itself it EXPANDS to the
+    /// structure: `x : { [x: string]: string; }`.  `resolveTypeofType` tags the
+    /// type for the first (composite) position, which is where the tag pays;
+    /// this strips it back off for the second.  `typeof <Class>` is exempt: tsc
+    /// keeps that one in both positions.
+    fn expandBindingTypeofDisplay(self: *Checker, ty_node: NodeIndex, ty: TypeId) TypeId {
+        var n = ty_node;
+        while (n != .none and self.ast_ref.nodeTag(n) == .ts_parenthesized_type) n = self.ast_ref.nodeData(n).lhs;
+        if (n == .none or self.ast_ref.nodeTag(n) != .ts_typeof_type) return ty;
+        const t = self.store.get(ty);
+        if (t.display_name.len == 0) return ty;
+        var inner = self.ast_ref.nodeData(n).lhs;
+        if (inner == .none) return ty;
+        while (self.ast_ref.nodeTag(inner) == .grouping_expr) inner = self.ast_ref.nodeData(inner).lhs;
+        const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(inner));
+        if (self.classAstNodeByName(name) != null) return ty;
+        // Qualified queries (`typeof M2.Point`, `typeof ns.Member`) are kept by
+        // tsc in every position — only a bare `typeof <var>` expands.
+        if (std.mem.indexOfScalar(u8, t.display_name, '.') != null) return ty;
+        var copy = t.*;
+        copy.display_name = "";
+        return self.store.add(copy) catch ty;
+    }
+
     pub fn declaredTypeAtBinding(self: *Checker, binding: NodeIndex) TypeId {
         if (binding == .none) return tymod.ID_ANY;
         // Enum binding: the symbol's decl node is the ts_enum_decl itself
@@ -6750,7 +6799,7 @@ pub const Checker = struct {
                     self.type_pos_depth += 1;
                     const ty = self.resolveTypeNode(ty_node);
                     self.type_pos_depth -= 1;
-                    return ty;
+                    return self.expandBindingTypeofDisplay(ty_node, ty);
                 }
                 // If no annotation, peel to lhs
                 node = data.lhs;
@@ -6789,7 +6838,7 @@ pub const Checker = struct {
                     "";
                 if (bn.len > 0) self.typeof_building.put(self.gpa, bn, {}) catch {};
                 self.type_pos_depth += 1;
-                var ty = self.resolveTypeNode(ty_node);
+                var ty = self.expandBindingTypeofDisplay(ty_node, self.resolveTypeNode(ty_node));
                 self.type_pos_depth -= 1;
                 if (bn.len > 0) _ = self.typeof_building.remove(bn);
                 // Catch-clause parameter: TypeScript permits ONLY `any` /
@@ -6837,7 +6886,7 @@ pub const Checker = struct {
                     self.type_pos_depth += 1;
                     const ty = self.resolveTypeNode(ty_node);
                     self.type_pos_depth -= 1;
-                    return ty;
+                    return self.expandBindingTypeofDisplay(ty_node, ty);
                 }
             }
         }
@@ -9614,12 +9663,17 @@ pub const Checker = struct {
             if (t.eq(tymod.ID_UNKNOWN) and self.constInitIsSymbolCall(name)) {
                 return self.store.stringLiteral(name) catch t;
             }
-            // NOTE: `typeof <var>` is NOT tagged for display preservation here —
-            // tsc's keep-vs-expand choice for a variable query is
-            // position-dependent (a function-type param `(a: typeof y)` is kept
-            // verbatim, but a class-field `a: typeof x` expands to the structure),
-            // too subtle to replicate reliably.  Only `typeof ClassName` (above)
-            // is preserved.
+            // tsc keeps a `typeof <var>` query verbatim wherever it appears
+            // inside a larger type (`{ (x: typeof a): any; … }`), so tag the
+            // display here.  The one position that EXPANDS instead — the
+            // declared type of the binding itself — is stripped back by
+            // `expandBindingTypeofDisplay`.  A query whose target is a
+            // PRIMITIVE or literal is never kept (tsc prints `number`, not
+            // `typeof x`), and tagging one also perturbs the primitive
+            // sub-metric, so leave those alone.
+            if (!self.typeofTargetIsScalar(t)) {
+                if (self.typeofDisplayName(name)) |disp| return self.tagDisplayName(t, disp);
+            }
             return t;
         }
         if (self.global_value_types.get(name)) |t| return t;
@@ -16804,7 +16858,7 @@ pub const Checker = struct {
                 var ty: TypeId = tymod.ID_UNKNOWN;
                 if (data.rhs != .none and self.ast_ref.nodeTag(data.rhs) == .ts_type_annotation) {
                     const ty_node = self.ast_ref.nodeData(data.rhs).lhs;
-                    ty = self.resolveTypeNode(ty_node);
+                    ty = self.expandBindingTypeofDisplay(ty_node, self.resolveTypeNode(ty_node));
                 }
                 const optional = propertyHasOptionalMarker(self, data.lhs);
                 const is_readonly = propertyHasReadonlyModifier(self, data.lhs);
@@ -17332,7 +17386,7 @@ pub const Checker = struct {
                     self.ast_ref.nodeTag(pd.type_annotation) == .ts_type_annotation)
                 {
                     const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
-                    ty = self.resolveTypeNode(ty_node);
+                    ty = self.expandBindingTypeofDisplay(ty_node, self.resolveTypeNode(ty_node));
                 } else if (pd.value != .none) {
                     const raw = self.typeOf(pd.value);
                     const t = self.store.get(raw);
