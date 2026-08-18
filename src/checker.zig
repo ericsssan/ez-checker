@@ -10045,7 +10045,16 @@ pub const Checker = struct {
         // Class expression as an OBJECT-LITERAL property value (`{ x: class {…} }`)
         // → named by the property key (`typeof x`).
         if (name.len == 0) name = self.classExprObjectPropertyKey(node) orelse "";
-        if (name.len == 0) return tymod.ID_UNKNOWN;
+        // An unnamed class expression with nothing to take a name from (an array
+        // element, a parameter default, a class-field initializer) is displayed
+        // by tsc as `typeof (Anonymous class)`.  EXCEPT when it is mixin-shaped
+        // (`class extends TBase {…}`, `extends f(x)`): tsc renders those
+        // structurally (`{ new (...args: any[]): (Anonymous class); … }`), so
+        // naming them would trade a gap for a wrong.
+        if (name.len == 0) {
+            if (self.classExprExtendsNonClass(node, cd)) return tymod.ID_UNKNOWN;
+            name = "(Anonymous class)";
+        }
         // `module.exports = class {…}` / `exports = class {…}` — the binding
         // target is `exports`, but tsc names the module's export by its import
         // type (`typeof import("mod")`), not `typeof exports`.  Leave un-tagged.
