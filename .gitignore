@@ -1,2 +1,12 @@
 .zig-cache/
 zig-out/
+
+# Oracle snapshot/diff scratch — regenerate with `zig build oracle-snapshot -- out.tsv`
+*.tsv
+
+# Ad-hoc debugging scratch and session transcripts
+/20??-??-??.txt
+/*_before.txt
+
+# Stale in-tree backups
+*.backup

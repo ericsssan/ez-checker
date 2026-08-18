@@ -21,7 +21,7 @@ Literals, template literals, arrays, objects, functions, classes, binary/unary o
 Primitives, arrays, tuples, union, intersection, object types, function types, `typeof`, `keyof`, indexed access (`T[K]`), mapped types, conditional types (including `infer`), template literal types, generic type references, recursive type aliases.
 
 **Utility types**
-`Partial`, `Required`, `Readonly`, `Pick`, `Omit`, `Exclude`, `Extract`, `NonNullable`, `Record`, `ReturnType`, `Parameters`, `Awaited`.
+`Partial`, `Required`, `Readonly`, `Pick`, `Omit`, `Exclude`, `Extract`, `NonNullable`, `Record`, `ReturnType`, `Parameters`, `Awaited`, `ConstructorParameters`, `InstanceType`.
 
 **Control-flow narrowing**
 Null/undefined checks, `typeof` guards, `instanceof`, type predicates (`x is T`), assertion functions (`asserts x`), discriminated unions, truthiness, assignment narrowing, early-return narrowing.
@@ -41,7 +41,7 @@ Measured against the TypeScript compiler itself: for every expression in the [mi
 | Metric | Correct | Total | Rate |
 | --- | --- | --- | --- |
 | All expression types | 554,176 | 657,474 | **84.3%** |
-| Primitive types (sub-metric) | 338,560 | 372,262 | **90.9%** |
+| Primitive types (sub-metric) | 338,569 | 372,262 | **90.9%** |
 
 A ratchet (`oracle/baseline.lock`) records these floors; `zig build test-oracle` fails if any metric regresses, and CI enforces it on every push and pull request. Sweep the corpus with `zig build run-oracle`; raise the floor after a genuine gain with `zig build save-baseline`.
 
@@ -49,17 +49,20 @@ A ratchet (`oracle/baseline.lock`) records these floors; `zig build test-oracle`
 
 ## Known gaps
 
-See [open issues](https://github.com/ericsssan/ez-checker/issues/9) for the full tracked list. Short version:
+Every gap originally tracked here has since been implemented; the list below is
+what the checker still does not do, re-audited against the numbers in the table
+above.
 
-- `ConstructorParameters<T>` and `InstanceType<T>` not yet implemented
-- `as const` on object literals (arrays work; objects do not)
-- Optional chaining (`?.`) does not add `| undefined` to the result type
-- `==`/`!=` (loose equality) does not narrow
-- `throw` does not narrow subsequent code
-- Class + interface declaration merging not supported
-- `declare module` / `declare global` augmentation not supported
-- Overload resolution picks the first matching signature, not the best one
-- Global built-in types (~30 hand-curated entries; no full lib.dom or lib.es*)
+- `declare module` / `declare global` augmentation is only partial — a same-named `interface` in a global block merges, but general module augmentation does not
+- Cross-file resolution (opt-in via `ModuleResolver`) does not cover import-equals aliases, `node_modules` packages, or CommonJS `exports` shapes
+- JS-file semantics: a prototype-based constructor (`C.prototype.m = ...`, no `this.x` in the body) is not recognised as class-like, and plain JS functions have no polymorphic `this` type
+- Global built-in types are hand-curated (globals, DOM, `Intl`, `Temporal`, typed arrays). Anything unmodelled resolves to an opaque named type rather than a structural one — there is no full `lib.dom` / `lib.es*` ingest
+- Corpus-wide, ~9% of expressions still yield no type at all and ~5% yield one that differs from `tsc`; `zig build run-oracle` prints the breakdown by category
+
+Implemented since this list was first written: `ConstructorParameters<T>` and
+`InstanceType<T>`, `as const` on object literals, optional-chaining `| undefined`,
+`==` / `!=` narrowing, `throw` narrowing, class + interface declaration merging,
+and best-match (not first-match) overload resolution.
 
 ---
 
@@ -92,8 +95,9 @@ const ez = @import("ez_checker");
 const Checker  = ez.Checker;
 const types    = ez.types;
 
-// Init from an already-parsed file.
-var checker = try Checker.init(allocator, &ast, &semantic_result);
+// Init from an already-parsed file. The fourth argument is `CheckerOpts`
+// (language, target/lib, strictness); `.{}` takes the defaults.
+var checker = try Checker.init(allocator, &ast, &semantic_result, .{});
 defer checker.deinit();
 
 // Optional: wire cross-file resolution.
@@ -126,9 +130,19 @@ fn resolveImpl(
     return cache.resolve(from_dir, module_spec, export_name, local_store, gpa);
 }
 
+fn moduleSourceImpl(
+    ctx: *anyopaque,
+    from_dir: []const u8,
+    module_spec: []const u8,
+) ?[]const u8 {
+    const cache: *MyCache = @ptrCast(@alignCast(ctx));
+    return cache.source(from_dir, module_spec);
+}
+
 checker.module_resolver = .{
-    .ctx        = @ptrCast(my_cache),
-    .resolve_fn = &resolveImpl,
+    .ctx               = @ptrCast(my_cache),
+    .resolve_fn        = &resolveImpl,
+    .module_source_fn  = &moduleSourceImpl,
 };
 ```
 
