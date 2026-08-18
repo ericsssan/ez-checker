@@ -23673,7 +23673,15 @@ pub const Checker = struct {
         }
         if (std.mem.eql(u8, t.name, "Promise")) {
             const inner = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
-            return self.promisePrototypeProperty(name, inner);
+            const lib_member = self.promisePrototypeProperty(name, inner);
+            // A file declaring its own `interface Promise<T>` AUGMENTS the global
+            // one: tsc merges the declarations and displays the LIB signature
+            // first, then the user's overloads (promisePermutations).
+            if (self.userIfaceMember("Promise", name, inner, recv_node)) |user_member| {
+                if (lib_member) |l| return self.mergeFunctionTypes(l, user_member);
+                return user_member;
+            }
+            return lib_member;
         }
         // Well-known symbols: `Symbol.iterator` etc. are `unique symbol`.
         if (std.mem.eql(u8, t.name, "SymbolConstructor")) {
@@ -23939,6 +23947,45 @@ pub const Checker = struct {
             }
         }
         return null;
+    }
+
+    /// Member lookup on a USER-DECLARED global interface (`interface Promise<T>
+    /// { then…; done… }`), with the interface's first type parameter bound to
+    /// `arg`.  Null when the file declares no such interface, or it has no such
+    /// member — the caller then keeps the builtin alone.
+    fn userIfaceMember(self: *Checker, iface_name: []const u8, prop_name: []const u8, arg: TypeId, use_site: NodeIndex) ?TypeId {
+        const decl = self.decl_index.primaryDecl(iface_name) orelse return null;
+        if (self.ast_ref.nodeTag(decl) != .ts_interface_decl) return null;
+        const ty = self.resolveDeclaredTypeAt(iface_name, use_site) orelse return null;
+        const t = self.store.get(ty);
+        if (t.kind != .object_t) return null;
+        var found: ?TypeId = null;
+        for (self.store.propsOf(t.object_props)) |p| {
+            if (std.mem.eql(u8, p.name, prop_name)) {
+                found = p.type_id;
+                break;
+            }
+        }
+        const member_ty = found orelse return null;
+        // Bind the interface's own type parameter (`T`) to the receiver's type
+        // argument.  A method that declares a type parameter of the SAME name
+        // would have it captured by the substitution, so leave those alone.
+        const idata = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
+        if (idata.type_params_end > idata.type_params) {
+            const tp: NodeIndex = @enumFromInt(self.ast_ref.extra_data[idata.type_params]);
+            if (self.ast_ref.nodeTag(tp) == .ts_type_parameter) {
+                const tp_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+                if (self.fn_type_params.get(member_ty)) |mprefix| {
+                    var names: [8][]const u8 = undefined;
+                    const n = extractTpNames(mprefix, &names);
+                    for (names[0..n]) |mn| {
+                        if (std.mem.eql(u8, mn, tp_name)) return member_ty;
+                    }
+                }
+                return self.substituteTypeId(member_ty, &.{tp_name}, &.{arg});
+            }
+        }
+        return member_ty;
     }
 
     fn promisePrototypeProperty(self: *Checker, name: []const u8, inner: TypeId) ?TypeId {
