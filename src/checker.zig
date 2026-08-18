@@ -15642,9 +15642,22 @@ pub const Checker = struct {
         if (sigs.len <= 1) return 0;
         outer: for (sigs, 0..) |sig, si| {
             const params = self.store.signatureParamsOf(sig);
-            if (arg_types.len > params.len) continue;
+            // A rest parameter (`(...items: T[])`) accepts any number of
+            // trailing arguments, each checked against the rest ELEMENT type.
+            const rest_at: ?usize = if (sig.rest_param_index != 0xFFFF and sig.rest_param_index < params.len)
+                sig.rest_param_index
+            else
+                null;
+            if (arg_types.len > params.len and rest_at == null) continue;
             for (arg_types, 0..) |arg_ty, ai| {
-                const param_ty = params[ai];
+                const param_ty = blk: {
+                    if (rest_at) |r| if (ai >= r) {
+                        const rest_ty = params[r];
+                        break :blk self.elementTypeOf(rest_ty) orelse rest_ty;
+                    };
+                    if (ai >= params.len) continue :outer;
+                    break :blk params[ai];
+                };
                 if (tymod.isAny(&self.store, param_ty)) continue;
                 // Overload selection uses the SUBTYPE relation: `any` is only a
                 // subtype of `any`, so an `any` argument does NOT match a
@@ -15661,7 +15674,7 @@ pub const Checker = struct {
         // in that case returning its return type would be actively wrong.  When
         // sig[0] has enough params, use it as the best-effort result (index 0).
         const sig0_params = self.store.signatureParamsOf(sigs[0]);
-        if (arg_types.len > sig0_params.len) return null;
+        if (arg_types.len > sig0_params.len and sigs[0].rest_param_index == 0xFFFF) return null;
         return 0;
     }
 
@@ -24601,8 +24614,26 @@ pub const Checker = struct {
             const arr_ty = self.store.arrayOf(elem) catch return tymod.ID_UNKNOWN;
             return self.makePredicateArrayFn(elem, arr_ty);
         }
+        // concat: tsc's lib.es5 declares TWO overloads, and an uncalled
+        // `arr.concat` displays both:
+        //   { (...items: ConcatArray<T>[]): T[];
+        //     (...items: (T | ConcatArray<T>)[]): T[]; }
+        // The second parameter type collapses on its own for the absorbing
+        // element types — `any | ConcatArray<any>` is `any` and
+        // `never | ConcatArray<never>` is `ConcatArray<never>` — which is
+        // exactly what the baselines show for those cases.
+        if (std.mem.eql(u8, name, "concat")) {
+            const arr_ty = self.store.arrayOf(elem) catch return tymod.ID_UNKNOWN;
+            const ca = self.store.typeRef("ConcatArray", &.{elem}) catch return self.makeNullaryFn(arr_ty);
+            const ca_arr = self.store.arrayOf(ca) catch return self.makeNullaryFn(arr_ty);
+            const mixed = self.store.unionOf(&.{ elem, ca }) catch ca;
+            const mixed_arr = self.store.arrayOf(mixed) catch ca_arr;
+            const s1 = self.makeRestFn(ca_arr, arr_ty) orelse return self.makeNullaryFn(arr_ty);
+            const s2 = self.makeRestFn(mixed_arr, arr_ty) orelse return s1;
+            return self.mergeFunctionTypes(s1, s2);
+        }
         // T[] returners (without callback).
-        if (std.mem.eql(u8, name, "slice") or std.mem.eql(u8, name, "concat") or
+        if (std.mem.eql(u8, name, "slice") or
             std.mem.eql(u8, name, "reverse") or
             std.mem.eql(u8, name, "toSorted") or std.mem.eql(u8, name, "toReversed") or
             std.mem.eql(u8, name, "splice"))
@@ -24948,6 +24979,21 @@ pub const Checker = struct {
             &.{ false, true },
             ret,
         ) orelse self.makeNullaryFn(ret);
+    }
+
+    /// `(...items: <items_arr>) => <ret>` — one rest-parameter signature.
+    fn makeRestFn(self: *Checker, items_arr: TypeId, ret: TypeId) ?TypeId {
+        var pbuf = [_]TypeId{items_arr};
+        var nbuf = [_][]const u8{"items"};
+        var obuf = [_]bool{false};
+        const pr = self.store.appendSignatureParamsFull(&pbuf, &nbuf, &obuf) catch return null;
+        const sig: tymod.Signature = .{
+            .params_start = pr.start,
+            .params_end = pr.end,
+            .return_type = ret,
+            .rest_param_index = 0,
+        };
+        return self.store.functionType(sig) catch null;
     }
 
     /// `(...items: <elem>[]) => number` — the signature of Array.push/unshift.
