@@ -24739,31 +24739,21 @@ pub const Checker = struct {
             const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_UNKNOWN;
             return self.makePredicateArrayFn(elem, opt);
         }
+        // filter: lib.es5 declares two overloads and an uncalled `arr.filter`
+        // shows both, the type-guard one first.
         if (std.mem.eql(u8, name, "filter")) {
             const arr_ty = self.store.arrayOf(elem) catch return tymod.ID_UNKNOWN;
             const plain = self.makePredicateArrayFn(elem, arr_ty);
             const s_ty = self.store.add(.{ .kind = .type_param, .name = "S" }) catch return plain;
             const s_arr = self.store.arrayOf(s_ty) catch return plain;
-            var pbuf = [_]TypeId{ elem, tymod.ID_NUMBER, arr_ty };
-            var nbuf = [_][]const u8{ "value", "index", "array" };
-            var obuf = [_]bool{ false, false, false };
-            const pr = self.store.appendSignatureParamsFull(&pbuf, &nbuf, &obuf) catch return plain;
-            const cb = self.store.functionType(.{
-                .params_start = pr.start, .params_end = pr.end,
-                .return_type = tymod.ID_BOOLEAN,
-                .predicate_param_index = 0, .predicate_target = s_ty,
-            }) catch return plain;
-            const guard = self.makeNamedFn(&.{ cb, tymod.ID_ANY }, &.{ "predicate", "thisArg" }, &.{ false, true }, s_arr) orelse return plain;
-            // `<S extends <elem>>` — the generic prefix, rendered from the element
-            // type so `(number | null)[]` shows `<S extends number | null>`.
-            if (self.typeToString(elem)) |elem_str| {
-                defer self.gpa.free(elem_str);
-                if (std.fmt.allocPrint(self.gpa, "<S extends {s}>", .{elem_str})) |prefix| {
-                    if (self.string_pool.append(self.gpa, prefix)) |_| {
-                        self.tagLibFnPrefix(guard, prefix);
-                    } else |_| self.gpa.free(prefix);
-                } else |_| {}
-            } else |_| {}
+            const cb = self.makeGuardCallback(elem, arr_ty, s_ty) orelse return plain;
+            const guard = self.makeNamedFn(
+                &.{ cb, tymod.ID_ANY },
+                &.{ "predicate", "thisArg" },
+                &.{ false, true },
+                s_arr,
+            ) orelse return plain;
+            self.tagSExtendsPrefix(guard, elem);
             return self.mergeFunctionTypes(guard, plain);
         }
         // concat: tsc's lib.es5 declares TWO overloads, and an uncalled
@@ -24795,8 +24785,31 @@ pub const Checker = struct {
         }
         // includes: simple boolean returner (no predicate callback).
         if (std.mem.eql(u8, name, "includes")) return self.makeNullaryFn(tymod.ID_BOOLEAN);
-        // every/some: (predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => boolean
-        if (std.mem.eql(u8, name, "every") or std.mem.eql(u8, name, "some")) {
+        // every: two lib overloads, the first a type guard whose result narrows
+        // the RECEIVER — `(predicate: (v) => v is S, thisArg?: any): this is S[]`.
+        // The `this` predicate is the printer's 0xFFFE sentinel.
+        if (std.mem.eql(u8, name, "every")) {
+            const plain = self.makePredicateArrayFn(elem, tymod.ID_BOOLEAN);
+            const arr_ty = self.store.arrayOf(elem) catch return plain;
+            const s_ty = self.store.add(.{ .kind = .type_param, .name = "S" }) catch return plain;
+            const s_arr = self.store.arrayOf(s_ty) catch return plain;
+            const cb = self.makeGuardCallback(elem, arr_ty, s_ty) orelse return plain;
+            var pbuf = [_]TypeId{ cb, tymod.ID_ANY };
+            var nbuf = [_][]const u8{ "predicate", "thisArg" };
+            var obuf = [_]bool{ false, true };
+            const pr = self.store.appendSignatureParamsFull(&pbuf, &nbuf, &obuf) catch return plain;
+            const guard = self.store.functionType(.{
+                .params_start = pr.start,
+                .params_end = pr.end,
+                .return_type = tymod.ID_BOOLEAN,
+                .predicate_param_index = 0xFFFE,
+                .predicate_target = s_arr,
+            }) catch return plain;
+            self.tagSExtendsPrefix(guard, elem);
+            return self.mergeFunctionTypes(guard, plain);
+        }
+        // some: a single lib signature (no type-guard overload).
+        if (std.mem.eql(u8, name, "some")) {
             return self.makePredicateArrayFn(elem, tymod.ID_BOOLEAN);
         }
         // push/unshift: `(...items: T[]) => number`.
@@ -25131,6 +25144,36 @@ pub const Checker = struct {
             &.{ false, true },
             ret,
         ) orelse self.makeNullaryFn(ret);
+    }
+
+    /// `(value: T, index: number, array: T[]) => value is S` — the type-guard
+    /// callback in filter's and every's first lib overload.
+    fn makeGuardCallback(self: *Checker, elem: TypeId, arr_ty: TypeId, s_ty: TypeId) ?TypeId {
+        var pbuf = [_]TypeId{ elem, tymod.ID_NUMBER, arr_ty };
+        var nbuf = [_][]const u8{ "value", "index", "array" };
+        var obuf = [_]bool{ false, false, false };
+        const pr = self.store.appendSignatureParamsFull(&pbuf, &nbuf, &obuf) catch return null;
+        return self.store.functionType(.{
+            .params_start = pr.start,
+            .params_end = pr.end,
+            .return_type = tymod.ID_BOOLEAN,
+            .predicate_param_index = 0,
+            .predicate_target = s_ty,
+        }) catch null;
+    }
+
+    /// Tag the `<S extends <elem>>` generic prefix on a guard overload, rendering
+    /// the constraint from the element type (`(number | null)[]` shows
+    /// `<S extends number | null>`).
+    fn tagSExtendsPrefix(self: *Checker, fn_ty: TypeId, elem: TypeId) void {
+        const elem_str = self.typeToString(elem) catch return;
+        defer self.gpa.free(elem_str);
+        const prefix = std.fmt.allocPrint(self.gpa, "<S extends {s}>", .{elem_str}) catch return;
+        self.string_pool.append(self.gpa, prefix) catch {
+            self.gpa.free(prefix);
+            return;
+        };
+        self.tagLibFnPrefix(fn_ty, prefix);
     }
 
     /// `(...items: <items_arr>) => <ret>` — one rest-parameter signature.
