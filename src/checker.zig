@@ -15642,6 +15642,14 @@ pub const Checker = struct {
     /// positional argument, the argument type is assignable to the parameter
     /// type (any/unknown on either side is always compatible).  Falls back to
     /// index 0 when nothing matches or when the function is not overloaded.
+    fn sigParamIsTypeGuard(self: *Checker, id: TypeId) bool {
+        const t = self.store.get(id);
+        if (t.kind != .function_t) return false;
+        const sigs = self.store.signaturesOf(t.signatures);
+        if (sigs.len == 0) return false;
+        return sigs[0].predicate_param_index != 0xFFFF and sigs[0].predicate_target != .none;
+    }
+
     fn pickOverload(self: *Checker, sigs: []const tymod.Signature, arg_types: []const TypeId) ?usize {
         if (sigs.len <= 1) return 0;
         outer: for (sigs, 0..) |sig, si| {
@@ -15654,6 +15662,9 @@ pub const Checker = struct {
                 null;
             if (arg_types.len > params.len and rest_at == null) continue;
             for (arg_types, 0..) |arg_ty, ai| {
+                // NOTE: this check must come BEFORE the any/unknown early-continues
+                // below — an argument that is `any`/`unknown` would otherwise match
+                // a type-guard parameter vacuously.
                 const param_ty = blk: {
                     if (rest_at) |r| if (ai >= r) {
                         const rest_ty = params[r];
@@ -15662,6 +15673,7 @@ pub const Checker = struct {
                     if (ai >= params.len) continue :outer;
                     break :blk params[ai];
                 };
+                if (self.sigParamIsTypeGuard(param_ty) and !self.sigParamIsTypeGuard(arg_ty)) continue :outer;
                 if (tymod.isAny(&self.store, param_ty)) continue;
                 // Overload selection uses the SUBTYPE relation: `any` is only a
                 // subtype of `any`, so an `any` argument does NOT match a
@@ -15673,13 +15685,24 @@ pub const Checker = struct {
             }
             return si;
         }
-        // Fallback: no overload matched. Return null only when sig[0] (the
-        // conventional default) itself can't accommodate the actual arg count —
-        // in that case returning its return type would be actively wrong.  When
-        // sig[0] has enough params, use it as the best-effort result (index 0).
-        const sig0_params = self.store.signatureParamsOf(sigs[0]);
-        if (arg_types.len > sig0_params.len and sigs[0].rest_param_index == 0xFFFF) return null;
-        return 0;
+        // Fallback: no overload matched.  Use a signature as the best-effort
+        // result, but NEVER a type-guard overload (`<S extends T>(p: (v) => v is S)
+        // => S[]`): tsc selects those only for an argument that is itself a type
+        // guard, so falling back to one leaks its unbound `S` into the call
+        // result.  Prefer the first non-guard signature; index 0 if all are.
+        var fb: usize = 0;
+        for (sigs, 0..) |sg, ix| {
+            var guard_shaped = false;
+            for (self.store.signatureParamsOf(sg)) |pp| {
+                if (self.sigParamIsTypeGuard(pp)) { guard_shaped = true; break; }
+            }
+            if (!guard_shaped) { fb = ix; break; }
+        }
+        // Return null only when the chosen signature can't accommodate the actual
+        // arg count — there, returning its return type would be actively wrong.
+        const fb_params = self.store.signatureParamsOf(sigs[fb]);
+        if (arg_types.len > fb_params.len and sigs[fb].rest_param_index == 0xFFFF) return null;
+        return fb;
     }
 
     fn resolveReturnType(self: *Checker, id: TypeId) TypeId {
@@ -24716,10 +24739,32 @@ pub const Checker = struct {
             const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_UNKNOWN;
             return self.makePredicateArrayFn(elem, opt);
         }
-        // filter: (predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => T[]
         if (std.mem.eql(u8, name, "filter")) {
             const arr_ty = self.store.arrayOf(elem) catch return tymod.ID_UNKNOWN;
-            return self.makePredicateArrayFn(elem, arr_ty);
+            const plain = self.makePredicateArrayFn(elem, arr_ty);
+            const s_ty = self.store.add(.{ .kind = .type_param, .name = "S" }) catch return plain;
+            const s_arr = self.store.arrayOf(s_ty) catch return plain;
+            var pbuf = [_]TypeId{ elem, tymod.ID_NUMBER, arr_ty };
+            var nbuf = [_][]const u8{ "value", "index", "array" };
+            var obuf = [_]bool{ false, false, false };
+            const pr = self.store.appendSignatureParamsFull(&pbuf, &nbuf, &obuf) catch return plain;
+            const cb = self.store.functionType(.{
+                .params_start = pr.start, .params_end = pr.end,
+                .return_type = tymod.ID_BOOLEAN,
+                .predicate_param_index = 0, .predicate_target = s_ty,
+            }) catch return plain;
+            const guard = self.makeNamedFn(&.{ cb, tymod.ID_ANY }, &.{ "predicate", "thisArg" }, &.{ false, true }, s_arr) orelse return plain;
+            // `<S extends <elem>>` — the generic prefix, rendered from the element
+            // type so `(number | null)[]` shows `<S extends number | null>`.
+            if (self.typeToString(elem)) |elem_str| {
+                defer self.gpa.free(elem_str);
+                if (std.fmt.allocPrint(self.gpa, "<S extends {s}>", .{elem_str})) |prefix| {
+                    if (self.string_pool.append(self.gpa, prefix)) |_| {
+                        self.tagLibFnPrefix(guard, prefix);
+                    } else |_| self.gpa.free(prefix);
+                } else |_| {}
+            } else |_| {}
+            return self.mergeFunctionTypes(guard, plain);
         }
         // concat: tsc's lib.es5 declares TWO overloads, and an uncalled
         // `arr.concat` displays both:
