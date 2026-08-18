@@ -18620,6 +18620,25 @@ pub const Checker = struct {
         return self.store.unionOf(buf[0..n]) catch id;
     }
 
+    /// `Int8Array.from(…)` / `Int8Array.of(…)` → `Int8Array<ArrayBuffer>`.
+    fn typedArrayStaticCallReturn(self: *Checker, callee: NodeIndex) ?TypeId {
+        if (callee == .none or self.ast_ref.nodeTag(callee) != .member_expr) return null;
+        const d = self.ast_ref.nodeData(callee);
+        if (d.lhs == .none or d.rhs == .none) return null;
+        if (self.ast_ref.nodeTag(d.lhs) != .identifier) return null;
+        const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.rhs));
+        if (!std.mem.eql(u8, prop, "from") and !std.mem.eql(u8, prop, "of")) return null;
+        const recv = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs));
+        if (!eqAny(recv, &.{
+            "Int8Array",  "Uint8Array",  "Uint8ClampedArray",
+            "Int16Array", "Uint16Array", "Int32Array",
+            "Uint32Array", "Float32Array", "Float64Array",
+        })) return null;
+        if (self.decl_index.hasType(recv)) return null;
+        const ab = self.store.typeRef("ArrayBuffer", &.{}) catch return null;
+        return self.store.typeRef(recv, &.{ab}) catch null;
+    }
+
     fn inferCallReturn(self: *Checker, node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(node);
         const callee = data.lhs;
@@ -18638,6 +18657,11 @@ pub const Checker = struct {
         // first argument's type.  ez's generic path leaves the bare `T`, so
         // substitute it with the receiver's actual type.
         if (self.objectIdentityStaticReturn(node, callee)) |ty| return ty;
+        // `Int8Array.from(...)` / `.of(...)` — the statics return the instance
+        // type, exactly like `new Int8Array(...)`.  Without this the call rides
+        // the opaque overload-DISPLAY ref and lands on `any`, which also
+        // perturbs the enclosing function's inferred return type.
+        if (self.typedArrayStaticCallReturn(callee)) |ty| return ty;
         // `Error(...)` / `TypeError(...)` / … called WITHOUT `new` returns an
         // instance of the same type (the lib gives the Error constructors a
         // call signature equal to their construct signature).  Only fires when
@@ -20212,6 +20236,11 @@ pub const Checker = struct {
             const elem = if (args.len == 1) args[0] else tymod.ID_ANY;
             return self.store.arrayOf(elem) catch null;
         }
+        // `Int8Array.from(...)` / `.of(...)` — the static returns the instance
+        // type, same as `new`.  Without this the call rides an opaque display
+        // ref and lands on `any`, which also perturbs the enclosing function's
+        // inferred return type.
+        // (kept next to the `new` handling below so the two stay in step)
         // TypedArray constructors: `new Int8Array(n)` → `Int8Array<ArrayBuffer>`.
         // tsc renders the instance with its buffer type arg; for the `new` form
         // in this corpus the buffer is always `ArrayBuffer` (SharedArrayBuffer
@@ -22768,7 +22797,7 @@ pub const Checker = struct {
             // Snapshot name before any type-adding calls — libTypeRefProperty/resolveDeclaredType
             // may grow types.items, invalidating the `obj` pointer obtained from store.get().
             const ref_name = obj.name;
-            if (self.libTypeRefProperty(obj_ty, prop_name)) |ty| return ty;
+            if (self.libTypeRefProperty(obj_ty, prop_name, obj_node)) |ty| return ty;
             // Scope-aware build first, as a PURE ADDITION: when `ref_name` is
             // declared in several namespaces, try the homonym visible at the use
             // site. Only short-circuit if it actually resolves the member —
@@ -23451,10 +23480,84 @@ pub const Checker = struct {
     /// Look up a property on a lib type_ref (Promise / Array / Set /
     /// Map).  Returns null when the type isn't recognised or doesn't
     /// have the named property modeled.
-    fn libTypeRefProperty(self: *Checker, ref_ty: TypeId, name: []const u8) ?TypeId {
+    /// tsc renames a lib signature's type parameter `T` to `T_1` when the USE
+    /// SITE sits inside a declaration that already declares a `T` — the printer
+    /// disambiguates against what is in scope there.  This is the narrow,
+    /// checkable slice of that rule: is `node` inside the span of a declaration
+    /// owning a type parameter named `T`?
+    fn inScopeOfTypeParamNamedT(self: *Checker, node: NodeIndex) bool {
+        if (node == .none) return false;
+        const parents = self.semantic.parent_indices;
+        var n = node;
+        var guard: u16 = 0;
+        while (guard < 256) : (guard += 1) {
+            const i = n.toInt();
+            if (i >= parents.len) return false;
+            const p = parents[i];
+            if (p == @intFromEnum(NodeIndex.none) or p >= self.ast_ref.nodes.len) return false;
+            const pn: NodeIndex = @enumFromInt(p);
+            const pd = self.ast_ref.nodeData(pn);
+            var range: ?struct { s: u32, e: u32 } = null;
+            switch (self.ast_ref.nodeTag(pn)) {
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                => {
+                    const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(pd.lhs));
+                    range = .{ .s = fd.type_params, .e = fd.type_params_end };
+                },
+                .class_decl, .class_expr => {
+                    const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(pd.lhs));
+                    range = .{ .s = cd.type_params, .e = cd.type_params_end };
+                },
+                else => {},
+            }
+            if (range) |r| {
+                var k = r.s;
+                while (k < r.e) : (k += 1) {
+                    const tp_node: NodeIndex = @enumFromInt(self.ast_ref.extra_data[k]);
+                    if (std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node)), "T")) return true;
+                }
+            }
+            n = pn;
+        }
+        return false;
+    }
+
+    /// `Int8Array.from` … `Float64Array.from` — the lib's four-overload static,
+    /// emitted as an opaque named ref carrying tsc's exact display (the
+    /// established lever for lib method VALUES: member access on it stays a
+    /// coverage gap rather than becoming a wrong concrete answer).
+    fn typedArrayFromOverloads(self: *Checker, ctor_name: []const u8, recv_node: NodeIndex) ?TypeId {
+        if (!std.mem.endsWith(u8, ctor_name, "ArrayConstructor")) return null;
+        const elem_name = ctor_name[0 .. ctor_name.len - "Constructor".len];
+        if (!eqAny(elem_name, &.{
+            "Int8Array",  "Uint8Array",  "Uint8ClampedArray",
+            "Int16Array", "Uint16Array", "Int32Array",
+            "Uint32Array", "Float32Array", "Float64Array",
+        })) return null;
+        const in_t = self.inScopeOfTypeParamNamedT(recv_node);
+        const tp: []const u8 = if (in_t) "T_1" else "T";
+        const disp = std.fmt.allocPrint(self.gpa,
+            "{{ (arrayLike: ArrayLike<number>): {0s}<ArrayBuffer>; " ++
+            "<{1s}>(arrayLike: ArrayLike<{1s}>, mapfn: (v: {1s}, k: number) => number, thisArg?: any): {0s}<ArrayBuffer>; " ++
+            "(elements: Iterable<number>): {0s}<ArrayBuffer>; " ++
+            "<{1s}>(elements: Iterable<{1s}>, mapfn?: (v: {1s}, k: number) => number, thisArg?: any): {0s}<ArrayBuffer>; }}",
+            .{ elem_name, tp }) catch return null;
+        self.string_pool.append(self.gpa, disp) catch {
+            self.gpa.free(disp);
+            return null;
+        };
+        return self.store.typeRef(disp, &.{}) catch null;
+    }
+
+    fn libTypeRefProperty(self: *Checker, ref_ty: TypeId, name: []const u8, recv_node: NodeIndex) ?TypeId {
         const t = self.store.get(ref_ty);
         if (t.kind != .type_ref) return null;
         const args = self.store.idsOf(t.list_data);
+        // TypedArray constructor statics: `Int8Array.from` and friends.
+        if (std.mem.eql(u8, name, "from")) {
+            if (self.typedArrayFromOverloads(t.name, recv_node)) |ty| return ty;
+        }
         // Wrapper-object types (`Number`/`String`/`Boolean`) expose the same
         // instance methods as the primitives — route to the primitive prototype
         // handlers so `x: T extends Number; x.toFixed()` and `n: Number;
