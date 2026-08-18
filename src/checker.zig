@@ -1604,8 +1604,8 @@ pub const Checker = struct {
             // their signature (param types + return type).  Class
             // expressions still fall back to unknown for now.
             .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
-                => self.functionTypeFromFnDecl(node),
-            .arrow_fn, .async_arrow_fn => self.functionTypeFromArrow(node),
+                => self.expandoFunctionType(node, self.functionTypeFromFnDecl(node)),
+            .arrow_fn, .async_arrow_fn => self.expandoFunctionType(node, self.functionTypeFromArrow(node)),
             // Object-literal method shorthands (`{ async f() {} }`).
             // The facade calls typeOf(method_def) when the synthetic FunctionExpression
             // has no _i; this gives returnsThenable the correct function_t.
@@ -10198,6 +10198,96 @@ pub const Checker = struct {
         return self.staticPropertyKey(pd.lhs);
     }
 
+    /// The nearest enclosing block / function / root node — the scope a binding
+    /// or an assignment lives in.
+    fn enclosingScopeNode(self: *Checker, node: NodeIndex) NodeIndex {
+        const parents = self.semantic.parent_indices;
+        var n = node;
+        var guard: u16 = 0;
+        while (guard < 256) : (guard += 1) {
+            const i = n.toInt();
+            if (i >= parents.len) return n;
+            const p = parents[i];
+            if (p == @intFromEnum(NodeIndex.none) or p >= self.ast_ref.nodes.len) return n;
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .block_stmt, .root,
+                .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                .arrow_fn, .async_arrow_fn,
+                => return pn,
+                else => n = pn,
+            }
+        }
+        return n;
+    }
+
+    /// True when a declarator belongs to a `const` declaration.
+    fn declaratorIsConst(self: *Checker, decl_node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const ni = decl_node.toInt();
+        if (ni >= parents.len) return false;
+        const p = parents[ni];
+        if (p == @intFromEnum(NodeIndex.none) or p >= self.ast_ref.nodes.len) return false;
+        const tok = self.ast_ref.nodeMainToken(@enumFromInt(p));
+        return std.mem.eql(u8, self.ast_ref.tokenText(tok), "const");
+    }
+
+    /// A function expression bound to a name that also carries expando property
+    /// assignments (`const dice = () => …; dice.first = "Rando"`) is typed by tsc
+    /// as the call signature PLUS those properties —
+    /// `{ (): number; first: string; }` — not as the bare signature.  The printer
+    /// already renders an object_t that carries `signatures`, so this grafts the
+    /// props onto the built function type.  Property types are WIDENED: they are
+    /// mutable properties, so `dice.first = "Rando"` is `string`, not `"Rando"`.
+    fn expandoFunctionType(self: *Checker, fn_node: NodeIndex, fn_ty: TypeId) TypeId {
+        const ft = self.store.get(fn_ty);
+        if (ft.kind != .function_t) return fn_ty;
+        // The function already renders by NAME (`typeof SomeConstructor`) — a JS
+        // constructor function, a named function expression, a class-like.  tsc
+        // shows those by name in every position, expandos or not, and grafting
+        // props here would drop the display tag that earned that.
+        if (ft.display_name.len > 0) return fn_ty;
+        const name = self.jsFunctionAssignedName(fn_node) orelse return fn_ty;
+        const list = self.expando_fns.get(name) orelse return fn_ty;
+        if (list.items.len == 0 or list.items.len > 24) return fn_ty;
+        const sigs = ft.signatures;
+        var props: [24]tymod.ObjectProp = undefined;
+        var n: usize = 0;
+        for (list.items) |e| {
+            if (n >= props.len) break;
+            // `X.prototype.m = …` makes X a CONSTRUCTOR function, which tsc
+            // displays as `typeof X` — not as a call signature with a
+            // `prototype` member.  Leave those to the existing path.
+            if (std.mem.eql(u8, e.name, "prototype")) continue;
+            // `expando_fns` is keyed by bare NAME, so a shadowed binding in
+            // another block contributes its writes to the same list
+            // (expandoFunctionBlockShadowing: two `Y.test` writes, one per
+            // scope).  Only take writes from this function's own scope.
+            if (self.enclosingScopeNode(fn_node) != self.enclosingScopeNode(e.value)) continue;
+            const raw = self.widenLiteralKind(self.typeOf(e.value));
+            // Repeated writes to one property union: `g.both = 1; g.both = "s"`
+            // is `number | string`, not just the last write.
+            var merged = false;
+            for (props[0..n]) |*existing| {
+                if (!std.mem.eql(u8, existing.name, e.name)) continue;
+                if (!existing.type_id.eq(raw)) {
+                    existing.type_id = self.store.unionOf(&.{ existing.type_id, raw }) catch existing.type_id;
+                }
+                merged = true;
+                break;
+            }
+            if (merged) continue;
+            props[n] = .{ .name = e.name, .type_id = raw };
+            n += 1;
+        }
+        if (n == 0) return fn_ty;
+        const obj = self.store.objectOf(props[0..n]) catch return fn_ty;
+        var t = self.store.get(obj).*;
+        t.signatures = sigs;
+        return self.store.add(t) catch fn_ty;
+    }
+
     /// The name a function EXPRESSION is bound to by its enclosing declarator
     /// or assignment (`var Foo = fn`, `X.Foo = fn`), for JS constructor-function
     /// naming.  Returns the rightmost identifier of the target, or null.
@@ -14356,6 +14446,32 @@ pub const Checker = struct {
                                     // later `Outer.x = …` — tsc (salsa) types
                                     // Outer as `typeof Outer`.
                                     .declarator => {
+                                        // `const dice = () => …; dice.first = "x"`:
+                                        // a function EXPRESSION bound to a name picks
+                                        // up expando props in every language (tsc
+                                        // shows the call signature plus the props),
+                                        // unlike the `var X = {}` salsa form below
+                                        // which is JS-only.
+                                        const ddf = self.ast_ref.nodeData(decl_node);
+                                        switch (self.ast_ref.nodeTag(ddf.rhs)) {
+                                            .arrow_fn, .async_arrow_fn, .fn_expr, .async_fn_expr,
+                                            .generator_fn_expr, .async_generator_fn_expr => {
+                                                // TypeScript only grants expando properties to a
+                                                // CONST binding — `var f = function(){}; f.p = 1`
+                                                // is an error there and keeps the bare signature
+                                                // (typeFromPropertyAssignment29 says so in a
+                                                // comment).  JS salsa accepts any binding kind.
+                                                if (!self.checker_opts.is_js_file and
+                                                    !self.declaratorIsConst(decl_node)) continue;
+                                                const fgop = try self.expando_fns.getOrPut(self.gpa, name);
+                                                if (!fgop.found_existing) fgop.value_ptr.* = .empty;
+                                                if (direct_prop) |pn| {
+                                                    try fgop.value_ptr.append(self.gpa, .{ .name = pn, .value = data.rhs });
+                                                }
+                                                continue;
+                                            },
+                                            else => {},
+                                        }
                                         if (!self.checker_opts.is_js_file) continue;
                                         const dd = self.ast_ref.nodeData(decl_node);
                                         // Only EMPTY literals (`var X = {}`) get the
