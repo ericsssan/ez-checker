@@ -700,9 +700,20 @@ pub const Checker = struct {
     /// Their props live in `expando_fns` alongside function expandos.
     expando_objs: std.StringHashMapUnmanaged(void) = .empty,
 
-    /// True when the file contains `module.exports = { … }` (object-literal
-    /// RHS) — only then does tsc display `typeof module.exports`.
+    /// True when the file builds a CommonJS export OBJECT — `module.exports = {…}`
+    /// or member-by-member `module.exports.a = …` — which tsc displays as
+    /// `typeof module.exports`.
     module_exports_literal: bool = false,
+    /// True when a JS file uses ES module syntax (`import`/`export`).  There
+    /// `module` is just the ambient global, so a stray `module.exports.x = …`
+    /// (an error tsc still checks) types as `any`, NOT as the export object.
+    file_is_es_module: bool = false,
+    /// True when the file assigns an existing ENTITY to the whole export object
+    /// (`module.exports = Foo`, `= class {…}`, `= function () {}`, `= require(…)`).
+    /// tsc then displays that entity (or `typeof import(".")`) rather than
+    /// `typeof module.exports`, so it SUPPRESSES the display above — even when
+    /// the file also writes properties onto it (`module.exports.Sub = …`).
+    module_exports_entity: bool = false,
 
     /// Lazily-built map: destructuring pattern node → its `ts_type_annotation`
     /// node.  Patterns store their `: T` annotation as a child node parented to
@@ -2201,6 +2212,47 @@ pub const Checker = struct {
         return std.mem.eql(u8, prop, "exports");
     }
 
+    /// True when a whole-object assignment to `module.exports` makes tsc display
+    /// something OTHER than `typeof module.exports`.
+    ///
+    /// Assigning an existing entity (`= Foo`, `= class {…}`, `= require(…)`) shows
+    /// that entity, and a NON-EMPTY object literal shows the literal's structure.
+    /// Two shapes do NOT suppress: the empty literal `= {}` (the canonical "this
+    /// module builds its exports" marker), and a self-reference (`module.exports =
+    /// exports`), which is just aliasing.  Chained assignments are peeled to the
+    /// value that actually lands: `module.exports = exports = {}` is an empty
+    /// literal, not an entity.
+    fn moduleExportsAssignSuppresses(self: *Checker, lhs: NodeIndex, rhs: NodeIndex) bool {
+        if (!self.isModuleExportsMember(lhs)) return false;
+        var r = rhs;
+        var depth: u8 = 0;
+        while (depth < 8 and r != .none and self.ast_ref.nodeTag(r) == .assign) : (depth += 1) {
+            r = self.ast_ref.nodeData(r).rhs;
+        }
+        if (r == .none) return false;
+        if (self.isEmptyObjectLiteral(r)) return false;
+        if (self.isModuleExportsMember(r)) return false;
+        if (self.ast_ref.nodeTag(r) == .identifier and
+            std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(r)), "exports")) return false;
+        return true;
+    }
+
+    /// True when `node` is a member chain ROOTED at `module.exports`
+    /// (`module.exports.a`, `module.exports.a.b`) — the LHS shape of a CommonJS
+    /// property export.
+    fn assignsIntoModuleExports(self: *Checker, node: NodeIndex) bool {
+        var n = node;
+        var depth: u8 = 0;
+        while (depth < 8) : (depth += 1) {
+            if (n == .none or self.ast_ref.nodeTag(n) != .member_expr) return false;
+            const d = self.ast_ref.nodeData(n);
+            if (d.lhs == .none) return false;
+            if (self.isModuleExportsMember(d.lhs)) return true;
+            n = d.lhs;
+        }
+        return false;
+    }
+
     /// Whether the program declares an `Element` type inside a `JSX` namespace
     /// (`declare namespace JSX { interface Element {} }`).  When present, a JSX
     /// element expression is `JSX.Element` regardless of the jsx EMIT mode
@@ -3233,6 +3285,18 @@ pub const Checker = struct {
         // built in inferCallReturn.
         if (std.mem.eql(u8, name, "fetch") and self.global_value_types.contains("fetch")) {
             return self.store.typeRef("(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>", &.{}) catch tymod.ID_ANY;
+        }
+        // CommonJS `module` — tsc shows the module record whose single member is
+        // the export object: `{ exports: typeof module.exports; }`.  Gated on the
+        // same signal as the `module.exports` display below, so a plain JS file
+        // that never exports keeps `module` as the `any` global.
+        if (self.checker_opts.is_js_file and self.module_exports_literal and
+            !self.module_exports_entity and !self.file_is_es_module and
+            std.mem.eql(u8, name, "module"))
+        {
+            const exports_ty = self.store.typeRef("typeof module.exports", &.{}) catch tymod.ID_ANY;
+            var props = [_]tymod.ObjectProp{.{ .name = "exports", .type_id = exports_ty }};
+            if (self.store.objectOf(&props)) |ot| return ot else |_| {}
         }
         if (self.global_value_types.get(name)) |t| {
             // Namespace-value globals (Temporal, Intl) map to `typeof X`. In a
@@ -14230,15 +14294,33 @@ pub const Checker = struct {
         var i: u32 = 0;
         while (i < total) : (i += 1) {
             const ni: NodeIndex = @enumFromInt(i);
-            if (self.ast_ref.nodeTag(ni) != .assign) continue;
+            const ntag = self.ast_ref.nodeTag(ni);
+            if (self.checker_opts.is_js_file and !self.file_is_es_module) {
+                switch (ntag) {
+                    .import_decl, .export_named, .export_named_from, .export_all,
+                    .export_default_expr, .export_default_fn, .export_default_class,
+                    => self.file_is_es_module = true,
+                    else => {},
+                }
+            }
+            if (ntag != .assign) continue;
             const data = self.ast_ref.nodeData(ni);
             if (data.lhs == .none or data.lhs.toInt() == NONE) continue;
-            // CommonJS: note `module.exports = { … }` (object-literal RHS).
+            // CommonJS: note that the file builds an export OBJECT, either
+            // wholesale (`module.exports = { … }`) or member-by-member
+            // (`module.exports.a = …`).  tsc displays both as
+            // `typeof module.exports`; only assigning an existing entity
+            // (`module.exports = Foo`) shows that entity instead.
             if (self.checker_opts.is_js_file and !self.module_exports_literal and
-                self.isModuleExportsMember(data.lhs) and
-                self.isEmptyObjectLiteral(data.rhs))
+                ((self.isModuleExportsMember(data.lhs) and self.isEmptyObjectLiteral(data.rhs)) or
+                    self.assignsIntoModuleExports(data.lhs)))
             {
                 self.module_exports_literal = true;
+            }
+            if (self.checker_opts.is_js_file and !self.module_exports_entity and
+                self.moduleExportsAssignSuppresses(data.lhs, data.rhs))
+            {
+                self.module_exports_entity = true;
             }
             // Direct single-level property write `foo.x = v`: remember the
             // prop so member access can type it later.
@@ -21185,7 +21267,8 @@ pub const Checker = struct {
         // an object literal (`module.exports = {…}`); assigning an existing
         // entity (`module.exports = Foo`) shows that entity's type instead.
         if (self.checker_opts.is_js_file and self.isModuleExportsMember(node) and
-            self.module_exports_literal)
+            self.module_exports_literal and !self.module_exports_entity and
+            !self.file_is_es_module)
         {
             return self.store.typeRef("typeof module.exports", &.{}) catch tymod.ID_ANY;
         }
