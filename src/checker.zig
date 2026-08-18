@@ -17225,16 +17225,33 @@ pub const Checker = struct {
         }
         if (n == 0) return new_ty;
         const merged_sigs = self.store.appendSignatures(sig_buf[0..n]) catch return new_ty;
+        // Duplicate the source prefixes BEFORE any writes: a destination slot may
+        // be one of the sources, and the overwrite below frees what it replaces.
+        var owned: [8]?[]u8 = undefined;
+        for (&owned) |*slot| slot.* = null;
         for (0..n) |k| {
+            if (k >= owned.len) break;
             if (self.sig_type_params.get(src_idx[k])) |prefix| {
-                const dst = merged_sigs.start + @as(u32, @intCast(k));
-                if (!self.sig_type_params.contains(dst)) {
-                    const dup = self.gpa.dupe(u8, prefix) catch break;
-                    self.sig_type_params.put(self.gpa, dst, dup) catch self.gpa.free(dup);
-                }
+                owned[k] = self.gpa.dupe(u8, prefix) catch null;
             }
         }
-        return self.store.add(.{ .kind = .function_t, .signatures = merged_sigs, .is_overload_set = n > 1 }) catch new_ty;
+        const result = self.store.add(.{ .kind = .function_t, .signatures = merged_sigs, .is_overload_set = n > 1 }) catch {
+            for (owned[0..@min(n, owned.len)]) |o| if (o) |v| self.gpa.free(v);
+            return new_ty;
+        };
+        // Write the prefixes against the RESULT's signature range, not the range
+        // just appended: `store.add` INTERNS, so an identical function type
+        // already in the store comes back with its OWN (different) range, and
+        // prefixes written to the appended range would be orphaned — leaving the
+        // previous owner's `<U>` rendered on the lib's `<TResult1 = …>` signature.
+        const rstart = self.store.get(result).signatures.start;
+        for (0..@min(n, owned.len)) |k| {
+            const dup = owned[k] orelse continue;
+            const dst = rstart + @as(u32, @intCast(k));
+            if (self.sig_type_params.fetchRemove(dst)) |old_kv| self.gpa.free(old_kv.value);
+            self.sig_type_params.put(self.gpa, dst, dup) catch self.gpa.free(dup);
+        }
+        return result;
     }
 
     /// Build the INSTANCE type of a class — a record of fields and methods.
@@ -24047,10 +24064,12 @@ pub const Checker = struct {
         const ft = self.store.get(fn_ty);
         if (ft.kind == .function_t) {
             const slot = ft.signatures.start;
-            if (!self.sig_type_params.contains(slot)) {
-                const dup2 = self.gpa.dupe(u8, prefix) catch return;
-                self.sig_type_params.put(self.gpa, slot, dup2) catch self.gpa.free(dup2);
-            }
+            // Overwrite: this signature was just built for THIS lib member, so
+            // its prefix is authoritative for the slot.  First-writer-wins left a
+            // previous owner's `<U>` on the lib's `<TResult1 = …>` signature.
+            const dup2 = self.gpa.dupe(u8, prefix) catch return;
+            if (self.sig_type_params.fetchRemove(slot)) |old_kv| self.gpa.free(old_kv.value);
+            self.sig_type_params.put(self.gpa, slot, dup2) catch self.gpa.free(dup2);
         }
     }
 
