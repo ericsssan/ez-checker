@@ -7426,6 +7426,12 @@ pub const Checker = struct {
                     break :blk parents[ridx] == @intFromEnum(NodeIndex.none);
                 };
                 if (rest_orphan or self.isFunctionParamNode(parent)) {
+                    // An IIFE contextually types its rest parameter as the TUPLE
+                    // of the remaining argument types — `((...numbers) => …)(5,6,7)`
+                    // is `[number, number, number]`, not `any[]`.  This is the
+                    // path the identifier row takes; `paramDeclaredType` has the
+                    // same check for the other one.
+                    if (self.iifeArgParamType(parent)) |t| return t;
                     return self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_UNKNOWN;
                 }
                 return tymod.ID_UNKNOWN;
@@ -11552,6 +11558,7 @@ pub const Checker = struct {
                 const ty = self.ast_ref.nodeData(rdata.rhs).lhs;
                 return self.resolveTypeNode(ty);
             }
+            if (self.iifeArgParamType(node)) |t| return t;
             // Unannotated rest parameters are `any[]` (an array of implicit
             // any), matching tsc with noImplicitAny off.
             return self.store.arrayOf(tymod.ID_ANY) catch tymod.ID_ANY;
@@ -25908,6 +25915,7 @@ pub const Checker = struct {
                     fn_node = pn; ps = fd.params; pe = fd.params_end;
                     break;
                 },
+                .rest_element => {},
                 else => return null,
             }
         }
@@ -25915,8 +25923,19 @@ pub const Checker = struct {
         const ext = self.ast_ref.extra_data;
         if (ps > pe or pe > ext.len) return null;
         var idx: ?usize = null;
+        var param_is_rest = false;
         for (ext[ps..pe], 0..) |raw, i| {
-            if (raw == param.toInt()) { idx = i; break; }
+            if (raw == param.toInt()) {
+                idx = i;
+                param_is_rest = self.ast_ref.nodeTag(param) == .rest_element;
+                break;
+            }
+            const rn: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(rn) == .rest_element and self.ast_ref.nodeData(rn).lhs == param) {
+                idx = i;
+                param_is_rest = true;
+                break;
+            }
         }
         const pidx = idx orelse return null;
         // Walk up through any wrapping parentheses to a call whose CALLEE is the
@@ -25932,6 +25951,19 @@ pub const Checker = struct {
             if (ctag == .call_expr or ctag == .optional_call_expr) {
                 if (self.ast_ref.nodeData(cpn).lhs != cur) return null; // fn must be the callee
                 const args = self.callArguments(cpn);
+                if (param_is_rest) {
+                    var tbuf: [16]TypeId = undefined;
+                    var tn: usize = 0;
+                    for (args, 0..) |raw_arg, ai| {
+                        if (ai < pidx) continue;
+                        const an: NodeIndex = @enumFromInt(raw_arg);
+                        if (self.ast_ref.nodeTag(an) == .spread_element) return null;
+                        if (tn >= tbuf.len) break;
+                        tbuf[tn] = self.widenLiteralKind(self.typeOf(an));
+                        tn += 1;
+                    }
+                    return self.store.tupleOf(tbuf[0..tn]) catch null;
+                }
                 // Effective positional arg type at pidx, expanding a spread of a
                 // FIXED tuple (`(function(a,b,c){})(...t1)`, t1:[number,boolean,
                 // string]) so a,b,c align to the tuple's elements.  Non-tuple /
