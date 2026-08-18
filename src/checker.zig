@@ -23481,6 +23481,11 @@ pub const Checker = struct {
     }
 
     fn substituteObject(self: *Checker, id: TypeId, t: *const tymod.Type, keys: []const []const u8, vals: []const TypeId) TypeId {
+        // Snapshot the TYPE too, not just its props: `t` borrows into the store's
+        // type array, and the substitution below calls `store.add`, which can
+        // realloc it.  Reading `t.*` afterwards would copy a dangling struct
+        // (name slice included) straight into the intern hash.
+        const t_snapshot = t.*;
         const props_slice = self.store.propsOf(t.object_props);
         if (props_slice.len == 0) return id;
         var props_buf: [16]tymod.ObjectProp = undefined;
@@ -23508,7 +23513,20 @@ pub const Checker = struct {
             }
         }
         if (!changed) return id;
-        return self.store.objectOf(new_buf[0..props.len]) catch id;
+        // Rebuild by COPYING the original type and swapping only the props:
+        // `objectOf` would produce a bare object_t, silently dropping the
+        // interface `name` (which member lookup and the facade rely on), any
+        // CALL SIGNATURES the object carries (an expando function type is an
+        // object_t with `signatures`), and the base-type refs in `list_data`.
+        // `alias_name` / `display_name` are deliberately NOT carried: they are
+        // display overrides captured before substitution, so keeping them would
+        // render an instantiated type under the uninstantiated name.
+        const list = self.store.appendObjectProps(new_buf[0..props.len]) catch return id;
+        var nt = t_snapshot;
+        nt.object_props = list;
+        nt.alias_name = "";
+        nt.display_name = "";
+        return self.store.add(nt) catch id;
     }
 
     /// Look up a property on a lib type_ref (Promise / Array / Set /
