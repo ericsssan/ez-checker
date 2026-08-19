@@ -23445,7 +23445,21 @@ pub const Checker = struct {
                         }
                     }
                 }
-                return self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = was_overload_set }) catch id;
+                const subst_result = self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = was_overload_set }) catch id;
+                // Carry the WHOLE-TYPE prefix too.  `fn_type_params` is keyed by
+                // TypeId, and substitution mints a new one — so an instantiated
+                // generic method (`then<U>` on `Promise<T>` with T := number)
+                // lost its `<U>`, which is what the SINGLE-signature render path
+                // reads (`fn_type_params.get(id)`).
+                if (!subst_result.eq(id)) {
+                    if (self.fn_type_params.get(id)) |prefix| {
+                        if (!self.fn_type_params.contains(subst_result)) {
+                            const dup = self.gpa.dupe(u8, prefix) catch return subst_result;
+                            self.fn_type_params.put(self.gpa, subst_result, dup) catch self.gpa.free(dup);
+                        }
+                    }
+                }
+                return subst_result;
             },
             else => return id,
         }
