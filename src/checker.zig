@@ -850,9 +850,14 @@ pub const Checker = struct {
     /// rendering `{ <T>(…): R; <U>(…): R; }` overload sets.
     sig_type_params: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
 
-    /// Local names bound by a RESOLVABLE `import X = require("...")`, lazily indexed.
-    require_aliases: std.StringHashMapUnmanaged(void) = .empty,
+    /// Local names bound by a RESOLVABLE `import X = require("...")`, mapped to
+    /// the name tsc displays for the module (see `requireAliasDisplayName`).
+    require_aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
     require_alias_built: bool = false,
+    /// Guard: while a require-alias is being displayed as `typeof X`, member
+    /// lookups through it must NOT resolve into the target module (see
+    /// `memberOnApparentType`).
+    require_alias_opaque: bool = true,
 
     /// Temporary type-param rename table used during multi-sig overload rendering.
     /// Maps original param name → display name (e.g. "T" → "T_1").
@@ -3295,7 +3300,8 @@ pub const Checker = struct {
         if (!self.identifierInTypePosition(node) and !self.identifierInBareNamePosition(node) and
             self.isResolvableRequireAlias(name))
         {
-            const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return tymod.ID_ANY;
+            const disp_nm = self.requireAliasDisplayName(name) orelse name;
+            const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp_nm}) catch return tymod.ID_ANY;
             if (self.store.typeRef(typeof_name, &.{})) |r| {
                 self.string_pool.append(self.gpa, typeof_name) catch self.gpa.free(typeof_name);
                 return r;
@@ -3591,6 +3597,15 @@ pub const Checker = struct {
         if (self.ast_ref.nodeTag(pd0.lhs) != .identifier) return base;
         const recv_nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd0.lhs));
         if (!self.isResolvableRequireAlias(recv_nm)) return base;
+        // Only for modules we have NO declarations for (a `/// <reference>` lib
+        // such as `react`), where `typeof X.Member` is the only display we can
+        // produce.  When the target is a local section its members are real
+        // declarations — a function member displays its SIGNATURE, not a
+        // `typeof`, so guessing there is wrong (`exporter.createExportedWidget1`
+        // wants `() => …`, not `typeof exporter.createExportedWidget1`).
+        if (self.namespace_import_map.get(recv_nm)) |spec| {
+            if (self.moduleSpecIsLocalSection(spec)) return base;
+        }
         const prop_nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
         if (prop_nm.len == 0) return base;
         const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ recv_nm, prop_nm }) catch return base;
@@ -21966,46 +21981,129 @@ pub const Checker = struct {
     /// Find the inner declaration node for an exported member named `name` in a
     /// namespace/module body.  Unwraps `export class/enum/namespace` wrappers.
     /// True when `name` is bound by `import <name> = require("<spec>")` for a
-    /// module this file can actually be expected to RESOLVE — currently: a BARE
-    /// specifier backed by a `/// <reference … <spec>.d.ts>` lib the corpus
-    /// supplies (`react`).
+    /// module this file can actually be expected to RESOLVE (see
+    /// `requireSpecResolves`).
     ///
     /// The resolvability test is the whole point.  tsc displays such a binding by
     /// its LOCAL name (`typeof React`) only when the module resolves; when it does
     /// not, tsc prints `any` — so a blanket syntactic rule costs far more than it
-    /// gains (measured: +295 correct / +1335 wrong; privacyImportParseErrors's
-    /// `require("m1_M3_public")` and constDeclarations-access5's relative import
-    /// both want `any`, and the latter HAS a `/// <reference>` line, so the
-    /// specifier itself must be the one referenced).
+    /// gains (measured: +295 correct / +1335 wrong — privacyImportParseErrors's
+    /// `require("m1_M3_public")` resolves to nothing and every alias it binds is
+    /// `any`).
     ///
     /// The form is invisible to the import machinery: the parser emits an
     /// `import_decl` with `lhs == .none` and the `require(…)` CALL in `rhs`, and
     /// registers no specifier, so `import_map` / `namespace_import_map` never see it.
     fn isResolvableRequireAlias(self: *Checker, name: []const u8) bool {
-        if (name.len == 0) return false;
+        return self.requireAliasDisplayName(name) != null;
+    }
+
+    /// The name tsc displays for a resolvable require-alias's module — its own
+    /// local name, but ONLY when it is the module's sole binding in the program.
+    ///
+    /// When a module is bound more than once the display is the symbol's
+    /// canonical name, which is not recoverable from syntax: `import * as a1
+    /// from "./a"; import a2 = require("./a")` types `a2` as `typeof a1`
+    /// (importsImplicitlyReadonly), yet the same shape in unusedImports11 types
+    /// `r` as `typeof r`, and nodeModules1's esm/cjs views of one file are
+    /// distinct symbols again.  Multiply-bound modules therefore stay a gap
+    /// rather than a guess.
+    fn requireAliasDisplayName(self: *Checker, name: []const u8) ?[]const u8 {
+        if (name.len == 0) return null;
         if (!self.require_alias_built) {
             self.require_alias_built = true;
+            // Module identity is the resolved source SLICE: two specifiers that
+            // reach the same section (`"./subfolder"` / `"./subfolder/"`) return
+            // the same bytes, so the pointer identifies the module.
+            var binds: std.AutoHashMapUnmanaged(usize, u32) = .empty;
+            defer binds.deinit(self.gpa);
             const total: u32 = @intCast(self.ast_ref.nodes.len);
             var i: u32 = 1;
             while (i < total) : (i += 1) {
                 const ni: NodeIndex = @enumFromInt(i);
                 if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
-                const d = self.ast_ref.nodeData(ni);
-                if (d.lhs != .none or d.rhs == .none) continue;
-                if (self.ast_ref.nodeTag(d.rhs) != .call_expr) continue;
-                const callee = self.ast_ref.nodeData(d.rhs).lhs;
-                if (callee == .none or self.ast_ref.nodeTag(callee) != .identifier) continue;
-                if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(callee)), "require")) continue;
-                const spec = self.requireCallSpec(d.rhs) orelse continue;
-                if (spec.len == 0 or spec[0] == '.' or spec[0] == '/') continue; // bare only
-                if (!self.sourceReferencesLib(spec)) continue;
-                var tok = self.ast_ref.nodeMainToken(ni) + 1;
-                if (std.mem.eql(u8, self.ast_ref.tokenText(tok), "type")) tok += 1;
-                const alias = self.ast_ref.tokenText(tok);
-                if (alias.len > 0) self.require_aliases.put(self.gpa, alias, {}) catch {};
+                const b = self.importDeclBinding(ni) orelse continue;
+                const src = self.resolvedModuleSpecSource(b.spec) orelse continue;
+                const gop = binds.getOrPut(self.gpa, @intFromPtr(src.ptr)) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = 0;
+                gop.value_ptr.* += 1;
+            }
+            i = 1;
+            while (i < total) : (i += 1) {
+                const ni: NodeIndex = @enumFromInt(i);
+                if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
+                const b = self.importDeclBinding(ni) orelse continue;
+                if (!b.is_require) continue;
+                if (!self.requireSpecResolves(b.spec)) continue;
+                if (self.resolvedModuleSpecSource(b.spec)) |src| {
+                    if ((binds.get(@intFromPtr(src.ptr)) orelse 1) > 1) continue;
+                }
+                self.require_aliases.put(self.gpa, b.name, b.name) catch {};
             }
         }
-        return self.require_aliases.contains(name);
+        return self.require_aliases.get(name);
+    }
+
+    const ImportBinding = struct { name: []const u8, spec: []const u8, is_require: bool };
+
+    /// The single MODULE binding an `import_decl` introduces: the local name of
+    /// `import X = require("spec")` or of `import * as X from "spec"`.  Named and
+    /// default specifiers bind entities, not the module, so they are skipped.
+    fn importDeclBinding(self: *Checker, ni: NodeIndex) ?ImportBinding {
+        const d = self.ast_ref.nodeData(ni);
+        if (d.lhs == .none) {
+            if (d.rhs == .none or self.ast_ref.nodeTag(d.rhs) != .call_expr) return null;
+            const callee = self.ast_ref.nodeData(d.rhs).lhs;
+            if (callee == .none or self.ast_ref.nodeTag(callee) != .identifier) return null;
+            if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(callee)), "require")) return null;
+            const spec = self.requireCallSpec(d.rhs) orelse return null;
+            var tok = self.ast_ref.nodeMainToken(ni) + 1;
+            if (std.mem.eql(u8, self.ast_ref.tokenText(tok), "type")) tok += 1;
+            const alias = self.ast_ref.tokenText(tok);
+            if (alias.len == 0) return null;
+            return .{ .name = alias, .spec = spec, .is_require = true };
+        }
+        const idata = self.ast_ref.extraData(ast.ImportData, @intFromEnum(d.lhs));
+        const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(idata.source));
+        const spec: []const u8 = if (raw.len >= 2 and (raw[0] == '\'' or raw[0] == '"'))
+            raw[1 .. raw.len - 1]
+        else
+            raw;
+        if (idata.specifiers_end <= idata.specifiers_start) return null;
+        for (self.ast_ref.extra_data[idata.specifiers_start..idata.specifiers_end]) |raw_idx| {
+            const sn: NodeIndex = @enumFromInt(raw_idx);
+            if (self.ast_ref.nodeTag(sn) != .import_namespace_specifier) continue;
+            const local = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(self.ast_ref.nodeData(sn).lhs));
+            if (local.len == 0) continue;
+            return .{ .name = local, .spec = spec, .is_require = false };
+        }
+        return null;
+    }
+
+    /// Can `require("<spec>")` be expected to resolve from this file?
+    ///   * relative (`./sib`) — a sibling module section with that name exists;
+    ///   * bare (`react`)     — a `/// <reference … <spec>.d.ts>` supplies it.
+    /// Anything else is unresolvable, and tsc types the binding `any`.
+    fn requireSpecResolves(self: *Checker, spec: []const u8) bool {
+        if (spec.len == 0) return false;
+        if (spec[0] == '/') return false;
+        if (spec[0] != '.') return self.sourceReferencesLib(spec);
+        const sec_src = self.resolvedModuleSpecSource(spec) orelse return false;
+        // `export =` modules name the binding after the EXPORTED ENTITY (or take
+        // its type outright, or are an error typed `any`) — never after the local
+        // alias.  Same exclusion `namespaceImportBindingType` makes for `import *
+        // as ns`.
+        if (std.mem.indexOf(u8, sec_src, "export =") != null) return false;
+        if (std.mem.indexOf(u8, sec_src, "export=") != null) return false;
+        return true;
+    }
+
+    /// Is `name` a require-alias bound to a RELATIVE sibling section?  Those are
+    /// the ones whose members must stay opaque (see `memberOnApparentType`).
+    fn isLocalRequireAlias(self: *Checker, name: []const u8) bool {
+        if (!self.isResolvableRequireAlias(name)) return false;
+        const spec = self.namespace_import_map.get(name) orelse return false;
+        return spec.len > 0 and spec[0] == '.';
     }
 
     /// The string-literal argument of a `require("…")` call, unquoted.
@@ -23229,7 +23327,20 @@ pub const Checker = struct {
                     }
                 }
                 if (self.namespace_import_map.get(inner_name)) |mod_spec| {
-                    if (self.inferMemberOnNamespace(mod_spec, prop_name)) |resolved| return resolved;
+                    // `import X = require("./sib")` alias: resolving members
+                    // through it is premature.  The member's type routinely
+                    // names an entity declared in a THIRD module, which tsc
+                    // displays as `import("./that-mod").Name` — a display we
+                    // don't build yet, so every such member would resolve to a
+                    // plain, WRONG name (measured: 600 gap→wrong, against 109
+                    // gap→correct).  Keep them a coverage gap until the
+                    // qualified display lands.  ES `import * as ns` bindings are
+                    // unaffected — only require-aliases are held opaque.
+                    const held = self.require_alias_opaque and
+                        self.isLocalRequireAlias(inner_name);
+                    if (!held) {
+                        if (self.inferMemberOnNamespace(mod_spec, prop_name)) |resolved| return resolved;
+                    }
                 }
                 // `typeof LocalNamespace` — scan exported var/let/const members only.
                 // We avoid building the full namespace type (which stores classes as instance
