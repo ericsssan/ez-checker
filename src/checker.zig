@@ -23884,6 +23884,214 @@ pub const Checker = struct {
     /// the given name.  Returns only scalar types (number, string, boolean, etc.);
     /// skips classes, interfaces, and function exports to avoid returning wrong
     /// concrete types for members that tsc renders as `typeof X`.
+    /// Entities declared INSIDE a namespace render qualified when named from
+    /// outside it: `namespace C { export class A{} export function F2<T>(x: T):
+    /// A<B> }` types `C.F2` as `<T>(x: T) => C.A<C.B>`.  Types are cached across
+    /// the file, so this rewrites the display for THIS use site only (a new
+    /// interned leaf; nothing shared is mutated).
+    fn qualifyNamespaceEntities(self: *Checker, id: TypeId, ns_decl: NodeIndex, use_site: NodeIndex) ?TypeId {
+        if (use_site != .none and self.nodeIsInside(use_site, ns_decl)) return id;
+        const name_node = self.ast_ref.nodeData(ns_decl).lhs;
+        if (name_node == .none or self.ast_ref.nodeTag(name_node) != .identifier) return id;
+        const ns_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(name_node));
+        if (ns_name.len == 0) return id;
+        var sc: NsRefScan = .{ .ns_decl = ns_decl };
+        self.scanNsRefs(id, &sc, 0);
+        // A GENERIC internal reference (`C.A<C.B>`) would need the rename to
+        // rebuild the type args too; substituting the leaf drops them, so the
+        // whole answer is withheld instead.
+        if (sc.bail) return null;
+        if (sc.n == 0) return id;
+        // An `import <alias> = <ns>.<member>` in the file gives tsc a shorter
+        // name to print (`im_private_c_private` rather than
+        // `m_private.c_private`), and which alias wins is not a syntactic
+        // property — so a type that NEEDS qualifying isn't answered when one
+        // exists.  Types with nothing to qualify are unaffected.
+        if (self.fileHasImportEqualsAlias()) return null;
+        var keys: [8][]const u8 = undefined;
+        var vals: [8]TypeId = undefined;
+        var k: usize = 0;
+        for (sc.names[0..sc.n]) |nm| {
+            const qn = std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ ns_name, nm }) catch continue;
+            const leaf = self.store.typeRef(qn, &.{}) catch {
+                self.gpa.free(qn);
+                continue;
+            };
+            self.string_pool.append(self.gpa, qn) catch self.gpa.free(qn);
+            keys[k] = nm;
+            vals[k] = leaf;
+            k += 1;
+        }
+        // A GENERIC member is withheld outright.  Its type-parameter list lives
+        // in the `fn_type_params` side table, outside both the structural walk
+        // and the rendered form, so an internal name in a CONSTRAINT (`<T
+        // extends A<B>>`) is invisible here — and tsc may also RENAME the
+        // parameters against the use site (`<T, U>` printed as `<T_1, U>`).
+        if (self.fn_type_params.contains(id)) return null;
+        const out = if (k == 0) id else self.substituteTypeId(id, keys[0..k], vals[0..k]);
+        // Last check on the RENDERED form: an internal name the structural walk
+        // never reached would print unqualified and wrong.
+        if (self.renderMentionsNsEntity(out, ns_decl)) return null;
+        return out;
+    }
+
+    /// Would this type render differently depending on where it is printed?
+    fn renderIsContextDependent(self: *Checker, id: TypeId, ns_decl: NodeIndex) bool {
+        const rendered = self.typeToString(id) catch return true;
+        defer self.gpa.free(rendered);
+        if (std.mem.indexOfScalar(u8, rendered, '<') != null) return true; // generic
+        return self.renderMentionsNsEntity(id, ns_decl);
+    }
+
+    /// Does the rendered type still name an entity declared inside `ns_decl`?
+    fn renderMentionsNsEntity(self: *Checker, id: TypeId, ns_decl: NodeIndex) bool {
+        const rendered = self.typeToString(id) catch return false;
+        defer self.gpa.free(rendered);
+        var i: usize = 0;
+        while (i < rendered.len) {
+            if (!isIdentChar(rendered[i]) or (rendered[i] >= '0' and rendered[i] <= '9')) {
+                i += 1;
+                continue;
+            }
+            const st = i;
+            while (i < rendered.len and isIdentChar(rendered[i])) i += 1;
+            // A qualified occurrence (`C.A`) is already correct.
+            if (st > 0 and rendered[st - 1] == '.') continue;
+            const word = rendered[st..i];
+            if (self.decl_index.primaryDecl(word)) |d| {
+                if (self.nodeIsInside(d, ns_decl)) return true;
+            }
+            // `primaryDecl` answers with ONE declaration; a same-named entity
+            // inside the namespace still forces the qualification
+            // (differentTypesWithSameName has a `variable` on both sides).
+            if (self.declNamedInside(word, ns_decl)) return true;
+        }
+        return false;
+    }
+
+    /// Is any declaration inside `ns_decl` named `name`?
+    fn declNamedInside(self: *Checker, name: []const u8, ns_decl: NodeIndex) bool {
+        if (name.len == 0) return false;
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            const d = self.ast_ref.nodeData(ni);
+            const dn: []const u8 = switch (self.ast_ref.nodeTag(ni)) {
+                .class_decl => blk: {
+                    if (d.lhs == .none) break :blk "";
+                    const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(d.lhs));
+                    if (cd.name == .none) break :blk "";
+                    break :blk self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+                },
+                .ts_interface_decl, .ts_enum_decl => self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni) + 1),
+                else => "",
+            };
+            if (dn.len == 0 or !std.mem.eql(u8, dn, name)) continue;
+            if (self.nodeIsInside(ni, ns_decl)) return true;
+        }
+        return false;
+    }
+
+    /// Does the file bind any `import <alias> = <path>` (the internal-alias form)?
+    fn fileHasImportEqualsAlias(self: *Checker) bool {
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
+            const d = self.ast_ref.nodeData(ni);
+            if (d.lhs != .none or d.rhs == .none) continue;
+            if (self.ast_ref.nodeTag(d.rhs) != .call_expr) return true; // `= Ns.Member`
+        }
+        return false;
+    }
+
+    const NsRefScan = struct {
+        ns_decl: NodeIndex,
+        names: [8][]const u8 = undefined,
+        n: usize = 0,
+        bail: bool = false,
+    };
+
+    /// Collect the NAMES in `id` that are declared inside `sc.ns_decl`, flagging
+    /// any that carries type arguments.
+    fn scanNsRefs(self: *Checker, id: TypeId, sc: *NsRefScan, depth: u8) void {
+        if (depth > 6 or sc.bail) return;
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .type_ref => {
+                const nm = t.name;
+                const args = self.store.idsOf(t.list_data);
+                if (nm.len > 0 and std.mem.indexOfAny(u8, nm, ".<>(){}[]| ") == null) {
+                    if (self.decl_index.primaryDecl(nm)) |d| {
+                        if (self.nodeIsInside(d, sc.ns_decl)) {
+                            if (args.len > 0) {
+                                sc.bail = true;
+                                return;
+                            }
+                            var seen = false;
+                            for (sc.names[0..sc.n]) |x| if (std.mem.eql(u8, x, nm)) {
+                                seen = true;
+                            };
+                            if (!seen and sc.n < sc.names.len) {
+                                sc.names[sc.n] = nm;
+                                sc.n += 1;
+                            }
+                        }
+                    }
+                }
+                for (args) |a| self.scanNsRefs(a, sc, depth + 1);
+            },
+            .function_t => {
+                for (self.store.signaturesOf(t.signatures)) |sg| {
+                    for (self.store.signatureParamsOf(sg)) |pp| self.scanNsRefs(pp, sc, depth + 1);
+                    self.scanNsRefs(sg.return_type, sc, depth + 1);
+                }
+            },
+            .object_t => {
+                for (self.store.propsOf(t.object_props)) |pr| self.scanNsRefs(pr.type_id, sc, depth + 1);
+            },
+            .union_t, .intersection_t, .array_t, .readonly_array_t, .tuple_t => {
+                for (self.store.idsOf(t.list_data)) |e| self.scanNsRefs(e, sc, depth + 1);
+            },
+            else => {},
+        }
+    }
+
+    /// Is `node` a descendant of `ancestor`?
+    fn nodeIsInside(self: *Checker, node: NodeIndex, ancestor: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        var cur = node.toInt();
+        var guard: u16 = 0;
+        while (guard < 256) : (guard += 1) {
+            if (cur == ancestor.toInt()) return true;
+            if (cur >= parents.len) return false;
+            const p = parents[cur];
+            if (p == @intFromEnum(NodeIndex.none)) return false;
+            cur = p;
+        }
+        return false;
+    }
+
+    /// Is any namespace in the file named `name`?  Then the member may be a
+    /// FUNDULE (function + namespace), which tsc displays as `typeof f` — and
+    /// the merge can live in a SEPARATE `namespace M { … }` block, so the search
+    /// cannot be scoped to one declaration node.
+    fn namespaceNamedAnywhere(self: *Checker, name: []const u8) bool {
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            const tag = self.ast_ref.nodeTag(ni);
+            if (tag != .ts_namespace_decl and tag != .ts_module_decl) continue;
+            const nn = self.ast_ref.nodeData(ni).lhs;
+            if (nn == .none or self.ast_ref.nodeTag(nn) != .identifier) continue;
+            if (std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(nn)), name)) return true;
+        }
+        return false;
+    }
+
     fn namespaceVarMemberType(self: *Checker, ns_decl: NodeIndex, prop_name: []const u8) ?TypeId {
         const ns_data = self.ast_ref.nodeData(ns_decl);
         const body = ns_data.rhs;
@@ -23902,6 +24110,29 @@ pub const Checker = struct {
             if (inner == .none) continue;
             const inner_stmt = inner;
             const stag = self.ast_ref.nodeTag(inner_stmt);
+            // Exported FUNCTION member: `namespace X { export function f(): A {…} }`
+            // — `X.f` is that function's type (fakeInfinity3 wants `() => Infinity`).
+            if (stag == .fn_decl) {
+                const fdat = self.ast_ref.nodeData(inner_stmt);
+                if (fdat.lhs == .none) continue;
+                const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(fdat.lhs));
+                if (fd.name == .none) continue;
+                if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(fd.name)), prop_name)) continue;
+                // A FUNDULE member (function + namespace of the same name) is
+                // displayed `typeof f`, not as the function type — its own
+                // lever, and guessing the signature here costs rows.
+                if (self.namespaceNamedAnywhere(prop_name)) return null;
+                const ft = self.functionTypeFromFnDecl(inner_stmt);
+                if (ft.eq(tymod.ID_UNKNOWN) or tymod.isAny(&self.store, ft)) continue;
+                // Withheld when the signature's DISPLAY depends on where it is
+                // printed: a generic member may have its type parameters renamed
+                // against the use site (`<T, U>` → `<T_1, U>`), and a member
+                // naming an entity declared inside the namespace must qualify it
+                // (`(v: variable)` → `(v: m.variable)`) — a rewrite the caller
+                // can only do for the shapes it can reach.
+                if (self.renderIsContextDependent(ft, ns_decl)) return null;
+                return ft;
+            }
             if (stag != .var_decl and stag != .let_decl and stag != .const_decl) continue;
             const d = self.ast_ref.nodeData(inner_stmt);
             const range = self.safeSubRange(d.lhs) orelse continue;
@@ -24256,7 +24487,10 @@ pub const Checker = struct {
                 if (self.decl_index.primaryDecl(inner_name)) |ns_decl| {
                     const ndtag = self.ast_ref.nodeTag(ns_decl);
                     if (ndtag == .ts_namespace_decl or ndtag == .ts_module_decl) {
-                        if (self.namespaceVarMemberType(ns_decl, prop_name)) |vt| return vt;
+                        if (self.namespaceVarMemberType(ns_decl, prop_name)) |vt| {
+                            if (self.qualifyNamespaceEntities(vt, ns_decl, obj_node)) |q| return q;
+                            return tymod.ID_ANY;
+                        }
                     }
                 }
                 // `typeof ClassName` — look up static member on the class.
