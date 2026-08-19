@@ -14922,6 +14922,27 @@ pub const Checker = struct {
                 const iargs = self.collectTypeArgs(ty_node, &ia_buf);
                 return self.store.typeRef(name, iargs) catch tymod.ID_ANY;
             }
+            // QUALIFIED through an imported root (`predom.JSX.Element`): keep the
+            // name verbatim.  Falling through resolved the ROOT instead — the ref
+            // came back named `predom`, so a nested type rendered as its outermost
+            // namespace (inlineJsxFactoryDeclarationsLocalTypes).  The local-
+            // namespace path below handles the same shape only when the root is
+            // DECLARED in this file; an imported root never reaches it.
+            const md2 = self.ast_ref.nodeData(ty_data2.lhs);
+            if (md2.rhs != .none) {
+                var iq_buf: [8]TypeId = undefined;
+                const iqargs = self.collectTypeArgs(ty_node, &iq_buf);
+                // Only for a NON-generic reference.  With type arguments the
+                // target is typically a generic type ALIAS that tsc EVALUATES
+                // (`id.A<1>` → `1`); emitting the opaque name there replaces a
+                // resolved type with a ref (declarationEmitNoInvalidCommentReuse3).
+                if (iqargs.len == 0) {
+                    const qual2 = self.qualifiedTypeName(ty_node, md2.rhs);
+                    if (qual2.len > 0) {
+                        return self.store.typeRef(qual2, iqargs) catch tymod.ID_ANY;
+                    }
+                }
+            }
         }
         // Qualified type `A.B` whose last component `B` is NOT a declared
         // type anywhere (e.g. `TypeScript.AST` where AST lives in another file
