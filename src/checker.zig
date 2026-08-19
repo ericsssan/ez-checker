@@ -850,6 +850,10 @@ pub const Checker = struct {
     /// rendering `{ <T>(…): R; <U>(…): R; }` overload sets.
     sig_type_params: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
 
+    /// Local names bound by a RESOLVABLE `import X = require("...")`, lazily indexed.
+    require_aliases: std.StringHashMapUnmanaged(void) = .empty,
+    require_alias_built: bool = false,
+
     /// Temporary type-param rename table used during multi-sig overload rendering.
     /// Maps original param name → display name (e.g. "T" → "T_1").
     /// Set/cleared per-sig inside typeToStringInner; read by .type_param rendering.
@@ -1054,7 +1058,8 @@ pub const Checker = struct {
         {
             var it = self.sig_type_params.valueIterator();
             while (it.next()) |v| self.gpa.free(v.*);
-            self.sig_type_params.deinit(self.gpa);
+            self.require_aliases.deinit(self.gpa);
+        self.sig_type_params.deinit(self.gpa);
         }
         self.tp_renames.deinit(self.gpa);
         self.overload_fn_types.deinit(self.gpa);
@@ -3286,6 +3291,16 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "fetch") and self.global_value_types.contains("fetch")) {
             return self.store.typeRef("(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>", &.{}) catch tymod.ID_ANY;
         }
+        // `import X = require("mod")` (resolvable) in VALUE position → `typeof X`.
+        if (!self.identifierInTypePosition(node) and !self.identifierInBareNamePosition(node) and
+            self.isResolvableRequireAlias(name))
+        {
+            const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return tymod.ID_ANY;
+            if (self.store.typeRef(typeof_name, &.{})) |r| {
+                self.string_pool.append(self.gpa, typeof_name) catch self.gpa.free(typeof_name);
+                return r;
+            } else |_| self.gpa.free(typeof_name);
+        }
         // CommonJS `module` — tsc shows the module record whose single member is
         // the export object: `{ exports: typeof module.exports; }`.  Gated on the
         // same signal as the `module.exports` display below, so a plain JS file
@@ -3551,6 +3566,43 @@ pub const Checker = struct {
     /// Type inference for `property_ident` nodes — the property name on the
     /// right-hand side of a non-computed member expression (`obj.prop`).
     fn inferPropertyIdent(self: *Checker, node: NodeIndex) TypeId {
+        const base = self.inferPropertyIdentInner(node);
+        // LAST-RESORT display for `X.Member` where X is a resolvable
+        // `import X = require(…)` alias: tsc shows the property token as
+        // `typeof X.Member`.  Only when nothing else resolved it — a module
+        // AUGMENTATION can give the member a real type (`declare module "file1"
+        // { let b: number }` → `b : number`), and that must win.
+        //
+        // The whole member EXPRESSION is deliberately left alone: in a heritage
+        // clause tsc types it as the instance (`React.Component<{ x: number; },
+        // {}>`), which needs the real lib.
+        if (!tymod.isAny(&self.store, base)) return base;
+        const parents = self.semantic.parent_indices;
+        if (node.toInt() >= parents.len) return base;
+        const pidx0 = parents[node.toInt()];
+        if (pidx0 == @intFromEnum(NodeIndex.none) or pidx0 >= self.ast_ref.nodes.len) return base;
+        const par: NodeIndex = @enumFromInt(pidx0);
+        switch (self.ast_ref.nodeTag(par)) {
+            .member_expr, .optional_member_expr => {},
+            else => return base,
+        }
+        const pd0 = self.ast_ref.nodeData(par);
+        if (pd0.rhs != node or pd0.lhs == .none) return base;
+        if (self.ast_ref.nodeTag(pd0.lhs) != .identifier) return base;
+        const recv_nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd0.lhs));
+        if (!self.isResolvableRequireAlias(recv_nm)) return base;
+        const prop_nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+        if (prop_nm.len == 0) return base;
+        const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ recv_nm, prop_nm }) catch return base;
+        const r = self.store.typeRef(disp, &.{}) catch {
+            self.gpa.free(disp);
+            return base;
+        };
+        self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
+        return r;
+    }
+
+    fn inferPropertyIdentInner(self: *Checker, node: NodeIndex) TypeId {
         const parents = self.semantic.parent_indices;
         const nidx = node.toInt();
         if (nidx >= parents.len) return tymod.ID_ANY;
@@ -21913,6 +21965,70 @@ pub const Checker = struct {
 
     /// Find the inner declaration node for an exported member named `name` in a
     /// namespace/module body.  Unwraps `export class/enum/namespace` wrappers.
+    /// True when `name` is bound by `import <name> = require("<spec>")` for a
+    /// module this file can actually be expected to RESOLVE — currently: a BARE
+    /// specifier backed by a `/// <reference … <spec>.d.ts>` lib the corpus
+    /// supplies (`react`).
+    ///
+    /// The resolvability test is the whole point.  tsc displays such a binding by
+    /// its LOCAL name (`typeof React`) only when the module resolves; when it does
+    /// not, tsc prints `any` — so a blanket syntactic rule costs far more than it
+    /// gains (measured: +295 correct / +1335 wrong; privacyImportParseErrors's
+    /// `require("m1_M3_public")` and constDeclarations-access5's relative import
+    /// both want `any`, and the latter HAS a `/// <reference>` line, so the
+    /// specifier itself must be the one referenced).
+    ///
+    /// The form is invisible to the import machinery: the parser emits an
+    /// `import_decl` with `lhs == .none` and the `require(…)` CALL in `rhs`, and
+    /// registers no specifier, so `import_map` / `namespace_import_map` never see it.
+    fn isResolvableRequireAlias(self: *Checker, name: []const u8) bool {
+        if (name.len == 0) return false;
+        if (!self.require_alias_built) {
+            self.require_alias_built = true;
+            const total: u32 = @intCast(self.ast_ref.nodes.len);
+            var i: u32 = 1;
+            while (i < total) : (i += 1) {
+                const ni: NodeIndex = @enumFromInt(i);
+                if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
+                const d = self.ast_ref.nodeData(ni);
+                if (d.lhs != .none or d.rhs == .none) continue;
+                if (self.ast_ref.nodeTag(d.rhs) != .call_expr) continue;
+                const callee = self.ast_ref.nodeData(d.rhs).lhs;
+                if (callee == .none or self.ast_ref.nodeTag(callee) != .identifier) continue;
+                if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(callee)), "require")) continue;
+                const spec = self.requireCallSpec(d.rhs) orelse continue;
+                if (spec.len == 0 or spec[0] == '.' or spec[0] == '/') continue; // bare only
+                if (!self.sourceReferencesLib(spec)) continue;
+                var tok = self.ast_ref.nodeMainToken(ni) + 1;
+                if (std.mem.eql(u8, self.ast_ref.tokenText(tok), "type")) tok += 1;
+                const alias = self.ast_ref.tokenText(tok);
+                if (alias.len > 0) self.require_aliases.put(self.gpa, alias, {}) catch {};
+            }
+        }
+        return self.require_aliases.contains(name);
+    }
+
+    /// The string-literal argument of a `require("…")` call, unquoted.
+    fn requireCallSpec(self: *Checker, call: NodeIndex) ?[]const u8 {
+        const args = self.callArguments(call);
+        if (args.len != 1) return null;
+        const arg: NodeIndex = @enumFromInt(args[0]);
+        if (self.ast_ref.nodeTag(arg) != .string_literal) return null;
+        const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(arg));
+        if (raw.len < 2) return null;
+        return raw[1 .. raw.len - 1];
+    }
+
+    /// Does the source carry a `/// <reference …>` naming `<spec>.d.ts`?  That is
+    /// how the corpus supplies `react` (`/// <reference path="/.lib/react.d.ts" />`).
+    fn sourceReferencesLib(self: *Checker, spec: []const u8) bool {
+        const src = self.ast_ref.source;
+        if (std.mem.indexOf(u8, src, "<reference") == null) return false;
+        var buf: [128]u8 = undefined;
+        const needle = std.fmt.bufPrint(&buf, "{s}.d.ts", .{spec}) catch return false;
+        return std.mem.indexOf(u8, src, needle) != null;
+    }
+
     fn nsMemberStmt(self: *Checker, ns_decl: NodeIndex, name: []const u8) ?NodeIndex {
         const ns_data = self.ast_ref.nodeData(ns_decl);
         const body = ns_data.rhs;
