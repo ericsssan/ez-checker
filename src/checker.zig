@@ -26675,6 +26675,13 @@ pub const Checker = struct {
     /// Lookup an Array.prototype method by name and return its
     /// (function or scalar) type.  Returns ID_UNKNOWN for properties
     /// we don't model.
+    /// Is the effective `@lib` at least `level`?  A library member introduced
+    /// later than the configured lib does not exist: tsc errors on it and types
+    /// the whole reference `any`, so the curated shape must not be offered.
+    fn libAtLeast(self: *Checker, level: CheckerOpts.Target) bool {
+        return @intFromEnum(self.checker_opts.lib) >= @intFromEnum(level);
+    }
+
     fn arrayPrototypeProperty(self: *Checker, name: []const u8, elem: TypeId) TypeId {
         // length / indexOf / lastIndexOf return numbers.
         if (std.mem.eql(u8, name, "length")) return tymod.ID_NUMBER;
@@ -26705,6 +26712,14 @@ pub const Checker = struct {
             return self.makeNullaryFn(self.store.typeRef("ArrayIterator", &.{tup}) catch return tymod.ID_ANY);
         }
         // find/findLast: (predicate: (value: T, index: number, array: T[]) => unknown, thisArg?: any) => T | undefined
+        if (std.mem.eql(u8, name, "findLast") and !self.libAtLeast(.es2023)) return tymod.ID_ANY;
+        if (std.mem.eql(u8, name, "findLastIndex") and !self.libAtLeast(.es2023)) return tymod.ID_ANY;
+        if (eqAny(name, &.{ "toSorted", "toReversed", "toSpliced", "with" }) and !self.libAtLeast(.es2023))
+            return tymod.ID_ANY;
+        if (eqAny(name, &.{ "flat", "flatMap" }) and !self.libAtLeast(.es2019)) return tymod.ID_ANY;
+        if (std.mem.eql(u8, name, "includes") and !self.libAtLeast(.es2016)) return tymod.ID_ANY;
+        if (eqAny(name, &.{ "find", "findIndex", "fill", "copyWithin" }) and !self.libAtLeast(.es2015))
+            return tymod.ID_ANY;
         if (std.mem.eql(u8, name, "find") or std.mem.eql(u8, name, "findLast")) {
             const opt = self.store.unionOf(&.{ elem, tymod.ID_UNDEFINED }) catch return tymod.ID_UNKNOWN;
             return self.makePredicateArrayFn(elem, opt);
@@ -26865,6 +26880,13 @@ pub const Checker = struct {
         const S = tymod.ID_STRING;
         const N = tymod.ID_NUMBER;
         if (std.mem.eql(u8, name, "length")) return N;
+        // Members newer than the effective `@lib` don't exist (see `libAtLeast`).
+        if (eqAny(name, &.{ "includes", "startsWith", "endsWith", "repeat", "codePointAt", "normalize" }) and
+            !self.libAtLeast(.es2015)) return null;
+        if (eqAny(name, &.{ "padStart", "padEnd" }) and !self.libAtLeast(.es2017)) return null;
+        if (eqAny(name, &.{ "trimStart", "trimEnd" }) and !self.libAtLeast(.es2019)) return null;
+        if (std.mem.eql(u8, name, "replaceAll") and !self.libAtLeast(.es2021)) return null;
+        if (std.mem.eql(u8, name, "at") and !self.libAtLeast(.es2022)) return null;
         // lib.es5 String.prototype signatures with named params (tsc fidelity).
         const named = struct {
             fn one(c: *Checker, t: TypeId, nm: []const u8, opt: bool, ret: TypeId) ?TypeId {
@@ -26924,6 +26946,7 @@ pub const Checker = struct {
             return self.makeNamedFn(&.{regexp_ty}, &.{"regexp"}, &.{false}, nullable);
         }
         // matchAll(regexp): never (rarely used in corpus; keep simple)
+        if (std.mem.eql(u8, name, "matchAll") and !self.libAtLeast(.es2020)) return tymod.ID_UNKNOWN;
         if (std.mem.eql(u8, name, "matchAll")) {
             const rma = self.store.typeRef("RegExpMatchArray", &.{}) catch return null;
             const nullable = self.store.unionOf(&.{ rma, tymod.ID_NULL }) catch rma;
