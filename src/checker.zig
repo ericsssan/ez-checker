@@ -2453,18 +2453,149 @@ pub const Checker = struct {
     /// `ts_namespace_decl` or `ts_module_decl` (the fallback path, where semantic
     /// has no reference entry for the declaration name itself).
     fn typeForNamespaceDeclarationName(self: *Checker, node: NodeIndex, name: []const u8) ?TypeId {
-        const parents = self.semantic.parent_indices;
-        const nidx = node.toInt();
-        if (nidx >= parents.len) return null;
-        const pidx = parents[nidx];
-        if (pidx == @intFromEnum(NodeIndex.none)) return null;
-        const parent: NodeIndex = @enumFromInt(pidx);
-        const ptag = self.ast_ref.nodeTag(parent);
-        if (ptag != .ts_namespace_decl and ptag != .ts_module_decl) return null;
-        const data = self.ast_ref.nodeData(parent);
-        if (data.lhs != node) return null;
+        if (!self.isNamespaceHeaderName(node)) return null;
         const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return null;
-        return self.store.typeRef(typeof_name, &.{}) catch null;
+        const r = self.store.typeRef(typeof_name, &.{}) catch {
+            self.gpa.free(typeof_name);
+            return null;
+        };
+        self.string_pool.append(self.gpa, typeof_name) catch self.gpa.free(typeof_name);
+        return r;
+    }
+
+    /// Is `node` one of the identifier segments naming a namespace/module
+    /// declaration?  A dotted header parses as a member-expression chain
+    /// (`namespace X.A.B.C {}` → `((X.A).B).C`), and tsc types EVERY segment as
+    /// `typeof <segment>` — the outer ones are the implicitly-declared enclosing
+    /// namespaces, each a value in its own right.
+    fn isNamespaceHeaderName(self: *Checker, node: NodeIndex) bool {
+        const decl = self.namespaceHeaderDecl(node) orelse return false;
+        // A single-identifier header (`namespace M {}`) has always displayed as
+        // `typeof M`; only the DOTTED form needs the shadowing test, because
+        // only there does tsc reach for a qualified path.
+        const name_node = self.ast_ref.nodeData(decl).lhs;
+        if (name_node == .none or self.ast_ref.nodeTag(name_node) != .member_expr) return true;
+        return self.namespaceHeaderIsUnshadowed(decl);
+    }
+
+    /// The namespace/module declaration `node` helps NAME, if any.
+    fn namespaceHeaderDecl(self: *Checker, node: NodeIndex) ?NodeIndex {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var cur = node;
+        var guard: u8 = 0;
+        while (guard < 8) : (guard += 1) {
+            const ci = cur.toInt();
+            if (ci >= parents.len) return null;
+            const pi = parents[ci];
+            if (pi == NONE or pi >= self.ast_ref.nodes.len) return null;
+            const parent: NodeIndex = @enumFromInt(pi);
+            switch (self.ast_ref.nodeTag(parent)) {
+                .member_expr => cur = parent,
+                .ts_namespace_decl, .ts_module_decl => {
+                    if (self.ast_ref.nodeData(parent).lhs == cur) return parent;
+                    return null;
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Is every segment of this header's name free of a same-named NON-namespace
+    /// declaration?
+    ///
+    /// tsc displays a symbol by its minimal UNAMBIGUOUS name, so a shadowing
+    /// declaration promotes the whole header to a qualified path: `function
+    /// data(my)` inside `namespace my.data {}` makes that header's `data` print
+    /// as `typeof my.data`, and `import M = Z.M` inside `namespace A.M {}` makes
+    /// its `M` print as `typeof A.M`.  Reproducing the minimal qualification is
+    /// its own problem (it is relative to the use site and can reach
+    /// `globalThis`), so a shadowed header keeps the `any` gap instead.
+    fn namespaceHeaderIsUnshadowed(self: *Checker, decl: NodeIndex) bool {
+        var cur = self.ast_ref.nodeData(decl).lhs;
+        var guard: u8 = 0;
+        while (guard < 8) : (guard += 1) {
+            if (cur == .none) return true;
+            switch (self.ast_ref.nodeTag(cur)) {
+                .member_expr => {
+                    const d = self.ast_ref.nodeData(cur);
+                    if (d.rhs != .none and !self.nameIsPlainNamespace(
+                        self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.rhs)),
+                    )) return false;
+                    cur = d.lhs;
+                },
+                .identifier => return self.nameIsPlainNamespace(
+                    self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cur)),
+                ),
+                else => return true,
+            }
+        }
+        return true;
+    }
+
+    /// True unless `name` also names a non-namespace declaration in the program.
+    ///
+    /// `decl_index` is scope-aware and a namespace wins there, so the shadowers
+    /// that matter (a `function data` or `import M = Z.M` INSIDE the namespace
+    /// body) are invisible to it — hence the direct scan.
+    fn nameIsPlainNamespace(self: *Checker, name: []const u8) bool {
+        if (name.len == 0) return false;
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            const tag = self.ast_ref.nodeTag(ni);
+            const d = self.ast_ref.nodeData(ni);
+            const decl_name: []const u8 = switch (tag) {
+                .fn_decl => blk: {
+                    if (d.lhs == .none) break :blk "";
+                    const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
+                    if (fd.name == .none) break :blk "";
+                    break :blk self.ast_ref.tokenText(self.ast_ref.nodeMainToken(fd.name));
+                },
+                .class_decl => blk: {
+                    if (d.lhs == .none) break :blk "";
+                    const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(d.lhs));
+                    if (cd.name == .none) break :blk "";
+                    break :blk self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+                },
+                .ts_enum_decl, .ts_interface_decl => self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni) + 1),
+                .declarator => blk: {
+                    if (d.lhs == .none or self.ast_ref.nodeTag(d.lhs) != .identifier) break :blk "";
+                    break :blk self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs));
+                },
+                // Any import binding, not just the module forms `importDeclBinding`
+                // knows: `import M = Z.M` (an internal alias) is exactly the
+                // shadower in moduleSharesNameWithImportDeclarationInsideIt.
+                .import_decl => blk: {
+                    if (d.lhs != .none) {
+                        const idata = self.ast_ref.extraData(ast.ImportData, @intFromEnum(d.lhs));
+                        if (idata.specifiers_end > idata.specifiers_start) {
+                            for (self.ast_ref.extra_data[idata.specifiers_start..idata.specifiers_end]) |raw_idx| {
+                                const sn: NodeIndex = @enumFromInt(raw_idx);
+                                const sd = self.ast_ref.nodeData(sn);
+                                const local: NodeIndex = switch (self.ast_ref.nodeTag(sn)) {
+                                    .import_specifier => sd.rhs,
+                                    .import_default_specifier, .import_namespace_specifier => sd.lhs,
+                                    else => continue,
+                                };
+                                if (local == .none) continue;
+                                if (std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(local)), name))
+                                    return false;
+                            }
+                        }
+                        break :blk "";
+                    }
+                    var tok = self.ast_ref.nodeMainToken(ni) + 1;
+                    if (std.mem.eql(u8, self.ast_ref.tokenText(tok), "type")) tok += 1;
+                    break :blk self.ast_ref.tokenText(tok);
+                },
+                else => "",
+            };
+            if (decl_name.len > 0 and std.mem.eql(u8, decl_name, name)) return false;
+        }
+        return true;
     }
 
     fn typeForClassDeclarationName(self: *Checker, node: NodeIndex, name: []const u8) ?TypeId {
@@ -3572,6 +3703,18 @@ pub const Checker = struct {
     /// Type inference for `property_ident` nodes — the property name on the
     /// right-hand side of a non-computed member expression (`obj.prop`).
     fn inferPropertyIdent(self: *Checker, node: NodeIndex) TypeId {
+        // Inner segment of a dotted namespace header (`namespace X.A.B.C {}`).
+        if (self.isNamespaceHeaderName(node)) {
+            const nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+            if (nm.len > 0) {
+                if (std.fmt.allocPrint(self.gpa, "typeof {s}", .{nm})) |disp| {
+                    if (self.store.typeRef(disp, &.{})) |r| {
+                        self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
+                        return r;
+                    } else |_| self.gpa.free(disp);
+                } else |_| {}
+            }
+        }
         const base = self.inferPropertyIdentInner(node);
         // LAST-RESORT display for `X.Member` where X is a resolvable
         // `import X = require(…)` alias: tsc shows the property token as
