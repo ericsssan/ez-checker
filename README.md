@@ -1,7 +1,7 @@
 # ez-checker
 
 [![CI](https://github.com/ericsssan/ez-checker/actions/workflows/ci.yml/badge.svg)](https://github.com/ericsssan/ez-checker/actions/workflows/ci.yml)
-[![TypeScript corpus](https://img.shields.io/badge/TypeScript_corpus-84.7%25-brightgreen)](#conformance)
+[![TypeScript corpus](https://img.shields.io/badge/TypeScript_corpus-84.8%25-brightgreen)](#conformance)
 [![primitive types](https://img.shields.io/badge/primitive_types-91.0%25-brightgreen)](#conformance)
 
 A reimplementation of the TypeScript type checker. Just the type system: infer the type of any expression, resolve declarations, narrow through control flow. No emit, no diagnostics, no `tsconfig.json`.
@@ -40,8 +40,8 @@ Measured against the TypeScript compiler itself: for every expression in the [mi
 
 | Metric | Correct | Total | Rate |
 | --- | --- | --- | --- |
-| All expression types | 557,089 | 657,474 | **84.7%** |
-| Primitive types (sub-metric) | 338,684 | 372,262 | **91.0%** |
+| All expression types | 557,660 | 657,474 | **84.8%** |
+| Primitive types (sub-metric) | 338,734 | 372,262 | **91.0%** |
 
 A ratchet (`oracle/baseline.lock`) records these floors; `zig build test-oracle` fails if any metric regresses, and CI enforces it on every push and pull request. Sweep the corpus with `zig build run-oracle`; raise the floor after a genuine gain with `zig build save-baseline`.
 

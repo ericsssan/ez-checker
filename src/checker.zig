@@ -857,7 +857,7 @@ pub const Checker = struct {
     /// Guard: while a require-alias is being displayed as `typeof X`, member
     /// lookups through it must NOT resolve into the target module (see
     /// `memberOnApparentType`).
-    require_alias_opaque: bool = true,
+    require_alias_opaque: bool = false,
 
     /// Temporary type-param rename table used during multi-sig overload rendering.
     /// Maps original param name → display name (e.g. "T" → "T_1").
@@ -21812,7 +21812,7 @@ pub const Checker = struct {
             if (obj_tag == .identifier) {
                 const obj_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(obj_node));
                 if (self.namespace_import_map.get(obj_name)) |mod_spec| {
-                    if (self.inferMemberOnNamespace(mod_spec, prop_name)) |resolved| {
+                    if (self.inferMemberOnNamespace(mod_spec, prop_name, obj_node)) |resolved| {
                         return self.maybeAddOptionalUndefined(resolved, nullcheck_ty, in_chain);
                     }
                 }
@@ -21875,11 +21875,460 @@ pub const Checker = struct {
         return self.narrowMemberAtUse(node, result);
     }
 
-    fn inferMemberOnNamespace(self: *Checker, module_spec: []const u8, member_name: []const u8) ?TypeId {
+    /// A cross-module member type, or null to leave it a coverage gap.
+    ///
+    /// `any` ANYWHERE inside means a piece of the other module didn't resolve
+    /// (a nested-namespace return like `Widgets.SpecializedWidget.createWidget2()`),
+    /// and a half-resolved type displays wrong far more often than it displays
+    /// right — so it is not reported at all.
+    fn crossModuleResult(self: *Checker, id: TypeId, use_site: NodeIndex, ranged: bool) ?TypeId {
+        if (self.typeHasAnyDeep(id, 0)) return null;
+        if (!ranged and self.typeCarriesNamedEntity(id, 0)) return null;
+        return self.qualifyForeignEntities(id, use_site);
+    }
+
+    /// Does the type name an entity (a class instance, an interface ref) whose
+    /// display depends on where it is referenced from?
+    fn typeCarriesNamedEntity(self: *Checker, id: TypeId, depth: u8) bool {
+        if (depth > 6) return false;
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .type_ref, .object_t => {
+                if (t.name.len > 0) return true;
+                if (t.kind == .object_t) {
+                    for (self.store.propsOf(t.object_props)) |pr| {
+                        if (self.typeCarriesNamedEntity(pr.type_id, depth + 1)) return true;
+                    }
+                }
+            },
+            .function_t => {
+                for (self.store.signaturesOf(t.signatures)) |sg| {
+                    for (self.store.signatureParamsOf(sg)) |p| {
+                        if (self.typeCarriesNamedEntity(p, depth + 1)) return true;
+                    }
+                    if (self.typeCarriesNamedEntity(sg.return_type, depth + 1)) return true;
+                }
+            },
+            .union_t, .intersection_t, .array_t, .readonly_array_t, .tuple_t => {
+                for (self.store.idsOf(t.list_data)) |e| {
+                    if (self.typeCarriesNamedEntity(e, depth + 1)) return true;
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    /// `containsAny`, but through function signatures too — the `any` that
+    /// matters here hides in a RETURN type (`() => any`).
+    fn typeHasAnyDeep(self: *Checker, id: TypeId, depth: u8) bool {
+        if (depth > 6) return false;
+        if (tymod.containsAny(&self.store, id)) return true;
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .function_t => {
+                for (self.store.signaturesOf(t.signatures)) |sg| {
+                    for (self.store.signatureParamsOf(sg)) |p| {
+                        if (self.typeHasAnyDeep(p, depth + 1)) return true;
+                    }
+                    if (self.typeHasAnyDeep(sg.return_type, depth + 1)) return true;
+                }
+            },
+            .object_t => {
+                for (self.store.propsOf(t.object_props)) |pr| {
+                    if (self.typeHasAnyDeep(pr.type_id, depth + 1)) return true;
+                }
+            },
+            .union_t, .intersection_t, .array_t, .readonly_array_t, .tuple_t => {
+                for (self.store.idsOf(t.list_data)) |e| {
+                    if (self.typeHasAnyDeep(e, depth + 1)) return true;
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    /// Is the member access whose RECEIVER is `use_site` an assignment target?
+    fn crossModuleMemberIsWriteTarget(self: *Checker, use_site: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        if (use_site == .none or use_site.toInt() >= parents.len) return false;
+        const pi = parents[use_site.toInt()];
+        if (pi == @intFromEnum(NodeIndex.none) or pi >= self.ast_ref.nodes.len) return false;
+        const member: NodeIndex = @enumFromInt(pi);
+        switch (self.ast_ref.nodeTag(member)) {
+            .member_expr, .optional_member_expr => {},
+            else => return false,
+        }
+        if (self.identifierIsAssignLhs(member)) return true;
+        // `m.x++` / `++m.x` mutate too.
+        var n = member;
+        var guard: u8 = 0;
+        while (guard < 3) : (guard += 1) {
+            const ni = n.toInt();
+            if (ni >= parents.len) return false;
+            const p2 = parents[ni];
+            if (p2 == @intFromEnum(NodeIndex.none) or p2 >= self.ast_ref.nodes.len) return false;
+            const pn: NodeIndex = @enumFromInt(p2);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .prefix_inc, .prefix_dec, .postfix_inc, .postfix_dec => return true,
+                .grouping_expr => n = pn,
+                else => return false,
+            }
+        }
+        return false;
+    }
+
+    /// Is `member_name` exported from `module_spec` as a class or enum?
+    fn moduleExportIsClassLike(self: *Checker, module_spec: []const u8, member_name: []const u8, use_site: NodeIndex) bool {
+        // Byte ranges are only available when the eval unit carries them; when
+        // it doesn't, fall back to a bare-name search over the whole AST — the
+        // same shape the resolution fallback below uses, and the DISPLAY is the
+        // alias-qualified name either way.
+        const rng = self.moduleRangeForSpec(module_spec, use_site) orelse return false;
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            const tag = self.ast_ref.nodeTag(ni);
+            if (tag != .class_decl and tag != .ts_enum_decl and tag != .ts_namespace_decl) continue;
+            const off = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(ni));
+            if (off < rng[0] or off >= rng[1]) continue;
+            const nm: []const u8 = if (tag == .class_decl) blk: {
+                const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(self.ast_ref.nodeData(ni).lhs));
+                if (cd.name == .none) break :blk "";
+                break :blk self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name));
+            } else self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni) + 1); // enum/namespace name follows the keyword
+            if (std.mem.eql(u8, nm, member_name)) return true;
+        }
+        return false;
+    }
+
+    /// Byte range of the module `module_spec` names: the sibling section, or the
+    /// section holding its ambient `declare module` block.
+    fn moduleRangeForSpec(self: *Checker, module_spec: []const u8, use_site: NodeIndex) ?[2]u32 {
+        if (self.moduleFileForSpec(module_spec)) |mf| return .{ mf.start, mf.end };
+        if (!self.ambientModuleDeclared(module_spec, use_site)) return null;
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .ts_module_decl) continue;
+            const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni) + 1);
+            if (raw.len < 2 or (raw[0] != '\'' and raw[0] != '"')) continue;
+            if (!std.mem.eql(u8, raw[1 .. raw.len - 1], module_spec)) continue;
+            const off = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(ni));
+            for (self.checker_opts.module_files) |mf| {
+                if (off >= mf.start and off < mf.end) return .{ mf.start, mf.end };
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /// tsc renders a type entity the current file has NO local name for as
+    /// `import("<module>").<Name>` — the declaration-emit naming that the
+    /// `privacy*` tests are built around.  A member reached through another
+    /// module routinely names an entity declared in a THIRD one
+    /// (`exporter.createExportedWidget1(): Widget1`, where `Widget1` lives in
+    /// `_Widgets`), and the qualification is by the DECLARING module, not the
+    /// one we went through.
+    ///
+    /// Display only: the leaf type_ref is rebuilt under the qualified name and
+    /// substituted structurally, so containing types (`() => Widget1`) re-render
+    /// without any shared interned type being mutated.
+    fn qualifyForeignEntities(self: *Checker, id: TypeId, use_site: NodeIndex) ?TypeId {
+        const cur = self.sectionOfNode(use_site) orelse return id;
+        var names: [8][]const u8 = undefined;
+        var n: usize = 0;
+        self.collectTypeRefNames(id, &names, &n, 0);
+        if (n == 0) return id;
+        var keys: [8][]const u8 = undefined;
+        var vals: [8]TypeId = undefined;
+        var k: usize = 0;
+        for (names[0..n]) |nm| {
+            switch (self.entityReach(nm, cur)) {
+                .local => {},
+                // A foreign entity we cannot name is worse than no answer: the
+                // bare name is always wrong (`d` for `typeof glo_m4.d`), while
+                // no answer is an honest coverage gap.
+                .unnameable => return null,
+                .qualified => |disp| {
+                    const leaf = self.store.typeRef(disp, &.{}) catch return null;
+                    keys[k] = nm;
+                    vals[k] = leaf;
+                    k += 1;
+                },
+            }
+        }
+        if (k == 0) return id;
+        return self.substituteTypeId(id, keys[0..k], vals[0..k]);
+    }
+
+    const EntityReach = union(enum) { local, unnameable, qualified: []const u8 };
+
+    /// How the current section can refer to the type entity `name`.
+    ///
+    /// `name` may already carry a qualification applied for ANOTHER section —
+    /// types are cached across the whole unit, but this display is per-file, so
+    /// `Widgets.Widget1` (right inside the module that imports `Widgets`) has to
+    /// become `import("./…_Widgets").Widget1` in a file that doesn't.
+    fn entityReach(self: *Checker, name: []const u8, cur: ModuleFile) EntityReach {
+        if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
+            if (std.mem.startsWith(u8, name, "import(")) {
+                const close = std.mem.indexOf(u8, name, "\").") orelse return .local;
+                const spec = name[8..close];
+                const tail = name[close + 3 ..];
+                const mf = self.moduleFileForSpec(spec) orelse return .local;
+                return self.entityDisplayFor(mf, tail, cur);
+            }
+            const head = name[0..dot];
+            const tail = name[dot + 1 ..];
+            const mf = self.aliasTargetModule(head) orelse return .local;
+            return self.entityDisplayFor(mf, tail, cur);
+        }
+        const decl = self.decl_index.primaryDecl(name) orelse return .local;
+        switch (self.ast_ref.nodeTag(decl)) {
+            .class_decl, .ts_interface_decl, .ts_enum_decl => {},
+            else => return .local,
+        }
+        const off = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(decl));
+        if (off >= cur.start and off < cur.end) return .local; // declared right here
+        if (self.nameBoundInSection(name, cur)) return .local; // imported under this name
+        // When this file already imports the declaring module, tsc names the
+        // entity through THAT alias (`Widgets.Widget1`), not `import(…)`.
+        if (self.moduleAliasInSection(off, cur)) |alias| {
+            const qn = std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ alias, name }) catch return .unnameable;
+            self.string_pool.append(self.gpa, qn) catch {
+                self.gpa.free(qn);
+                return .unnameable;
+            };
+            return .{ .qualified = qn };
+        }
+        const spec = self.entityModuleSpec(decl, off, cur) orelse return .unnameable;
+        const disp = std.fmt.allocPrint(self.gpa, "import(\"{s}\").{s}", .{ spec, name }) catch return .unnameable;
+        self.string_pool.append(self.gpa, disp) catch {
+            self.gpa.free(disp);
+            return .unnameable;
+        };
+        return .{ .qualified = disp };
+    }
+
+    /// The section a node lives in.  Multi-file tests are concatenated into one
+    /// source, so the node's byte offset picks the file — `file_path` isn't set
+    /// on every eval path, the offset always is.
+    fn sectionOfNode(self: *Checker, node: NodeIndex) ?ModuleFile {
+        if (self.checker_opts.module_files.len == 0 or node == .none) return null;
+        const off = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(node));
+        for (self.checker_opts.module_files) |mf| {
+            if (off >= mf.start and off < mf.end) return mf;
+        }
+        return null;
+    }
+
+    /// Every named `type_ref` reachable in `id`, capped in both breadth and depth.
+    fn collectTypeRefNames(self: *Checker, id: TypeId, out: *[8][]const u8, n: *usize, depth: u8) void {
+        if (depth > 6 or n.* >= out.len) return;
+        const t = self.store.get(id);
+        switch (t.kind) {
+            .type_ref => {
+                const nm = t.name;
+                const qualified_form = std.mem.indexOfScalar(u8, nm, '.') != null and
+                    std.mem.indexOfAny(u8, nm, "<>{}[]| ") == null;
+                if (nm.len > 0 and (qualified_form or std.mem.indexOfAny(u8, nm, ".<>(){}[]| ") == null)) {
+                    for (out[0..n.*]) |seen| if (std.mem.eql(u8, seen, nm)) return;
+                    out[n.*] = nm;
+                    n.* += 1;
+                }
+            },
+            .function_t => {
+                const sigs = self.store.signaturesOf(t.signatures);
+                for (sigs) |sg| {
+                    for (self.store.signatureParamsOf(sg)) |p| self.collectTypeRefNames(p, out, n, depth + 1);
+                    self.collectTypeRefNames(sg.return_type, out, n, depth + 1);
+                }
+            },
+            .array_t, .readonly_array_t, .union_t, .intersection_t, .tuple_t => {
+                for (self.store.idsOf(t.list_data)) |e| self.collectTypeRefNames(e, out, n, depth + 1);
+            },
+            .object_t => {
+                for (self.store.propsOf(t.object_props)) |pr| self.collectTypeRefNames(pr.type_id, out, n, depth + 1);
+            },
+            else => {},
+        }
+    }
+
+    /// How `cur` should display entity `tail` exported from module `mf`: through
+    /// a local alias if it has one, else the canonical `import("<spec>")` form.
+    fn entityDisplayFor(self: *Checker, mf: ModuleFile, tail: []const u8, cur: ModuleFile) EntityReach {
+        if (mf.start == cur.start and mf.end == cur.end) return .local;
+        if (self.moduleAliasInSection(mf.start, cur)) |alias| {
+            const qn = std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ alias, tail }) catch return .unnameable;
+            self.string_pool.append(self.gpa, qn) catch {
+                self.gpa.free(qn);
+                return .unnameable;
+            };
+            return .{ .qualified = qn };
+        }
+        if (std.mem.indexOfScalar(u8, mf.name, '/') != null) return .unnameable;
+        var stem = mf.name;
+        if (std.mem.lastIndexOfScalar(u8, stem, '.')) |d| stem = stem[0..d];
+        if (std.mem.endsWith(u8, stem, ".d")) stem = stem[0 .. stem.len - 2];
+        const disp = std.fmt.allocPrint(self.gpa, "import(\"./{s}\").{s}", .{ stem, tail }) catch return .unnameable;
+        self.string_pool.append(self.gpa, disp) catch {
+            self.gpa.free(disp);
+            return .unnameable;
+        };
+        return .{ .qualified = disp };
+    }
+
+    /// The module a local import binding named `alias` (anywhere in the program)
+    /// points at.
+    fn aliasTargetModule(self: *Checker, alias: []const u8) ?ModuleFile {
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
+            const b = self.importDeclBinding(ni) orelse continue;
+            if (!std.mem.eql(u8, b.name, alias)) continue;
+            return self.moduleFileForSpec(b.spec);
+        }
+        return null;
+    }
+
+    /// A local name in `cur` that refers to the module containing byte `off`
+    /// (`import Widgets = require("./…_Widgets")` → `Widgets`), if any.
+    fn moduleAliasInSection(self: *Checker, off: u32, cur: ModuleFile) ?[]const u8 {
+        var target: ?ModuleFile = null;
+        for (self.checker_opts.module_files) |mf| {
+            if (off >= mf.start and off < mf.end) target = mf;
+        }
+        const tgt = target orelse return null;
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
+            const ioff = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(ni));
+            if (ioff < cur.start or ioff >= cur.end) continue;
+            const b = self.importDeclBinding(ni) orelse continue;
+            const mf = self.moduleFileForSpec(b.spec) orelse continue;
+            if (mf.start == tgt.start and mf.end == tgt.end) return b.name;
+        }
+        return null;
+    }
+
+    /// The module specifier naming the entity declared at `off`: the enclosing
+    /// ambient `declare module "X"` if there is one, else the sibling section
+    /// containing it (`./<stem>`).  Sections in other directories are skipped —
+    /// the display would need a real relative path.
+    fn entityModuleSpec(self: *Checker, decl: NodeIndex, off: u32, cur: ModuleFile) ?[]const u8 {
+        if (self.ambientModuleNameOf(decl)) |amb| return amb;
+        if (std.mem.indexOfScalar(u8, cur.name, '/') != null) return null;
+        for (self.checker_opts.module_files) |mf| {
+            if (off < mf.start or off >= mf.end) continue;
+            if (std.mem.indexOfScalar(u8, mf.name, '/') != null) return null;
+            var stem = mf.name;
+            if (std.mem.lastIndexOfScalar(u8, stem, '.')) |d| stem = stem[0..d];
+            if (std.mem.endsWith(u8, stem, ".d")) stem = stem[0 .. stem.len - 2];
+            if (stem.len == 0) return null;
+            const spec = std.fmt.allocPrint(self.gpa, "./{s}", .{stem}) catch return null;
+            self.string_pool.append(self.gpa, spec) catch {
+                self.gpa.free(spec);
+                return null;
+            };
+            return spec;
+        }
+        return null;
+    }
+
+    /// The name of the ambient `declare module "X"` enclosing `decl`, if any.
+    fn ambientModuleNameOf(self: *Checker, decl: NodeIndex) ?[]const u8 {
+        const parents = self.semantic.parent_indices;
+        var p: u32 = if (decl.toInt() < parents.len) parents[decl.toInt()] else @intFromEnum(NodeIndex.none);
+        var guard: u8 = 0;
+        while (p != @intFromEnum(NodeIndex.none) and p < self.ast_ref.nodes.len and guard < 12) : (guard += 1) {
+            const pn: NodeIndex = @enumFromInt(p);
+            if (self.ast_ref.nodeTag(pn) == .ts_module_decl) {
+                const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pn) + 1);
+                if (raw.len >= 2 and (raw[0] == '\'' or raw[0] == '"')) return raw[1 .. raw.len - 1];
+            }
+            if (p >= parents.len) break;
+            p = parents[p];
+        }
+        return null;
+    }
+
+    /// Does an import inside `sec` bind `name` locally?
+    fn nameBoundInSection(self: *Checker, name: []const u8, sec: ModuleFile) bool {
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
+            const off = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(ni));
+            if (off < sec.start or off >= sec.end) continue;
+            const d = self.ast_ref.nodeData(ni);
+            if (d.lhs == .none) {
+                if (self.importDeclBinding(ni)) |b| {
+                    if (std.mem.eql(u8, b.name, name)) return true;
+                }
+                continue;
+            }
+            const idata = self.ast_ref.extraData(ast.ImportData, @intFromEnum(d.lhs));
+            if (idata.specifiers_end <= idata.specifiers_start) continue;
+            for (self.ast_ref.extra_data[idata.specifiers_start..idata.specifiers_end]) |raw_idx| {
+                const sn: NodeIndex = @enumFromInt(raw_idx);
+                const sd = self.ast_ref.nodeData(sn);
+                const local: NodeIndex = switch (self.ast_ref.nodeTag(sn)) {
+                    .import_specifier => sd.rhs,
+                    .import_default_specifier, .import_namespace_specifier => sd.lhs,
+                    else => continue,
+                };
+                if (local == .none) continue;
+                if (std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(local)), name)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn inferMemberOnNamespace(self: *Checker, module_spec: []const u8, member_name: []const u8, use_site: NodeIndex) ?TypeId {
+        // The TARGET module's byte range is what makes the per-file display
+        // computable.  An eval unit that doesn't carry it (importDecl's units
+        // list only their own section, while the concatenated source still
+        // holds the others) can still resolve a STRUCTURAL type safely, but a
+        // NAMED entity it cannot qualify comes out bare and wrong — `glo_m4.d`
+        // as `d` where tsc wants `typeof glo_m4.d`.
+        const ranged = self.moduleRangeForSpec(module_spec, use_site) != null;
+        // A module's exports are READONLY: writing one is an error, and tsc
+        // types the whole erroring reference `any` (constDeclarations-access5
+        // types `m.x` as `any` at `m.x = 1` but `0` at `var a = m.x + 1`).
+        if (self.crossModuleMemberIsWriteTarget(use_site)) return null;
+        // A CLASS (or enum) export used as a VALUE shows its static side under
+        // the qualified name — `glo_m4.d` is `typeof glo_m4.d`, never the
+        // structural class object.  Mirrors `localNamespaceMemberValue` for
+        // locally-declared namespaces.
+        if (self.moduleExportIsClassLike(module_spec, member_name, use_site) and
+            !self.identifierInBareNamePosition(use_site))
+        {
+            if (self.ast_ref.nodeTag(use_site) == .identifier) {
+                const recv = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(use_site));
+                if (recv.len > 0) {
+                    if (std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ recv, member_name })) |disp| {
+                        if (self.store.typeRef(disp, &.{})) |r| {
+                            self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
+                            return r;
+                        } else |_| self.gpa.free(disp);
+                    } else |_| {}
+                }
+            }
+        }
         if (self.module_resolver) |resolver| {
             if (self.file_path.len > 0) {
                 const from_dir = std.fs.path.dirname(self.file_path) orelse ".";
-                if (resolver.resolveExportedType(from_dir, module_spec, member_name, &self.store, self.gpa)) |t| return t;
+                if (resolver.resolveExportedType(from_dir, module_spec, member_name, &self.store, self.gpa)) |t|
+                    return self.crossModuleResult(t, use_site, ranged);
             }
         }
         // Same-AST fallback: multi-file test sources are concatenated into one
@@ -21888,14 +22337,14 @@ pub const Checker = struct {
         // the specifier names one of the concatenated sections; anything else
         // is genuinely external (stays any).  Skip when the member name is
         // itself an import binding (avoid resolving `b.b` to the alias `b`).
-        if (self.moduleSpecIsLocalSection(module_spec) and
+        if ((self.moduleSpecIsLocalSection(module_spec) or self.ambientModuleDeclared(module_spec, use_site)) and
             self.namespace_import_map.get(member_name) == null)
         {
             if (self.typeOfNameByAstSearch(member_name, .none)) |t| {
-                if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ANY)) return t;
+                if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ANY)) return self.crossModuleResult(t, use_site, ranged);
             }
             if (self.resolveDeclaredType(member_name)) |t| {
-                if (!t.eq(tymod.ID_UNKNOWN)) return t;
+                if (!t.eq(tymod.ID_UNKNOWN)) return self.crossModuleResult(t, use_site, ranged);
             }
         }
         return null;
@@ -22034,7 +22483,7 @@ pub const Checker = struct {
                 if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
                 const b = self.importDeclBinding(ni) orelse continue;
                 if (!b.is_require) continue;
-                if (!self.requireSpecResolves(b.spec)) continue;
+                if (!self.requireSpecResolves(b.spec, ni)) continue;
                 if (self.resolvedModuleSpecSource(b.spec)) |src| {
                     if ((binds.get(@intFromPtr(src.ptr)) orelse 1) > 1) continue;
                 }
@@ -22084,11 +22533,21 @@ pub const Checker = struct {
     ///   * relative (`./sib`) — a sibling module section with that name exists;
     ///   * bare (`react`)     — a `/// <reference … <spec>.d.ts>` supplies it.
     /// Anything else is unresolvable, and tsc types the binding `any`.
-    fn requireSpecResolves(self: *Checker, spec: []const u8) bool {
+    fn requireSpecResolves(self: *Checker, spec: []const u8, at: NodeIndex) bool {
         if (spec.len == 0) return false;
         if (spec[0] == '/') return false;
-        if (spec[0] != '.') return self.sourceReferencesLib(spec);
+        // node16/nodenext give one file two module identities (esm vs cjs) and
+        // make `import X = require(…)` an error in ESM-format files; tsc's
+        // displays there follow rules this doesn't model.
+        if (self.checker_opts.isNode16Style()) return false;
+        // Bare: either a `/// <reference … <spec>.d.ts>` lib, or an ambient
+        // `declare module "<spec>"` in the program (how the corpus supplies
+        // `GlobalWidgets`).
+        if (spec[0] != '.') return self.sourceReferencesLib(spec) or self.ambientModuleDeclared(spec, at);
         const sec_src = self.resolvedModuleSpecSource(spec) orelse return false;
+        // A file with no top-level `export` isn't an external module at all —
+        // `import foo = require("./nonExternal")` is an error typed `any`.
+        if (std.mem.indexOf(u8, sec_src, "export") == null) return false;
         // `export =` modules name the binding after the EXPORTED ENTITY (or take
         // its type outright, or are an error typed `any`) — never after the local
         // alias.  Same exclusion `namespaceImportBindingType` makes for `import *
@@ -22115,6 +22574,44 @@ pub const Checker = struct {
         const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(arg));
         if (raw.len < 2) return null;
         return raw[1 .. raw.len - 1];
+    }
+
+    /// Is `spec` supplied by an ambient `declare module "<spec>"` that the file
+    /// at `from` can actually import?
+    ///
+    /// The declaration must live in ANOTHER section.  A `declare module "X"` in
+    /// the importing file is a module AUGMENTATION, not an ambient external
+    /// module — privacyImportParseErrors declares `glo_M2_public` right above
+    /// the `require("glo_M2_public")` that uses it, and tsc still types the
+    /// binding `any`.  `export =` bodies are excluded for the same reason as
+    /// relative sections: they name the binding after the exported entity.
+    fn ambientModuleDeclared(self: *Checker, spec: []const u8, from: NodeIndex) bool {
+        const cur = self.sectionOfNode(from);
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .ts_module_decl) continue;
+            const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni) + 1);
+            if (raw.len < 2 or (raw[0] != '\'' and raw[0] != '"')) continue;
+            if (!std.mem.eql(u8, raw[1 .. raw.len - 1], spec)) continue;
+            const off = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(ni));
+            const c = cur orelse return false; // no section info: can't tell it apart
+            if (off >= c.start and off < c.end) continue; // same file → augmentation
+            const body = self.sectionSourceAt(off) orelse return false;
+            if (std.mem.indexOf(u8, body, "export =") != null) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// The source of the section containing byte offset `off`.
+    fn sectionSourceAt(self: *Checker, off: u32) ?[]const u8 {
+        for (self.checker_opts.module_files) |mf| {
+            if (off >= mf.start and off < mf.end and mf.end <= self.ast_ref.source.len)
+                return self.ast_ref.source[mf.start..mf.end];
+        }
+        return null;
     }
 
     /// Does the source carry a `/// <reference …>` naming `<spec>.d.ts`?  That is
@@ -23339,7 +23836,13 @@ pub const Checker = struct {
                     const held = self.require_alias_opaque and
                         self.isLocalRequireAlias(inner_name);
                     if (!held) {
-                        if (self.inferMemberOnNamespace(mod_spec, prop_name)) |resolved| return resolved;
+                        if (self.inferMemberOnNamespace(mod_spec, prop_name, obj_node)) |resolved| return resolved;
+                        // The receiver is OURS: an `import X = require(…)` module
+                        // object.  If its export didn't resolve, later fallbacks
+                        // are guessing at a name they cannot see (importDecl's
+                        // `glo_m4.d` came out as a bare `d`), so stop here — an
+                        // honest gap beats an invented name.
+                        if (self.isResolvableRequireAlias(inner_name)) return tymod.ID_ANY;
                     }
                 }
                 // `typeof LocalNamespace` — scan exported var/let/const members only.
