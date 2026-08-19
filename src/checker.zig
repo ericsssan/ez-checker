@@ -2756,6 +2756,16 @@ pub const Checker = struct {
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
         if (self.exportSpecifierBindingType(node)) |t| return t;
+        if (self.heritageBaseOwner(node)) |owner| {
+            if (self.classBaseChainCycles(owner)) {
+                const nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+                if (nm.len > 0 and self.import_map.get(nm) == null and
+                    self.namespace_import_map.get(nm) == null and self.classNameIsUnique(nm))
+                {
+                    if (self.typeofRef(nm)) |t| return t;
+                }
+            }
+        }
         // The BINDING NAME inside an import declaration: tsc types it as the
         // imported symbol (`import { SomeClass } from './aux'` shows
         // `SomeClass : typeof SomeClass`).  A declaration site, so it precedes
@@ -3774,6 +3784,17 @@ pub const Checker = struct {
     /// Type inference for `property_ident` nodes — the property name on the
     /// right-hand side of a non-computed member expression (`obj.prop`).
     fn inferPropertyIdent(self: *Checker, node: NodeIndex) TypeId {
+        // `class E extends Module.D {}` — the PROPERTY token of a qualified base
+        // is the base's static side (`typeof D`) even when the class itself is
+        // fine; only the whole expression follows the instance/cycle rule.
+        // Restricted to a class in a namespace the use site is inside, where the
+        // minimal name is the bare one.
+        if (self.heritageBaseOwner(node) != null) {
+            const nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+            if (nm.len > 0 and self.siblingNamespaceClass(nm, node)) {
+                if (self.typeofRef(nm)) |t| return t;
+            }
+        }
         // `export { c as c2 }` — the alias parses as a `property_ident`.
         if (self.exportSpecifierBindingType(node)) |t| return t;
         // An import specifier's names parse as `property_ident` in some
@@ -21935,6 +21956,18 @@ pub const Checker = struct {
 
     fn inferMember(self: *Checker, node: NodeIndex) TypeId {
         const data = self.ast_ref.nodeData(node);
+        // A qualified base whose class sits in a circular chain: the whole
+        // reference is the static side, named as the use site can reach it.
+        if (data.rhs != .none) {
+            if (self.heritageBaseOwner(node)) |owner| {
+                if (self.classBaseChainCycles(owner)) {
+                    const pn = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.rhs));
+                    if (pn.len > 0 and self.siblingNamespaceClass(pn, node)) {
+                        if (self.typeofRef(pn)) |t| return t;
+                    }
+                }
+            }
+        }
         // CommonJS: `module.exports` is the module's export object — tsc
         // displays `typeof module.exports`, but only when the module assigns
         // an object literal (`module.exports = {…}`); assigning an existing
@@ -23107,6 +23140,154 @@ pub const Checker = struct {
     /// (parent `class_decl`), or an export specifier / `export default <X>`.
     /// The local-symbol path handles these for in-file decls; the imported-entity
     /// lever must mirror it by NOT emitting `typeof` here.
+    /// The class whose `extends` clause `node` sits in, if any.
+    ///
+    /// A heritage clause WITH type arguments is an instantiation that tsc types
+    /// as the instance, so it is excluded.
+    fn heritageBaseOwner(self: *Checker, node: NodeIndex) ?NodeIndex {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var cur = node;
+        var guard: u8 = 0;
+        while (guard < 6) : (guard += 1) {
+            const ci = cur.toInt();
+            if (ci >= parents.len) return null;
+            const pi = parents[ci];
+            if (pi == NONE or pi >= self.ast_ref.nodes.len) return null;
+            const parent: NodeIndex = @enumFromInt(pi);
+            switch (self.ast_ref.nodeTag(parent)) {
+                .member_expr, .grouping_expr => cur = parent,
+                .ts_instantiation_expr => return null,
+                .class_decl => {
+                    const pd = self.ast_ref.nodeData(parent);
+                    if (pd.lhs == .none) return null;
+                    const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(pd.lhs));
+                    return if (cd.super_class == cur) parent else null;
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Does the `extends` chain starting at `class_decl` come back to it?
+    ///
+    /// tsc cannot form the instance type of a class in a circular base chain, so
+    /// it falls back to the base's STATIC side — `class C extends D {}` inside a
+    /// C→D→…→C cycle prints `D : typeof D`, where an ordinary base prints the
+    /// instance (`class B extends A {}` → `A : A`).  A cycle that does NOT reach
+    /// back here (`class E extends D` where only D's chain loops) leaves E's own
+    /// base normal.
+    fn classBaseChainCycles(self: *Checker, class_decl: NodeIndex) bool {
+        var seen: [16]NodeIndex = undefined;
+        var n: usize = 0;
+        var cur = class_decl;
+        var guard: u8 = 0;
+        while (guard < 32) : (guard += 1) {
+            const d = self.ast_ref.nodeData(cur);
+            if (d.lhs == .none) return false;
+            const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(d.lhs));
+            if (cd.super_class == .none) return false;
+            const base_name = self.rightmostNameOf(cd.super_class) orelse return false;
+            const next = self.decl_index.primaryDecl(base_name) orelse return false;
+            if (self.ast_ref.nodeTag(next) != .class_decl) return false;
+            if (next == class_decl) return true;
+            for (seen[0..n]) |sn| if (sn == next) return false; // a cycle we are not part of
+            if (n == seen.len) return false;
+            seen[n] = next;
+            n += 1;
+            cur = next;
+        }
+        return false;
+    }
+
+    /// The last identifier of a (possibly qualified or instantiated) reference.
+    fn rightmostNameOf(self: *Checker, node: NodeIndex) ?[]const u8 {
+        var cur = node;
+        var guard: u8 = 0;
+        while (guard < 8) : (guard += 1) {
+            switch (self.ast_ref.nodeTag(cur)) {
+                .identifier, .property_ident, .ts_type_reference => {
+                    const t = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cur));
+                    return if (t.len > 0) t else null;
+                },
+                .member_expr, .optional_member_expr => {
+                    const d = self.ast_ref.nodeData(cur);
+                    if (d.rhs == .none) return null;
+                    cur = d.rhs;
+                },
+                .grouping_expr, .ts_instantiation_expr => {
+                    const d = self.ast_ref.nodeData(cur);
+                    if (d.lhs == .none) return null;
+                    cur = d.lhs;
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Is `name` a class declared in a namespace the use site also sits in — so
+    /// tsc names it bare rather than `Ns.C`?
+    fn siblingNamespaceClass(self: *Checker, name: []const u8, use_site: NodeIndex) bool {
+        const d = self.decl_index.primaryDecl(name) orelse return false;
+        if (self.ast_ref.nodeTag(d) != .class_decl) return false;
+        const ns = self.enclosingNamespaceDecl(d) orelse return false;
+        if (!self.nodeIsInside(use_site, ns)) return false;
+        // A non-exported member isn't reachable as `Ns.C` at all — tsc types
+        // that reference `any` (classExtendingQualifiedName).
+        if (!self.declIsExported(d)) return false;
+        // The bare name is only the minimal one while it is UNAMBIGUOUS
+        // (declFileWithClassNameConflictingWithClassInNamespace has two `W`s and
+        // tsc falls back to `base.W`), and an imported binding of the same name
+        // has its own display rules.
+        if (self.import_map.get(name) != null or self.namespace_import_map.get(name) != null) return false;
+        return self.classNameIsUnique(name);
+    }
+
+    /// Does an `export` modifier precede this declaration?
+    fn declIsExported(self: *Checker, decl: NodeIndex) bool {
+        const tok = self.ast_ref.nodeMainToken(decl);
+        if (tok == 0) return false;
+        return std.mem.eql(u8, self.ast_ref.tokenText(tok - 1), "export") or
+            (tok >= 2 and std.mem.eql(u8, self.ast_ref.tokenText(tok - 1), "declare") and
+                std.mem.eql(u8, self.ast_ref.tokenText(tok - 2), "export"));
+    }
+
+    /// Is `name` the name of exactly one class in the file?
+    fn classNameIsUnique(self: *Checker, name: []const u8) bool {
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        var n: u32 = 0;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .class_decl) continue;
+            const d = self.ast_ref.nodeData(ni);
+            if (d.lhs == .none) continue;
+            const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(d.lhs));
+            if (cd.name == .none) continue;
+            if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cd.name)), name)) continue;
+            n += 1;
+            if (n > 1) return false;
+        }
+        return n == 1;
+    }
+
+    /// The nearest namespace/module declaration containing `node`.
+    fn enclosingNamespaceDecl(self: *Checker, node: NodeIndex) ?NodeIndex {
+        const parents = self.semantic.parent_indices;
+        var p: u32 = if (node.toInt() < parents.len) parents[node.toInt()] else @intFromEnum(NodeIndex.none);
+        var guard: u16 = 0;
+        while (p != @intFromEnum(NodeIndex.none) and p < self.ast_ref.nodes.len and guard < 128) : (guard += 1) {
+            const pn: NodeIndex = @enumFromInt(p);
+            const tag = self.ast_ref.nodeTag(pn);
+            if (tag == .ts_namespace_decl or tag == .ts_module_decl) return pn;
+            if (p >= parents.len) break;
+            p = parents[p];
+        }
+        return null;
+    }
+
     fn identifierInBareNamePosition(self: *Checker, node: NodeIndex) bool {
         const parents = self.semantic.parent_indices;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
