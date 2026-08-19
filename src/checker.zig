@@ -259,6 +259,38 @@ fn isIdentChar(c: u8) bool {
 /// `export enum X` and a bare `enum X` later exported via `export { X }` (an
 /// imported name is necessarily exported, so export-syntax need not be on the
 /// decl line itself).  `const` covers `const enum X`.
+/// Does the block starting at the next `{` after `at` declare any VALUE?
+fn blockHasValueMember(src: []const u8, at: usize) bool {
+    const open = std.mem.indexOfScalarPos(u8, src, at, '{') orelse return false;
+    var depth: i32 = 0;
+    var i = open;
+    var end = src.len;
+    while (i < src.len) : (i += 1) {
+        if (src[i] == '{') depth += 1;
+        if (src[i] == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                end = i;
+                break;
+            }
+        }
+    }
+    const body = src[open..end];
+    inline for (.{ "const ", "let ", "var ", "function ", "class ", "enum ", "namespace " }) |kw| {
+        if (std.mem.indexOf(u8, body, kw) != null) return true;
+    }
+    return false;
+}
+
+/// Like `lineStartsTopLevelDecl`, but the declaration must be EXPORTED.
+fn lineStartsExportedDecl(src: []const u8, at: usize) bool {
+    var ls = at;
+    while (ls > 0 and src[ls - 1] != '\n') ls -= 1;
+    var i = ls;
+    while (i < src.len and (src[i] == ' ' or src[i] == '\t')) i += 1;
+    return std.mem.startsWith(u8, src[i..], "export ");
+}
+
 fn lineStartsTopLevelDecl(src: []const u8, at: usize) bool {
     var ls = at;
     while (ls > 0 and src[ls - 1] != '\n') ls -= 1;
@@ -1383,6 +1415,8 @@ pub const Checker = struct {
             // on the receiver type.  property_ident has no symbol reference, so
             // skip straight to the parent-based dispatch.
             .property_ident => self.inferPropertyIdent(node),
+            .import_specifier, .import_default_specifier, .import_namespace_specifier =>
+                self.importSpecifierType(node),
 
             .ts_as_expr, .ts_type_assertion => self.inferAsCast(node, t),
             .ts_satisfies_expr => self.inferSatisfies(node),
@@ -2697,6 +2731,14 @@ pub const Checker = struct {
     }
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
+        // The BINDING NAME inside an import declaration: tsc types it as the
+        // imported symbol (`import { SomeClass } from './aux'` shows
+        // `SomeClass : typeof SomeClass`).  A declaration site, so it precedes
+        // every use-site rule below.  Only type entities are answered — a value
+        // import would need the other module's inferred type and stays a gap.
+        if (self.importBindingRef(node)) |ib| {
+            if (self.importBindingDisplayType(node, ib.local, ib.kind)) |t| return t;
+        }
         // Unannotated parameter in a type-only signature (interface method /
         // call / construct signature).  Without an annotation, `typeOfNameByAstSearch`
         // (the final fallback below) would find any outer variable with the same name
@@ -3427,6 +3469,10 @@ pub const Checker = struct {
         if (std.mem.eql(u8, name, "fetch") and self.global_value_types.contains("fetch")) {
             return self.store.typeRef("(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>", &.{}) catch tymod.ID_ANY;
         }
+        // The BINDING NAME inside an import declaration: tsc types it as the
+        // imported symbol (`import { SomeClass } from './aux'` shows
+        // `SomeClass : typeof SomeClass`).  Only type entities are answered here
+        // — a value import would need the other module's inferred type.
         // `import X = require("mod")` (resolvable) in VALUE position → `typeof X`.
         if (!self.identifierInTypePosition(node) and !self.identifierInBareNamePosition(node) and
             self.isResolvableRequireAlias(name))
@@ -3703,6 +3749,11 @@ pub const Checker = struct {
     /// Type inference for `property_ident` nodes — the property name on the
     /// right-hand side of a non-computed member expression (`obj.prop`).
     fn inferPropertyIdent(self: *Checker, node: NodeIndex) TypeId {
+        // An import specifier's names parse as `property_ident` in some
+        // positions — same binding, same answer (see `importBindingRef`).
+        if (self.importBindingRef(node)) |ib| {
+            if (self.importBindingDisplayType(node, ib.local, ib.kind)) |t| return t;
+        }
         // Inner segment of a dotted namespace header (`namespace X.A.B.C {}`).
         if (self.isNamespaceHeaderName(node)) {
             const nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
@@ -23028,6 +23079,179 @@ pub const Checker = struct {
             p = parents[p];
         }
         return false;
+    }
+
+    const ImportBindingKind = enum { namespace, entity };
+
+    /// `typeof <local>` for an import binding of a TYPE ENTITY (class / enum /
+    /// namespace) or of a resolvable namespace import.  A value import would
+    /// need the other module's inferred type and stays a gap.
+    fn importBindingDisplayType(self: *Checker, node: NodeIndex, local: []const u8, bk: ImportBindingKind) ?TypeId {
+        if (self.importDeclIsTypeOnly(node)) return null;
+        const shown: []const u8 = switch (bk) {
+            .namespace => blk: {
+                const spec = self.namespace_import_map.get(local) orelse return null;
+                if (self.namespaceImportBindingType(local, spec) == null) return null;
+                break :blk local;
+            },
+            // The LOCAL name, for BOTH nodes of an aliased specifier:
+            // `import { a11 as b }` types the `a11` node and the `b` node alike
+            // as `typeof b` (es6ImportNamedImportDts).  `importedEntityDeclaredName`
+            // only VERIFIES that the import names an exported type entity.
+            .entity => blk: {
+                _ = self.importedEntityDeclaredName(local) orelse return null;
+                // A symbol bound more than once in the file is displayed by its
+                // FIRST binding, which syntax alone doesn't settle (`import
+                // { Member } …; import { Member as M } …` types BOTH as `typeof
+                // Member`, while a lone `import { a11 as b }` types both as
+                // `typeof b`).  Same rule the require-alias display declines.
+                if (self.importBoundMoreThanOnce(local)) return null;
+                break :blk local;
+            },
+        };
+        const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{shown}) catch return null;
+        const r = self.store.typeRef(tn, &.{}) catch {
+            self.gpa.free(tn);
+            return null;
+        };
+        self.string_pool.append(self.gpa, tn) catch self.gpa.free(tn);
+        return r;
+    }
+
+    /// The specifier NODE itself (`{ SomeClass }`) carries the same text as its
+    /// binding name, and the oracle anchors tsc's row on whichever comes first —
+    /// so it must answer the same thing.
+    fn importSpecifierType(self: *Checker, node: NodeIndex) TypeId {
+        const d = self.ast_ref.nodeData(node);
+        const bk: ImportBindingKind = switch (self.ast_ref.nodeTag(node)) {
+            .import_specifier, .import_default_specifier => .entity,
+            .import_namespace_specifier => .namespace,
+            else => return tymod.ID_ANY,
+        };
+        const local: NodeIndex = switch (self.ast_ref.nodeTag(node)) {
+            .import_specifier => if (d.rhs != .none) d.rhs else d.lhs,
+            else => d.lhs,
+        };
+        if (local == .none) return tymod.ID_ANY;
+        const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(local));
+        return self.importBindingDisplayType(local, name, bk) orelse tymod.ID_ANY;
+    }
+
+    /// The name under which an imported TYPE ENTITY is declared in its module,
+    /// or null when the import doesn't name one.
+    ///
+    /// Stricter than `importedTypeEntityDisplayName` (which serves use sites):
+    /// the declaration must be EXPORTED — importNonExportedMember3 imports a
+    /// `class Foo` the module keeps to itself, and tsc types that binding `any`.
+    fn importedEntityDeclaredName(self: *Checker, local: []const u8) ?[]const u8 {
+        const entry = self.import_map.get(local) orelse return null;
+        const spec = entry.module_specifier;
+        if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
+        const src = self.resolvedModuleSpecSource(spec) orelse return null;
+        const exp = entry.exported_name;
+        if (std.mem.eql(u8, exp, "default")) {
+            // A CJS target (`export =` / `module.exports`) makes the binding an
+            // interop synthesis whose display tsc derives from the target, not
+            // the local name — esmModuleExports1..3 want `typeof Foo`, `any`,
+            // even `"oops"` for the same shape.
+            if (std.mem.indexOf(u8, src, "export =") != null) return null;
+            if (std.mem.indexOf(u8, src, "module.exports") != null) return null;
+            const at = std.mem.indexOf(u8, src, "export default class ") orelse
+                std.mem.indexOf(u8, src, "export default abstract class ") orelse return null;
+            var i = at + "export default ".len;
+            if (std.mem.startsWith(u8, src[i..], "abstract ")) i += "abstract ".len;
+            i += "class ".len;
+            const ns = i;
+            while (i < src.len and isIdentChar(src[i])) i += 1;
+            return if (i > ns) src[ns..i] else null;
+        }
+        var buf: [192]u8 = undefined;
+        inline for (.{ "enum ", "class ", "namespace " }) |kw| {
+            const needle = std.fmt.bufPrint(&buf, "{s}{s}", .{ kw, exp }) catch return null;
+            var idx: usize = 0;
+            while (std.mem.indexOfPos(u8, src, idx, needle)) |at| {
+                const after = at + needle.len;
+                if ((after >= src.len or !isIdentChar(src[after])) and lineStartsExportedDecl(src, at)) {
+                    // A namespace of pure TYPES has no value side, so the import
+                    // binds nothing and tsc types it `any` (`declare namespace id
+                    // { type A<T> = T }` in declarationEmitNoInvalidCommentReuse3).
+                    if (std.mem.eql(u8, kw, "namespace ") and !blockHasValueMember(src, after)) return null;
+                    return exp;
+                }
+                idx = after;
+            }
+        }
+        return null;
+    }
+
+    /// Is the local binding `local` one of SEVERAL imports of the same symbol?
+    fn importBoundMoreThanOnce(self: *Checker, local: []const u8) bool {
+        const entry = self.import_map.get(local) orelse return false;
+        var it = self.import_map.iterator();
+        var n: u32 = 0;
+        while (it.next()) |e| {
+            const v = e.value_ptr.*;
+            if (!std.mem.eql(u8, v.exported_name, entry.exported_name)) continue;
+            if (!std.mem.eql(u8, v.module_specifier, entry.module_specifier)) continue;
+            n += 1;
+            if (n > 1) return true;
+        }
+        return false;
+    }
+
+    /// Is `node` inside an `import type … ` declaration?  A type-only import
+    /// binds no value, and tsc types it `any`.
+    fn importDeclIsTypeOnly(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        var p: u32 = if (node.toInt() < parents.len) parents[node.toInt()] else @intFromEnum(NodeIndex.none);
+        var guard: u8 = 0;
+        var seen_import = false;
+        while (p != @intFromEnum(NodeIndex.none) and p < self.ast_ref.nodes.len and guard < 12) : (guard += 1) {
+            const pn: NodeIndex = @enumFromInt(p);
+            switch (self.ast_ref.nodeTag(pn)) {
+                .import_decl => {
+                    if (std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pn) + 1), "type")) return true;
+                    seen_import = true;
+                },
+                // An import inside a `declare module "…" { … }` augmentation
+                // binds nothing in this file; tsc types it `any`
+                // (moduleAugmentationImportsAndExports2).
+                .ts_module_decl => if (seen_import) return true,
+                else => {},
+            }
+            if (p >= parents.len) break;
+            p = parents[p];
+        }
+        return false;
+    }
+
+    const ImportBindingRef = struct { kind: ImportBindingKind, local: []const u8 };
+
+    /// When `node` is a name inside an import specifier — the LOCAL binding or,
+    /// for `{ A as B }`, the imported name — the binding it belongs to.  Both
+    /// nodes carry the same source text when there is no alias, and the oracle
+    /// anchors tsc's row on whichever the walk reaches first, so both must
+    /// answer.  The binding is always verified through the LOCAL name (that is
+    /// what `import_map` is keyed by) while the display uses the node's own.
+    fn importBindingRef(self: *Checker, node: NodeIndex) ?ImportBindingRef {
+        const parents = self.semantic.parent_indices;
+        if (node.toInt() >= parents.len) return null;
+        const pi = parents[node.toInt()];
+        if (pi == @intFromEnum(NodeIndex.none) or pi >= self.ast_ref.nodes.len) return null;
+        const parent: NodeIndex = @enumFromInt(pi);
+        const pd = self.ast_ref.nodeData(parent);
+        const kind: ImportBindingKind = switch (self.ast_ref.nodeTag(parent)) {
+            .import_specifier => if (pd.lhs == node or pd.rhs == node) .entity else return null,
+            .import_default_specifier => if (pd.lhs == node) .entity else return null,
+            .import_namespace_specifier => if (pd.lhs == node) .namespace else return null,
+            else => return null,
+        };
+        const local_node: NodeIndex = switch (self.ast_ref.nodeTag(parent)) {
+            .import_specifier => if (pd.rhs != .none) pd.rhs else pd.lhs,
+            else => pd.lhs,
+        };
+        if (local_node == .none) return null;
+        return .{ .kind = kind, .local = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(local_node)) };
     }
 
     fn namespaceImportBindingType(self: *Checker, ns_name: []const u8, spec: []const u8) ?TypeId {
