@@ -19167,8 +19167,8 @@ pub const Checker = struct {
         bindings: *[8]TypeId,
     ) usize {
         const fn_decl = self.findCalleeFnDecl(callee) orelse return 0;
-        const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(self.ast_ref.nodeData(fn_decl).lhs));
-        if (fd.type_params_end <= fd.type_params) return 0;
+        const fd = self.calleeSigRanges(fn_decl) orelse return 0;
+        if (fd.tp_end <= fd.tp_start) return 0;
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
         var tp_count: usize = 0;
         var const_mask = std.mem.zeroes([8]bool);
@@ -19176,8 +19176,8 @@ pub const Checker = struct {
         // unknown[]>`), strip `readonly` from the array const form (tsc gives a
         // mutable tuple); a `readonly unknown[]` constraint keeps it.
         var const_strip_ro = std.mem.zeroes([8]bool);
-        if (fd.type_params_end <= ext_len) {
-            for (self.ast_ref.extra_data[fd.type_params..fd.type_params_end]) |raw| {
+        if (fd.tp_end <= ext_len) {
+            for (self.ast_ref.extra_data[fd.tp_start..fd.tp_end]) |raw| {
                 if (tp_count >= names.len) break;
                 const tp_node: NodeIndex = @enumFromInt(raw);
                 if (self.ast_ref.nodeTag(tp_node) != .ts_type_parameter) continue;
@@ -19217,7 +19217,7 @@ pub const Checker = struct {
             }
         }
         if (fd.params_end > ext_len) return tp_count;
-        const params = self.ast_ref.extra_data[fd.params..fd.params_end];
+        const params = self.ast_ref.extra_data[fd.params_start..fd.params_end];
         // Detect a trailing rest parameter (peel default/parameter-property).
         var rest_pi: usize = std.math.maxInt(usize);
         if (params.len > 0) {
@@ -19961,11 +19961,77 @@ pub const Checker = struct {
     /// For a call's callee, find the matching function declaration
     /// node in the AST (by identifier name).  Returns null if the
     /// callee isn't a simple identifier or we can't find a fn-decl.
+    const CalleeSigRanges = struct { tp_start: u32, tp_end: u32, params_start: u32, params_end: u32, return_type: NodeIndex };
+
+    /// Type-parameter and parameter ranges of a callee declaration.  A function
+    /// declaration (and a `ts_function_type`, which shares the layout) keeps them
+    /// in `FnData`; an interface METHOD signature keeps them in
+    /// `InterfaceSigData`, whose fields sit at different offsets — so the two
+    /// cannot be read through one struct.
+    fn calleeSigRanges(self: *Checker, decl: NodeIndex) ?CalleeSigRanges {
+        const d = self.ast_ref.nodeData(decl);
+        if (d.lhs == .none) return null;
+        if (self.ast_ref.nodeTag(decl) == .ts_method_signature) {
+            const sd = self.ast_ref.extraData(ast.InterfaceSigData, @intFromEnum(d.lhs));
+            return .{
+                .tp_start = sd.type_params,
+                .tp_end = sd.type_params_end,
+                .params_start = sd.params_start,
+                .params_end = sd.params_end,
+                .return_type = sd.return_type,
+            };
+        }
+        const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
+        return .{
+            .tp_start = fd.type_params,
+            .tp_end = fd.type_params_end,
+            .params_start = fd.params,
+            .params_end = fd.params_end,
+            .return_type = fd.return_type,
+        };
+    }
+
+    /// The interface METHOD SIGNATURE a member call resolves to
+    /// (`r1.then(…)` → `then<U>(…)` in `interface IPromise<T>`), so generic
+    /// inference can bind the method's own type parameters.  Only generic
+    /// methods are returned; a non-generic one has nothing to infer.
+    fn findCalleeMethodSig(self: *Checker, callee: NodeIndex) ?NodeIndex {
+        if (self.ast_ref.nodeTag(callee) != .member_expr) return null;
+        const md = self.ast_ref.nodeData(callee);
+        if (md.lhs == .none or md.rhs == .none) return null;
+        const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
+        if (prop.len == 0) return null;
+        const recv = self.store.get(self.typeOf(md.lhs));
+        const tname: []const u8 = switch (recv.kind) {
+            .type_ref, .object_t => recv.name,
+            else => "",
+        };
+        if (tname.len == 0) return null;
+        const decl = self.decl_index.primaryDecl(tname) orelse return null;
+        if (self.ast_ref.nodeTag(decl) != .ts_interface_decl) return null;
+        const idata = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
+        if (idata.body_end <= idata.body_start or idata.body_end > self.ast_ref.extra_data.len) return null;
+        for (self.ast_ref.extra_data[idata.body_start..idata.body_end]) |raw| {
+            const member: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(member) != .ts_method_signature) continue;
+            const mdata = self.ast_ref.nodeData(member);
+            if (mdata.lhs == .none) continue;
+            const sd = self.ast_ref.extraData(ast.InterfaceSigData, @intFromEnum(mdata.lhs));
+            if (sd.key == .none) continue;
+            if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(sd.key)), prop)) continue;
+            if (sd.type_params_end <= sd.type_params) continue; // not generic
+            return member;
+        }
+        return null;
+    }
+
     fn findCalleeFnDecl(self: *Checker, callee: NodeIndex) ?NodeIndex {
         var c = callee;
         while (self.ast_ref.nodeTag(c) == .grouping_expr or
                self.ast_ref.nodeTag(c) == .ts_instantiation_expr)
             c = self.ast_ref.nodeData(c).lhs;
+        // `obj.method(…)` on an interface: infer the METHOD's own type params.
+        if (self.ast_ref.nodeTag(c) == .member_expr) return self.findCalleeMethodSig(c);
         if (self.ast_ref.nodeTag(c) != .identifier) return null;
         const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(c));
         if (name.len == 0) return null;
