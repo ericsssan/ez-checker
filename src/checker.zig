@@ -28044,6 +28044,22 @@ pub const Checker = struct {
                 fn_ty_id = cs[0];
             }
         }
+        // A contextual UNION or INTERSECTION containing exactly one signature
+        // (`((x: number) => void) | undefined`, or a function type intersected
+        // with a props object) still types the params — pick that member.
+        {
+            const ct = self.store.get(fn_ty_id);
+            if (ct.kind == .union_t or ct.kind == .intersection_t) {
+                var only: ?TypeId = null;
+                var n_fn: u32 = 0;
+                for (self.store.idsOf(ct.list_data)) |m| {
+                    if (self.store.get(m).kind != .function_t) continue;
+                    n_fn += 1;
+                    only = m;
+                }
+                if (n_fn == 1) fn_ty_id = only.?;
+            }
+        }
         const ft = self.store.get(fn_ty_id);
         if (ft.kind != .function_t) return null;
         const sigs = self.store.signaturesOf(ft.signatures);
