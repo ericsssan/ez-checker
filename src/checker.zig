@@ -22027,15 +22027,20 @@ pub const Checker = struct {
             }
             // this.prop inside an object-literal method: scan the literal's own members.
             if (self.ast_ref.nodeTag(obj_node) == .this_expr) {
-                if (self.thisHostObjectLiteral(obj_node)) |objlit| {
-                    if ((self.ast_ref.nodeTag(node) == .member_expr or
-                        self.ast_ref.nodeTag(node) == .optional_member_expr) and
-                        data.rhs != .none)
-                    {
-                        const prop_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.rhs));
-                        if (prop_name.len > 0) {
+                if ((self.ast_ref.nodeTag(node) == .member_expr or
+                    self.ast_ref.nodeTag(node) == .optional_member_expr) and
+                    data.rhs != .none)
+                {
+                    const prop_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.rhs));
+                    if (prop_name.len > 0) {
+                        if (self.thisHostObjectLiteral(obj_node)) |objlit| {
                             if (self.objectLiteralDataPropLookup(objlit, prop_name)) |pt| return pt;
                         }
+                        // `this` is `any` here only because the enclosing class
+                        // is mid-build: typing `ib = () => this.ia` needs C,
+                        // which needs `ib`.  Read the sibling member straight
+                        // off the class body instead of giving up.
+                        if (self.thisClassDirectPropLookup(obj_node, prop_name, false)) |dt| return dt;
                     }
                 }
             }
@@ -24683,12 +24688,18 @@ pub const Checker = struct {
             }
             // Polymorphic `this` type: resolve member access via the enclosing class.
             if (std.mem.eql(u8, ref_name, "this")) {
+                // A class-property arrow (`ia = 1; ib = () => this.ia`) has no
+                // enclosing-class TYPE yet — building it is what asked for this
+                // member — so the class body is read directly.
+                if (self.thisEnclosingClassType(obj_node) == null) {
+                    if (self.thisClassDirectPropLookup(obj_node, prop_name, true)) |direct_ty| return direct_ty;
+                }
                 if (self.thisEnclosingClassType(obj_node)) |class_ty| {
                     if (class_ty.eq(tymod.ID_UNKNOWN)) {
                         // Class is still being built (sentinel) — memberOnApparentType
                         // would return any, masking the real type.  Directly scan the
                         // class body for an annotated property declaration instead.
-                        if (self.thisClassDirectPropLookup(obj_node, prop_name)) |direct_ty| {
+                        if (self.thisClassDirectPropLookup(obj_node, prop_name, false)) |direct_ty| {
                             return direct_ty;
                         }
                     } else {
@@ -24698,7 +24709,7 @@ pub const Checker = struct {
                         // build returns a bare typeRef whose members don't
                         // resolve (e.g. `this.x` while building the instance type
                         // for `super.f`). Fall back to a direct class-body scan.
-                        if (self.thisClassDirectPropLookup(obj_node, prop_name)) |direct_ty| return direct_ty;
+                        if (self.thisClassDirectPropLookup(obj_node, prop_name, false)) |direct_ty| return direct_ty;
                     }
                 }
             }
@@ -27288,7 +27299,7 @@ pub const Checker = struct {
     /// Used as a fallback when the class type is still being built (the normal
     /// resolveDeclaredType path returns the ID_UNKNOWN sentinel).  Scans the
     /// class body for an annotated instance property with the given name.
-    fn thisClassDirectPropLookup(self: *Checker, node: NodeIndex, prop_name: []const u8) ?TypeId {
+    fn thisClassDirectPropLookup(self: *Checker, node: NodeIndex, prop_name: []const u8, initializer_only: bool) ?TypeId {
         const parents = self.semantic.parent_indices;
         if (parents.len == 0) return null;
         const nidx = node.toInt();
@@ -27338,9 +27349,36 @@ pub const Checker = struct {
                     const key = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(mdata.lhs));
                     if (!std.mem.eql(u8, key, prop_name)) continue;
                     const pd = self.ast_ref.extraData(ast.PropertyData, @intFromEnum(mdata.rhs));
-                    if (pd.type_annotation == .none) return null;
-                    const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
-                    return self.resolveTypeNode(ty_node);
+                    // An OPTIONAL property reads as `T | undefined`, which this
+                    // shortcut doesn't build (classUsedBeforeInitializedVariables).
+                    if (pd.optional != 0) return null;
+                    if (pd.type_annotation != .none) {
+                        // The mid-build fallback answers only for UNANNOTATED
+                        // members: an annotated one already resolves through the
+                        // normal path once the class is built, and short-circuiting
+                        // it here skips the narrowing that path applies
+                        // (nonNullReferenceMatching's `this.props.x!`).
+                        if (initializer_only) return null;
+                        const ty_node = self.ast_ref.nodeData(pd.type_annotation).lhs;
+                        return self.resolveTypeNode(ty_node);
+                    }
+                    // No annotation: take the INITIALIZER's widened type.  A
+                    // sibling initializer that reads this property (`ia = 1; ib
+                    // = () => this.ia`) is exactly the case this lookup exists
+                    // for — the class type is mid-build, so the normal member
+                    // path would answer `any`.
+                    if (pd.value == .none) return null;
+                    // `#private` names have their own resolution path.
+                    if (key.len > 0 and key[0] == '#') return null;
+                    switch (self.ast_ref.nodeTag(pd.value)) {
+                        // A class expression's property type is its STATIC side,
+                        // and tsc's naming of anonymous ones differs here.
+                        .class_expr => return null,
+                        else => {},
+                    }
+                    const vt = self.typeOf(pd.value);
+                    if (vt.eq(tymod.ID_UNKNOWN) or tymod.isAny(&self.store, vt)) return null;
+                    return self.widenLiteralKind(vt);
                 }
             }
         }
