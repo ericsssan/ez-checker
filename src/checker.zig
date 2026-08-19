@@ -17760,6 +17760,59 @@ pub const Checker = struct {
         }
     }
 
+    /// Does this TYPE ANNOTATION NODE mention any of `names`?  Conservative: an
+    /// unrecognised shape answers TRUE, so callers keep their existing
+    /// (deferring) behaviour rather than acting on an unverified negative.
+    fn typeNodeMentionsName(self: *Checker, node: NodeIndex, names: []const []const u8, depth: u8) bool {
+        if (node == .none or depth >= 8) return true;
+        const data = self.ast_ref.nodeData(node);
+        switch (self.ast_ref.nodeTag(node)) {
+            .ts_type_reference => {
+                const nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+                for (names) |k| if (std.mem.eql(u8, k, nm)) return true;
+                if (self.safeSubRange(data.rhs)) |range| {
+                    if (range.end > self.ast_ref.extra_data.len) return true;
+                    for (self.ast_ref.extra_data[range.start..range.end]) |raw| {
+                        if (self.typeNodeMentionsName(@enumFromInt(raw), names, depth + 1)) return true;
+                    }
+                }
+                return false;
+            },
+            .ts_parenthesized_type, .ts_array_type => return self.typeNodeMentionsName(data.lhs, names, depth + 1),
+            .ts_union_type, .ts_intersection_type, .ts_tuple_type => {
+                const start = @intFromEnum(data.lhs);
+                const end = @intFromEnum(data.rhs);
+                if (start > end or end > self.ast_ref.extra_data.len) return true;
+                for (self.ast_ref.extra_data[start..end]) |raw| {
+                    if (self.typeNodeMentionsName(@enumFromInt(raw), names, depth + 1)) return true;
+                }
+                return false;
+            },
+            else => return true,
+        }
+    }
+
+    /// True when EVERY parameter annotation of a `ts_function_type` is free of
+    /// `names` — i.e. the callback's parameter types are already determined by
+    /// the enclosing instantiation and do NOT depend on the type parameters this
+    /// call is still inferring.  Answers false for anything it cannot verify.
+    fn fnTypeParamsIndependentOf(self: *Checker, fn_ty_node: NodeIndex, names: []const []const u8) bool {
+        var n = fn_ty_node;
+        while (self.ast_ref.nodeTag(n) == .ts_parenthesized_type) n = self.ast_ref.nodeData(n).lhs;
+        if (self.ast_ref.nodeTag(n) != .ts_function_type) return false;
+        const d = self.ast_ref.nodeData(n);
+        if (d.lhs == .none) return false;
+        const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(d.lhs));
+        if (fd.params_end > self.ast_ref.extra_data.len or fd.params > fd.params_end) return false;
+        // A zero-parameter callback has nothing to be sensitive to.
+        for (self.ast_ref.extra_data[fd.params..fd.params_end]) |raw| {
+            const param: NodeIndex = @enumFromInt(raw);
+            const ann = self.paramAnnotationNode(param) orelse return false; // unannotated → cannot verify
+            if (self.typeNodeMentionsName(ann, names, 0)) return false;
+        }
+        return true;
+    }
+
     fn firstTypeArg(self: *Checker, ref_node: NodeIndex) NodeIndex {
         const data = self.ast_ref.nodeData(ref_node);
         const range = self.safeSubRange(data.rhs) orelse return .none;
@@ -19280,6 +19333,24 @@ pub const Checker = struct {
             const param: NodeIndex = @enumFromInt(params[pidx]);
             const param_ty_node = self.paramAnnotationNode(param) orelse continue;
             if (self.argIsContextSensitiveFn(@enumFromInt(arg_raw))) {
+                // ...unless the callback's PARAMETER ANNOTATIONS are free of the
+                // type params this call is inferring: then its parameter types
+                // come from the enclosing instantiation, the arrow types fully
+                // without waiting on anything, and inferring FORWARD from it is
+                // what tsc does — before the backward pass, which would otherwise
+                // let the expected type win (overEagerReturnTypeSpecialization:
+                // `v1.func(…).func(str => str.length)` binding U=string).
+                // Checked on the ANNOTATION NODES, not the resulting type: an
+                // arrow whose params fall back to implicit `any` yields a
+                // perfectly "concrete" `(x: any) => any` that would pollute the
+                // binding via any-wins — the pollution this exclusion exists for.
+                if (self.fnTypeParamsIndependentOf(param_ty_node, names[0..tp_count])) {
+                    const cs_ty = self.typeOf(@enumFromInt(arg_raw));
+                    if (self.store.get(cs_ty).kind == .function_t) {
+                        self.matchTypeParam(param_ty_node, cs_ty, names[0..tp_count], bindings[0..tp_count]);
+                        continue;
+                    }
+                }
                 // Contribute only the arrow's annotated (param-independent)
                 // return; the rest is deferred to the backward / pass-2 steps.
                 if (self.arrowAnnotatedReturnType(@enumFromInt(arg_raw)) != null)
