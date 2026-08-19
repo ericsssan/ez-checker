@@ -20244,6 +20244,28 @@ pub const Checker = struct {
                 const sr = self.safeSubRange(data.rhs) orelse return;
                 const type_arg_nodes = self.ast_ref.extra_data[sr.start..sr.end];
                 const arg_t = self.store.get(arg_ty);
+                // The arg is an INSTANTIATION of the same alias, carried as an
+                // alias tag rather than a ref (`Mapper<string, number>` whose
+                // structure is already `(x: string) => number`).  Unify the
+                // recorded alias arguments positionally — that is what lets a
+                // backward-inferred return type fix `T` for a context-sensitive
+                // callback (`let f: Mapper<string, number> = wrap(s => …)`).
+                {
+                    const aa = self.store.idsOf(arg_t.alias_args);
+                    if (aa.len > 0 and arg_t.alias_name.len > 0) {
+                        const base = if (std.mem.indexOfScalar(u8, arg_t.alias_name, '<')) |lt|
+                            arg_t.alias_name[0..lt]
+                        else
+                            arg_t.alias_name;
+                        if (std.mem.eql(u8, base, tname)) {
+                            for (type_arg_nodes, 0..) |raw, ai| {
+                                if (ai >= aa.len) break;
+                                self.matchTypeParam(@enumFromInt(raw), aa[ai], names, bindings);
+                            }
+                            return;
+                        }
+                    }
+                }
                 if (arg_t.kind == .type_ref and std.mem.eql(u8, arg_t.name, tname)) {
                     const arg_type_args = self.store.idsOf(arg_t.list_data);
                     for (type_arg_nodes, 0..) |raw, ai| {
