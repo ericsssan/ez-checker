@@ -2486,6 +2486,25 @@ pub const Checker = struct {
     /// Returns `typeRef("typeof NS")` when `node` is the name identifier of a
     /// `ts_namespace_decl` or `ts_module_decl` (the fallback path, where semantic
     /// has no reference entry for the declaration name itself).
+    /// Is `name` a namespace/module declared here that has a VALUE side?
+    ///
+    /// A namespace of pure types is never instantiated, so a query on it is
+    /// `any` (InvalidNonInstantiatedModule) — the same rule that governs an
+    /// import of one.  Merged re-openings count: any part with a value member
+    /// instantiates the whole.
+    fn localNamespaceHasValueSide(self: *Checker, name: []const u8) bool {
+        const nd = self.decl_index.primaryDecl(name) orelse return false;
+        const ndt = self.ast_ref.nodeTag(nd);
+        if (ndt != .ts_namespace_decl and ndt != .ts_module_decl) return false;
+        const src = self.ast_ref.source;
+        if (blockHasValueMember(src, self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(nd)))) return true;
+        for (self.decl_index.merged_ns_extra.items) |e| {
+            if (!std.mem.eql(u8, e.name, name)) continue;
+            if (blockHasValueMember(src, self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(e.node)))) return true;
+        }
+        return false;
+    }
+
     fn typeForNamespaceDeclarationName(self: *Checker, node: NodeIndex, name: []const u8) ?TypeId {
         if (!self.isNamespaceHeaderName(node)) return null;
         const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return null;
@@ -9952,6 +9971,9 @@ pub const Checker = struct {
         // In type position, `typeof A` has lhs = ts_type_reference (not .identifier).
         // Accept either form — both carry the name in the main_token.
         if (inner_tag != .identifier and inner_tag != .ts_type_reference) return tymod.ID_UNKNOWN;
+        const qualified_query = inner_tag == .ts_type_reference and
+            self.ast_ref.nodeData(inner).lhs != .none and
+            self.ast_ref.nodeTag(self.ast_ref.nodeData(inner).lhs) == .member_expr;
         const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(inner));
         if (name.len == 0) return tymod.ID_UNKNOWN;
         // If the function whose value type `typeof name` refers to is currently
@@ -10010,6 +10032,21 @@ pub const Checker = struct {
                 if (self.typeofDisplayName(name)) |disp| return self.tagDisplayName(t, disp);
             }
             return t;
+        }
+        // `typeof <LocalNamespace>` — a query on a namespace/module declared in
+        // this file.  tsc renders it verbatim; the namespace's structure is not
+        // modelled, so the ref stays opaque and member access through it remains
+        // an honest gap rather than a wrong shape.
+        //
+        // Only for an UNQUALIFIED query: `typeof M.Color` carries the same root
+        // token, but wants the MEMBER (`typeof M3.Color`, `string`, a signature),
+        // which the qualified branch above resolves when it can.
+        if (!qualified_query and self.localNamespaceHasValueSide(name)) {
+            const disp = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return tymod.ID_ANY;
+            if (self.store.typeRef(disp, &.{})) |r| {
+                self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
+                return r;
+            } else |_| self.gpa.free(disp);
         }
         if (self.global_value_types.get(name)) |t| return t;
         // `typeof <param>` — a type query on a parameter in scope, e.g.
