@@ -1417,6 +1417,11 @@ pub const Checker = struct {
             .property_ident => self.inferPropertyIdent(node),
             .import_specifier, .import_default_specifier, .import_namespace_specifier =>
                 self.importSpecifierType(node),
+            .export_specifier => blk: {
+                const sd = self.ast_ref.nodeData(node);
+                if (sd.lhs == .none) break :blk tymod.ID_ANY;
+                break :blk self.exportSpecifierBindingType(sd.lhs) orelse tymod.ID_ANY;
+            },
 
             .ts_as_expr, .ts_type_assertion => self.inferAsCast(node, t),
             .ts_satisfies_expr => self.inferSatisfies(node),
@@ -2750,6 +2755,7 @@ pub const Checker = struct {
     }
 
     fn inferIdentifier(self: *Checker, node: NodeIndex) TypeId {
+        if (self.exportSpecifierBindingType(node)) |t| return t;
         // The BINDING NAME inside an import declaration: tsc types it as the
         // imported symbol (`import { SomeClass } from './aux'` shows
         // `SomeClass : typeof SomeClass`).  A declaration site, so it precedes
@@ -3768,6 +3774,8 @@ pub const Checker = struct {
     /// Type inference for `property_ident` nodes — the property name on the
     /// right-hand side of a non-computed member expression (`obj.prop`).
     fn inferPropertyIdent(self: *Checker, node: NodeIndex) TypeId {
+        // `export { c as c2 }` — the alias parses as a `property_ident`.
+        if (self.exportSpecifierBindingType(node)) |t| return t;
         // An import specifier's names parse as `property_ident` in some
         // positions — same binding, same answer (see `importBindingRef`).
         if (self.importBindingRef(node)) |ib| {
@@ -23116,6 +23124,123 @@ pub const Checker = struct {
             p = parents[p];
         }
         return false;
+    }
+
+    /// `export { c }` / `export { c as c2 }` — tsc types BOTH names as the
+    /// LOCAL declaration's value: `typeof c` for a class, enum or instantiated
+    /// namespace, the variable's own type for a `var`.  An interface or an
+    /// uninstantiated namespace has no value side and stays `any`.
+    ///
+    /// A re-export (`export { x } from "./m"`) names another module's symbol and
+    /// is left alone.
+    fn exportSpecifierBindingType(self: *Checker, node: NodeIndex) ?TypeId {
+        const parents = self.semantic.parent_indices;
+        if (node.toInt() >= parents.len) return null;
+        const pi = parents[node.toInt()];
+        if (pi == @intFromEnum(NodeIndex.none) or pi >= self.ast_ref.nodes.len) return null;
+        const spec: NodeIndex = @enumFromInt(pi);
+        if (self.ast_ref.nodeTag(spec) != .export_specifier) return null;
+        if (pi < parents.len) {
+            const gp = parents[pi];
+            if (gp != @intFromEnum(NodeIndex.none) and gp < self.ast_ref.nodes.len and
+                self.ast_ref.nodeTag(@as(NodeIndex, @enumFromInt(gp))) == .export_named_from) return null;
+        }
+        const sd = self.ast_ref.nodeData(spec);
+        if (sd.lhs == .none) return null;
+        const local = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(sd.lhs));
+        if (local.len == 0) return null;
+        // JS files carry their own (JSDoc-driven) shapes for these bindings.
+        if (self.checker_opts.is_js_file) return null;
+        // An export clause INSIDE a namespace re-exports that namespace's own
+        // member, which tsc displays `any` (reExportAliasMakesInstantiated).
+        if (self.nodeInsideNamespace(spec)) return null;
+        // `export type { A }` exports the TYPE: tsc prints `A` for a class or
+        // interface, and `any` for anything else (a const or function has no
+        // type side).
+        if (self.exportIsTypeOnly(spec)) {
+            // An ALIASED type-only export splits the two nodes' roles — the
+            // local name keeps denoting the value (`typeof A`) while the alias
+            // denotes the type (`A`) — and which node the row anchors on isn't
+            // decidable here, so nothing is answered.
+            if (sd.rhs != .none and sd.rhs != sd.lhs) return null;
+            const d = self.decl_index.primaryDecl(local) orelse return null;
+            switch (self.ast_ref.nodeTag(d)) {
+                .class_decl => {
+                    const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(self.ast_ref.nodeData(d).lhs));
+                    // A generic class prints with its parameters (`A<T>`), which
+                    // this plain ref can't reproduce.
+                    if (cd.type_params < cd.type_params_end) return null;
+                },
+                .ts_interface_decl => {},
+                else => return null,
+            }
+            return self.store.typeRef(local, &.{}) catch null;
+        }
+        return self.localBindingValueType(local);
+    }
+
+    /// Is this specifier part of a type-only export (`export type { A }` or
+    /// `export { type A }`)?
+    fn exportIsTypeOnly(self: *Checker, spec: NodeIndex) bool {
+        const first = self.ast_ref.nodeMainToken(spec);
+        if (first > 0 and std.mem.eql(u8, self.ast_ref.tokenText(first - 1), "type")) return true;
+        const parents = self.semantic.parent_indices;
+        if (spec.toInt() >= parents.len) return false;
+        const pi = parents[spec.toInt()];
+        if (pi == @intFromEnum(NodeIndex.none) or pi >= self.ast_ref.nodes.len) return false;
+        const pn: NodeIndex = @enumFromInt(pi);
+        return std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pn) + 1), "type");
+    }
+
+    /// The value type of a locally-declared `name`, as an export clause shows it.
+    fn localBindingValueType(self: *Checker, name: []const u8) ?TypeId {
+        if (self.decl_index.primaryDecl(name)) |d| {
+            switch (self.ast_ref.nodeTag(d)) {
+                .class_decl, .ts_enum_decl => return self.typeofRef(name),
+                .ts_namespace_decl, .ts_module_decl => {
+                    if (!self.localNamespaceHasValueSide(name)) return null;
+                    return self.typeofRef(name);
+                },
+                .ts_interface_decl => return null,
+                else => {},
+            }
+        }
+        const t = self.typeOfNameByAstSearch(name, .none) orelse return null;
+        if (t.eq(tymod.ID_UNKNOWN) or tymod.isAny(&self.store, t)) return null;
+        // A GENERIC signature renders with its type parameters, which this path
+        // reproduces only approximately (assertionFunctionWildcardImport2).
+        if (self.fn_type_params.contains(t)) return null;
+        // A `var`/`let` export shows the WIDENED type (`var x = 10` is `number`);
+        // only a `const` keeps the literal.  `decl_index` doesn't carry variable
+        // declarations, so the declarator is found directly.
+        if (!self.nameIsConstDeclared(name)) return self.widenLiteralKind(t);
+        return t;
+    }
+
+    /// Is `name` declared with `const`?
+    fn nameIsConstDeclared(self: *Checker, name: []const u8) bool {
+        const total: u32 = @intCast(self.ast_ref.nodes.len);
+        var i: u32 = 1;
+        while (i < total) : (i += 1) {
+            const ni: NodeIndex = @enumFromInt(i);
+            if (self.ast_ref.nodeTag(ni) != .declarator) continue;
+            const d = self.ast_ref.nodeData(ni);
+            if (d.lhs == .none or self.ast_ref.nodeTag(d.lhs) != .identifier) continue;
+            if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.lhs)), name)) continue;
+            return self.declaratorIsConst(ni);
+        }
+        return false;
+    }
+
+    /// An opaque `typeof <name>` ref, pooled.
+    fn typeofRef(self: *Checker, name: []const u8) ?TypeId {
+        const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return null;
+        const r = self.store.typeRef(tn, &.{}) catch {
+            self.gpa.free(tn);
+            return null;
+        };
+        self.string_pool.append(self.gpa, tn) catch self.gpa.free(tn);
+        return r;
     }
 
     const ImportBindingKind = enum { namespace, entity };
