@@ -9909,14 +9909,26 @@ pub const Checker = struct {
     }
 
     fn keyofOf(self: *Checker, id: TypeId) TypeId {
+        // Everything below can add types, which moves the store's array and its
+        // pools; `t` and any slice taken from it must be read BEFORE that, not
+        // after.  The name BYTES live in the string pool and stay put — only the
+        // slice headers need saving.
         const t = self.store.get(id);
+        const kind = t.kind;
+        const ref_name = t.name;
         // Object: union of own prop names.
-        if (t.kind == .object_t) {
+        if (kind == .object_t) {
+            var names: [32][]const u8 = undefined;
+            var pn: usize = 0;
+            for (self.store.propsOf(t.object_props)) |p| {
+                if (pn >= names.len) break;
+                names[pn] = p.name;
+                pn += 1;
+            }
             var buf: [32]TypeId = undefined;
             var n: usize = 0;
-            for (self.store.propsOf(t.object_props)) |p| {
-                if (n >= buf.len) break;
-                buf[n] = self.store.stringLiteral(p.name) catch continue;
+            for (names[0..pn]) |nm| {
+                buf[n] = self.store.stringLiteral(nm) catch continue;
                 n += 1;
             }
             if (n == 0) return tymod.ID_NEVER;
@@ -9924,20 +9936,20 @@ pub const Checker = struct {
             return self.store.unionOf(buf[0..n]) catch tymod.ID_STRING;
         }
         // type_ref to user/interface — resolve and recurse.
-        if (t.kind == .type_ref) {
-            if (self.resolveDeclaredType(t.name)) |resolved| {
+        if (kind == .type_ref) {
+            if (self.resolveDeclaredType(ref_name)) |resolved| {
                 if (!resolved.eq(id)) return self.keyofOf(resolved);
             }
             // Unresolved reference (a type parameter like `T`): tsc keeps
             // `keyof T` symbolic rather than collapsing it to `string`.
-            if (t.name.len > 0) return self.symbolicKeyof(t.name);
+            if (ref_name.len > 0) return self.symbolicKeyof(ref_name);
         }
-        if (t.kind == .type_param and t.name.len > 0) return self.symbolicKeyof(t.name);
+        if (kind == .type_param and ref_name.len > 0) return self.symbolicKeyof(ref_name);
         // Array: keyof T[] includes number-coercible string indices +
         // 'length' / 'push' / 'pop' / etc.  TS technically returns a
         // huge union here; conservative: return number (the rule's
         // common case for `T[number]` shape).
-        if (t.kind == .array_t or t.kind == .readonly_array_t or t.kind == .tuple_t) {
+        if (kind == .array_t or kind == .readonly_array_t or kind == .tuple_t) {
             return tymod.ID_NUMBER;
         }
         return tymod.ID_STRING;
@@ -24027,7 +24039,11 @@ pub const Checker = struct {
                 const t = self.memberOnApparentType(obj_ty, kn, obj_node);
                 if (!tymod.isUnknown(&self.store, t) and !tymod.isAny(&self.store, t)) return t;
             }
-            const ref_name2 = obj2.name;  // snapshot before resolveDeclaredType may grow store
+            // Re-fetch: `memberOnApparentType` above can add types, and `obj2`
+            // points into the store's array — reading `obj2.name` after it is a
+            // use-after-realloc (the snapshot has to happen AFTER the growth,
+            // not before the next call).
+            const ref_name2 = self.store.get(obj_ty).name;
             if (self.resolveDeclaredType(ref_name2)) |resolved| {
                 if (!resolved.eq(obj_ty)) {
                     const subst = self.applyDeclTypeArgs(obj_ty, ref_name2, resolved);
@@ -25529,35 +25545,45 @@ pub const Checker = struct {
     }
 
     fn libTypeRefProperty(self: *Checker, ref_ty: TypeId, name: []const u8, recv_node: NodeIndex) ?TypeId {
-        const t = self.store.get(ref_ty);
-        if (t.kind != .type_ref) return null;
-        const args = self.store.idsOf(t.list_data);
+        // COPY the name and type arguments up front.  Everything below can add
+        // types, which moves both the types array (invalidating a `*Type`) and
+        // the id pool (invalidating a slice from `idsOf`) — reading either
+        // afterwards is a use-after-realloc.  The name's BYTES live in the
+        // string pool / source and stay put; only the header must be saved.
+        const t0 = self.store.get(ref_ty);
+        if (t0.kind != .type_ref) return null;
+        const ref_name = t0.name;
+        var args_buf: [8]TypeId = undefined;
+        const args_src = self.store.idsOf(t0.list_data);
+        const args_n = @min(args_src.len, args_buf.len);
+        @memcpy(args_buf[0..args_n], args_src[0..args_n]);
+        const args = args_buf[0..args_n];
         // TypedArray constructor statics: `Int8Array.from` and friends.
         if (std.mem.eql(u8, name, "from")) {
-            if (self.typedArrayFromOverloads(t.name, recv_node)) |ty| return ty;
+            if (self.typedArrayFromOverloads(ref_name, recv_node)) |ty| return ty;
         }
         // Wrapper-object types (`Number`/`String`/`Boolean`) expose the same
         // instance methods as the primitives — route to the primitive prototype
         // handlers so `x: T extends Number; x.toFixed()` and `n: Number;
         // n.valueOf()` resolve.  Skip when the user redeclared the interface.
-        if (!self.decl_index.hasType(t.name)) {
-            if (std.mem.eql(u8, t.name, "Number")) {
+        if (!self.decl_index.hasType(ref_name)) {
+            if (std.mem.eql(u8, ref_name, "Number")) {
                 if (self.numberPrototypeProperty(name)) |ty| return ty;
-            } else if (std.mem.eql(u8, t.name, "String")) {
+            } else if (std.mem.eql(u8, ref_name, "String")) {
                 if (self.stringPrototypeProperty(name)) |ty| return ty;
-            } else if (std.mem.eql(u8, t.name, "Boolean")) {
+            } else if (std.mem.eql(u8, ref_name, "Boolean")) {
                 if (std.mem.eql(u8, name, "valueOf")) return self.makeNullaryFn(tymod.ID_BOOLEAN);
                 if (std.mem.eql(u8, name, "toString")) return self.makeNullaryFn(tymod.ID_STRING);
             }
         }
         // URL instances (`new URL(...)`) — string accessors + toString/toJSON.
-        if (std.mem.eql(u8, t.name, "URL") and !self.decl_index.hasType("URL")) {
+        if (std.mem.eql(u8, ref_name, "URL") and !self.decl_index.hasType("URL")) {
             if (eqAny(name, &.{ "toString", "toJSON" })) return self.makeNullaryFn(tymod.ID_STRING);
             if (eqAny(name, &.{ "href", "origin", "protocol", "username", "password", "host", "hostname", "port", "pathname", "search", "hash" }))
                 return tymod.ID_STRING;
             if (std.mem.eql(u8, name, "searchParams")) return self.store.typeRef("URLSearchParams", &.{}) catch tymod.ID_STRING;
         }
-        if (std.mem.eql(u8, t.name, "Array") or std.mem.eql(u8, t.name, "ReadonlyArray")) {
+        if (std.mem.eql(u8, ref_name, "Array") or std.mem.eql(u8, ref_name, "ReadonlyArray")) {
             const elem = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
             const r = self.arrayPrototypeProperty(name, elem);
             // When user has declared interface Array<T> / ReadonlyArray<T>, the correct
@@ -25565,7 +25591,7 @@ pub const Checker = struct {
             // (declaration merging). Until merging is implemented, return any so the
             // member access stays a gap rather than exposing partial lib-only overloads.
             if (!r.eq(tymod.ID_ANY) and
-                self.decl_index.hasType(t.name) and
+                self.decl_index.hasType(ref_name) and
                 (std.mem.eql(u8, name, "reduce") or std.mem.eql(u8, name, "reduceRight")))
             {
                 return tymod.ID_ANY;
@@ -25573,7 +25599,7 @@ pub const Checker = struct {
             return r;
         }
         // RegExpMatchArray extends Array<string> — delegate to string-array prototype
-        if (std.mem.eql(u8, t.name, "RegExpMatchArray")) {
+        if (std.mem.eql(u8, ref_name, "RegExpMatchArray")) {
             return self.arrayPrototypeProperty(name, tymod.ID_STRING);
         }
         // Set instances — `add` is self-returning.  Gated on es2015+ (no Map/Set
@@ -25583,7 +25609,7 @@ pub const Checker = struct {
         // Library availability gates on the effective @lib (not the emit target):
         // Map/Set exist from the es2015 lib onward.
         const es2015 = @intFromEnum(self.checker_opts.lib) >= @intFromEnum(CheckerOpts.Target.es2015);
-        if (std.mem.eql(u8, t.name, "Set") and args.len >= 1 and es2015 and !self.decl_index.hasType("Set")) {
+        if (std.mem.eql(u8, ref_name, "Set") and args.len >= 1 and es2015 and !self.decl_index.hasType("Set")) {
             const elem = args[0];
             if (eqAny(name, &.{ "has", "delete" })) return self.makeNamedFn(&.{elem}, &.{"value"}, &.{false}, tymod.ID_BOOLEAN);
             if (std.mem.eql(u8, name, "add")) return self.makeNamedFn(&.{elem}, &.{"value"}, &.{false}, ref_ty);
@@ -25597,7 +25623,7 @@ pub const Checker = struct {
         }
         // Map instances — `set` is self-returning; `get` → V | undefined.  Gated
         // on es2015+ and a well-formed `Map<K,V>` (2 args).  WeakMap excluded.
-        if (std.mem.eql(u8, t.name, "Map") and args.len >= 2 and es2015 and !self.decl_index.hasType("Map")) {
+        if (std.mem.eql(u8, ref_name, "Map") and args.len >= 2 and es2015 and !self.decl_index.hasType("Map")) {
             const key = args[0];
             const val = args[1];
             if (eqAny(name, &.{ "has", "delete" })) return self.makeNamedFn(&.{key}, &.{"key"}, &.{false}, tymod.ID_BOOLEAN);
@@ -25615,7 +25641,7 @@ pub const Checker = struct {
                 return self.makeNullaryFn(self.store.typeRef("MapIterator", &.{tup}) catch return null);
             }
         }
-        if (std.mem.eql(u8, t.name, "Promise")) {
+        if (std.mem.eql(u8, ref_name, "Promise")) {
             const inner = if (args.len > 0) args[0] else tymod.ID_UNKNOWN;
             const lib_member = self.promisePrototypeProperty(name, inner);
             // A file declaring its own `interface Promise<T>` AUGMENTS the global
@@ -25628,7 +25654,7 @@ pub const Checker = struct {
             return lib_member;
         }
         // Well-known symbols: `Symbol.iterator` etc. are `unique symbol`.
-        if (std.mem.eql(u8, t.name, "SymbolConstructor")) {
+        if (std.mem.eql(u8, ref_name, "SymbolConstructor")) {
             const well_known = [_][]const u8{
                 "iterator",     "asyncIterator", "hasInstance",   "isConcatSpreadable",
                 "match",        "matchAll",      "replace",       "search",
@@ -25654,8 +25680,8 @@ pub const Checker = struct {
         // is `Date`, `RegExp.prototype` is `RegExp`).  Array/collection
         // prototypes render with type args in tsc (`any[]`, `Map<any, any>`),
         // so leave those to their dedicated handling rather than a bare name.
-        if (std.mem.eql(u8, name, "prototype") and std.mem.endsWith(u8, t.name, "Constructor")) {
-            const inst = t.name[0 .. t.name.len - "Constructor".len];
+        if (std.mem.eql(u8, name, "prototype") and std.mem.endsWith(u8, ref_name, "Constructor")) {
+            const inst = ref_name[0 .. ref_name.len - "Constructor".len];
             if (inst.len > 0 and !eqAny(inst, &.{ "Array", "Map", "Set", "WeakMap", "WeakSet", "Promise" })) {
                 return self.store.typeRef(inst, &.{}) catch null;
             }
@@ -25663,7 +25689,7 @@ pub const Checker = struct {
         // Document singleton essentials — `body` is the one accessor tsc types
         // as the base `HTMLElement` (head/documentElement are element-specific
         // subtypes, activeElement is `Element | null`, so leave those lazy).
-        if (std.mem.eql(u8, t.name, "Document")) {
+        if (std.mem.eql(u8, ref_name, "Document")) {
             if (std.mem.eql(u8, name, "body")) {
                 return self.store.typeRef("HTMLElement", &.{}) catch null;
             }
@@ -25671,7 +25697,7 @@ pub const Checker = struct {
         // `Response` body-consumer methods — each returns a `Promise<…>` (so
         // `await res.json()` unwraps to the body type).  Extends the fetch chain
         // (`fetch(…)` → `Promise<Response>`).
-        if (std.mem.eql(u8, t.name, "Response")) {
+        if (std.mem.eql(u8, ref_name, "Response")) {
             const body: ?TypeId = if (std.mem.eql(u8, name, "json")) tymod.ID_ANY else if (std.mem.eql(u8, name, "text")) tymod.ID_STRING else if (std.mem.eql(u8, name, "blob")) (self.store.typeRef("Blob", &.{}) catch return null) else if (std.mem.eql(u8, name, "arrayBuffer")) (self.store.typeRef("ArrayBuffer", &.{}) catch return null) else if (std.mem.eql(u8, name, "formData")) (self.store.typeRef("FormData", &.{}) catch return null) else null;
             if (body) |b| {
                 const pr = self.store.typeRef("Promise", &.{b}) catch return null;
@@ -25683,7 +25709,7 @@ pub const Checker = struct {
             }
         }
         // NumberConstructor statics (the value `Number` types as NumberConstructor).
-        if (std.mem.eql(u8, t.name, "NumberConstructor")) {
+        if (std.mem.eql(u8, ref_name, "NumberConstructor")) {
             if (eqAny(name, &.{ "NaN", "MAX_SAFE_INTEGER", "MIN_SAFE_INTEGER", "MAX_VALUE", "MIN_VALUE", "EPSILON", "POSITIVE_INFINITY", "NEGATIVE_INFINITY" })) {
                 return tymod.ID_NUMBER;
             }
@@ -25692,7 +25718,7 @@ pub const Checker = struct {
             }
         }
         // StringConstructor statics: `String.fromCharCode` / `fromCodePoint`.
-        if (std.mem.eql(u8, t.name, "StringConstructor")) {
+        if (std.mem.eql(u8, ref_name, "StringConstructor")) {
             const param_name: ?[]const u8 =
                 if (std.mem.eql(u8, name, "fromCharCode")) "codes" else if (std.mem.eql(u8, name, "fromCodePoint")) "codePoints" else null;
             if (param_name) |pn| {
@@ -25711,7 +25737,7 @@ pub const Checker = struct {
         // stable displays.  `set`/`defineProperty`/`get`/`apply`/`construct`
         // are omitted (generic overload sets or `any` returns tsc prints
         // differently).
-        if (std.mem.eql(u8, t.name, "typeof Reflect")) {
+        if (std.mem.eql(u8, ref_name, "typeof Reflect")) {
             const pkey = self.store.typeRef("PropertyKey", &.{}) catch return null;
             if (eqAny(name, &.{ "isExtensible", "preventExtensions" })) {
                 return self.makeNamedFn(&.{tymod.ID_OBJECT_KW}, &.{"target"}, &.{false}, tymod.ID_BOOLEAN);
@@ -25734,7 +25760,7 @@ pub const Checker = struct {
             }
         }
         // DateConstructor statics (the value `Date` types as DateConstructor).
-        if (std.mem.eql(u8, t.name, "DateConstructor")) {
+        if (std.mem.eql(u8, ref_name, "DateConstructor")) {
             if (std.mem.eql(u8, name, "now")) return self.makeNullaryFn(tymod.ID_NUMBER);
             if (std.mem.eql(u8, name, "parse")) {
                 return self.makeNamedFn(&.{tymod.ID_STRING}, &.{"s"}, &.{false}, tymod.ID_NUMBER);
@@ -25742,7 +25768,7 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, "prototype")) return self.store.typeRef("Date", &.{}) catch null;
         }
         // URL static object-URL helpers (lib.dom).
-        if (std.mem.eql(u8, t.name, "URLConstructor")) {
+        if (std.mem.eql(u8, ref_name, "URLConstructor")) {
             if (std.mem.eql(u8, name, "createObjectURL")) {
                 const blob = self.store.typeRef("Blob", &.{}) catch return null;
                 const ms = self.store.typeRef("MediaSource", &.{}) catch return null;
@@ -25754,7 +25780,7 @@ pub const Checker = struct {
             }
         }
         // Date.prototype essentials.
-        if (std.mem.eql(u8, t.name, "Date")) {
+        if (std.mem.eql(u8, ref_name, "Date")) {
             if (eqAny(name, &.{ "getTime", "getFullYear", "getMonth", "getDate", "getDay", "getHours", "getMinutes", "getSeconds", "getMilliseconds", "getTimezoneOffset", "getUTCFullYear", "getUTCMonth", "getUTCDate", "getUTCDay", "getUTCHours", "getUTCMinutes", "getUTCSeconds", "getUTCMilliseconds", "valueOf", "setTime" })) {
                 return self.makeNullaryFn(tymod.ID_NUMBER);
             }
@@ -25768,31 +25794,31 @@ pub const Checker = struct {
             if (std.mem.eql(u8, name, "toTemporalInstant")) return self.tempNullaryFn("Temporal.Instant");
         }
         // Temporal namespace (lib.esnext) — curated from the corpus surface.
-        if (std.mem.eql(u8, t.name, "typeof Temporal") or
-            std.mem.eql(u8, t.name, "typeof Temporal.Now") or
-            std.mem.startsWith(u8, t.name, "Temporal."))
+        if (std.mem.eql(u8, ref_name, "typeof Temporal") or
+            std.mem.eql(u8, ref_name, "typeof Temporal.Now") or
+            std.mem.startsWith(u8, ref_name, "Temporal."))
         {
-            if (self.temporalProperty(t.name, name)) |ty| return ty;
+            if (self.temporalProperty(ref_name, name)) |ty| return ty;
         }
         // Intl instance types: `Intl.NumberFormat` / `Intl.DateTimeFormat`
         // instance member access (.format / .resolvedOptions / …).
-        if (std.mem.startsWith(u8, t.name, "Intl.")) {
-            if (self.intlInstanceProperty(t.name, name)) |ty| return ty;
+        if (std.mem.startsWith(u8, ref_name, "Intl.")) {
+            if (self.intlInstanceProperty(ref_name, name)) |ty| return ty;
         }
         // Intl namespace: `Intl.NumberFormat` (value) → `Intl.NumberFormatConstructor`.
-        if (std.mem.eql(u8, t.name, "typeof Intl")) {
+        if (std.mem.eql(u8, ref_name, "typeof Intl")) {
             if (self.intlProperty(name)) |ty| return ty;
         }
         // High-fidelity Object/Array statics (lib.es5 shapes tsc prints).
-        if (std.mem.eql(u8, t.name, "ObjectConstructor")) {
+        if (std.mem.eql(u8, ref_name, "ObjectConstructor")) {
             if (self.objectConstructorProperty(name)) |ty| return ty;
         }
-        if (std.mem.eql(u8, t.name, "ArrayConstructor")) {
+        if (std.mem.eql(u8, ref_name, "ArrayConstructor")) {
             if (self.arrayConstructorProperty(name)) |ty| return ty;
         }
         // `Promise.resolve` as a VALUE (not called) — its lib overload set.
         // (`Promise.resolve(x)` calls are typed earlier in inferCallReturn.)
-        if (std.mem.eql(u8, t.name, "PromiseConstructor")) {
+        if (std.mem.eql(u8, ref_name, "PromiseConstructor")) {
             const sig: ?[]const u8 =
                 if (std.mem.eql(u8, name, "resolve"))
                     "{ (): Promise<void>; <T>(value: T): Promise<Awaited<T>>; <T>(value: T | PromiseLike<T>): Promise<Awaited<T>>; }"
@@ -25806,15 +25832,15 @@ pub const Checker = struct {
                     null;
             if (sig) |s| return self.store.typeRef(s, &.{}) catch tymod.ID_ANY;
         }
-        const struct_key: ?[]const u8 = if (std.mem.eql(u8, t.name, "Math"))
+        const struct_key: ?[]const u8 = if (std.mem.eql(u8, ref_name, "Math"))
             "__Math_struct"
-        else if (std.mem.eql(u8, t.name, "JSON"))
+        else if (std.mem.eql(u8, ref_name, "JSON"))
             "__JSON_struct"
-        else if (std.mem.eql(u8, t.name, "ArrayConstructor"))
+        else if (std.mem.eql(u8, ref_name, "ArrayConstructor"))
             "__Array_struct"
-        else if (std.mem.eql(u8, t.name, "ObjectConstructor"))
+        else if (std.mem.eql(u8, ref_name, "ObjectConstructor"))
             "__Object_struct"
-        else if (std.mem.eql(u8, t.name, "console") or std.mem.eql(u8, t.name, "Console"))
+        else if (std.mem.eql(u8, ref_name, "console") or std.mem.eql(u8, ref_name, "Console"))
             "__console_struct"
         else
             null;
@@ -25824,7 +25850,7 @@ pub const Checker = struct {
             }
             return null;
         }
-        if (std.mem.eql(u8, t.name, "IArguments")) {
+        if (std.mem.eql(u8, ref_name, "IArguments")) {
             if (std.mem.eql(u8, name, "length")) return tymod.ID_NUMBER;
             if (std.mem.eql(u8, name, "callee")) return self.store.typeRef("Function", &.{}) catch null;
             return tymod.ID_ANY;
@@ -25832,7 +25858,7 @@ pub const Checker = struct {
         // Typed array instances (Int8Array…Float64Array) — ES5/ES2015 lib types.
         // BigInt64Array/BigUint64Array intentionally excluded: their lib availability
         // is target-dependent and tsc returns `any` for members when the lib is absent.
-        if (eqAny(t.name, &.{
+        if (eqAny(ref_name, &.{
             "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array",
             "Int32Array", "Uint32Array", "Float32Array", "Float64Array",
         })) {
@@ -25869,7 +25895,7 @@ pub const Checker = struct {
         }
         // BigInt64Array / BigUint64Array instances (lib.es2020+).  Element type
         // is bigint; toLocaleString is a single overload with optional locales.
-        if (eqAny(t.name, &.{ "BigInt64Array", "BigUint64Array" }) and
+        if (eqAny(ref_name, &.{ "BigInt64Array", "BigUint64Array" }) and
             @intFromEnum(self.checker_opts.target) >= @intFromEnum(CheckerOpts.Target.es2020))
         {
             if (std.mem.eql(u8, name, "toLocaleString")) {
@@ -28465,7 +28491,8 @@ pub const Checker = struct {
             if (!tymod.isUnknown(&self.store, m) and !tymod.isAny(&self.store, m)) return m;
             // Curated lib option interface (Intl.NumberFormatOptions, …) whose
             // literal-union members aren't structurally modeled.
-            if (self.optionTypePropType(t.name, key)) |pt| return pt;
+            // Re-fetch: `memberOnApparentType` can add types and move the array.
+            if (self.optionTypePropType(self.store.get(obj_ty).name, key)) |pt| return pt;
         }
         return null;
     }

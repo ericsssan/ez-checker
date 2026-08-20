@@ -539,7 +539,37 @@ pub const TypeStore = struct {
         return &self.types.items[i];
     }
 
+    /// DEBUG SWEEP ONLY: force `types` to move on every add, so any pointer or
+    /// name slice held across a store mutation dangles deterministically instead
+    /// of surviving by luck of the allocator.  Flip on, run the corpus, fix what
+    /// crashes.  Must be `false` in committed code.
+    const paranoid_realloc = false;
+
+    /// How often the array is moved when the sweep is on.  1 catches every
+    /// dangling read but is O(n) per add — the full corpus exhausts memory, so
+    /// run per-file-family at 1, or the whole corpus at 16.
+    const paranoid_every: u32 = 1;
+
+    var paranoid_tick: u32 = 0;
+
+    fn forceMove(self: *TypeStore) void {
+        if (!paranoid_realloc) return;
+        // Moving on EVERY add is O(n) per add and exhausts memory on the full
+        // corpus; every 16th still guarantees a move between a binding and a
+        // later use in any non-trivial call chain.
+        paranoid_tick +%= 1;
+        if (paranoid_tick % paranoid_every != 0) return;
+        const n = self.types.items.len;
+        const fresh = self.gpa.alloc(Type, n + 8) catch return;
+        @memcpy(fresh[0..n], self.types.items[0..n]);
+        self.gpa.free(self.types.allocatedSlice());
+        self.types.items.ptr = fresh.ptr;
+        self.types.items.len = n;
+        self.types.capacity = fresh.len;
+    }
+
     pub fn add(self: *TypeStore, ty: Type) !TypeId {
+        defer self.forceMove();
         // Tentatively append so the intern context can hash/compare it, then
         // dedup.  On a hit, discard the tentative type and reclaim the pool
         // tails it just appended (append-then-add ⇒ those ranges are the tail).
