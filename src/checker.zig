@@ -891,6 +891,10 @@ pub const Checker = struct {
     /// `memberOnApparentType`).
     require_alias_opaque: bool = false,
 
+    /// Re-entrancy flag for the expected-return instantiation in
+    /// `callArgContextualType` (see the comment there).
+    in_ctx_return_inst: bool = false,
+
     /// Temporary type-param rename table used during multi-sig overload rendering.
     /// Maps original param name → display name (e.g. "T" → "T_1").
     /// Set/cleared per-sig inside typeToStringInner; read by .type_param rendering.
@@ -9377,6 +9381,20 @@ pub const Checker = struct {
         if (self.ast_ref.nodeTag(ret_node) == .ts_type_annotation) ret_node = self.ast_ref.nodeData(ret_node).lhs;
         if (ret_node == .none) return null;
         self.matchTypeParam(ret_node, expected, names[0..tp], bindings[0..tp]);
+        // Which params the expected return actually FIXED — only those may be
+        // substituted structurally below.  Filling the rest with `unknown` (as
+        // the node-level resolve does) would bake a wrong concrete type into the
+        // result instead of leaving it visibly uninstantiated for the caller to
+        // reject.
+        var sub_names: [8][]const u8 = undefined;
+        var sub_vals: [8]TypeId = undefined;
+        var sub_n: usize = 0;
+        for (0..tp) |i| {
+            if (bindings[i].eq(TypeId.none)) continue;
+            sub_names[sub_n] = names[i];
+            sub_vals[sub_n] = bindings[i];
+            sub_n += 1;
+        }
         for (bindings[0..tp]) |*b| {
             if (b.eq(TypeId.none)) b.* = tymod.ID_UNKNOWN;
         }
@@ -9384,7 +9402,19 @@ pub const Checker = struct {
         if (param_slot >= params.len) return null;
         const param: NodeIndex = @enumFromInt(params[param_slot]);
         const param_node = self.paramAnnotationNode(param) orelse return null;
-        return self.resolveTypeNodeWithSubst(param_node, names[0..tp], bindings[0..tp]);
+        const resolved = self.resolveTypeNodeWithSubst(param_node, names[0..tp], bindings[0..tp]);
+        if (sub_n == 0) return resolved;
+        // `resolveTypeNodeWithSubst` substitutes a BARE `T`, but a param written
+        // as an instantiated alias (`cb: Mapper<T, U>`) resolves to the alias
+        // body with `T`/`U` still inside.  Substituting structurally afterwards
+        // is both correct and cheap — re-threading the arguments through alias
+        // resolution instead made a full corpus sweep go from 80s to >10min.
+        const subbed = self.substituteTypeId(resolved, sub_names[0..sub_n], sub_vals[0..sub_n]);
+        // Only the FULLY instantiated form is an improvement.  A partial one
+        // leaks a foreign parameter name (`Mapper<A, number>`, `SetOf<C>`) into
+        // callers that don't re-check, so fall back to the unsubstituted type.
+        if (self.typeMentionsTypeParam(subbed)) return resolved;
+        return subbed;
     }
 
     /// The contextual (expected) type of `call`, propagated TOP-DOWN through any
@@ -28246,6 +28276,28 @@ pub const Checker = struct {
             self.nested_ctx_depth -= 1;
             if (inst) |it| {
                 if (!self.typeMentionsTypeParam(it)) return it;
+            }
+        }
+        // THIS call's own type params flow from ITS contextual type — the
+        // annotation on what it initializes (`let f: Mapper<string, number> =
+        // wrap(s => …)`) as much as an enclosing call.  Resolve `ai`'s param
+        // TOP-DOWN from that expected RETURN type so a context-sensitive
+        // callback argument gets concrete param types instead of `any`.
+        if (!self.in_ctx_return_inst and self.nested_ctx_depth < 3 and
+            self.argIsContextSensitiveFn(arg) and self.enclosingCallArg(call_node) == null and
+            self.typeMentionsTypeParam(ctx))
+        {
+            // Re-entrancy guard: this asks for the CALL's expected type, which
+            // walks back through `expectedTypeOf` — without the flag a chain of
+            // nested calls re-enters here per argument and the walk explodes.
+            self.in_ctx_return_inst = true;
+            self.nested_ctx_depth += 1;
+            const cexp = self.expectedTypeOf(call_node);
+            const t = if (cexp) |ce| self.instantiateParamFromExpectedReturn(call_node, ce, @intCast(ai)) else null;
+            self.nested_ctx_depth -= 1;
+            self.in_ctx_return_inst = false;
+            if (t) |tt| {
+                if (!self.typeMentionsTypeParam(tt)) return tt;
             }
         }
         // THIS call is itself nested in an enclosing generic call (e.g. the inner
