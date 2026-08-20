@@ -901,6 +901,9 @@ pub const Checker = struct {
     tp_owner_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
     tp_owner_built: bool = false,
 
+    /// Recursion guard for `expandUtilityRef`.
+    util_expand_depth: u8 = 0,
+
     /// Temporary type-param rename table used during multi-sig overload rendering.
     /// Maps original param name → display name (e.g. "T" → "T_1").
     /// Set/cleared per-sig inside typeToStringInner; read by .type_param rendering.
@@ -16262,6 +16265,57 @@ pub const Checker = struct {
         return self.store.unionOf(buf[0..n]) catch id;
     }
 
+    /// Structural form of a utility type_ref (`Omit<T, K>`, `Pick<T, K>`,
+    /// `Partial<T>`, …) whose arguments are now concrete.  Returns null for a
+    /// ref this doesn't model, or when an argument is still generic.
+    fn expandUtilityRef(self: *Checker, id: TypeId) ?TypeId {
+        if (self.util_expand_depth > 3) return null;
+        const t = self.store.get(id);
+        if (t.kind != .type_ref or t.name.len == 0) return null;
+        var args_buf: [4]TypeId = undefined;
+        const src = self.store.idsOf(t.list_data);
+        if (src.len == 0 or src.len > args_buf.len) return null;
+        @memcpy(args_buf[0..src.len], src);
+        const args = args_buf[0..src.len];
+        for (args) |a| {
+            if (self.store.get(a).kind == .type_param) return null;
+        }
+        const name = t.name;
+        self.util_expand_depth += 1;
+        defer self.util_expand_depth -= 1;
+        if (args.len == 2 and (std.mem.eql(u8, name, "Omit") or std.mem.eql(u8, name, "Pick"))) {
+            const src_obj = self.expandArg(args[0]);
+            // The resolvers pass a NON-object source through unchanged, which
+            // silently drops the key removal — right by luck in a few places,
+            // wrong in others.  Decline instead.
+            if (self.store.get(src_obj).kind != .object_t) return null;
+            return if (std.mem.eql(u8, name, "Omit"))
+                self.resolveOmit(src_obj, args[1])
+            else
+                self.resolvePick(src_obj, args[1]);
+        }
+        // `Partial` must be handled too, not just skipped: expanding the `Omit`
+        // nested INSIDE it while leaving the wrapper alone drops the optionality
+        // it adds (`Partial<Omit<T, …>>.phoneNumber` is `string | undefined`).
+        if (args.len == 1) {
+            const inner = self.expandArg(args[0]);
+            // Only when the argument really is an object: these resolvers pass a
+            // non-object through unchanged, which would hand back a shape
+            // missing the optionality the wrapper is there to add.
+            if (self.store.get(inner).kind == .object_t) {
+                if (std.mem.eql(u8, name, "Partial")) return self.resolvePartial(inner, true);
+                if (std.mem.eql(u8, name, "Required")) return self.resolvePartial(inner, false);
+                if (std.mem.eql(u8, name, "Readonly")) return self.resolveReadonly(inner);
+            }
+        }
+        return null;
+    }
+
+    /// A utility argument that is itself an unexpanded utility ref.
+    fn expandArg(self: *Checker, id: TypeId) TypeId {
+        return self.expandUtilityRef(id) orelse id;
+    }
+
     fn resolvePick(self: *Checker, id: TypeId, keys_id: TypeId) TypeId {
         const t = self.store.get(id);
         if (t.kind != .object_t) return id;
@@ -24832,6 +24886,20 @@ pub const Checker = struct {
                         // for `super.f`). Fall back to a direct class-body scan.
                         if (self.thisClassDirectPropLookup(obj_node, prop_name, false)) |direct_ty| return direct_ty;
                     }
+                }
+            }
+            // An UNEXPANDED utility type (`Omit<T, K>` left as a `type_ref`
+            // because its argument was still generic when the annotation was
+            // resolved): compute it now so members are visible.  `merge<base,
+            // props> = Omit<base, keyof props & keyof base> & props` reaches
+            // here through the intersection above, and `o1.p1` was `any` for
+            // want of expanding it.  LAST resort — the lookups above derive
+            // optionality in ways this reconstruction does not (an earlier
+            // placement cost 2 rows in complicatedIndexedAccessKeyofReliesOnKey).
+            if (self.expandUtilityRef(obj_ty)) |expanded| {
+                if (!expanded.eq(obj_ty)) {
+                    const et = self.memberOnApparentType(expanded, prop_name, obj_node);
+                    if (!tymod.isUnknown(&self.store, et) and !tymod.isAny(&self.store, et)) return et;
                 }
             }
             // Type parameter: chase constraint (apparent type).
