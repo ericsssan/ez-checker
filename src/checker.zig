@@ -9959,6 +9959,25 @@ pub const Checker = struct {
             // `keyof T` symbolic rather than collapsing it to `string`.
             if (ref_name.len > 0) return self.symbolicKeyof(ref_name);
         }
+        // `keyof (A & B)` is `keyof A | keyof B`; `keyof (A | B)` is the shared
+        // keys.  The merge chains (`Omit<base, keyof props & keyof base>` applied
+        // repeatedly) build exactly these, and without the rule the conditional
+        // guarding them can never see `never`.
+        if (kind == .intersection_t or kind == .union_t) {
+            var buf: [16]TypeId = undefined;
+            var n: usize = 0;
+            for (self.store.idsOf(t.list_data)) |m| {
+                if (n >= buf.len) return tymod.ID_STRING;
+                buf[n] = self.keyofOf(m);
+                n += 1;
+            }
+            if (n == 0) return tymod.ID_NEVER;
+            if (n == 1) return buf[0];
+            return if (kind == .intersection_t)
+                (self.store.unionOf(buf[0..n]) catch tymod.ID_STRING)
+            else
+                (self.store.intersectionOf(buf[0..n]) catch tymod.ID_STRING);
+        }
         if (kind == .type_param and ref_name.len > 0) return self.symbolicKeyof(ref_name);
         // Array: keyof T[] includes number-coercible string indices +
         // 'length' / 'push' / 'pop' / etc.  TS technically returns a
@@ -12726,6 +12745,65 @@ pub const Checker = struct {
 
     /// Evaluate `T extends U ? A : B` with an active substitution map.
     /// Supports distributive conditionals (T is a union) and `infer V` capture.
+    /// Is `id` an intersection of string-literal sets with nothing in common —
+    /// i.e. uninhabited?  `keyof { p1 } & keyof { p2 }` is the shape this exists
+    /// for.  Anything that is not entirely literal sets answers false.
+    fn emptyLiteralIntersection(self: *Checker, id: TypeId) bool {
+        const t = self.store.get(id);
+        if (t.kind != .intersection_t) return false;
+        const members = self.store.idsOf(t.list_data);
+        if (members.len < 2) return false;
+        for (members) |m| {
+            const mt = self.store.get(m);
+            switch (mt.kind) {
+                .string_literal => {},
+                .union_t => for (self.store.idsOf(mt.list_data)) |inner| {
+                    if (self.store.get(inner).kind != .string_literal) return false;
+                },
+                else => return false,
+            }
+        }
+        // Every member is a literal set: is any literal present in ALL of them?
+        const first = members[0];
+        const ft = self.store.get(first);
+        var probe_buf: [32]TypeId = undefined;
+        var probe_n: usize = 0;
+        if (ft.kind == .string_literal) {
+            probe_buf[0] = first;
+            probe_n = 1;
+        } else {
+            for (self.store.idsOf(ft.list_data)) |inner| {
+                if (probe_n == probe_buf.len) return false;
+                probe_buf[probe_n] = inner;
+                probe_n += 1;
+            }
+        }
+        for (probe_buf[0..probe_n]) |cand| {
+            const cs = self.store.get(cand).literal_value.string;
+            var in_all = true;
+            for (members[1..]) |m| {
+                const mt = self.store.get(m);
+                var found = false;
+                if (mt.kind == .string_literal) {
+                    found = std.mem.eql(u8, mt.literal_value.string, cs);
+                } else {
+                    for (self.store.idsOf(mt.list_data)) |inner| {
+                        if (std.mem.eql(u8, self.store.get(inner).literal_value.string, cs)) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                if (!found) {
+                    in_all = false;
+                    break;
+                }
+            }
+            if (in_all) return false; // shared key → inhabited
+        }
+        return true;
+    }
+
     fn resolveConditionalTypeWithSubst(
         self: *Checker,
         ty_node: NodeIndex,
@@ -12743,7 +12821,13 @@ pub const Checker = struct {
         const true_node: NodeIndex = @enumFromInt(slice[2]);
         const false_node: NodeIndex = @enumFromInt(slice[3]);
 
-        const check_ty = self.resolveTypeNodeWithSubst(check_node, keys, vals);
+        var check_ty = self.resolveTypeNodeWithSubst(check_node, keys, vals);
+        // `keyof A & keyof B` with no shared keys IS `never`, and the whole
+        // point of a `… extends never ?` check is to ask exactly that.  Reduced
+        // HERE rather than in `intersectionOf`, because tsc keeps an intersection
+        // written in an annotation verbatim in the display: `(t: "a" | ("b" &
+        // "c"))` prints unreduced even though the member is uninhabited.
+        if (self.emptyLiteralIntersection(check_ty)) check_ty = tymod.ID_NEVER;
 
         // Distributive: union check type → map conditional over members.
         const check_t = self.store.get(check_ty);
