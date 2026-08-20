@@ -197,6 +197,15 @@ pub const Type = struct {
     /// for no-unsafe-enum-comparison. Part of interning identity so an enum
     /// member's `0` stays distinct from a plain literal `0`.
     enum_name: []const u8 = "",
+    /// DECLARATION IDENTITY of a `.type_param`: the AST node of the generic
+    /// declaration that introduced it (0 when unknown).  Two parameters sharing
+    /// a NAME but declared by different signatures — `wrap<T, U>` nested inside
+    /// `combine<A, B, C>` — are different types, and only this separates them;
+    /// the name alone lives in a file-global namespace.  Part of interning
+    /// identity, but NOT observable: `eqlIgnoringOwner` collapses types that
+    /// differ only by it, because TypeScript is structural.
+    tp_owner: u32 = 0,
+
     /// True for function_t types created from overload declaration sets.
     /// Forces object-form rendering `{ (x): T; }` even for single signatures,
     /// matching tsc's output for `function f(x: T): U; function f(x: any) {}`.
@@ -338,6 +347,7 @@ pub const InternContext = struct {
             },
         }
         h.update(t.name);
+        if (t.tp_owner != 0) h.update(std.mem.asBytes(&t.tp_owner));
         h.update(t.alias_name);
         h.update(t.display_name);
         h.update(t.symbol_scope);
@@ -403,6 +413,7 @@ pub const InternContext = struct {
         if (ta.kind != tb.kind) return false;
         if (!literalEql(ta.literal_value, tb.literal_value)) return false;
         if (!std.mem.eql(u8, ta.name, tb.name)) return false;
+        if (ta.tp_owner != tb.tp_owner) return false;
         if (!std.mem.eql(u8, ta.alias_name, tb.alias_name)) return false;
         if (!std.mem.eql(u8, ta.display_name, tb.display_name)) return false;
         if (!std.mem.eql(u8, ta.symbol_scope, tb.symbol_scope)) return false;
@@ -871,10 +882,10 @@ pub const TypeStore = struct {
             const t = self.get(m);
             if (t.kind == .union_t) {
                 for (self.idsOf(t.list_data)) |inner| {
-                    try addUnique(self.gpa, &buf, inner);
+                    try self.addUniqueStructural(&buf, inner);
                 }
             } else {
-                try addUnique(self.gpa, &buf, m);
+                try self.addUniqueStructural(&buf, m);
             }
         }
         // `true | false` → `boolean`: TypeScript collapses the full boolean
@@ -1106,13 +1117,109 @@ pub const TypeStore = struct {
     /// `type_ref` so the facade's isTypeParameter / getConstraint work and
     /// assignability can treat `concrete → type_param` as not-assignable.
     pub fn typeParam(self: *TypeStore, name: []const u8, constraint: TypeId) !TypeId {
+        return self.typeParamOwned(name, constraint, 0);
+    }
+
+    /// A type parameter tagged with the declaration that introduced it.
+    pub fn typeParamOwned(self: *TypeStore, name: []const u8, constraint: TypeId, owner: u32) !TypeId {
         const list = if (constraint == .none) TypeIdList.empty else try self.appendTypeIds(&.{constraint});
-        return try self.add(.{ .kind = .type_param, .name = name, .list_data = list });
+        return try self.add(.{ .kind = .type_param, .name = name, .list_data = list, .tp_owner = owner });
     }
 
     fn addUnique(gpa: std.mem.Allocator, buf: *std.ArrayList(TypeId), id: TypeId) !void {
         for (buf.items) |x| if (x.eq(id)) return;
         try buf.append(gpa, id);
+    }
+
+    /// Union dedup that ignores `tp_owner`.  TypeScript is STRUCTURAL:
+    /// `<T>(x: T) => T[]` declared twice is ONE type, however the two `T`s are
+    /// tracked internally.  Parameter identity is inference bookkeeping and must
+    /// not leak into a type's observable shape — without this, `[f, g]` of two
+    /// such functions prints as a two-member union.
+    fn addUniqueStructural(self: *TypeStore, buf: *std.ArrayList(TypeId), id: TypeId) !void {
+        for (buf.items) |x| {
+            if (x.eq(id)) return;
+            if (self.eqlIgnoringOwner(x, id, 0)) return;
+        }
+        try buf.append(self.gpa, id);
+    }
+
+    /// Mirrors the intern `eql` field-for-field, except that a `.type_param`'s
+    /// `tp_owner` is ignored and children are compared RECURSIVELY (the intern
+    /// comparison can use id equality because children are already interned).
+    /// Every field the intern check looks at must be checked here too — leaving
+    /// one out silently merges types tsc keeps apart (predicate targets and
+    /// index-signature metadata each cost rows before they were added).
+    fn eqlIgnoringOwner(self: *const TypeStore, a: TypeId, b: TypeId, depth: u8) bool {
+        if (a.eq(b)) return true;
+        if (depth > 6) return false;
+        const ta = &self.types.items[a.toInt()];
+        const tb = &self.types.items[b.toInt()];
+        if (ta.kind != tb.kind) return false;
+        if (!literalEql(ta.literal_value, tb.literal_value)) return false;
+        if (!std.mem.eql(u8, ta.name, tb.name)) return false;
+        if (!std.mem.eql(u8, ta.alias_name, tb.alias_name)) return false;
+        if (!std.mem.eql(u8, ta.display_name, tb.display_name)) return false;
+        if (!std.mem.eql(u8, ta.symbol_scope, tb.symbol_scope)) return false;
+        if (!std.mem.eql(u8, ta.enum_name, tb.enum_name)) return false;
+        if (ta.is_overload_set != tb.is_overload_set) return false;
+        {
+            const aa = self.idsOf(ta.alias_args);
+            const ba = self.idsOf(tb.alias_args);
+            if (aa.len != ba.len) return false;
+            for (aa, ba) |x, y| {
+                if (!self.eqlIgnoringOwner(x, y, depth + 1)) return false;
+            }
+        }
+        const la = self.idsOf(ta.list_data);
+        const lb = self.idsOf(tb.list_data);
+        if (la.len != lb.len) return false;
+        for (la, lb) |x, y| {
+            if (!self.eqlIgnoringOwner(x, y, depth + 1)) return false;
+        }
+        const pa = self.propsOf(ta.object_props);
+        const pb = self.propsOf(tb.object_props);
+        if (pa.len != pb.len) return false;
+        for (pa, pb) |x, y| {
+            if (!std.mem.eql(u8, x.name, y.name)) return false;
+            if (!self.eqlIgnoringOwner(x.type_id, y.type_id, depth + 1)) return false;
+            if (x.optional != y.optional or x.readonly != y.readonly or
+                x.is_method != y.is_method or x.is_fn_property != y.is_fn_property or
+                x.is_static != y.is_static) return false;
+            if (!std.mem.eql(u8, x.index_key_name, y.index_key_name)) return false;
+            if (x.index_key_is_number != y.index_key_is_number) return false;
+            if (x.key_single_quoted != y.key_single_quoted) return false;
+            if (x.has_write_type != y.has_write_type) return false;
+            if (x.has_write_type and !self.eqlIgnoringOwner(x.write_type_id, y.write_type_id, depth + 1)) return false;
+            if (x.is_getter_only != y.is_getter_only) return false;
+        }
+        const sa = self.signaturesOf(ta.signatures);
+        const sb = self.signaturesOf(tb.signatures);
+        if (sa.len != sb.len) return false;
+        for (sa, sb) |x, y| {
+            if (!self.eqlIgnoringOwner(x.return_type, y.return_type, depth + 1)) return false;
+            if (x.is_async != y.is_async or x.is_generator != y.is_generator or
+                x.is_assertion != y.is_assertion or x.is_construct != y.is_construct) return false;
+            if (x.rest_param_index != y.rest_param_index) return false;
+            if (x.predicate_param_index != y.predicate_param_index) return false;
+            if (!self.eqlIgnoringOwner(x.predicate_target, y.predicate_target, depth + 1)) return false;
+            if (x.type_param_fp != y.type_param_fp) return false;
+            const xpa = self.signatureParamsOf(x);
+            const ypa = self.signatureParamsOf(y);
+            if (xpa.len != ypa.len) return false;
+            for (xpa, ypa) |m, nn| {
+                if (!self.eqlIgnoringOwner(m, nn, depth + 1)) return false;
+            }
+            const xoa = self.signatureParamOptionalsOf(x);
+            const yoa = self.signatureParamOptionalsOf(y);
+            if (xoa.len != yoa.len) return false;
+            for (xoa, yoa) |m, nn| if (m != nn) return false;
+            const xna = self.signatureParamNamesOf(x);
+            const yna = self.signatureParamNamesOf(y);
+            if (xna.len != yna.len) return false;
+            for (xna, yna) |m, nn| if (!std.mem.eql(u8, m, nn)) return false;
+        }
+        return true;
     }
 };
 

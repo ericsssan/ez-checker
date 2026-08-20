@@ -895,6 +895,12 @@ pub const Checker = struct {
     /// `callArgContextualType` (see the comment there).
     in_ctx_return_inst: bool = false,
 
+    /// The `ts_type_parameter` the last scope scan matched (see
+    /// `typeParamConstraintNode`), and the precomputed node → declaration map.
+    last_tp_decl_node: NodeIndex = .none,
+    tp_owner_map: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    tp_owner_built: bool = false,
+
     /// Temporary type-param rename table used during multi-sig overload rendering.
     /// Maps original param name → display name (e.g. "T" → "T_1").
     /// Set/cleared per-sig inside typeToStringInner; read by .type_param rendering.
@@ -1100,6 +1106,7 @@ pub const Checker = struct {
             var it = self.sig_type_params.valueIterator();
             while (it.next()) |v| self.gpa.free(v.*);
             self.require_aliases.deinit(self.gpa);
+        self.tp_owner_map.deinit(self.gpa);
         self.sig_type_params.deinit(self.gpa);
         }
         self.tp_renames.deinit(self.gpa);
@@ -9683,7 +9690,12 @@ pub const Checker = struct {
             if (spt.kind != .function_t) continue;
             const cb_sigs = self.store.signaturesOf(spt.signatures);
             if (cb_sigs.len == 0) continue;
-            const cb_ret = self.store.get(cb_sigs[0].return_type);
+            // COPY the signature: `typeOf` below adds types, which moves the
+            // signature pool and dangles this slice.  The struct itself holds
+            // pool INDICES, which stay valid across growth — only the slice does
+            // not — so everything derived from it must be re-fetched after.
+            const cb_sig = cb_sigs[0];
+            const cb_ret = self.store.get(cb_sig.return_type);
             if (cb_ret.kind != .type_param) continue;
             const tp_name = cb_ret.name;
             const arg_ty = self.typeOf(@enumFromInt(args[i]));
@@ -9697,7 +9709,7 @@ pub const Checker = struct {
             // its params against the expected callback's concrete param types
             // (`value: number`), then substitute into the return → `number`.
             if (self.typeMentionsTypeParam(concrete)) {
-                const exp_params = self.store.signatureParamsOf(cb_sigs[0]);
+                const exp_params = self.store.signatureParamsOf(cb_sig);
                 const arg_params = self.store.signatureParamsOf(arg_sigs[0]);
                 var ak_buf: [4][]const u8 = undefined;
                 var av_buf: [4]TypeId = undefined;
@@ -15702,6 +15714,7 @@ pub const Checker = struct {
         const ty_pos = tree.tokenStart(ty_main_tok);
         var best_tp_pos: u32 = 0;
         var best_constraint: NodeIndex = .none;
+        var best_node: NodeIndex = .none;
         var found_any = false;
         for (self.type_param_nodes.items) |ni| {
             if (!std.mem.eql(u8, tree.tokenText(tree.nodeMainToken(ni)), name)) continue;
@@ -15735,12 +15748,50 @@ pub const Checker = struct {
             if (!found_any or tp_pos > best_tp_pos) {
                 found_any = true;
                 best_tp_pos = tp_pos;
+                best_node = ni;
                 best_constraint = tree.nodeData(ni).lhs;
             }
         }
+        // The matched declaration travels back with the constraint: the caller
+        // needs it for `tp_owner`, and re-running this whole-file scan to get it
+        // separately is what made an earlier attempt hang the corpus sweep.
+        self.last_tp_decl_node = best_node;
         if (!found_any) return null;
         if (best_constraint == .none) return null;
         return best_constraint;
+    }
+
+    /// The generic declaration that a `ts_type_parameter` node belongs to,
+    /// precomputed once for every parameter in the file.
+    fn typeParamOwnerOf(self: *Checker, tp_node: NodeIndex) u32 {
+        if (tp_node == .none) return 0;
+        if (!self.tp_owner_built) {
+            self.tp_owner_built = true;
+            const parents = self.semantic.parent_indices;
+            for (self.type_param_nodes.items) |ni| {
+                var p: u32 = if (ni.toInt() < parents.len) parents[ni.toInt()] else @intFromEnum(NodeIndex.none);
+                var guard: u8 = 0;
+                var owner: u32 = ni.toInt();
+                while (p != @intFromEnum(NodeIndex.none) and p < self.ast_ref.nodes.len and guard < 8) : (guard += 1) {
+                    switch (self.ast_ref.nodeTag(@as(NodeIndex, @enumFromInt(p)))) {
+                        .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+                        .ts_declare_function, .fn_expr, .async_fn_expr, .generator_fn_expr,
+                        .async_generator_fn_expr, .arrow_fn, .async_arrow_fn, .method_def,
+                        .computed_method_def, .class_decl, .class_expr, .ts_type_alias_decl,
+                        .ts_interface_decl, .ts_function_type, .ts_constructor_type,
+                        .ts_call_signature, .ts_construct_signature, .ts_method_signature => {
+                            owner = p;
+                            break;
+                        },
+                        else => {},
+                    }
+                    if (p >= parents.len) break;
+                    p = parents[p];
+                }
+                self.tp_owner_map.put(self.gpa, ni.toInt(), owner) catch {};
+            }
+        }
+        return self.tp_owner_map.get(tp_node.toInt()) orelse 0;
     }
 
     /// Build a `.type_param` for the in-scope parameter `name` at `ref_node`,
@@ -15749,6 +15800,7 @@ pub const Checker = struct {
     /// `V as T` (safe) vs `T as V` (unsafe).
     fn buildTypeParam(self: *Checker, ref_node: NodeIndex, name: []const u8) TypeId {
         var c: TypeId = .none;
+        self.last_tp_decl_node = .none;
         // Resolve the constraint param-aware (so `V extends T` carries the
         // parameter T), but cap the depth — self/mutually-referential
         // constraints (`T extends Array<T>`) would otherwise recurse forever.
@@ -15760,7 +15812,8 @@ pub const Checker = struct {
                 if (!tymod.isAny(&self.store, r)) c = r;
             }
         }
-        return self.store.typeParam(name, c) catch tymod.ID_UNKNOWN;
+        const owner = self.typeParamOwnerOf(self.last_tp_decl_node);
+        return self.store.typeParamOwned(name, c, owner) catch tymod.ID_UNKNOWN;
     }
 
     /// Hardcoded lib type seeds for the most common parameterized types.
