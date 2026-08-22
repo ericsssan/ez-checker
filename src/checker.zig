@@ -2973,7 +2973,7 @@ pub const Checker = struct {
                 const alias_tok = self.ast_ref.nodeMainToken(node);
                 const alias_name = self.ast_ref.tokenText(alias_tok);
                 if (alias_name.len > 0) {
-                    if (self.decl_index.primaryDecl(alias_name)) |decl| {
+                    if (self.declAt(alias_name, node)) |decl| {
                         if (self.ast_ref.nodeTag(decl) == .ts_type_alias_decl) {
                             const dd = self.ast_ref.nodeData(decl);
                             if (dd.lhs != .none) {
@@ -3017,7 +3017,7 @@ pub const Checker = struct {
                 const iface_tok = self.ast_ref.nodeMainToken(node);
                 const iface_name = self.ast_ref.tokenText(iface_tok);
                 if (iface_name.len > 0) {
-                    if (self.decl_index.primaryDecl(iface_name)) |decl| {
+                    if (self.declAt(iface_name, node)) |decl| {
                         if (self.ast_ref.nodeTag(decl) == .ts_interface_decl) {
                             const id = self.ast_ref.nodeData(decl);
                             if (id.lhs != .none) {
@@ -3173,7 +3173,7 @@ pub const Checker = struct {
                 const tok_f = self.ast_ref.nodeMainToken(node);
                 const fn_name = self.ast_ref.tokenText(tok_f);
                 if (fn_name.len > 0) {
-                    if (self.decl_index.primaryDecl(fn_name)) |ns_node| {
+                    if (self.declAt(fn_name, node)) |ns_node| {
                         const ns_tag = self.ast_ref.nodeTag(ns_node);
                         if (ns_tag == .ts_namespace_decl or ns_tag == .ts_module_decl) {
                             const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{fn_name}) catch return tymod.ID_ANY;
@@ -3476,7 +3476,7 @@ pub const Checker = struct {
             // Fundule (function + namespace merge): the name maps to both a
             // function in value_decl_by_name AND a namespace in type_decl_nodes.
             // tsc types such an identifier as `typeof F`, not the function type.
-            if (self.decl_index.primaryDecl(name)) |ns_node| {
+            if (self.declAt(name, node)) |ns_node| {
                 const ns_tag = self.ast_ref.nodeTag(ns_node);
                 if (ns_tag == .ts_namespace_decl or ns_tag == .ts_module_decl) {
                     const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return t;
@@ -15065,7 +15065,7 @@ pub const Checker = struct {
             if (!subst.eq(self.resolveTypeNode(an))) changed = true;
         }
         if (!changed) return null;
-        const decl = self.decl_index.primaryDecl(nm) orelse return null;
+        const decl = self.typeDeclAt(nm, ty_node) orelse return null;
         const dtag = self.ast_ref.nodeTag(decl);
         const tpr = self.typeParamsRangeOf(decl) orelse return null;
         if (tpr.end <= tpr.start or tpr.end > self.ast_ref.extra_data.len) return null;
@@ -15366,7 +15366,19 @@ pub const Checker = struct {
         // renders as the class/interface name (matching tsc) rather than
         // expanding to the structural object shape.  Member access resolves
         // lazily via resolveDeclaredType inside memberOnApparentType.
-        if (self.decl_index.primaryDecl(name)) |decl| {
+        // Scope-aware pick, EXCEPT that a bare reference keeps the primary when
+        // the visible declaration is only a namespace: `Collection` names the
+        // interface even where `namespace Collection { … }` is nearer, while the
+        // QUALIFIED `Collection.Keyed` must fall through to the namespace path.
+        if (blk: {
+            const scoped = self.declAt(name, ty_node) orelse break :blk self.decl_index.primaryDecl(name);
+            const stag = self.ast_ref.nodeTag(scoped);
+            if (stag != .ts_namespace_decl and stag != .ts_module_decl) break :blk scoped;
+            const td = self.ast_ref.nodeData(ty_node);
+            const qualified = td.lhs != .none and self.ast_ref.nodeTag(td.lhs) == .member_expr;
+            if (qualified) break :blk scoped;
+            break :blk self.decl_index.primaryDecl(name) orelse scoped;
+        }) |decl| {
             const dtag = self.ast_ref.nodeTag(decl);
             if (dtag == .class_decl or dtag == .ts_interface_decl) {
                 var args_buf: [8]TypeId = undefined;
@@ -15426,7 +15438,7 @@ pub const Checker = struct {
         // Only for a namespace/module first component — enum members
         // (`AnimalType.cat`) and class/interface qualifications resolve through
         // their own paths below.
-        if (self.decl_index.primaryDecl(name)) |ndecl0| {
+        if (self.declAt(name, ty_node)) |ndecl0| {
             const ntag0 = self.ast_ref.nodeTag(ndecl0);
             if (ntag0 == .ts_namespace_decl or ntag0 == .ts_module_decl) {
                 const ty_data0 = self.ast_ref.nodeData(ty_node);
@@ -15477,7 +15489,7 @@ pub const Checker = struct {
                 // `.Yes` access and yield the whole enum. Look the member up in
                 // the enum's object shape instead — its props carry the
                 // enum-tagged literal (renders as "Choice.Yes").
-                if (self.decl_index.primaryDecl(name)) |edecl| {
+                if (self.declAt(name, ty_node)) |edecl| {
                     if (self.ast_ref.nodeTag(edecl) == .ts_enum_decl) {
                         const member_data = self.ast_ref.nodeData(ty_data.lhs);
                         if (member_data.rhs != .none) {
@@ -15518,8 +15530,8 @@ pub const Checker = struct {
                             // bare type_ref to the enum name — resolve to the
                             // union for assignability and tag the display name.
                             const names_enum = prop_kind == .type_ref and
-                                self.decl_index.primaryDecl(prop_t.name) != null and
-                                self.ast_ref.nodeTag(self.decl_index.primaryDecl(prop_t.name).?) == .ts_enum_decl;
+                                self.declAt(prop_t.name, ty_node) != null and
+                                self.ast_ref.nodeTag(self.declAt(prop_t.name, ty_node).?) == .ts_enum_decl;
                             if (prop_kind == .union_t or prop_t.enum_name.len > 0 or names_enum) {
                                 const qual_name = self.qualifiedTypeName(ty_node, member_data.rhs);
                                 if (qual_name.len > 0) {
@@ -15564,7 +15576,7 @@ pub const Checker = struct {
             // substitute them through the body.  For conditional type
             // bodies, resolve with the subst context directly so
             // `infer V` and type-param substitution work correctly.
-            const decl_opt = self.decl_index.primaryDecl(name);
+            const decl_opt = self.declAt(name, ty_node);
             if (decl_opt) |decl| {
                 if (self.ast_ref.nodeTag(decl) == .ts_type_alias_decl) {
                     const ta_dd = self.ast_ref.nodeData(decl);
@@ -15650,7 +15662,7 @@ pub const Checker = struct {
                         // Enum member inside a namespace: resolve to the enum's
                         // member union so assignability works, displayed with
                         // tsc's scope-relative qualification (`First.E`).
-                        if (self.decl_index.primaryDecl(last_name)) |edecl| {
+                        if (self.declAt(last_name, ty_node)) |edecl| {
                             if (self.ast_ref.nodeTag(edecl) == .ts_enum_decl) {
                                 if (self.buildEnumUnionType(last_name)) |eu| {
                                     const qual = self.qualifiedTypeName(ty_node, member_data.rhs);
@@ -16713,7 +16725,7 @@ pub const Checker = struct {
             if (self.ast_ref.nodeTag(sc) == .identifier) {
                 const parent_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(sc));
                 if (std.mem.eql(u8, parent_name, name)) return true;
-                if (self.decl_index.primaryDecl(parent_name)) |parent_decl| {
+                if (self.typeDeclAt(parent_name, decl)) |parent_decl| {
                     return self.declInheritsFromName(parent_decl, name, depth + 1);
                 }
             }
@@ -16742,7 +16754,7 @@ pub const Checker = struct {
                     self.ast_ref.nodeTag(ext_node) != .identifier) continue;
                 const ext_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ext_node));
                 if (std.mem.eql(u8, ext_name, name)) return true;
-                if (self.decl_index.primaryDecl(ext_name)) |parent_decl| {
+                if (self.typeDeclAt(ext_name, decl)) |parent_decl| {
                     if (self.declInheritsFromName(parent_decl, name, depth + 1)) return true;
                 }
             }
@@ -16980,6 +16992,74 @@ pub const Checker = struct {
     /// the use site sees the whole decl set anyway, or the chosen group is not a
     /// clean interface-only / single-class set (the tricky namespace+interface,
     /// enum, and alias merges stay on the proven scope-blind path).
+    /// `declAt`, restricted to declarations that carry a TYPE meaning.
+    ///
+    /// A class or interface merged with a same-named namespace (a "clodule",
+    /// `class m3d {} module m3d {}`) has two declarations; the namespace one
+    /// carries no type, so picking it by scope alone loses the named rendering
+    /// (`m3d` became the structural `{ foo(): void; }`).  Falls back to `declAt`
+    /// when no type-shaped declaration is visible.
+    fn typeDeclAt(self: *Checker, name: []const u8, use_site: NodeIndex) ?NodeIndex {
+        const scoped = self.declAt(name, use_site) orelse return null;
+        switch (self.ast_ref.nodeTag(scoped)) {
+            .ts_namespace_decl, .ts_module_decl => {},
+            else => return scoped,
+        }
+        const primary = self.decl_index.primaryDecl(name) orelse return scoped;
+        switch (self.ast_ref.nodeTag(primary)) {
+            .class_decl, .ts_interface_decl, .ts_enum_decl, .ts_type_alias_decl => {},
+            else => return scoped,
+        }
+        // A namespace carries no TYPE meaning at all, so a type reference looks
+        // past it to the nearest declaration that has one — even when the
+        // namespace is lexically nearer (cloduleTest2 declares `class m3d` at
+        // top level and `module m3d` inside `T1`).
+        return primary;
+    }
+
+    /// The declaration of `name` VISIBLE from `use_site`.
+    ///
+    /// `DeclIndex.primaryDecl` is scope-BLIND — one declaration per name for the
+    /// whole program — so a homonym in a sibling namespace can silently win
+    /// (differentTypesWithSameName has a `variable` inside a namespace and one
+    /// outside).  This narrows to the innermost enclosing scope that declares
+    /// the name, and is a strict refinement: with one declaration, no scope
+    /// information, or nothing enclosing the use site, it answers exactly what
+    /// `primaryDecl` would.
+    fn declAt(self: *Checker, name: []const u8, use_site: NodeIndex) ?NodeIndex {
+        const primary = self.decl_index.primaryDecl(name);
+        if (use_site == .none) return primary;
+        const list = self.decl_index.allTypeDecls(name) orelse return primary;
+        if (list.items.len < 2 or list.items.len > 64) return primary;
+        var ub: [192]u8 = undefined;
+        const use_scope = self.scope_tree.namespaceScopeKey(use_site, &ub);
+        var best: ?NodeIndex = null;
+        var best_len: usize = 0;
+        var primary_at_best = false;
+        var kb: [192]u8 = undefined;
+        for (list.items) |d| {
+            const k = self.scope_tree.namespaceScopeKey(d, &kb);
+            if (!scopeEncloses(k, use_scope)) continue;
+            if (best == null or k.len > best_len) {
+                best = d;
+                best_len = k.len;
+                primary_at_best = (primary != null and d == primary.?);
+            } else if (k.len == best_len) {
+                // Same scope: keep `primaryDecl`'s pick when it is in this group,
+                // so merged declarations still resolve through their primary.
+                if (primary != null and d == primary.?) {
+                    best = d;
+                    primary_at_best = true;
+                }
+            }
+        }
+        if (best) |b| {
+            if (primary_at_best) return primary;
+            return b;
+        }
+        return primary;
+    }
+
     fn resolveDeclaredTypeInScope(self: *Checker, name: []const u8, use_site: NodeIndex) ?TypeId {
         if (use_site == .none) return null;
         const list = self.decl_index.allTypeDecls(name) orelse return null;
@@ -20686,7 +20766,7 @@ pub const Checker = struct {
             else => "",
         };
         if (tname.len == 0) return null;
-        const decl = self.decl_index.primaryDecl(tname) orelse return null;
+        const decl = self.declAt(tname, callee) orelse return null;
         if (self.ast_ref.nodeTag(decl) != .ts_interface_decl) return null;
         const idata = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
         if (idata.body_end <= idata.body_start or idata.body_end > self.ast_ref.extra_data.len) return null;
@@ -21092,7 +21172,7 @@ pub const Checker = struct {
         // type renders as the class name (matching tsc) rather than expanding
         // to the structural object shape.  Member access resolves lazily via
         // memberOnApparentType → resolveDeclaredType.
-        if (self.decl_index.primaryDecl(name)) |decl| {
+        if (self.typeDeclAt(name, callee_ident)) |decl| {
             const dtag = self.ast_ref.nodeTag(decl);
             if (dtag == .class_decl or dtag == .ts_interface_decl) {
                 return self.store.typeRef(name, args) catch null;
@@ -22912,7 +22992,7 @@ pub const Checker = struct {
         // A heritage clause (`class X extends Ns.C`) or other bare-name position
         // shows the reference by its plain qualified name (`Ns.C`), not `typeof`.
         if (self.identifierInBareNamePosition(use_site)) return null;
-        const ns_decl = self.decl_index.primaryDecl(ns_root) orelse return null;
+        const ns_decl = self.declAt(ns_root, use_site) orelse return null;
         const dt = self.ast_ref.nodeTag(ns_decl);
         if (dt != .ts_namespace_decl and dt != .ts_module_decl) return null;
         if (!self.namespaceIsTopLevel(ns_decl)) return null;
@@ -23458,7 +23538,7 @@ pub const Checker = struct {
             const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(d.lhs));
             if (cd.super_class == .none) return false;
             const base_name = self.rightmostNameOf(cd.super_class) orelse return false;
-            const next = self.decl_index.primaryDecl(base_name) orelse return false;
+            const next = self.declAt(base_name, class_decl) orelse return false;
             if (self.ast_ref.nodeTag(next) != .class_decl) return false;
             if (next == class_decl) return true;
             for (seen[0..n]) |sn| if (sn == next) return false; // a cycle we are not part of
@@ -23499,7 +23579,7 @@ pub const Checker = struct {
     /// Is `name` a class declared in a namespace the use site also sits in — so
     /// tsc names it bare rather than `Ns.C`?
     fn siblingNamespaceClass(self: *Checker, name: []const u8, use_site: NodeIndex) bool {
-        const d = self.decl_index.primaryDecl(name) orelse return false;
+        const d = self.declAt(name, use_site) orelse return false;
         if (self.ast_ref.nodeTag(d) != .class_decl) return false;
         const ns = self.enclosingNamespaceDecl(d) orelse return false;
         if (!self.nodeIsInside(use_site, ns)) return false;
@@ -23613,7 +23693,7 @@ pub const Checker = struct {
             // denotes the type (`A`) — and which node the row anchors on isn't
             // decidable here, so nothing is answered.
             if (sd.rhs != .none and sd.rhs != sd.lhs) return null;
-            const d = self.decl_index.primaryDecl(local) orelse return null;
+            const d = self.declAt(local, node) orelse return null;
             switch (self.ast_ref.nodeTag(d)) {
                 .class_decl => {
                     const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(self.ast_ref.nodeData(d).lhs));
@@ -24537,7 +24617,7 @@ pub const Checker = struct {
             // A qualified occurrence (`C.A`) is already correct.
             if (st > 0 and rendered[st - 1] == '.') continue;
             const word = rendered[st..i];
-            if (self.decl_index.primaryDecl(word)) |d| {
+            if (self.declAt(word, ns_decl)) |d| {
                 if (self.nodeIsInside(d, ns_decl)) return true;
             }
             // `primaryDecl` answers with ONE declaration; a same-named entity
@@ -24803,7 +24883,7 @@ pub const Checker = struct {
                     else => "",
                 };
                 if (ret_name.len > 0) {
-                    if (self.decl_index.primaryDecl(ret_name)) |ret_decl| {
+                    if (self.typeDeclAt(ret_name, use_site)) |ret_decl| {
                         const parents = self.semantic.parent_indices;
                         const NONE: u32 = @intFromEnum(NodeIndex.none);
                         var p = if (ret_decl.toInt() < parents.len) parents[ret_decl.toInt()] else NONE;
@@ -24827,7 +24907,7 @@ pub const Checker = struct {
             std.mem.eql(u8, prop_name, "keys") or
             std.mem.eql(u8, prop_name, "values")) return null;
         // Bind the interface's first type parameter to the element type.
-        if (self.decl_index.primaryDecl(array_name)) |decl| {
+        if (self.typeDeclAt(array_name, use_site)) |decl| {
             if (self.ast_ref.nodeTag(decl) == .ts_interface_decl) {
                 const idata = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(self.ast_ref.nodeData(decl).lhs));
                 if (idata.type_params_end > idata.type_params) {
@@ -25083,7 +25163,7 @@ pub const Checker = struct {
                 // We avoid building the full namespace type (which stores classes as instance
                 // types, causing regressions); instead we do a direct AST scan for variable
                 // declarations that have a type annotation matching the property name.
-                if (self.decl_index.primaryDecl(inner_name)) |ns_decl| {
+                if (self.declAt(inner_name, obj_node)) |ns_decl| {
                     const ndtag = self.ast_ref.nodeTag(ns_decl);
                     if (ndtag == .ts_namespace_decl or ndtag == .ts_module_decl) {
                         if (self.namespaceVarMemberType(ns_decl, prop_name)) |vt| {
@@ -25093,7 +25173,7 @@ pub const Checker = struct {
                     }
                 }
                 // `typeof ClassName` — look up static member on the class.
-                if (self.decl_index.primaryDecl(inner_name)) |cls_decl| {
+                if (self.declAt(inner_name, obj_node)) |cls_decl| {
                     if (self.ast_ref.nodeTag(cls_decl) == .class_decl) {
                         const st = self.buildClassStaticType(cls_decl, inner_name);
                         if (!st.eq(tymod.ID_UNKNOWN)) {
@@ -26142,7 +26222,7 @@ pub const Checker = struct {
     /// `arg`.  Null when the file declares no such interface, or it has no such
     /// member — the caller then keeps the builtin alone.
     fn userIfaceMember(self: *Checker, iface_name: []const u8, prop_name: []const u8, arg: TypeId, use_site: NodeIndex) ?TypeId {
-        const decl = self.decl_index.primaryDecl(iface_name) orelse return null;
+        const decl = self.typeDeclAt(iface_name, use_site) orelse return null;
         if (self.ast_ref.nodeTag(decl) != .ts_interface_decl) return null;
         const ty = self.resolveDeclaredTypeAt(iface_name, use_site) orelse return null;
         const t = self.store.get(ty);
@@ -27777,7 +27857,7 @@ pub const Checker = struct {
             if (self.ast_ref.nodeTag(sc) == .identifier) {
                 const parent_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(sc));
                 if (parent_name.len > 0) {
-                    if (self.decl_index.primaryDecl(parent_name)) |parent_decl| {
+                    if (self.declAt(parent_name, class_decl)) |parent_decl| {
                         if (self.ast_ref.nodeTag(parent_decl) == .class_decl) {
                             return self.classStaticDirectPropLookup(parent_decl, prop_name);
                         }
