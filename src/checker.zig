@@ -3528,10 +3528,13 @@ pub const Checker = struct {
         {
             const disp_nm = self.requireAliasDisplayName(name) orelse name;
             const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp_nm}) catch return tymod.ID_ANY;
-            if (self.store.typeRef(typeof_name, &.{})) |r| {
-                self.string_pool.append(self.gpa, typeof_name) catch self.gpa.free(typeof_name);
-                return r;
-            } else |_| self.gpa.free(typeof_name);
+            // Pool BEFORE interning: `typeRef` retains the slice, so freeing it
+            // afterwards would leave the stored type pointing at freed memory.
+            self.string_pool.append(self.gpa, typeof_name) catch {
+                self.gpa.free(typeof_name);
+                return tymod.ID_ANY;
+            };
+            if (self.store.typeRef(typeof_name, &.{})) |r| return r else |_| {}
         }
         // CommonJS `module` — tsc shows the module record whose single member is
         // the export object: `{ exports: typeof module.exports; }`.  Gated on the
@@ -3821,9 +3824,9 @@ pub const Checker = struct {
             const nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
             if (nm.len > 0) {
                 if (std.fmt.allocPrint(self.gpa, "typeof {s}", .{nm})) |disp| {
-                    if (self.store.typeRef(disp, &.{})) |r| {
-                        self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
-                        return r;
+                    // Pool BEFORE interning (see `inferIdentifier`).
+                    if (self.string_pool.append(self.gpa, disp)) |_| {
+                        if (self.store.typeRef(disp, &.{})) |r| return r else |_| {}
                     } else |_| self.gpa.free(disp);
                 } else |_| {}
             }
@@ -10148,10 +10151,12 @@ pub const Checker = struct {
         // which the qualified branch above resolves when it can.
         if (!qualified_query and self.localNamespaceHasValueSide(name)) {
             const disp = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return tymod.ID_ANY;
-            if (self.store.typeRef(disp, &.{})) |r| {
-                self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
-                return r;
-            } else |_| self.gpa.free(disp);
+            // Pool BEFORE interning (see `inferIdentifier`).
+            self.string_pool.append(self.gpa, disp) catch {
+                self.gpa.free(disp);
+                return tymod.ID_ANY;
+            };
+            if (self.store.typeRef(disp, &.{})) |r| return r else |_| {}
         }
         if (self.global_value_types.get(name)) |t| return t;
         // `typeof <param>` — a type query on a parameter in scope, e.g.
@@ -20833,7 +20838,11 @@ pub const Checker = struct {
                     const member = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(md.rhs));
                     if (member.len > 0) {
                         const q = std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ root, member }) catch return null;
-                        self.string_pool.append(self.gpa, q) catch self.gpa.free(q);
+                        // Pool BEFORE interning (see `inferIdentifier`).
+                        self.string_pool.append(self.gpa, q) catch {
+                            self.gpa.free(q);
+                            return null;
+                        };
                         return self.store.typeRef(q, &.{}) catch null;
                     }
                 }
@@ -22848,9 +22857,9 @@ pub const Checker = struct {
                 const recv = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(use_site));
                 if (recv.len > 0) {
                     if (std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ recv, member_name })) |disp| {
-                        if (self.store.typeRef(disp, &.{})) |r| {
-                            self.string_pool.append(self.gpa, disp) catch self.gpa.free(disp);
-                            return r;
+                        // Pool BEFORE interning (see `inferIdentifier`).
+                        if (self.string_pool.append(self.gpa, disp)) |_| {
+                            if (self.store.typeRef(disp, &.{})) |r| return r else |_| {}
                         } else |_| self.gpa.free(disp);
                     } else |_| {}
                 }
@@ -25450,7 +25459,11 @@ pub const Checker = struct {
             }
             buf.append(self.gpa, '>') catch break :alias;
             const display = self.gpa.dupe(u8, buf.items) catch break :alias;
-            self.string_pool.append(self.gpa, display) catch self.gpa.free(display);
+            // Pool BEFORE handing the slice to a type (see `inferIdentifier`).
+            self.string_pool.append(self.gpa, display) catch {
+                self.gpa.free(display);
+                break :alias;
+            };
             return self.tagAliasArgs(sub_body, display, new_args);
         }
         switch (t.kind) {
