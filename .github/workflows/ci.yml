@@ -25,15 +25,13 @@ jobs:
           fetch-depth: 1
 
       # Pinned to the exact dev toolchain in build.zig.zon's minimum_zig_version.
-      # If this build is no longer hosted, bump both this and build.zig.zon.
+      # Keep this in step with the toolchain used for development: std moves
+      # under a dev pin, and CI that lags cannot see the breakage (the `zbc`
+      # step below stopped compiling for exactly that reason).
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.607+456b2ec07
-
-      # NOTE: we deliberately run the specific steps below rather than the
-      # default `zig build` — the default step also runs the `zbc` linter, which
-      # currently reports 4 pre-existing false positives and would fail the job.
+          version: 0.17.0-dev.1824+7988f7952
 
       - name: Unit tests
         run: zig build test
@@ -42,3 +40,8 @@ jobs:
       # (match_min / wrong_max / prim_match_min / prim_wrong_max).
       - name: Conformance ratchet (oracle)
         run: zig build test-oracle
+
+      # Static bug checker (memory-lifetime invariants: escape analysis,
+      # use-after-free, double-free, leaks).
+      - name: zbc
+        run: zig build zbc
