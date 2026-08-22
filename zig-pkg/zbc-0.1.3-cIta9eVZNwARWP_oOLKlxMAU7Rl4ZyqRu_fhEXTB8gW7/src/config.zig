@@ -954,8 +954,9 @@ pub fn isEnabled(config: *const Config, inv: Invariant) bool {
 /// unknown names so callers can surface a useful error message
 /// rather than silently ignoring typos.
 pub fn invariantFromName(name: []const u8) ?Invariant {
-    inline for (@typeInfo(Invariant).@"enum".fields) |f| {
-        if (std.mem.eql(u8, name, f.name)) return @enumFromInt(f.value);
+    const info = @typeInfo(Invariant).@"enum";
+    inline for (info.field_names, info.field_values) |fname, fvalue| {
+        if (std.mem.eql(u8, name, fname)) return @enumFromInt(fvalue);
     }
     return null;
 }
@@ -968,9 +969,10 @@ test "Default config defaults" {
 }
 
 test "invariantFromName round-trips every variant" {
-    inline for (@typeInfo(Invariant).@"enum".fields) |f| {
-        const got = invariantFromName(f.name).?;
-        try std.testing.expectEqual(@as(Invariant, @enumFromInt(f.value)), got);
+    const info = @typeInfo(Invariant).@"enum";
+    inline for (info.field_names, info.field_values) |fname, fvalue| {
+        const got = invariantFromName(fname).?;
+        try std.testing.expectEqual(@as(Invariant, @enumFromInt(fvalue)), got);
     }
 }
 

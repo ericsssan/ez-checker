@@ -512,7 +512,7 @@ pub const ProjectCache = struct {
         @memcpy(src[0..src_bytes.len], src_bytes);
         rewriteNonStandardSyntaxInPlace(src);
         // src is now owned by the new entry.
-        var tree = Ast.parse(self.gpa, src, .zig) catch {
+        var tree = Ast.parse(self.gpa, src, .{ .mode = .zig }) catch {
             self.gpa.free(src);
             self.gpa.free(abs_path);
             return null;

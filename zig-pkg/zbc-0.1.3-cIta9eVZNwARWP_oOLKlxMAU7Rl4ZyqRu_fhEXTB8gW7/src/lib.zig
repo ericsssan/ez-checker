@@ -49,7 +49,7 @@ pub fn analyzeEscape(
     @memcpy(src[0..src_bytes.len], src_bytes);
     rewriteNonStandardSyntax(src);
 
-    var tree = try Ast.parse(gpa, src, .zig);
+    var tree = try Ast.parse(gpa, src, .{ .mode = .zig });
     defer tree.deinit(gpa);
 
     var problems: std.ArrayListUnmanaged(Problem) = .empty;
