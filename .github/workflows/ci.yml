@@ -31,7 +31,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.17.0-dev.1824+7988f7952
+          version: 0.17.0-dev.1970+67f39b551
 
       - name: Unit tests
         run: zig build test

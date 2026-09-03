@@ -67,6 +67,10 @@ fn langIdx(l: Language) usize {
         .tsx => 2,
         .js => 3,
         .jsx => 4,
+        // Never produced by `Language.fromExtension`, which is the only
+        // source of `Language` values in this sweep — a caller-constructed
+        // language tag for non-corpus use of es-parser.
+        .js_ts => unreachable,
     };
 }
 
@@ -1223,6 +1227,7 @@ fn groupLang(lang: Language) u8 {
         .ts, .dts => 0, // ts+dts go together
         .tsx => 1,
         .js, .jsx => 2,
+        .js_ts => unreachable, // see langIdx
     };
 }
 
@@ -1235,6 +1240,7 @@ fn combinedLangFor(sections: []const Section, start: usize, end: usize) ?Languag
         switch (lang) {
             .ts, .dts => has_ts = true,
             .tsx => has_tsx = true,
+            .js_ts => unreachable, // see langIdx
             .js, .jsx => has_js = true,
         }
     }
