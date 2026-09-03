@@ -3897,6 +3897,17 @@ pub const Checker = struct {
                     return self.store.typeRef("ImportMeta", &.{}) catch tymod.ID_ANY;
                 return tymod.ID_ANY;
             },
+            // The `target` property-name node inside `new.target` — same
+            // anchoring split as `import.meta` above: tsc types this TOKEN the
+            // same as the whole meta-property expression, so delegate to the
+            // existing `inferNewTarget` (constructor → `typeof ClassName`,
+            // everywhere else the same decline it already applies).
+            .new_target => {
+                const tok = self.ast_ref.nodeMainToken(node);
+                if (std.mem.eql(u8, self.ast_ref.tokenText(tok), "target"))
+                    return self.inferNewTarget(parent);
+                return tymod.ID_ANY;
+            },
             .member_expr, .optional_member_expr => {
                 if (pdata.rhs != node) return tymod.ID_ANY;
                 if (pdata.lhs == .none) return tymod.ID_ANY;
