@@ -24835,17 +24835,28 @@ pub const Checker = struct {
         // whole answer is withheld instead.
         if (sc.bail) return null;
         if (sc.n == 0) return id;
-        // An `import <alias> = <ns>.<member>` in the file gives tsc a shorter
-        // name to print (`im_private_c_private` rather than
-        // `m_private.c_private`), and which alias wins is not a syntactic
-        // property — so a type that NEEDS qualifying isn't answered when one
-        // exists.  Types with nothing to qualify are unaffected.
-        if (self.fileHasImportEqualsAlias()) return null;
         var keys: [8][]const u8 = undefined;
         var vals: [8]TypeId = undefined;
         var k: usize = 0;
         for (sc.names[0..sc.n]) |nm| {
-            const qn = std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ ns_name, nm }) catch continue;
+            // An `import <alias> = <ns>.<member>` in the file gives tsc a
+            // shorter name to print for THIS specific member
+            // (`im_private_c_private` rather than `m_private.c_private`).
+            // `accessibleNameAt` answers this per-entity, gated to a no-op
+            // when no alias names `nm` anywhere; only when one genuinely
+            // competes (and the scope walk is trustworthy) does it differ
+            // from `nm`.
+            const nm_disp: []const u8 = blk: {
+                if (self.declAt(nm, ns_decl)) |d| {
+                    const a = self.accessibleNameAt(d, nm, use_site) orelse return null;
+                    if (!std.mem.eql(u8, a, nm)) break :blk a;
+                }
+                break :blk nm;
+            };
+            const qn = if (nm_disp.ptr == nm.ptr and nm_disp.len == nm.len)
+                std.fmt.allocPrint(self.gpa, "{s}.{s}", .{ ns_name, nm_disp }) catch continue
+            else
+                self.gpa.dupe(u8, nm_disp) catch continue; // an alias already fully names the entity
             const leaf = self.store.typeRef(qn, &.{}) catch {
                 self.gpa.free(qn);
                 continue;
@@ -24922,20 +24933,6 @@ pub const Checker = struct {
             };
             if (dn.len == 0 or !std.mem.eql(u8, dn, name)) continue;
             if (self.nodeIsInside(ni, ns_decl)) return true;
-        }
-        return false;
-    }
-
-    /// Does the file bind any `import <alias> = <path>` (the internal-alias form)?
-    fn fileHasImportEqualsAlias(self: *Checker) bool {
-        const total: u32 = @intCast(self.ast_ref.nodes.len);
-        var i: u32 = 1;
-        while (i < total) : (i += 1) {
-            const ni: NodeIndex = @enumFromInt(i);
-            if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
-            const d = self.ast_ref.nodeData(ni);
-            if (d.lhs != .none or d.rhs == .none) continue;
-            if (self.ast_ref.nodeTag(d.rhs) != .call_expr) return true; // `= Ns.Member`
         }
         return false;
     }
