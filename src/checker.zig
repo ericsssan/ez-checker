@@ -184,6 +184,12 @@ pub const ImportEntry = struct {
     module_specifier: []const u8,
     /// The name exported from the source module (may differ when `import { A as B }`).
     exported_name: []const u8,
+    /// Source position of the specifier that bound this local name.
+    /// `import_map` is a hash map, so iteration order isn't source order —
+    /// `importBoundMoreThanOnce` needs this to pick the EARLIEST of several
+    /// bindings of the same (module, exported_name) pair, matching tsc's
+    /// first-binding-wins display rule.
+    order: u32 = 0,
 };
 
 /// Returns true when a module specifier is a relative path that lacks an explicit
@@ -14813,24 +14819,24 @@ pub const Checker = struct {
                                     const exp_name = self.ast_ref.tokenText(
                                         self.ast_ref.nodeMainToken(spec_d.lhs),
                                     );
-                                    const local_name = self.ast_ref.tokenText(
-                                        self.ast_ref.nodeMainToken(spec_d.rhs),
-                                    );
+                                    const local_tok = self.ast_ref.nodeMainToken(spec_d.rhs);
+                                    const local_name = self.ast_ref.tokenText(local_tok);
                                     try self.known_type_names.put(self.gpa, local_name, {});
                                     try self.import_map.put(self.gpa, local_name, .{
                                         .module_specifier = module_spec,
                                         .exported_name = exp_name,
+                                        .order = self.ast_ref.tokenStart(local_tok),
                                     });
                                 },
                                 .import_default_specifier => {
                                     // data.lhs = local_node; exported name is "default"
-                                    const local_name = self.ast_ref.tokenText(
-                                        self.ast_ref.nodeMainToken(spec_d.lhs),
-                                    );
+                                    const local_tok = self.ast_ref.nodeMainToken(spec_d.lhs);
+                                    const local_name = self.ast_ref.tokenText(local_tok);
                                     try self.known_type_names.put(self.gpa, local_name, {});
                                     try self.import_map.put(self.gpa, local_name, .{
                                         .module_specifier = module_spec,
                                         .exported_name = "default",
+                                        .order = self.ast_ref.tokenStart(local_tok),
                                     });
                                 },
                                 .import_namespace_specifier => {
@@ -24079,12 +24085,10 @@ pub const Checker = struct {
             .entity => blk: {
                 _ = self.importedEntityDeclaredName(local) orelse return null;
                 // A symbol bound more than once in the file is displayed by its
-                // FIRST binding, which syntax alone doesn't settle (`import
-                // { Member } …; import { Member as M } …` types BOTH as `typeof
-                // Member`, while a lone `import { a11 as b }` types both as
-                // `typeof b`).  Same rule the require-alias display declines.
-                if (self.importBoundMoreThanOnce(local)) return null;
-                break :blk local;
+                // FIRST binding (source order): `import { Member } …; import
+                // { Member as M } …` types BOTH as `typeof Member` — same rule
+                // `requireAliasDisplayName` applies for require-aliases.
+                break :blk self.firstBoundLocal(local) orelse return null;
             },
         };
         const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{shown}) catch return null;
@@ -24162,19 +24166,37 @@ pub const Checker = struct {
         return null;
     }
 
-    /// Is the local binding `local` one of SEVERAL imports of the same symbol?
-    fn importBoundMoreThanOnce(self: *Checker, local: []const u8) bool {
-        const entry = self.import_map.get(local) orelse return false;
+    /// The local name of the EARLIEST-declared import binding sharing `local`'s
+    /// (module, exported_name) pair — `local` itself when it IS that earliest
+    /// binding, which is the overwhelming majority (nothing else imports the
+    /// same entity under a different name). `import_map` is a hash map, so
+    /// iteration order isn't source order; `ImportEntry.order` (a byte
+    /// position, stamped where the map is populated) is what makes "earliest"
+    /// answerable at all.
+    ///
+    /// `default`-exported bindings decline outright rather than pick a
+    /// winner: whether a `default` re-export names the SAME symbol as an
+    /// explicit `{ Name }` import of the identical module needs the OTHER
+    /// module's own symbol identity, which this checker doesn't have.
+    fn firstBoundLocal(self: *Checker, local: []const u8) ?[]const u8 {
+        const entry = self.import_map.get(local) orelse return null;
         var it = self.import_map.iterator();
+        var best_name = local;
+        var best_order = entry.order;
         var n: u32 = 0;
         while (it.next()) |e| {
             const v = e.value_ptr.*;
             if (!std.mem.eql(u8, v.exported_name, entry.exported_name)) continue;
             if (!std.mem.eql(u8, v.module_specifier, entry.module_specifier)) continue;
             n += 1;
-            if (n > 1) return true;
+            if (v.order < best_order) {
+                best_order = v.order;
+                best_name = e.key_ptr.*;
+            }
         }
-        return false;
+        if (n <= 1) return local; // no competing binding at all
+        if (std.mem.eql(u8, entry.exported_name, "default")) return null;
+        return best_name;
     }
 
     /// Is `node` inside an `import type … ` declaration?  A type-only import
