@@ -593,6 +593,14 @@ const DeclIndex = struct {
     /// merges into the primary kept in `type_decl_nodes`.
     const Merged = struct { name: []const u8, node: NodeIndex };
 
+    /// One `import <local> = <A.B.C>` internal-alias binding — the import-equals
+    /// form `require_aliases` never sees (its `rhs` is not a `call_expr`).
+    /// `tail` is the RIGHTMOST segment of the target path: the entity the alias
+    /// actually names (`c` for `import a = m.c`). Single-segment only — an alias
+    /// chain (`import b = a.c` where `a` is itself an alias) is not resolved
+    /// through here; see `aliasTargetDecl`.
+    const AliasDecl = struct { node: NodeIndex, local: []const u8, tail: []const u8 };
+
     gpa: std.mem.Allocator,
 
     /// name → AST node of the *primary* declaration, so `resolveTypeRef` can
@@ -625,6 +633,14 @@ const DeclIndex = struct {
     /// primary — two-block enum merging, ordered so source order = extras… primary.
     merged_enum_extra: std.ArrayListUnmanaged(Merged) = .empty,
 
+    /// Every internal alias in the file, in SOURCE order — relies on the same
+    /// ascending-node-index scan invariant `type_decls_by_name`'s own doc
+    /// comment already depends on ("all lexical scopes, source order").
+    alias_decls: std.ArrayListUnmanaged(AliasDecl) = .empty,
+    /// Target tail-segment name → indices into `alias_decls`, source order.
+    /// The candidate list `accessibleNameAt`'s scope walk searches.
+    alias_by_tail: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)) = .empty,
+
     fn deinit(self: *DeclIndex) void {
         self.type_decl_nodes.deinit(self.gpa);
         {
@@ -641,6 +657,30 @@ const DeclIndex = struct {
         self.merged_iface_extra.deinit(self.gpa);
         self.merged_ns_extra.deinit(self.gpa);
         self.merged_enum_extra.deinit(self.gpa);
+        self.alias_decls.deinit(self.gpa);
+        {
+            var ait = self.alias_by_tail.valueIterator();
+            while (ait.next()) |list| list.deinit(self.gpa);
+            self.alias_by_tail.deinit(self.gpa);
+        }
+    }
+
+    /// Register one `import <local> = <path>` internal alias, `path`'s
+    /// rightmost segment being `tail`. Call sites append in ascending AST-node
+    /// order, so `alias_decls`/`alias_by_tail`'s lists come out in source order
+    /// with no separate sort.
+    fn registerAlias(self: *DeclIndex, local: []const u8, tail: []const u8, node: NodeIndex) void {
+        const idx: u32 = @intCast(self.alias_decls.items.len);
+        self.alias_decls.append(self.gpa, .{ .node = node, .local = local, .tail = tail }) catch return;
+        const gop = self.alias_by_tail.getOrPut(self.gpa, tail) catch return;
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
+        gop.value_ptr.append(self.gpa, idx) catch {};
+    }
+
+    /// Every alias declared anywhere in the file that names `tail` (by value,
+    /// exact wrapper over `.get`, mirroring `allTypeDecls`).
+    fn aliasesNaming(self: *const DeclIndex, tail: []const u8) ?std.ArrayListUnmanaged(u32) {
+        return self.alias_by_tail.get(tail);
     }
 
     /// Primary declaration node for `name` (exact wrapper over `.get`).
@@ -14731,6 +14771,26 @@ pub const Checker = struct {
                                     try self.namespace_import_map.put(self.gpa, local_name, spec);
                                 }
                             }
+                        } else if (data.rhs != .none) {
+                            // `import X = A.B.C;` (internal alias, non-require):
+                            // register it in the alias index (see DeclIndex —
+                            // `accessibleNameAt` consults this to answer "does
+                            // this entity print by its own name or a nearer/
+                            // earlier alias's name"). Deliberately does NOT
+                            // touch `known_type_names`/`namespace_import_map` —
+                            // those affect `error_t` resolution and other
+                            // existing behavior; this index is display-only.
+                            const local_tok = self.ast_ref.nodeMainToken(ni) + 1;
+                            if (local_tok < self.ast_ref.tokens.len) {
+                                var lt = local_tok;
+                                if (std.mem.eql(u8, self.ast_ref.tokenText(lt), "type")) lt += 1;
+                                const local_name = self.ast_ref.tokenText(lt);
+                                if (local_name.len > 0) {
+                                    if (self.rightmostNameOf(data.rhs)) |tail| {
+                                        self.decl_index.registerAlias(local_name, tail, ni);
+                                    }
+                                }
+                            }
                         }
                         continue;
                     }
@@ -17100,6 +17160,132 @@ pub const Checker = struct {
             return b;
         }
         return primary;
+    }
+
+    /// The name `decl` (already resolved — e.g. via `declAt`) is displayed
+    /// under, when referenced from `use_site`: its own name, or a nearer or
+    /// earlier `import X = A.B` internal alias's local name.
+    ///
+    /// tsc's rule, verified against three corpus baselines (documented in
+    /// the project plan): within one lexical scope, (1) the entity's own
+    /// direct declaration in that scope always wins over an alias, even one
+    /// declared earlier in the same scope; (2) else the FIRST alias (source
+    /// order) in that scope naming the entity wins; (3) else step out to the
+    /// enclosing scope and repeat.
+    ///
+    /// Strict refinement: a file where no alias names `own_name` anywhere
+    /// returns `own_name` immediately, with no scope walk at all — the
+    /// overwhelming majority of files. Returns null only when the walk is
+    /// untrustworthy (a dotted-header scope key — see ScopeTree's `'{'` bug,
+    /// fixed for direct declarations but not yet proven safe for this walk)
+    /// or the alias chain doesn't resolve; callers keep their existing gap.
+    fn accessibleNameAt(self: *Checker, decl: NodeIndex, own_name: []const u8, use_site: NodeIndex) ?[]const u8 {
+        const cands = self.decl_index.aliasesNaming(own_name) orelse return own_name;
+        if (use_site == .none) return own_name;
+        var lb: [192]u8 = undefined;
+        var key = self.scope_tree.namespaceScopeKey(use_site, &lb);
+        if (std.mem.indexOfScalar(u8, key, '{') != null) return null;
+        var kb: [192]u8 = undefined;
+        while (true) {
+            if (self.symbol_table.typeDecls(own_name, key)) |g| {
+                for (g.items) |d| if (self.sameEntity(d, decl)) return own_name;
+            }
+            for (cands.items) |ai| {
+                const a = self.decl_index.alias_decls.items[ai];
+                if (!std.mem.eql(u8, self.scope_tree.namespaceScopeKey(a.node, &kb), key)) continue;
+                const t = self.aliasTargetDecl(ai, 0) orelse continue;
+                if (self.sameEntity(t, decl)) return a.local;
+            }
+            if (key.len == 0) break;
+            key = if (std.mem.lastIndexOfScalar(u8, key, '.')) |dot| key[0..dot] else key[0..0];
+        }
+        return own_name;
+    }
+
+    /// Resolve one internal alias (`decl_index.alias_decls[alias_idx]`) to its
+    /// ultimate declaration, walking its full target path (`import a = m.c` ->
+    /// the declaration of `c` inside `m`), not just the rightmost segment —
+    /// `alias_by_tail` indexes by tail alone, which is enough to find
+    /// CANDIDATE aliases quickly, but resolving one requires the whole path so
+    /// `import a = m.c; import a2 = other.c;` don't get confused.
+    ///
+    /// Bounded depth 3 (alias-of-alias chains) with a per-call visited set to
+    /// break a self-referential cycle (`import A = B; import B = A;`),
+    /// matching this file's other recursion guards (`nodeIsInside`: 256,
+    /// `enclosingNamespaceDecl`: 128).
+    fn aliasTargetDecl(self: *Checker, alias_idx: u32, depth: u8) ?NodeIndex {
+        if (depth > 3) return null;
+        const a = self.decl_index.alias_decls.items[alias_idx];
+        var segs: [4][]const u8 = undefined;
+        const n = self.aliasPathSegments(a.node, &segs) orelse return null;
+        if (n == 0) return null;
+        var cur = self.declAt(segs[0], a.node) orelse return null;
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            switch (self.ast_ref.nodeTag(cur)) {
+                .ts_namespace_decl, .ts_module_decl => {},
+                .import_decl => {
+                    // Alias-of-alias mid-chain: not reachable in v1 (the
+                    // registration walk below stops at the first import_decl
+                    // it would need to recurse through) — declared
+                    // unsupported rather than silently mishandled.
+                    return null;
+                },
+                else => return null,
+            }
+            cur = self.nsMemberStmt(cur, segs[i]) orelse return null;
+        }
+        if (self.ast_ref.nodeTag(cur) != .import_decl) return cur;
+        // The root segment itself resolved to another alias's binding
+        // identifier — `declAt` doesn't return `import_decl` nodes today (see
+        // the project plan's "declAt stays untouched" decision), so this arm
+        // is unreachable in practice; kept as a documented non-goal rather
+        // than assumed impossible.
+        return null;
+    }
+
+    /// The segments of an `import X = A.B.C` target path, OUTERMOST (root)
+    /// first, written into `out`. Returns the count, or null if the chain is
+    /// deeper than `out.len` or doesn't terminate in a plain identifier root
+    /// (an instantiated or otherwise-shaped reference — declines rather than
+    /// guesses).
+    fn aliasPathSegments(self: *Checker, node: NodeIndex, out: *[4][]const u8) ?usize {
+        var rev: [4][]const u8 = undefined;
+        var n: usize = 0;
+        var cur = node;
+        var guard: u8 = 0;
+        while (guard < 8) : (guard += 1) {
+            switch (self.ast_ref.nodeTag(cur)) {
+                .member_expr, .optional_member_expr => {
+                    const d = self.ast_ref.nodeData(cur);
+                    if (d.rhs == .none or n >= rev.len) return null;
+                    rev[n] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.rhs));
+                    n += 1;
+                    cur = d.lhs;
+                },
+                .identifier => {
+                    if (n >= rev.len) return null;
+                    rev[n] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cur));
+                    n += 1;
+                    var i: usize = 0;
+                    while (i < n) : (i += 1) out[i] = rev[n - 1 - i];
+                    return n;
+                },
+                else => return null,
+            }
+        }
+        return null;
+    }
+
+    /// Two nodes name the same entity. Both `decl` (a caller's already-resolved
+    /// declaration — typically itself the output of `declAt`/`typeDeclAt`) and
+    /// `aliasTargetDecl`'s result (via `declAt` for its root segment) are
+    /// already canonicalized toward `primaryDecl` for merged declarations by
+    /// `declAt` itself, so direct equality is correct here without a second
+    /// canonicalization pass.
+    fn sameEntity(self: *Checker, a: NodeIndex, b: NodeIndex) bool {
+        _ = self;
+        return a == b;
     }
 
     fn resolveDeclaredTypeInScope(self: *Checker, name: []const u8, use_site: NodeIndex) ?TypeId {
