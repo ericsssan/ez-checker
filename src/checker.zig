@@ -3893,7 +3893,12 @@ pub const Checker = struct {
         }
         const prop_nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
         if (prop_nm.len == 0) return base;
-        const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ recv_nm, prop_nm }) catch return base;
+        // The receiver may itself display through an EARLIER alias of the same
+        // module (see requireAliasDisplayName) — use that name, not the raw
+        // receiver token, or a second alias's member access would print the
+        // wrong prefix once the identifier lever starts doing so too.
+        const recv_disp = self.requireAliasDisplayName(recv_nm) orelse recv_nm;
+        const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ recv_disp, prop_nm }) catch return base;
         const r = self.store.typeRef(disp, &.{}) catch {
             self.gpa.free(disp);
             return base;
@@ -23105,24 +23110,55 @@ pub const Checker = struct {
         return self.requireAliasDisplayName(name) != null;
     }
 
-    /// The name tsc displays for a resolvable require-alias's module — its own
-    /// local name, but ONLY when it is the module's sole binding in the program.
+    /// The name tsc displays for a resolvable require-alias's module — the
+    /// EARLIEST require-alias's own local name, among every require-alias of
+    /// that module WITHIN ITS OWN SECTION.
     ///
-    /// When a module is bound more than once the display is the symbol's
-    /// canonical name, which is not recoverable from syntax: `import * as a1
-    /// from "./a"; import a2 = require("./a")` types `a2` as `typeof a1`
-    /// (importsImplicitlyReadonly), yet the same shape in unusedImports11 types
-    /// `r` as `typeof r`, and nodeModules1's esm/cjs views of one file are
-    /// distinct symbols again.  Multiply-bound modules therefore stay a gap
-    /// rather than a guess.
+    /// Two things this is not, both found by direct corpus verification
+    /// rather than assumed:
+    ///
+    ///   * Module identity is scoped PER SECTION, not just by resolved source
+    ///     pointer. The oracle concatenates a multi-file test's `@Filename`
+    ///     sections into one AST, so `importDecl.types`'s three files each
+    ///     independently bind the same `./importDecl_require` under `m4` /
+    ///     `m4` / `multiImport_m4` — one binding per section, never
+    ///     ambiguous — but the resolved-source-pointer identity is IDENTICAL
+    ///     across sections (same target file), so counting bindings by
+    ///     pointer alone miscounted three independent single-bindings as one
+    ///     module bound three times and declined all of them.
+    ///
+    ///   * When more than one require-alias in the SAME section binds the
+    ///     same module, the display is the EARLIEST one's name for every
+    ///     later alias too (`import m4 = require(...); import multiImport_m4
+    ///     = require(...);` inside one section both display `typeof m4`) —
+    ///     but ONLY among require-aliases. A require-alias competing with an
+    ///     `import * as ns` binding of the SAME module is a genuine,
+    ///     unresolved ambiguity: `importsImplicitlyReadonly` (`import * as
+    ///     a1 from "./a"; import a2 = require("./a")`) types `a2` as `typeof
+    ///     a1` (the namespace-import wins), while the identical shape in
+    ///     `unusedImports11` (`import * as ns from './b'; import r =
+    ///     require('./b')`) types `r` as `typeof r` (the require-alias wins)
+    ///     — no discriminator recovers which. Mixed-kind competition
+    ///     therefore still declines entirely; only same-kind (require vs.
+    ///     require) ordering is resolved.
     fn requireAliasDisplayName(self: *Checker, name: []const u8) ?[]const u8 {
         if (name.len == 0) return null;
         if (!self.require_alias_built) {
             self.require_alias_built = true;
-            // Module identity is the resolved source SLICE: two specifiers that
-            // reach the same section (`"./subfolder"` / `"./subfolder/"`) return
-            // the same bytes, so the pointer identifies the module.
-            var binds: std.AutoHashMapUnmanaged(usize, u32) = .empty;
+            // Module identity is `(section, resolved source SLICE pointer)`:
+            // two specifiers that reach the same section (`"./subfolder"` /
+            // `"./subfolder/"`) return the same bytes, so the pointer
+            // identifies the module; the section keeps that identity from
+            // leaking across independently-bound `@Filename` blocks. `sec` is
+            // 0 uniformly when `module_files` is empty (ordinary single-file
+            // sweep), preserving the exact prior single-file behavior.
+            const SecMod = struct { sec: u32, mod: usize };
+            const Info = struct {
+                first_require_name: ?[]const u8 = null,
+                first_require_pos: u32 = std.math.maxInt(u32),
+                saw_other_kind: bool = false,
+            };
+            var binds: std.AutoHashMapUnmanaged(SecMod, Info) = .empty;
             defer binds.deinit(self.gpa);
             const total: u32 = @intCast(self.ast_ref.nodes.len);
             var i: u32 = 1;
@@ -23131,9 +23167,19 @@ pub const Checker = struct {
                 if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
                 const b = self.importDeclBinding(ni) orelse continue;
                 const src = self.resolvedModuleSpecSource(b.spec) orelse continue;
-                const gop = binds.getOrPut(self.gpa, @intFromPtr(src.ptr)) catch continue;
-                if (!gop.found_existing) gop.value_ptr.* = 0;
-                gop.value_ptr.* += 1;
+                const sec: u32 = if (self.sectionOfNode(ni)) |mf| mf.start else 0;
+                const key = SecMod{ .sec = sec, .mod = @intFromPtr(src.ptr) };
+                const gop = binds.getOrPut(self.gpa, key) catch continue;
+                if (!gop.found_existing) gop.value_ptr.* = .{};
+                if (!b.is_require) {
+                    gop.value_ptr.saw_other_kind = true;
+                    continue;
+                }
+                const pos = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(ni));
+                if (pos < gop.value_ptr.first_require_pos) {
+                    gop.value_ptr.first_require_pos = pos;
+                    gop.value_ptr.first_require_name = b.name;
+                }
             }
             i = 1;
             while (i < total) : (i += 1) {
@@ -23142,10 +23188,15 @@ pub const Checker = struct {
                 const b = self.importDeclBinding(ni) orelse continue;
                 if (!b.is_require) continue;
                 if (!self.requireSpecResolves(b.spec, ni)) continue;
+                var disp = b.name;
                 if (self.resolvedModuleSpecSource(b.spec)) |src| {
-                    if ((binds.get(@intFromPtr(src.ptr)) orelse 1) > 1) continue;
+                    const sec: u32 = if (self.sectionOfNode(ni)) |mf| mf.start else 0;
+                    if (binds.get(SecMod{ .sec = sec, .mod = @intFromPtr(src.ptr) })) |info| {
+                        if (info.saw_other_kind) continue; // genuine mixed-kind ambiguity
+                        disp = info.first_require_name orelse b.name;
+                    }
                 }
-                self.require_aliases.put(self.gpa, b.name, b.name) catch {};
+                self.require_aliases.put(self.gpa, b.name, disp) catch {};
             }
         }
         return self.require_aliases.get(name);
