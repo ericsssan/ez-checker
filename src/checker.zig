@@ -23861,11 +23861,19 @@ pub const Checker = struct {
         // that reference `any` (classExtendingQualifiedName).
         if (!self.declIsExported(d)) return false;
         // The bare name is only the minimal one while it is UNAMBIGUOUS
-        // (declFileWithClassNameConflictingWithClassInNamespace has two `W`s and
-        // tsc falls back to `base.W`), and an imported binding of the same name
-        // has its own display rules.
+        // (declFileWithClassNameConflictingWithClassReferredByExtendsClause has
+        // classes named `W` in two entirely UNRELATED namespace trees — no
+        // outward walk from either use site ever reaches the other, so
+        // `accessibleNameAt` alone can't see the conflict; `classNameIsUnique`'s
+        // whole-program scan is still required for that), and an imported
+        // binding of the same name has its own display rules.
         if (self.import_map.get(name) != null or self.namespace_import_map.get(name) != null) return false;
-        return self.classNameIsUnique(name);
+        if (!self.classNameIsUnique(name)) return false;
+        // ADDITIONALLY: an internal `import Y = Ns.C` alias `siblingNamespaceClass`
+        // never considered before can be nearer or earlier than `C`'s own name
+        // even when `C` is otherwise unique.
+        const disp = self.accessibleNameAt(d, name, use_site) orelse return false;
+        return std.mem.eql(u8, disp, name);
     }
 
     /// Does an `export` modifier precede this declaration?
@@ -24039,12 +24047,16 @@ pub const Checker = struct {
     /// An opaque `typeof <name>` ref, pooled.
     fn typeofRef(self: *Checker, name: []const u8) ?TypeId {
         const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{name}) catch return null;
-        const r = self.store.typeRef(tn, &.{}) catch {
+        // Pool BEFORE interning: `typeRef` retains the slice, so freeing it
+        // afterwards (on an interning failure) would leave the stored type
+        // pointing at freed memory once the pool's copy was gone too — the same
+        // ordering already fixed at every other display-leaf builder in this
+        // file (see `inferIdentifier`'s require-alias display, 8d981c2).
+        self.string_pool.append(self.gpa, tn) catch {
             self.gpa.free(tn);
             return null;
         };
-        self.string_pool.append(self.gpa, tn) catch self.gpa.free(tn);
-        return r;
+        return self.store.typeRef(tn, &.{}) catch null;
     }
 
     const ImportBindingKind = enum { namespace, entity };
