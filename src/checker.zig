@@ -382,7 +382,33 @@ const ScopeTree = struct {
             var name: []const u8 = "";
             if (kind == .namespace or kind == .module) {
                 const d = self.ast.nodeData(ni);
-                if (d.lhs != .none) name = self.ast.tokenText(self.ast.nodeMainToken(d.lhs));
+                if (d.lhs != .none) {
+                    if (self.ast.nodeTag(d.lhs) == .member_expr) {
+                        // Dotted header (`namespace A.B.C {}`): the parser sets
+                        // this node's own main_token to whatever comes AFTER the
+                        // last segment (`{` or a further `.` — see
+                        // parseNamespaceOrModule in es_parser's typescript.zig,
+                        // `main_token = p.tokIdx()` called post-advance), so
+                        // `tokenText` on it is never the name. The real name is
+                        // the literal SOURCE SPAN from the root identifier
+                        // through the last segment's property token — a single
+                        // dotted namespace has exactly one scope node for its
+                        // whole path, so this scope's name must be the FULL
+                        // "A.B.C", not just the last segment.
+                        var root = d.lhs;
+                        while (self.ast.nodeTag(root) == .member_expr) root = self.ast.nodeData(root).lhs;
+                        const outer = self.ast.nodeData(d.lhs);
+                        if (outer.rhs != .none) {
+                            const root_tok = self.ast.nodeMainToken(root);
+                            const last_tok = self.ast.nodeMainToken(outer.rhs);
+                            const s = self.ast.tokenStart(root_tok);
+                            const e = self.ast.tokenStart(last_tok) + self.ast.tokens.items(.len)[last_tok];
+                            if (s < e and e <= self.ast.source.len) name = self.ast.source[s..e];
+                        }
+                    } else {
+                        name = self.ast.tokenText(self.ast.nodeMainToken(d.lhs));
+                    }
+                }
             }
             const idx: u32 = @intCast(self.scopes.items.len);
             try self.scopes.append(self.gpa, .{ .kind = kind, .parent = 0, .name = name });
