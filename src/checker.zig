@@ -23216,20 +23216,41 @@ pub const Checker = struct {
     /// `typeof`.
     fn localNamespaceMemberValue(self: *Checker, ns_root: []const u8, prop_name: []const u8, use_site: NodeIndex) ?TypeId {
         if (ns_root.len == 0 or prop_name.len == 0) return null;
-        // Restrict to TOP-LEVEL namespaces accessed from a TOP-LEVEL use-site.
-        // For nested namespaces (or references from inside a namespace), tsc
-        // displays the symbol minimally-qualified relative to the use site
-        // (`A.B.C.E` → `typeof E`), which our simple full-path display can't
-        // reproduce — so we cap at the unambiguous case.
+        // Restrict to TOP-LEVEL namespace ROOTS. `A.B.C.E`'s multi-segment
+        // form needs a multi-segment answer this function doesn't build.
         if (std.mem.indexOfScalar(u8, ns_root, '.') != null) return null;
-        if (self.nodeInsideNamespace(use_site)) return null;
         // A heritage clause (`class X extends Ns.C`) or other bare-name position
         // shows the reference by its plain qualified name (`Ns.C`), not `typeof`.
         if (self.identifierInBareNamePosition(use_site)) return null;
+        // A generic instantiation (`extends Ns.C<string>`, `new Ns.C<string>`)
+        // is typed as the INSTANCE (with its type args), never `typeof` —
+        // same reasoning as `heritageBaseOwner`'s own
+        // `ts_instantiation_expr => return null` branch. Checked locally
+        // (not folded into `identifierInBareNamePosition`, which other call
+        // sites rely on for a narrower "bare name" question only).
+        if (self.parentIsInstantiationExpr(use_site)) return null;
         const ns_decl = self.declAt(ns_root, use_site) orelse return null;
         const dt = self.ast_ref.nodeTag(ns_decl);
         if (dt != .ts_namespace_decl and dt != .ts_module_decl) return null;
         if (!self.namespaceIsTopLevel(ns_decl)) return null;
+        // A use site INSIDE `ns_decl` ITSELF may need a display SHORTER than
+        // `ns_root.prop_name` (even bare `prop_name`, per tsc's minimal-
+        // qualification rule: `A.B.C.E` referenced from inside `A` can shrink
+        // all the way down) — this function only ever builds the full
+        // qualified form, so that specific case still declines. A use site
+        // inside some OTHER namespace (sibling or unrelated) is not shortened
+        // this way; `ns_root.prop_name` (or an alias's name in its place)
+        // remains the correct answer there.
+        if (self.nodeIsInside(use_site, ns_decl)) return null;
+        // A declaration-MERGED block of the same namespace name shares its
+        // scope with `ns_decl` (`namespace m1 {...} namespace m1 {...}` is one
+        // logical scope) — a use site inside ANY block of it hits the same
+        // "may need a shorter answer" case just described, not only `ns_decl`
+        // itself.
+        for (self.decl_index.merged_ns_extra.items) |e| {
+            if (!std.mem.eql(u8, e.name, ns_root)) continue;
+            if (self.nodeIsInside(use_site, e.node)) return null;
+        }
         var member = self.nsMemberStmt(ns_decl, prop_name);
         if (member == null) {
             for (self.decl_index.merged_ns_extra.items) |e| {
@@ -23245,7 +23266,11 @@ pub const Checker = struct {
         // minimally-qualified / import-alias-sensitive and cascades wrongly.
         if (self.ast_ref.nodeTag(m) != .class_decl) return null;
         const base = self.buildClassStaticType(m, prop_name);
-        const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ ns_root, prop_name }) catch return null;
+        // The namespace itself may print through a nearer or earlier internal
+        // alias (`import Y = Ns;`) rather than its own name — same rule every
+        // other site in this project applies.
+        const prefix = self.accessibleNameAt(ns_decl, ns_root, use_site) orelse return null;
+        const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ prefix, prop_name }) catch return null;
         self.string_pool.append(self.gpa, disp) catch {
             self.gpa.free(disp);
             return null;
@@ -23937,6 +23962,41 @@ pub const Checker = struct {
                 .export_named, .export_specifier, .export_named_from,
                 .export_default_expr, .export_default_class, .export_default_fn,
                 => return true,
+                else => return false,
+            }
+            p = parents[p];
+        }
+        return false;
+    }
+
+    /// Is `node` (an identifier) inside a member-expr chain that is a HERITAGE
+    /// superclass with explicit type args (`class X extends Ns.C<string>`)?
+    /// That prints as the instance (with its args), never `typeof` — same
+    /// case `heritageBaseOwner` excludes.  Deliberately narrower than "any
+    /// `ts_instantiation_expr` ancestor": `new Ns.C<string>()`'s callee
+    /// `Ns.C` is instantiated too, but the callee itself still denotes the
+    /// constructor value (`typeof Ns.C`), so that case must NOT decline here
+    /// (`genericClassesInModule.ts`'s `new Foo.B<Foo.A>()` is the verified
+    /// counter-example).
+    fn parentIsInstantiationExpr(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        var p = if (node.toInt() < parents.len) parents[node.toInt()] else NONE;
+        var guard: u8 = 0;
+        var saw_instantiation = false;
+        while (p != NONE and p < parents.len and p < self.ast_ref.nodes.len and guard < 6) : (guard += 1) {
+            const tag = self.ast_ref.nodeTag(@enumFromInt(p));
+            switch (tag) {
+                .member_expr, .optional_member_expr, .grouping_expr => {},
+                .ts_instantiation_expr => saw_instantiation = true,
+                .class_decl => {
+                    if (!saw_instantiation) return false;
+                    const pd = self.ast_ref.nodeData(@enumFromInt(p));
+                    if (pd.lhs == .none) return false;
+                    const cd = self.ast_ref.extraData(ast.ClassData, @intFromEnum(pd.lhs));
+                    return cd.super_class.toInt() < parents.len and
+                        self.nodeIsInside(node, cd.super_class);
+                },
                 else => return false,
             }
             p = parents[p];
