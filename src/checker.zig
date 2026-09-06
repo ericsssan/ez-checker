@@ -17199,7 +17199,7 @@ pub const Checker = struct {
             for (cands.items) |ai| {
                 const a = self.decl_index.alias_decls.items[ai];
                 if (!std.mem.eql(u8, self.scope_tree.namespaceScopeKey(a.node, &kb), key)) continue;
-                const t = self.aliasTargetDecl(ai, 0) orelse continue;
+                const t = self.aliasTargetDecl(ai) orelse continue;
                 if (self.sameEntity(t, decl)) return a.local;
             }
             if (key.len == 0) break;
@@ -17215,12 +17215,11 @@ pub const Checker = struct {
     /// CANDIDATE aliases quickly, but resolving one requires the whole path so
     /// `import a = m.c; import a2 = other.c;` don't get confused.
     ///
-    /// Bounded depth 3 (alias-of-alias chains) with a per-call visited set to
-    /// break a self-referential cycle (`import A = B; import B = A;`),
-    /// matching this file's other recursion guards (`nodeIsInside`: 256,
-    /// `enclosingNamespaceDecl`: 128).
-    fn aliasTargetDecl(self: *Checker, alias_idx: u32, depth: u8) ?NodeIndex {
-        if (depth > 3) return null;
+    /// Does NOT chase an alias-of-alias chain (`import a = m.c; import b =
+    /// a;` doesn't resolve `b`) — the loop below hits `import_decl` mid-walk
+    /// and declines outright rather than recursing into it. Single-hop only,
+    /// consistent with `aliasPathSegments`' bound of 4 path segments.
+    fn aliasTargetDecl(self: *Checker, alias_idx: u32) ?NodeIndex {
         const a = self.decl_index.alias_decls.items[alias_idx];
         var segs: [4][]const u8 = undefined;
         const n = self.aliasPathSegments(a.node, &segs) orelse return null;
