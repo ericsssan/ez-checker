@@ -646,6 +646,11 @@ const DeclIndex = struct {
     /// Target tail-segment name → indices into `alias_decls`, source order.
     /// The candidate list `accessibleNameAt`'s scope walk searches.
     alias_by_tail: std.StringHashMapUnmanaged(std.ArrayListUnmanaged(u32)) = .empty,
+    /// `import_decl` node (as `u32`) → its index in `alias_decls`. Lets a
+    /// caller holding the declaration node (e.g. `internalAliasValueType`,
+    /// walked to via a symbol's decl node) find its alias entry in O(1)
+    /// instead of a linear scan of `alias_decls`.
+    alias_by_node: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 
     fn deinit(self: *DeclIndex) void {
         self.type_decl_nodes.deinit(self.gpa);
@@ -669,6 +674,7 @@ const DeclIndex = struct {
             while (ait.next()) |list| list.deinit(self.gpa);
             self.alias_by_tail.deinit(self.gpa);
         }
+        self.alias_by_node.deinit(self.gpa);
     }
 
     /// Register one `import <local> = <path>` internal alias, `path`'s
@@ -681,6 +687,7 @@ const DeclIndex = struct {
         const gop = self.alias_by_tail.getOrPut(self.gpa, tail) catch return;
         if (!gop.found_existing) gop.value_ptr.* = .empty;
         gop.value_ptr.append(self.gpa, idx) catch {};
+        self.alias_by_node.put(self.gpa, node.toInt(), idx) catch {};
     }
 
     /// Every alias declared anywhere in the file that names `tail` (by value,
@@ -3153,17 +3160,18 @@ pub const Checker = struct {
                     if (ns_name.len > 0) {
                         // A nearer or earlier `import <alias> = <ns_name>` in
                         // scope prints in this reference's place instead of
-                        // the entity's own name — gated to a no-op when no
-                        // alias names `ns_name` anywhere in the file. Skipped
-                        // for a member-access receiver (`isMemberAccessReceiver`) —
-                        // that position keeps its own written name instead.
+                        // the entity's own name — gated to a no-op when the
+                        // file has no internal aliases at all (the common
+                        // case; `accessibleNameAt` would reach the same
+                        // no-op via `aliasesNaming`, but checking here skips
+                        // the `declAt` lookup too). Also skipped for a
+                        // member-access receiver (`identifierIsMemberObject`)
+                        // — that position keeps its own written name instead.
                         const disp = blk: {
-                            if (!self.isMemberAccessReceiver(node)) {
-                                if (self.declAt(ns_name, node)) |d| {
-                                    break :blk self.accessibleNameAt(d, ns_name, node) orelse ns_name;
-                                }
-                            }
-                            break :blk ns_name;
+                            if (self.decl_index.alias_decls.items.len == 0) break :blk ns_name;
+                            if (self.identifierIsMemberObject(node)) break :blk ns_name;
+                            const d = self.declAt(ns_name, node) orelse break :blk ns_name;
+                            break :blk self.accessibleNameAt(d, ns_name, node) orelse ns_name;
                         };
                         const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp}) catch return tymod.ID_ANY;
                         return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
@@ -17238,7 +17246,9 @@ pub const Checker = struct {
 
     /// Resolve one internal alias (`decl_index.alias_decls[alias_idx]`) to its
     /// ultimate declaration — SINGLE-SEGMENT targets only (`import a = M;`),
-    /// never `import a = m.c;`.
+    /// never `import a = m.c;`: a bare `.identifier` `rhs` is accepted
+    /// directly, anything else (a dotted `member_expr` path, a `require()`
+    /// call, ...) declines.
     ///
     /// A multi-segment target's own minimal-qualified name is itself a
     /// DOTTED path (`m.c`), which `accessibleNameAt`'s callers can only ever
@@ -17253,53 +17263,15 @@ pub const Checker = struct {
     fn aliasTargetDecl(self: *Checker, alias_idx: u32) ?NodeIndex {
         const a = self.decl_index.alias_decls.items[alias_idx];
         // `a.node` is the `import_decl` ITSELF (kept for scope-key lookups
-        // elsewhere) — the path expression to walk is its `rhs`.
+        // elsewhere) — the path expression to check is its `rhs`.
         const rhs = self.ast_ref.nodeData(a.node).rhs;
-        if (rhs == .none) return null;
-        var segs: [4][]const u8 = undefined;
-        const n = self.aliasPathSegments(rhs, &segs) orelse return null;
-        if (n != 1) return null;
-        const cur = self.declAt(segs[0], a.node) orelse return null;
-        // The root segment itself resolved to another alias's binding
-        // identifier — `declAt` doesn't return `import_decl` nodes today (see
-        // the project plan's "declAt stays untouched" decision), so this arm
-        // is unreachable in practice; kept as a documented non-goal rather
-        // than assumed impossible.
-        if (self.ast_ref.nodeTag(cur) == .import_decl) return null;
-        return cur;
-    }
-
-    /// The segments of an `import X = A.B.C` target path, OUTERMOST (root)
-    /// first, written into `out`. Returns the count, or null if the chain is
-    /// deeper than `out.len` or doesn't terminate in a plain identifier root
-    /// (an instantiated or otherwise-shaped reference — declines rather than
-    /// guesses).
-    fn aliasPathSegments(self: *Checker, node: NodeIndex, out: *[4][]const u8) ?usize {
-        var rev: [4][]const u8 = undefined;
-        var n: usize = 0;
-        var cur = node;
-        var guard: u8 = 0;
-        while (guard < 8) : (guard += 1) {
-            switch (self.ast_ref.nodeTag(cur)) {
-                .member_expr, .optional_member_expr => {
-                    const d = self.ast_ref.nodeData(cur);
-                    if (d.rhs == .none or n >= rev.len) return null;
-                    rev[n] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(d.rhs));
-                    n += 1;
-                    cur = d.lhs;
-                },
-                .identifier => {
-                    if (n >= rev.len) return null;
-                    rev[n] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(cur));
-                    n += 1;
-                    var i: usize = 0;
-                    while (i < n) : (i += 1) out[i] = rev[n - 1 - i];
-                    return n;
-                },
-                else => return null,
-            }
-        }
-        return null;
+        if (rhs == .none or self.ast_ref.nodeTag(rhs) != .identifier) return null;
+        const name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(rhs));
+        // `declAt` doesn't return `import_decl` nodes today (see the project
+        // plan's "declAt stays untouched" decision), so a chain through
+        // another alias can't come back out here — `sameEntity` relies on
+        // that same invariant.
+        return self.declAt(name, a.node);
     }
 
     /// Two nodes name the same entity. Both `decl` (a caller's already-resolved
@@ -17311,33 +17283,6 @@ pub const Checker = struct {
     fn sameEntity(self: *Checker, a: NodeIndex, b: NodeIndex) bool {
         _ = self;
         return a == b;
-    }
-
-    /// Is `node` the RECEIVER (left side) of a member access (`node.prop`)?
-    ///
-    /// A member-access receiver keeps ITS OWN written name as the qualifying
-    /// prefix for the property-access RESULT's display, independent of what
-    /// `node` itself resolves to as a bare value: `import provide = foo; new
-    /// provide.Provide()` wants `typeof provide.Provide` (aliasErrors.ts),
-    /// even though a bare reference to `provide` elsewhere resolves to
-    /// `typeof foo` (rule 1: `foo`'s own declaration is in the same scope).
-    /// Same pattern verified in privacyImport.ts's `glo_im1_private.c1`.
-    /// tsc answers a receiver's own bare type and a property-access result's
-    /// qualification independently; `accessibleNameAt` models only the
-    /// former, so callers built for bare references must decline here
-    /// rather than feed a receiver-position substitution into member access.
-    fn isMemberAccessReceiver(self: *Checker, node: NodeIndex) bool {
-        const parents = self.semantic.parent_indices;
-        const ni = node.toInt();
-        if (ni >= parents.len) return false;
-        const NONE: u32 = @intFromEnum(NodeIndex.none);
-        const pi = parents[ni];
-        if (pi == NONE or pi >= self.ast_ref.nodes.len) return false;
-        const parent: NodeIndex = @enumFromInt(pi);
-        return switch (self.ast_ref.nodeTag(parent)) {
-            .member_expr, .optional_member_expr => self.ast_ref.nodeData(parent).lhs == node,
-            else => false,
-        };
     }
 
     /// Does `ns_decl`'s body produce a runtime value — a var/let/const,
@@ -17409,11 +17354,18 @@ pub const Checker = struct {
     /// needed to find which alias this reference belongs to.
     ///
     /// Does NOT fire when `use_site` is a member-access RECEIVER
-    /// (`isMemberAccessReceiver`) — see that function's doc comment for the
-    /// verified corpus reasoning (the property-access result keeps the
-    /// alias's own written name, not its bare-reference substitution).
+    /// (`identifierIsMemberObject`): a member-access receiver keeps ITS OWN
+    /// written name as the qualifying prefix for the property-access
+    /// RESULT's display, independent of what it resolves to as a bare
+    /// value — `import provide = foo; new provide.Provide()` wants `typeof
+    /// provide.Provide` (aliasErrors.ts), even though a bare reference to
+    /// `provide` elsewhere resolves to `typeof foo` (rule 1: `foo`'s own
+    /// declaration is in the same scope). Same pattern verified in
+    /// privacyImport.ts's `glo_im1_private.c1`. tsc answers a receiver's
+    /// own bare type and a property-access result's qualification
+    /// independently; `accessibleNameAt` models only the former.
     fn internalAliasValueType(self: *Checker, sym: symbol_mod.SymbolId, use_site: NodeIndex) ?TypeId {
-        if (self.isMemberAccessReceiver(use_site)) return null;
+        if (self.identifierIsMemberObject(use_site)) return null;
         const decl_node = self.semantic.symbols.getDeclNode(sym);
         if (decl_node == .none) return null;
         const parents = self.semantic.parent_indices;
@@ -17424,14 +17376,7 @@ pub const Checker = struct {
         if (pi == NONE or pi >= self.ast_ref.nodes.len) return null;
         const import_node: NodeIndex = @enumFromInt(pi);
         if (self.ast_ref.nodeTag(import_node) != .import_decl) return null;
-        var alias_idx: ?u32 = null;
-        for (self.decl_index.alias_decls.items, 0..) |a, idx| {
-            if (a.node == import_node) {
-                alias_idx = @intCast(idx);
-                break;
-            }
-        }
-        const ai = alias_idx orelse return null;
+        const ai = self.decl_index.alias_by_node.get(pi) orelse return null;
         const a = self.decl_index.alias_decls.items[ai];
         const target = self.aliasTargetDecl(ai) orelse return null;
         // A target with no VALUE side (a namespace of pure types, or an
@@ -17445,14 +17390,8 @@ pub const Checker = struct {
         switch (self.ast_ref.nodeTag(target)) {
             .ts_interface_decl => return null,
             .ts_namespace_decl, .ts_module_decl => {
-                // NOT `localNamespaceHasValueSide` — its textual scan
-                // false-positives on a NESTED namespace's mere keyword
-                // presence (`namespace inA {...}` inside `A`'s body text
-                // matches "namespace " even when `inA` itself holds only
-                // interfaces). `namespaceHasDirectValueSide` walks the
-                // actual child statements instead; verified correct
-                // against importStatementsInterfaces.ts (`A` has NO value
-                // side despite textually containing the word "namespace").
+                // Not `localNamespaceHasValueSide` — see
+                // `namespaceHasDirectValueSide`'s doc comment for why.
                 var has_value = self.namespaceHasDirectValueSide(target, 0);
                 if (!has_value) for (self.decl_index.merged_ns_extra.items) |e| {
                     if (!std.mem.eql(u8, e.name, a.tail)) continue;
