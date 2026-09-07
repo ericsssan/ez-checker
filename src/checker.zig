@@ -3136,6 +3136,9 @@ pub const Checker = struct {
                         const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp}) catch return tymod.ID_ANY;
                         return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
                     }
+                    // `import <local> = <A.B.C>;` (internal alias, non-`require`):
+                    // neither map above owns this form.
+                    if (self.internalAliasValueType(sym, node)) |t| return t;
                 }
             }
             if ((bkind == .namespace_decl or bkind == .class_decl or bkind == .enum_decl) and
@@ -3148,7 +3151,21 @@ pub const Checker = struct {
                     const tok = self.ast_ref.nodeMainToken(node);
                     const ns_name = self.ast_ref.tokenText(tok);
                     if (ns_name.len > 0) {
-                        const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
+                        // A nearer or earlier `import <alias> = <ns_name>` in
+                        // scope prints in this reference's place instead of
+                        // the entity's own name — gated to a no-op when no
+                        // alias names `ns_name` anywhere in the file. Skipped
+                        // for a member-access receiver (`isMemberAccessReceiver`) —
+                        // that position keeps its own written name instead.
+                        const disp = blk: {
+                            if (!self.isMemberAccessReceiver(node)) {
+                                if (self.declAt(ns_name, node)) |d| {
+                                    break :blk self.accessibleNameAt(d, ns_name, node) orelse ns_name;
+                                }
+                            }
+                            break :blk ns_name;
+                        };
+                        const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp}) catch return tymod.ID_ANY;
                         return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
                     }
                     return tymod.ID_ANY;
@@ -17188,6 +17205,17 @@ pub const Checker = struct {
     fn accessibleNameAt(self: *Checker, decl: NodeIndex, own_name: []const u8, use_site: NodeIndex) ?[]const u8 {
         const cands = self.decl_index.aliasesNaming(own_name) orelse return own_name;
         if (use_site == .none) return own_name;
+        // An AMBIENT `declare module "X" {}` block is its own lexical scope
+        // (an alias inside one does NOT share scope with a same-named
+        // top-level declaration outside it — privacyGloImport.ts's
+        // `use_glo_M1_public` alias wins over the outer `glo_M1_public` it
+        // targets), but `ScopeTree.build` does not register the
+        // string-literal module-header form as a scope boundary at all, so
+        // `namespaceScopeKey` below would incorrectly walk straight to the
+        // enclosing (global) scope and let the OUTER declaration win. Until
+        // ScopeTree grows real ambient-module scope support, decline rather
+        // than misresolve.
+        if (self.ambientModuleNameOf(use_site) != null) return null;
         var lb: [192]u8 = undefined;
         var key = self.scope_tree.namespaceScopeKey(use_site, &lb);
         if (std.mem.indexOfScalar(u8, key, '{') != null) return null;
@@ -17209,44 +17237,36 @@ pub const Checker = struct {
     }
 
     /// Resolve one internal alias (`decl_index.alias_decls[alias_idx]`) to its
-    /// ultimate declaration, walking its full target path (`import a = m.c` ->
-    /// the declaration of `c` inside `m`), not just the rightmost segment —
-    /// `alias_by_tail` indexes by tail alone, which is enough to find
-    /// CANDIDATE aliases quickly, but resolving one requires the whole path so
-    /// `import a = m.c; import a2 = other.c;` don't get confused.
+    /// ultimate declaration — SINGLE-SEGMENT targets only (`import a = M;`),
+    /// never `import a = m.c;`.
     ///
-    /// Does NOT chase an alias-of-alias chain (`import a = m.c; import b =
-    /// a;` doesn't resolve `b`) — the loop below hits `import_decl` mid-walk
-    /// and declines outright rather than recursing into it. Single-hop only,
-    /// consistent with `aliasPathSegments`' bound of 4 path segments.
+    /// A multi-segment target's own minimal-qualified name is itself a
+    /// DOTTED path (`m.c`), which `accessibleNameAt`'s callers can only ever
+    /// substitute with a single flat name (the alias's own `local`, or the
+    /// target's own single identifier) — verified WRONG against the corpus
+    /// when this was briefly widened to multi-segment: `import beez =
+    /// provide.bar;` wants `typeof provide.bar` for a bare reference to
+    /// `beez` (the qualified path, NOT the alias name `beez` and NOT a
+    /// resolved single name), which this architecture cannot produce. Kept
+    /// as a documented v1 boundary (see the project plan's "multi-segment
+    /// alias names" non-goal) rather than guessing.
     fn aliasTargetDecl(self: *Checker, alias_idx: u32) ?NodeIndex {
         const a = self.decl_index.alias_decls.items[alias_idx];
+        // `a.node` is the `import_decl` ITSELF (kept for scope-key lookups
+        // elsewhere) — the path expression to walk is its `rhs`.
+        const rhs = self.ast_ref.nodeData(a.node).rhs;
+        if (rhs == .none) return null;
         var segs: [4][]const u8 = undefined;
-        const n = self.aliasPathSegments(a.node, &segs) orelse return null;
-        if (n == 0) return null;
-        var cur = self.declAt(segs[0], a.node) orelse return null;
-        var i: usize = 1;
-        while (i < n) : (i += 1) {
-            switch (self.ast_ref.nodeTag(cur)) {
-                .ts_namespace_decl, .ts_module_decl => {},
-                .import_decl => {
-                    // Alias-of-alias mid-chain: not reachable in v1 (the
-                    // registration walk below stops at the first import_decl
-                    // it would need to recurse through) — declared
-                    // unsupported rather than silently mishandled.
-                    return null;
-                },
-                else => return null,
-            }
-            cur = self.nsMemberStmt(cur, segs[i]) orelse return null;
-        }
-        if (self.ast_ref.nodeTag(cur) != .import_decl) return cur;
+        const n = self.aliasPathSegments(rhs, &segs) orelse return null;
+        if (n != 1) return null;
+        const cur = self.declAt(segs[0], a.node) orelse return null;
         // The root segment itself resolved to another alias's binding
         // identifier — `declAt` doesn't return `import_decl` nodes today (see
         // the project plan's "declAt stays untouched" decision), so this arm
         // is unreachable in practice; kept as a documented non-goal rather
         // than assumed impossible.
-        return null;
+        if (self.ast_ref.nodeTag(cur) == .import_decl) return null;
+        return cur;
     }
 
     /// The segments of an `import X = A.B.C` target path, OUTERMOST (root)
@@ -17291,6 +17311,173 @@ pub const Checker = struct {
     fn sameEntity(self: *Checker, a: NodeIndex, b: NodeIndex) bool {
         _ = self;
         return a == b;
+    }
+
+    /// Is `node` the RECEIVER (left side) of a member access (`node.prop`)?
+    ///
+    /// A member-access receiver keeps ITS OWN written name as the qualifying
+    /// prefix for the property-access RESULT's display, independent of what
+    /// `node` itself resolves to as a bare value: `import provide = foo; new
+    /// provide.Provide()` wants `typeof provide.Provide` (aliasErrors.ts),
+    /// even though a bare reference to `provide` elsewhere resolves to
+    /// `typeof foo` (rule 1: `foo`'s own declaration is in the same scope).
+    /// Same pattern verified in privacyImport.ts's `glo_im1_private.c1`.
+    /// tsc answers a receiver's own bare type and a property-access result's
+    /// qualification independently; `accessibleNameAt` models only the
+    /// former, so callers built for bare references must decline here
+    /// rather than feed a receiver-position substitution into member access.
+    fn isMemberAccessReceiver(self: *Checker, node: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        const ni = node.toInt();
+        if (ni >= parents.len) return false;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const pi = parents[ni];
+        if (pi == NONE or pi >= self.ast_ref.nodes.len) return false;
+        const parent: NodeIndex = @enumFromInt(pi);
+        return switch (self.ast_ref.nodeTag(parent)) {
+            .member_expr, .optional_member_expr => self.ast_ref.nodeData(parent).lhs == node,
+            else => false,
+        };
+    }
+
+    /// Does `ns_decl`'s body produce a runtime value — a var/let/const,
+    /// function, class, enum, or a NESTED namespace that (recursively)
+    /// does? Exported or not (instantiation doesn't require export, only
+    /// SOME value member to exist — matching `localNamespaceHasValueSide`'s
+    /// own contract).
+    ///
+    /// Deliberately NOT `localNamespaceHasValueSide`: that helper's
+    /// `blockHasValueMember` is a TEXTUAL keyword scan over the whole body,
+    /// which false-positives on a NESTED namespace's mere keyword presence —
+    /// `namespace inA {...}` inside `A`'s body text matches "namespace "
+    /// even when `inA` itself holds only interfaces. This walks the actual
+    /// child statements (mirroring `nsMemberStmt`'s export-wrapper
+    /// unwrapping) and recurses into a nested namespace to ask the SAME
+    /// question of it, rather than trusting its keyword's mere presence.
+    /// Bounded depth guards a pathological nesting chain.
+    fn namespaceHasDirectValueSide(self: *Checker, ns_decl: NodeIndex, depth: u8) bool {
+        if (depth > 6) return false;
+        const nd = self.ast_ref.nodeData(ns_decl);
+        const body = nd.rhs;
+        if (body == .none or self.ast_ref.nodeTag(body) != .block_stmt) return false;
+        const bd = self.ast_ref.nodeData(body);
+        const start = @intFromEnum(bd.lhs);
+        const end = @intFromEnum(bd.rhs);
+        if (start >= end or end > self.ast_ref.extra_data.len) return false;
+        for (self.ast_ref.extra_data[start..end]) |raw| {
+            var stmt: NodeIndex = @enumFromInt(raw);
+            switch (self.ast_ref.nodeTag(stmt)) {
+                .export_named, .export_default_fn, .export_default_class => {
+                    const inner = self.ast_ref.nodeData(stmt).lhs;
+                    if (inner == .none) continue;
+                    stmt = inner;
+                },
+                else => {},
+            }
+            switch (self.ast_ref.nodeTag(stmt)) {
+                .var_decl,
+                .let_decl,
+                .const_decl,
+                .fn_decl,
+                .async_fn_decl,
+                .generator_fn_decl,
+                .async_generator_fn_decl,
+                .class_decl,
+                .ts_enum_decl,
+                => return true,
+                .ts_namespace_decl, .ts_module_decl => {
+                    if (self.namespaceHasDirectValueSide(stmt, depth + 1)) return true;
+                },
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    /// `import <local> = <A.B.C>;` (internal alias, non-`require`) referenced
+    /// as a VALUE anywhere in the file — including its own declaration line
+    /// (`import a = A;` itself types `a` as `typeof a` in tsc, not just later
+    /// uses) — displays `typeof <accessible-name>`, where the accessible name
+    /// is the target's own name or a nearer/earlier alias's local name
+    /// (`accessibleNameAt`), per the minimal-qualification rule.
+    ///
+    /// `sym`'s declaration node is the synthetic identifier the parser
+    /// attaches to the `import_decl` via `parent_fixups` (an import-equals
+    /// local has no natural data slot — see parser.zig's import-alias
+    /// branch); its PARENT is the `import_decl` node itself, which
+    /// `alias_decls` indexes by node identity, so no name/scope lookup is
+    /// needed to find which alias this reference belongs to.
+    ///
+    /// Does NOT fire when `use_site` is a member-access RECEIVER
+    /// (`isMemberAccessReceiver`) — see that function's doc comment for the
+    /// verified corpus reasoning (the property-access result keeps the
+    /// alias's own written name, not its bare-reference substitution).
+    fn internalAliasValueType(self: *Checker, sym: symbol_mod.SymbolId, use_site: NodeIndex) ?TypeId {
+        if (self.isMemberAccessReceiver(use_site)) return null;
+        const decl_node = self.semantic.symbols.getDeclNode(sym);
+        if (decl_node == .none) return null;
+        const parents = self.semantic.parent_indices;
+        const di = decl_node.toInt();
+        if (di >= parents.len) return null;
+        const NONE: u32 = @intFromEnum(NodeIndex.none);
+        const pi = parents[di];
+        if (pi == NONE or pi >= self.ast_ref.nodes.len) return null;
+        const import_node: NodeIndex = @enumFromInt(pi);
+        if (self.ast_ref.nodeTag(import_node) != .import_decl) return null;
+        var alias_idx: ?u32 = null;
+        for (self.decl_index.alias_decls.items, 0..) |a, idx| {
+            if (a.node == import_node) {
+                alias_idx = @intCast(idx);
+                break;
+            }
+        }
+        const ai = alias_idx orelse return null;
+        const a = self.decl_index.alias_decls.items[ai];
+        const target = self.aliasTargetDecl(ai) orelse return null;
+        // A target with no VALUE side (a namespace of pure types, or an
+        // interface) is never instantiated, so tsc types the alias `any`
+        // (InvalidNonInstantiatedModule) — the same rule that governs a
+        // direct reference to such a namespace. Verified against
+        // importStatementsInterfaces.ts (`import a = A;` where `A` holds
+        // only interfaces) vs. importStatements.ts (`A` holds a class and a
+        // `var`): identical shape, opposite answers, discriminated entirely
+        // by the target's value side, not by alias usage.
+        switch (self.ast_ref.nodeTag(target)) {
+            .ts_interface_decl => return null,
+            .ts_namespace_decl, .ts_module_decl => {
+                // NOT `localNamespaceHasValueSide` — its textual scan
+                // false-positives on a NESTED namespace's mere keyword
+                // presence (`namespace inA {...}` inside `A`'s body text
+                // matches "namespace " even when `inA` itself holds only
+                // interfaces). `namespaceHasDirectValueSide` walks the
+                // actual child statements instead; verified correct
+                // against importStatementsInterfaces.ts (`A` has NO value
+                // side despite textually containing the word "namespace").
+                var has_value = self.namespaceHasDirectValueSide(target, 0);
+                if (!has_value) for (self.decl_index.merged_ns_extra.items) |e| {
+                    if (!std.mem.eql(u8, e.name, a.tail)) continue;
+                    if (self.namespaceHasDirectValueSide(e.node, 0)) {
+                        has_value = true;
+                        break;
+                    }
+                };
+                if (!has_value) return null;
+            },
+            else => {},
+        }
+        // Unlike the plain-namespace-reference call site (which safely falls
+        // back to the entity's own name — the exact pre-existing behavior),
+        // there IS no pre-existing behavior for this brand-new value
+        // position: a `null` here means the walk is UNTRUSTWORTHY (e.g. an
+        // ambient-module scope ScopeTree doesn't model), so decline the
+        // whole feature rather than silently assume the target's name wins.
+        const disp = self.accessibleNameAt(target, a.tail, use_site) orelse return null;
+        const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp}) catch return null;
+        self.string_pool.append(self.gpa, typeof_name) catch {
+            self.gpa.free(typeof_name);
+            return null;
+        };
+        return self.store.typeRef(typeof_name, &.{}) catch null;
     }
 
     fn resolveDeclaredTypeInScope(self: *Checker, name: []const u8, use_site: NodeIndex) ?TypeId {
