@@ -23416,7 +23416,12 @@ pub const Checker = struct {
         const ns_decl = self.declAt(ns_root, use_site) orelse return null;
         const dt = self.ast_ref.nodeTag(ns_decl);
         if (dt != .ts_namespace_decl and dt != .ts_module_decl) return null;
-        if (!self.namespaceIsTopLevel(ns_decl)) return null;
+        // Restricted to TOP-LEVEL namespaces because the fallback prefix
+        // (accessibleNameAt's minimal qualification) doesn't handle nested
+        // ones — but that concern doesn't apply when `alias_override`
+        // already supplies the prefix outright (the alias's own literal
+        // written name, independent of where its target namespace lives).
+        if (alias_override == null and !self.namespaceIsTopLevel(ns_decl)) return null;
         // A use site INSIDE `ns_decl` ITSELF may need a display SHORTER than
         // `ns_root.prop_name` (even bare `prop_name`, per tsc's minimal-
         // qualification rule: `A.B.C.E` referenced from inside `A` can shrink
