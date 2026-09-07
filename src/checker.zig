@@ -268,16 +268,25 @@ fn isIdentChar(c: u8) bool {
 /// Textual scan of a `{...}` block for a value-bearing member — the
 /// cross-module counterpart to `namespaceHasDirectValueSide` (used when the
 /// block's source is another file's raw text, with no `NodeIndex`/AST
-/// available at all). `const`/`let`/`var`/`function`/`class`/`enum` are
-/// unconditionally value-bearing wherever they occur; a nested `namespace `
-/// is NOT — a namespace of pure types has no value side, so its mere
-/// keyword presence must not prove one for its ENCLOSING block (verified
-/// against importStatementsInterfaces.ts's AST-side counterpart in
-/// `namespaceHasDirectValueSide`). Each `namespace ` occurrence therefore
-/// recurses into ITS OWN body instead. `nest_depth` bounds a pathological
-/// nesting chain (mirrors `namespaceHasDirectValueSide`'s own guard).
-fn blockHasValueMember(src: []const u8, at: usize, nest_depth: u8) bool {
-    if (nest_depth > 6) return false;
+/// available at all).
+///
+/// `namespace ` is deliberately NOT in the keyword list: a namespace of
+/// pure types has no value side, so its mere keyword presence must not
+/// prove one for its ENCLOSING block (verified against
+/// importStatementsInterfaces.ts's AST-side counterpart in
+/// `namespaceHasDirectValueSide`). No recursion is needed to handle a
+/// nested namespace's OWN value members correctly, though: `body` is a
+/// flat BYTE-RANGE slice spanning the whole block, so a real value
+/// keyword anywhere inside a nested namespace (at any depth) is already a
+/// literal substring of `body` and is found directly by the scan below —
+/// unlike the AST walker, which only sees one statement level at a time
+/// and genuinely needs to recurse. (An earlier version of this function
+/// DID recurse into each `namespace ` occurrence explicitly; it was
+/// provably redundant — if the flat scan finds nothing, no nested
+/// namespace's own text, being a subset of the same already-scanned
+/// range, can find anything either — and, for a wide or long chain of
+/// namespace keywords, cost more than the single pass below ever does.)
+fn blockHasValueMember(src: []const u8, at: usize) bool {
     const open = std.mem.indexOfScalarPos(u8, src, at, '{') orelse return false;
     var depth: i32 = 0;
     var i = open;
@@ -295,12 +304,6 @@ fn blockHasValueMember(src: []const u8, at: usize, nest_depth: u8) bool {
     const body = src[open..end];
     inline for (.{ "const ", "let ", "var ", "function ", "class ", "enum " }) |kw| {
         if (std.mem.indexOf(u8, body, kw) != null) return true;
-    }
-    var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, body, idx, "namespace ")) |rel| {
-        const abs = open + rel + "namespace ".len;
-        if (blockHasValueMember(src, abs, nest_depth + 1)) return true;
-        idx = rel + "namespace ".len;
     }
     return false;
 }
@@ -24359,7 +24362,7 @@ pub const Checker = struct {
                     // A namespace of pure TYPES has no value side, so the import
                     // binds nothing and tsc types it `any` (`declare namespace id
                     // { type A<T> = T }` in declarationEmitNoInvalidCommentReuse3).
-                    if (std.mem.eql(u8, kw, "namespace ") and !blockHasValueMember(src, after, 0)) return null;
+                    if (std.mem.eql(u8, kw, "namespace ") and !blockHasValueMember(src, after)) return null;
                     return exp;
                 }
                 idx = after;
