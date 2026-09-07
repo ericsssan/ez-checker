@@ -10175,7 +10175,7 @@ pub const Checker = struct {
                 if (qd.rhs != .none and self.ast_ref.nodeTag(qd.lhs) == .identifier) {
                     const ns_root = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.lhs));
                     const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.rhs));
-                    if (self.localNamespaceMemberValue(ns_root, prop, ty_node)) |t| return t;
+                    if (self.localNamespaceMemberValue(ns_root, prop, ty_node, null)) |t| return t;
                 }
                 // `typeof <ns>.Member` where `<ns>` is a DIRECT namespace import
                 // (`import * as types`): tsc keeps the query verbatim as
@@ -17395,8 +17395,26 @@ pub const Checker = struct {
     /// privacyImport.ts's `glo_im1_private.c1`. tsc answers a receiver's
     /// own bare type and a property-access result's qualification
     /// independently; `accessibleNameAt` models only the former.
+    /// If `recv` is a bare identifier bound to an internal `import <local> =
+    /// <path>;` alias, that alias's OWN local name — used by `inferMember`
+    /// to override `localNamespaceMemberValue`'s computed prefix when the
+    /// receiver of a property access is syntactically an alias (see that
+    /// function's `alias_override` doc comment for the verified rule this
+    /// implements). Shares `alias_by_node`'s lookup with `internalAliasValueType`.
+    fn aliasLocalNameOfReceiver(self: *Checker, recv: NodeIndex) ?[]const u8 {
+        if (self.ast_ref.nodeTag(recv) != .identifier) return null;
+        const sym = self.symbolForIdentRef(recv) orelse return null;
+        if (self.semantic.symbols.getBindingKind(sym) != .import_binding) return null;
+        const decl_node = self.semantic.symbols.getDeclNode(sym);
+        if (decl_node == .none) return null;
+        const parents = self.semantic.parent_indices;
+        const di = decl_node.toInt();
+        if (di >= parents.len) return null;
+        const ai = self.decl_index.alias_by_node.get(parents[di]) orelse return null;
+        return self.decl_index.alias_decls.items[ai].local;
+    }
+
     fn internalAliasValueType(self: *Checker, sym: symbol_mod.SymbolId, use_site: NodeIndex) ?TypeId {
-        if (self.identifierIsMemberObject(use_site)) return null;
         const decl_node = self.semantic.symbols.getDeclNode(sym);
         if (decl_node == .none) return null;
         const parents = self.semantic.parent_indices;
@@ -22845,7 +22863,8 @@ pub const Checker = struct {
         // declared namespace/module and prop is an exported class/enum/namespace
         // → the member's static side, displayed `typeof <Ns>.<prop>`.
         if (self.typeofRootName(lookup_ty)) |ns_root| {
-            if (self.localNamespaceMemberValue(ns_root, prop_name, node)) |resolved|
+            const alias_override = self.aliasLocalNameOfReceiver(data.lhs);
+            if (self.localNamespaceMemberValue(ns_root, prop_name, node, alias_override)) |resolved|
                 return self.maybeAddOptionalUndefined(resolved, nullcheck_ty, in_chain);
         }
         // Simple `=` assignment target: a divergent get/set accessor exposes its
@@ -23359,7 +23378,21 @@ pub const Checker = struct {
     /// carry the same canonical name).  Var/function members fall through (null)
     /// to the normal structural lookup — they show their own value type, not a
     /// `typeof`.
-    fn localNamespaceMemberValue(self: *Checker, ns_root: []const u8, prop_name: []const u8, use_site: NodeIndex) ?TypeId {
+    ///
+    /// `alias_override`, when non-null, is the SYNTACTIC receiver's own
+    /// written name and wins over `accessibleNameAt`'s computed prefix
+    /// outright: a property access through an internal-alias RECEIVER
+    /// (`import provide = foo; provide.Provide`) keeps the alias's own name
+    /// as the qualifying prefix (`typeof provide.Provide`) regardless of
+    /// what accessibleNameAt would say for a BARE reference to that same
+    /// receiver (which, per rule 1, can resolve to the TARGET's own name
+    /// instead when they're same-scope siblings — `provide` alone
+    /// legitimately resolves to `typeof foo`). tsc answers a receiver's own
+    /// bare type and a property-access result's qualification
+    /// independently (verified: aliasErrors.ts, privacyImport.ts's
+    /// `glo_im1_private.c1`); only the caller reaching this via an actual
+    /// member-access receiver node can supply it.
+    fn localNamespaceMemberValue(self: *Checker, ns_root: []const u8, prop_name: []const u8, use_site: NodeIndex, alias_override: ?[]const u8) ?TypeId {
         if (ns_root.len == 0 or prop_name.len == 0) return null;
         // Restrict to TOP-LEVEL namespace ROOTS. `A.B.C.E`'s multi-segment
         // form needs a multi-segment answer this function doesn't build.
@@ -23414,7 +23447,7 @@ pub const Checker = struct {
         // The namespace itself may print through a nearer or earlier internal
         // alias (`import Y = Ns;`) rather than its own name — same rule every
         // other site in this project applies.
-        const prefix = self.accessibleNameAt(ns_decl, ns_root, use_site) orelse return null;
+        const prefix = alias_override orelse (self.accessibleNameAt(ns_decl, ns_root, use_site) orelse return null);
         const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ prefix, prop_name }) catch return null;
         self.string_pool.append(self.gpa, disp) catch {
             self.gpa.free(disp);
