@@ -10175,7 +10175,8 @@ pub const Checker = struct {
                 if (qd.rhs != .none and self.ast_ref.nodeTag(qd.lhs) == .identifier) {
                     const ns_root = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.lhs));
                     const prop = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.rhs));
-                    if (self.localNamespaceMemberValue(ns_root, prop, ty_node, null)) |t| return t;
+                    const alias_override = self.aliasLocalNameOfReceiver(qd.lhs);
+                    if (self.localNamespaceMemberValue(ns_root, prop, ty_node, alias_override)) |t| return t;
                 }
                 // `typeof <ns>.Member` where `<ns>` is a DIRECT namespace import
                 // (`import * as types`): tsc keeps the query verbatim as
@@ -17370,6 +17371,45 @@ pub const Checker = struct {
         return false;
     }
 
+    /// The `alias_decls` index for the internal alias `decl_node` declares,
+    /// if any — the shared tail of `aliasLocalNameOfReceiver` and
+    /// `internalAliasValueType`, both of which start from a declaration
+    /// node and need its registered alias entry. `alias_by_node`'s keys
+    /// come only from the `.import_decl` arm of `registerAlias`'s caller,
+    /// so a hit alone already guarantees the parent names a registered
+    /// alias's `import_decl` node — no separate bounds/tag check on it is
+    /// needed.
+    fn aliasIndexForDeclNode(self: *Checker, decl_node: NodeIndex) ?u32 {
+        if (decl_node == .none) return null;
+        const parents = self.semantic.parent_indices;
+        const di = decl_node.toInt();
+        if (di >= parents.len) return null;
+        return self.decl_index.alias_by_node.get(parents[di]);
+    }
+
+    /// If `recv` is a bare identifier bound to an internal `import <local> =
+    /// <path>;` alias, that alias's OWN local name — used by `inferMember`
+    /// and `resolveTypeofType` to override `localNamespaceMemberValue`'s
+    /// computed prefix when the receiver of a property access (or a
+    /// `typeof <recv>.<Member>` type query) is syntactically an alias: a
+    /// property-access receiver keeps ITS OWN written name as the
+    /// qualifying prefix for the result, independent of what it resolves
+    /// to as a bare value — `import provide = foo; new provide.Provide()`
+    /// wants `typeof provide.Provide` (aliasErrors.ts), even though a bare
+    /// reference to `provide` elsewhere resolves to `typeof foo` (rule 1:
+    /// `foo`'s own declaration is in the same scope). Same pattern
+    /// verified in privacyImport.ts's `glo_im1_private.c1`. tsc answers a
+    /// receiver's own bare type and a property-access result's
+    /// qualification independently; `accessibleNameAt` models only the
+    /// former.
+    fn aliasLocalNameOfReceiver(self: *Checker, recv: NodeIndex) ?[]const u8 {
+        if (self.ast_ref.nodeTag(recv) != .identifier) return null;
+        const sym = self.symbolForIdentRef(recv) orelse return null;
+        if (self.semantic.symbols.getBindingKind(sym) != .import_binding) return null;
+        const ai = self.aliasIndexForDeclNode(self.semantic.symbols.getDeclNode(sym)) orelse return null;
+        return self.decl_index.alias_decls.items[ai].local;
+    }
+
     /// `import <local> = <A.B.C>;` (internal alias, non-`require`) referenced
     /// as a VALUE anywhere in the file — including its own declaration line
     /// (`import a = A;` itself types `a` as `typeof a` in tsc, not just later
@@ -17384,47 +17424,13 @@ pub const Checker = struct {
     /// `alias_decls` indexes by node identity, so no name/scope lookup is
     /// needed to find which alias this reference belongs to.
     ///
-    /// Does NOT fire when `use_site` is a member-access RECEIVER
-    /// (`identifierIsMemberObject`): a member-access receiver keeps ITS OWN
-    /// written name as the qualifying prefix for the property-access
-    /// RESULT's display, independent of what it resolves to as a bare
-    /// value — `import provide = foo; new provide.Provide()` wants `typeof
-    /// provide.Provide` (aliasErrors.ts), even though a bare reference to
-    /// `provide` elsewhere resolves to `typeof foo` (rule 1: `foo`'s own
-    /// declaration is in the same scope). Same pattern verified in
-    /// privacyImport.ts's `glo_im1_private.c1`. tsc answers a receiver's
-    /// own bare type and a property-access result's qualification
-    /// independently; `accessibleNameAt` models only the former.
-    /// If `recv` is a bare identifier bound to an internal `import <local> =
-    /// <path>;` alias, that alias's OWN local name — used by `inferMember`
-    /// to override `localNamespaceMemberValue`'s computed prefix when the
-    /// receiver of a property access is syntactically an alias (see that
-    /// function's `alias_override` doc comment for the verified rule this
-    /// implements). Shares `alias_by_node`'s lookup with `internalAliasValueType`.
-    fn aliasLocalNameOfReceiver(self: *Checker, recv: NodeIndex) ?[]const u8 {
-        if (self.ast_ref.nodeTag(recv) != .identifier) return null;
-        const sym = self.symbolForIdentRef(recv) orelse return null;
-        if (self.semantic.symbols.getBindingKind(sym) != .import_binding) return null;
-        const decl_node = self.semantic.symbols.getDeclNode(sym);
-        if (decl_node == .none) return null;
-        const parents = self.semantic.parent_indices;
-        const di = decl_node.toInt();
-        if (di >= parents.len) return null;
-        const ai = self.decl_index.alias_by_node.get(parents[di]) orelse return null;
-        return self.decl_index.alias_decls.items[ai].local;
-    }
-
+    /// Fires for a member-access RECEIVER too (its own bare type IS wanted
+    /// there — only the property-access RESULT's own qualification needs
+    /// the alias's name instead of this function's answer; that's handled
+    /// separately by `aliasLocalNameOfReceiver`, which the caller feeds
+    /// into `localNamespaceMemberValue` as an override).
     fn internalAliasValueType(self: *Checker, sym: symbol_mod.SymbolId, use_site: NodeIndex) ?TypeId {
-        const decl_node = self.semantic.symbols.getDeclNode(sym);
-        if (decl_node == .none) return null;
-        const parents = self.semantic.parent_indices;
-        const di = decl_node.toInt();
-        if (di >= parents.len) return null;
-        // `alias_by_node`'s keys come only from the `.import_decl` arm of
-        // `registerAlias`'s caller, so a hit alone already guarantees `pi`
-        // names a registered alias's `import_decl` node — no separate
-        // bounds/tag check on it is needed.
-        const ai = self.decl_index.alias_by_node.get(parents[di]) orelse return null;
+        const ai = self.aliasIndexForDeclNode(self.semantic.symbols.getDeclNode(sym)) orelse return null;
         const a = self.decl_index.alias_decls.items[ai];
         const target = self.aliasTargetDecl(ai) orelse return null;
         // A target with no VALUE side (a namespace of pure types, or an
@@ -23447,7 +23453,7 @@ pub const Checker = struct {
         // The namespace itself may print through a nearer or earlier internal
         // alias (`import Y = Ns;`) rather than its own name — same rule every
         // other site in this project applies.
-        const prefix = alias_override orelse (self.accessibleNameAt(ns_decl, ns_root, use_site) orelse return null);
+        const prefix = alias_override orelse self.accessibleNameAt(ns_decl, ns_root, use_site) orelse return null;
         const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ prefix, prop_name }) catch return null;
         self.string_pool.append(self.gpa, disp) catch {
             self.gpa.free(disp);
