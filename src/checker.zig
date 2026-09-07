@@ -17276,7 +17276,7 @@ pub const Checker = struct {
 
     /// Two nodes name the same entity. Both `decl` (a caller's already-resolved
     /// declaration — typically itself the output of `declAt`/`typeDeclAt`) and
-    /// `aliasTargetDecl`'s result (via `declAt` for its root segment) are
+    /// `aliasTargetDecl`'s result (also via `declAt`) are
     /// already canonicalized toward `primaryDecl` for merged declarations by
     /// `declAt` itself, so direct equality is correct here without a second
     /// canonicalization pass.
@@ -17371,12 +17371,11 @@ pub const Checker = struct {
         const parents = self.semantic.parent_indices;
         const di = decl_node.toInt();
         if (di >= parents.len) return null;
-        const NONE: u32 = @intFromEnum(NodeIndex.none);
-        const pi = parents[di];
-        if (pi == NONE or pi >= self.ast_ref.nodes.len) return null;
-        const import_node: NodeIndex = @enumFromInt(pi);
-        if (self.ast_ref.nodeTag(import_node) != .import_decl) return null;
-        const ai = self.decl_index.alias_by_node.get(pi) orelse return null;
+        // `alias_by_node`'s keys come only from the `.import_decl` arm of
+        // `registerAlias`'s caller, so a hit alone already guarantees `pi`
+        // names a registered alias's `import_decl` node — no separate
+        // bounds/tag check on it is needed.
+        const ai = self.decl_index.alias_by_node.get(parents[di]) orelse return null;
         const a = self.decl_index.alias_decls.items[ai];
         const target = self.aliasTargetDecl(ai) orelse return null;
         // A target with no VALUE side (a namespace of pure types, or an
