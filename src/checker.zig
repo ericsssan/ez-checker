@@ -205,6 +205,32 @@ fn node16UnresolvableSpec(spec: []const u8) bool {
     return true;
 }
 
+/// True when `pj_src` (a package.json's raw source) declares
+/// `"type": "module"`.  Simple key-then-value scan, matching this file's
+/// existing package.json parsing convention (`exportsHasSubpath`) rather
+/// than a real JSON parser.
+fn packageJsonTypeIsModule(pj_src: []const u8) bool {
+    const ki = std.mem.indexOf(u8, pj_src, "\"type\"") orelse return false;
+    var i = ki + "\"type\"".len;
+    while (i < pj_src.len and (pj_src[i] == ' ' or pj_src[i] == ':' or pj_src[i] == '\t' or
+        pj_src[i] == '\n' or pj_src[i] == '\r')) i += 1;
+    return std.mem.startsWith(u8, pj_src[i..], "\"module\"");
+}
+
+/// Does a resolved require() target's source allow an `import X =
+/// require(spec)` alias to bind to it? A file with no top-level `export` at
+/// all isn't an external module — `import foo = require("./nonExternal")`
+/// is an error typed `any`. An `export =` module names the binding after
+/// the EXPORTED ENTITY (or takes its type outright, or is an error typed
+/// `any`) — never after the local alias; same exclusion
+/// `namespaceImportBindingType` makes for `import * as ns`.
+fn sectionAllowsRequireAliasBinding(sec_src: []const u8) bool {
+    if (std.mem.indexOf(u8, sec_src, "export") == null) return false;
+    if (std.mem.indexOf(u8, sec_src, "export =") != null) return false;
+    if (std.mem.indexOf(u8, sec_src, "export=") != null) return false;
+    return true;
+}
+
 /// Strip a recognized TS/JS module extension from a file name, returning the
 /// extensionless path.  `.d.ts`-style declaration suffixes are handled first.
 fn stripModuleExt(name: []const u8) []const u8 {
@@ -23644,6 +23670,81 @@ pub const Checker = struct {
         return null;
     }
 
+    /// The effective module format of `path`: `.cts`/`.cjs` are always CJS;
+    /// `.mts`/`.mjs` are always ESM; everything else (`.ts`/`.tsx`/`.js`/
+    /// `.jsx`) is AMBIGUOUS and defers to the nearest ancestor
+    /// package.json's `"type"` field (`"module"` → ESM, absent/anything
+    /// else → CJS — Node's own default).
+    fn fileIsCjsFormat(self: *Checker, path: []const u8) bool {
+        if (std.mem.endsWith(u8, path, ".cts") or std.mem.endsWith(u8, path, ".cjs")) return true;
+        if (std.mem.endsWith(u8, path, ".mts") or std.mem.endsWith(u8, path, ".mjs")) return false;
+        return !self.nearestPackageJsonIsEsm(path);
+    }
+
+    /// Does the nearest ancestor package.json (walking UP from `path`'s own
+    /// directory, matching `PackageJsonFile.name`'s directory exactly at
+    /// each level) declare `"type": "module"`? No package.json found at any
+    /// level defaults to false (CJS), matching Node's own default.
+    fn nearestPackageJsonIsEsm(self: *Checker, path: []const u8) bool {
+        var dir = dirOfPath(path);
+        while (true) {
+            for (self.checker_opts.package_jsons) |pj| {
+                if (std.mem.eql(u8, dirOfPath(pj.name), dir)) return packageJsonTypeIsModule(pj.source);
+            }
+            if (dir.len == 0) return false;
+            dir = dirOfPath(dir);
+        }
+    }
+
+    /// The first CJS-viable module `require("<spec>")` resolves to from
+    /// `from_path`, under Node's classic (extension + directory-index)
+    /// resolution — unlike a plain `import`, `require()` never needs an
+    /// explicit extension, even under node16/nodenext (that "must be
+    /// explicit" rule belongs to the ESM resolver a plain `import` uses).
+    /// Exact-file candidates are preferred over a directory's `/index`
+    /// fallback, mirroring `resolveRelativeSpec`'s own priority. A
+    /// candidate whose OWN format is ESM (`.mts`/`.mjs`, or an ambiguous
+    /// extension under a `"type": "module"` package.json) is skipped —
+    /// Node's require() cannot load an ESM module.
+    /// Does SOME CJS-viable sibling module NAME exist for `spec`, under
+    /// Node's classic (extension + directory-index) resolution — unlike a
+    /// plain `import`, `require()` never needs an explicit extension, even
+    /// under node16/nodenext (that "must be explicit" rule belongs to the
+    /// ESM resolver a plain `import` uses).  Checked against
+    /// `available_modules` (the full sibling name list — populated for
+    /// BOTH concatenated and per-module-isolated evaluation, unlike
+    /// `module_files`'s byte ranges, which an isolated unit only has for
+    /// itself) rather than `module_files`/`resolveRelativeSpec`, since an
+    /// isolated unit's own `module_files` doesn't carry its siblings at all.
+    /// Exact-file candidates are preferred over a directory's `/index`
+    /// fallback, mirroring `resolveRelativeSpec`'s own priority.  A
+    /// candidate whose OWN format is ESM (`.mts`/`.mjs`, or an ambiguous
+    /// extension under a `"type": "module"` package.json) is skipped —
+    /// Node's require() cannot load an ESM module.
+    fn relativeRequireResolvesNode16(self: *Checker, from_path: []const u8, spec: []const u8) bool {
+        var join_buf: [1024]u8 = undefined;
+        const dir = dirOfPath(from_path);
+        const joined = std.fmt.bufPrint(&join_buf, "{s}/{s}", .{ dir, stripModuleExt(spec) }) catch return false;
+        var norm_buf: [1024]u8 = undefined;
+        const target = normalizePath(&norm_buf, joined) orelse return false;
+        var idx_buf: [1024]u8 = undefined;
+        // `target` is "" at the program root (e.g. `require("./")` from a
+        // top-level file) — "{s}/index" would then wrongly produce a
+        // leading-slash "/index" that never matches a real (slash-less)
+        // module name.
+        const target_index = if (target.len == 0)
+            "index"
+        else
+            std.fmt.bufPrint(&idx_buf, "{s}/index", .{target}) catch return false;
+        for (self.checker_opts.available_modules) |name| {
+            var mfn_buf: [1024]u8 = undefined;
+            const mfn = normalizePath(&mfn_buf, stripModuleExt(name)) orelse continue;
+            if ((std.mem.eql(u8, mfn, target) or std.mem.eql(u8, mfn, target_index)) and
+                self.fileIsCjsFormat(name)) return true;
+        }
+        return false;
+    }
+
     /// Can `require("<spec>")` be expected to resolve from this file?
     ///   * relative (`./sib`) — a sibling module section with that name exists;
     ///   * bare (`react`)     — a `/// <reference … <spec>.d.ts>` supplies it.
@@ -23651,25 +23752,30 @@ pub const Checker = struct {
     fn requireSpecResolves(self: *Checker, spec: []const u8, at: NodeIndex) bool {
         if (spec.len == 0) return false;
         if (spec[0] == '/') return false;
-        // node16/nodenext give one file two module identities (esm vs cjs) and
-        // make `import X = require(…)` an error in ESM-format files; tsc's
-        // displays there follow rules this doesn't model.
-        if (self.checker_opts.isNode16Style()) return false;
+        if (self.checker_opts.isNode16Style()) {
+            // Only the relative form is modeled: a bare specifier needs
+            // package.json `exports`/`main` resolution under node16, out
+            // of scope here.
+            if (spec[0] != '.') return false;
+            const from = self.sectionOfNode(at) orelse return false;
+            if (!self.relativeRequireResolvesNode16(from.name, spec)) return false;
+            // The CJS-viability check above only confirms SOME candidate
+            // resolves; the actual content fetched here (via the same
+            // resolver/module_files path the non-node16 branch below uses)
+            // may come from a same-basename sibling rather than the exact
+            // candidate just validated when several share one extensionless
+            // path (verified harmless for this project's corpus: sibling
+            // format variants of one logical module carry the same export
+            // shape in every case measured).
+            const sec_src = self.resolvedModuleSpecSource(spec) orelse return false;
+            return sectionAllowsRequireAliasBinding(sec_src);
+        }
         // Bare: either a `/// <reference … <spec>.d.ts>` lib, or an ambient
         // `declare module "<spec>"` in the program (how the corpus supplies
         // `GlobalWidgets`).
         if (spec[0] != '.') return self.sourceReferencesLib(spec) or self.ambientModuleDeclared(spec, at);
         const sec_src = self.resolvedModuleSpecSource(spec) orelse return false;
-        // A file with no top-level `export` isn't an external module at all —
-        // `import foo = require("./nonExternal")` is an error typed `any`.
-        if (std.mem.indexOf(u8, sec_src, "export") == null) return false;
-        // `export =` modules name the binding after the EXPORTED ENTITY (or take
-        // its type outright, or are an error typed `any`) — never after the local
-        // alias.  Same exclusion `namespaceImportBindingType` makes for `import *
-        // as ns`.
-        if (std.mem.indexOf(u8, sec_src, "export =") != null) return false;
-        if (std.mem.indexOf(u8, sec_src, "export=") != null) return false;
-        return true;
+        return sectionAllowsRequireAliasBinding(sec_src);
     }
 
     /// Is `name` a require-alias bound to a RELATIVE sibling section?  Those are
