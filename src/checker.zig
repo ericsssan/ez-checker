@@ -2594,19 +2594,7 @@ pub const Checker = struct {
         const nd = self.decl_index.primaryDecl(name) orelse return false;
         const ndt = self.ast_ref.nodeTag(nd);
         if (ndt != .ts_namespace_decl and ndt != .ts_module_decl) return false;
-        // AST walk (`namespaceHasDirectValueSide`), not a textual scan: a
-        // TEXTUAL scan for "namespace "/"class "/etc. false-positives on a
-        // NESTED namespace's mere keyword presence — `namespace inA {...}`
-        // inside this namespace's own body text matches "namespace " even
-        // when `inA` itself holds only interfaces. Verified against
-        // importStatementsInterfaces.ts (see `namespaceHasDirectValueSide`'s
-        // own doc comment).
-        if (self.namespaceHasDirectValueSide(nd, 0)) return true;
-        for (self.decl_index.merged_ns_extra.items) |e| {
-            if (!std.mem.eql(u8, e.name, name)) continue;
-            if (self.namespaceHasDirectValueSide(e.node, 0)) return true;
-        }
-        return false;
+        return self.namespaceOrMergedHasValueSide(nd, name);
     }
 
     fn typeForNamespaceDeclarationName(self: *Checker, node: NodeIndex, name: []const u8) ?TypeId {
@@ -17297,15 +17285,18 @@ pub const Checker = struct {
     /// SOME value member to exist — matching `localNamespaceHasValueSide`'s
     /// own contract).
     ///
-    /// Deliberately NOT `localNamespaceHasValueSide`: that helper's
-    /// `blockHasValueMember` is a TEXTUAL keyword scan over the whole body,
-    /// which false-positives on a NESTED namespace's mere keyword presence —
-    /// `namespace inA {...}` inside `A`'s body text matches "namespace "
-    /// even when `inA` itself holds only interfaces. This walks the actual
-    /// child statements (mirroring `nsMemberStmt`'s export-wrapper
-    /// unwrapping) and recurses into a nested namespace to ask the SAME
-    /// question of it, rather than trusting its keyword's mere presence.
-    /// Bounded depth guards a pathological nesting chain.
+    /// Answers this for ONE physical block only — `localNamespaceHasValueSide`
+    /// and `internalAliasValueType` both need the "OR any `merged_ns_extra`
+    /// re-opening of the same name" half too; see `namespaceOrMergedHasValueSide`,
+    /// which both call.
+    ///
+    /// Walks the actual child statements (mirroring `nsMemberStmt`'s
+    /// export-wrapper unwrapping) and recurses into a nested namespace to ask
+    /// the SAME question of it — deliberately NOT a textual keyword scan
+    /// (the earlier `blockHasValueMember` approach), which false-positives on
+    /// a NESTED namespace's mere keyword presence: `namespace inA {...}`
+    /// inside `A`'s body text matches "namespace " even when `inA` itself
+    /// holds only interfaces. Bounded depth guards a pathological nesting chain.
     fn namespaceHasDirectValueSide(self: *Checker, ns_decl: NodeIndex, depth: u8) bool {
         if (depth > 6) return false;
         const nd = self.ast_ref.nodeData(ns_decl);
@@ -17341,6 +17332,20 @@ pub const Checker = struct {
                 },
                 else => {},
             }
+        }
+        return false;
+    }
+
+    /// Does `primary` (a namespace/module decl) have a direct value side, OR
+    /// any `merged_ns_extra` re-opening of the SAME name? Shared by
+    /// `localNamespaceHasValueSide` and `internalAliasValueType`, which both
+    /// need this "primary OR any merged re-opening" reduction over
+    /// `namespaceHasDirectValueSide` (a single physical block only).
+    fn namespaceOrMergedHasValueSide(self: *Checker, primary: NodeIndex, name: []const u8) bool {
+        if (self.namespaceHasDirectValueSide(primary, 0)) return true;
+        for (self.decl_index.merged_ns_extra.items) |e| {
+            if (!std.mem.eql(u8, e.name, name)) continue;
+            if (self.namespaceHasDirectValueSide(e.node, 0)) return true;
         }
         return false;
     }
@@ -17395,17 +17400,7 @@ pub const Checker = struct {
         switch (self.ast_ref.nodeTag(target)) {
             .ts_interface_decl => return null,
             .ts_namespace_decl, .ts_module_decl => {
-                // Not `localNamespaceHasValueSide` — see
-                // `namespaceHasDirectValueSide`'s doc comment for why.
-                var has_value = self.namespaceHasDirectValueSide(target, 0);
-                if (!has_value) for (self.decl_index.merged_ns_extra.items) |e| {
-                    if (!std.mem.eql(u8, e.name, a.tail)) continue;
-                    if (self.namespaceHasDirectValueSide(e.node, 0)) {
-                        has_value = true;
-                        break;
-                    }
-                };
-                if (!has_value) return null;
+                if (!self.namespaceOrMergedHasValueSide(target, a.tail)) return null;
             },
             else => {},
         }
