@@ -265,8 +265,19 @@ fn isIdentChar(c: u8) bool {
 /// `export enum X` and a bare `enum X` later exported via `export { X }` (an
 /// imported name is necessarily exported, so export-syntax need not be on the
 /// decl line itself).  `const` covers `const enum X`.
-/// Does the block starting at the next `{` after `at` declare any VALUE?
-fn blockHasValueMember(src: []const u8, at: usize) bool {
+/// Textual scan of a `{...}` block for a value-bearing member — the
+/// cross-module counterpart to `namespaceHasDirectValueSide` (used when the
+/// block's source is another file's raw text, with no `NodeIndex`/AST
+/// available at all). `const`/`let`/`var`/`function`/`class`/`enum` are
+/// unconditionally value-bearing wherever they occur; a nested `namespace `
+/// is NOT — a namespace of pure types has no value side, so its mere
+/// keyword presence must not prove one for its ENCLOSING block (verified
+/// against importStatementsInterfaces.ts's AST-side counterpart in
+/// `namespaceHasDirectValueSide`). Each `namespace ` occurrence therefore
+/// recurses into ITS OWN body instead. `nest_depth` bounds a pathological
+/// nesting chain (mirrors `namespaceHasDirectValueSide`'s own guard).
+fn blockHasValueMember(src: []const u8, at: usize, nest_depth: u8) bool {
+    if (nest_depth > 6) return false;
     const open = std.mem.indexOfScalarPos(u8, src, at, '{') orelse return false;
     var depth: i32 = 0;
     var i = open;
@@ -282,8 +293,14 @@ fn blockHasValueMember(src: []const u8, at: usize) bool {
         }
     }
     const body = src[open..end];
-    inline for (.{ "const ", "let ", "var ", "function ", "class ", "enum ", "namespace " }) |kw| {
+    inline for (.{ "const ", "let ", "var ", "function ", "class ", "enum " }) |kw| {
         if (std.mem.indexOf(u8, body, kw) != null) return true;
+    }
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, body, idx, "namespace ")) |rel| {
+        const abs = open + rel + "namespace ".len;
+        if (blockHasValueMember(src, abs, nest_depth + 1)) return true;
+        idx = rel + "namespace ".len;
     }
     return false;
 }
@@ -24342,7 +24359,7 @@ pub const Checker = struct {
                     // A namespace of pure TYPES has no value side, so the import
                     // binds nothing and tsc types it `any` (`declare namespace id
                     // { type A<T> = T }` in declarationEmitNoInvalidCommentReuse3).
-                    if (std.mem.eql(u8, kw, "namespace ") and !blockHasValueMember(src, after)) return null;
+                    if (std.mem.eql(u8, kw, "namespace ") and !blockHasValueMember(src, after, 0)) return null;
                     return exp;
                 }
                 idx = after;
