@@ -2594,11 +2594,17 @@ pub const Checker = struct {
         const nd = self.decl_index.primaryDecl(name) orelse return false;
         const ndt = self.ast_ref.nodeTag(nd);
         if (ndt != .ts_namespace_decl and ndt != .ts_module_decl) return false;
-        const src = self.ast_ref.source;
-        if (blockHasValueMember(src, self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(nd)))) return true;
+        // AST walk (`namespaceHasDirectValueSide`), not a textual scan: a
+        // TEXTUAL scan for "namespace "/"class "/etc. false-positives on a
+        // NESTED namespace's mere keyword presence — `namespace inA {...}`
+        // inside this namespace's own body text matches "namespace " even
+        // when `inA` itself holds only interfaces. Verified against
+        // importStatementsInterfaces.ts (see `namespaceHasDirectValueSide`'s
+        // own doc comment).
+        if (self.namespaceHasDirectValueSide(nd, 0)) return true;
         for (self.decl_index.merged_ns_extra.items) |e| {
             if (!std.mem.eql(u8, e.name, name)) continue;
-            if (blockHasValueMember(src, self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(e.node)))) return true;
+            if (self.namespaceHasDirectValueSide(e.node, 0)) return true;
         }
         return false;
     }
