@@ -8138,6 +8138,16 @@ pub const Checker = struct {
                         return ty;
                     }
                 }
+                // No annotation, but the destructuring SOURCE (if this default
+                // sits inside one) is itself `any`/unknown/error: property
+                // access on it is always `any`, regardless of what the
+                // default literal's own type would otherwise suggest
+                // (verified: `const { a = 1 } = {} as any;` types `a` as
+                // `any`, not `number`). A plain function-parameter default
+                // (no enclosing destructuring pattern) is unaffected —
+                // `destructuringSourceIsAny` only matches an enclosing
+                // declarator reached through pattern-wrapper ancestors.
+                if (self.destructuringSourceIsAny(parent)) return tymod.ID_ANY;
                 // No annotation: for simple literal defaults, return the base type.
                 // Only apply this for simple identifiers (not destructuring patterns).
                 if (data.lhs != .none and self.ast_ref.nodeTag(data.lhs) == .identifier and data.rhs != .none) {
@@ -9457,6 +9467,41 @@ pub const Checker = struct {
         }
     }
 
+    /// Does the destructuring SOURCE (the RHS of the enclosing declarator
+    /// that `pattern_ancestor` — an `assignment_pattern` or similar wrapper
+    /// node — sits within) resolve to `any`/`unknown`/error? Used to
+    /// override a destructured DEFAULT VALUE's own type: `const { a = 1 } =
+    /// {} as any;` types `a` as `any`, not `number` — property access on an
+    /// `any`-typed source is always `any` regardless of the default
+    /// literal's type (verified:
+    /// destructuringObjectBindingPatternAndAssignment4.ts).
+    fn destructuringSourceIsAny(self: *Checker, pattern_ancestor: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        var pattern_node = pattern_ancestor;
+        var cur: u32 = pattern_ancestor.toInt();
+        var guard: u32 = 0;
+        while (guard < 16) : (guard += 1) {
+            if (cur >= parents.len) return false;
+            const p_idx = parents[cur];
+            if (p_idx == @intFromEnum(NodeIndex.none)) return false;
+            const p: NodeIndex = @enumFromInt(p_idx);
+            switch (self.ast_ref.nodeTag(p)) {
+                .declarator => {
+                    const data = self.ast_ref.nodeData(p);
+                    if (data.lhs != pattern_node or data.rhs == .none) return false;
+                    const t = self.store.get(self.typeOf(data.rhs));
+                    return t.kind == .any or t.kind == .unknown or t.kind == .error_t;
+                },
+                .array_pattern, .object_pattern, .assignment_pattern,
+                .property, .shorthand_property => {},
+                else => return false,
+            }
+            pattern_node = p;
+            cur = p_idx;
+        }
+        return false;
+    }
+
     fn inferTypeFromDestructuringPattern(self: *Checker, binding: NodeIndex) ?TypeId {
         const parents = self.semantic.parent_indices;
         const bidx = binding.toInt();
@@ -9582,6 +9627,15 @@ pub const Checker = struct {
                     // Function parameter with default: `[x] = default`.
                     const data = self.ast_ref.nodeData(@enumFromInt(cur));
                     if (data.lhs == pattern_node and data.rhs != .none) {
+                        // Property access on an `any`/unresolvable SOURCE is
+                        // always `any`, regardless of what the default
+                        // literal's own type would otherwise suggest
+                        // (verified: `const { a = 1 } = {} as any;` types `a`
+                        // as `any`, not `number`). Only overrides the default
+                        // when the source itself is unresolvable — a real
+                        // source object with a genuinely-optional/absent
+                        // property still gets the default's own type, unchanged.
+                        if (self.destructuringSourceIsAny(@enumFromInt(cur))) return tymod.ID_ANY;
                         // Return the type of the default value.
                         return self.typeOf(data.rhs);
                     }

@@ -40,8 +40,8 @@ Measured against the TypeScript compiler itself: for every expression in the [mi
 
 | Metric | Correct | Total | Rate |
 | --- | --- | --- | --- |
-| All expression types | 561,262 | 657,474 | **85.4%** |
-| Primitive types (sub-metric) | 339,413 | 372,262 | **91.2%** |
+| All expression types | 561,272 | 657,474 | **85.4%** |
+| Primitive types (sub-metric) | 339,423 | 372,262 | **91.2%** |
 
 A ratchet (`oracle/baseline.lock`) records these floors; `zig build test-oracle` fails if any metric regresses, and CI enforces it on every push and pull request. Sweep the corpus with `zig build run-oracle`; raise the floor after a genuine gain with `zig build save-baseline`.
 
