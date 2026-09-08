@@ -192,6 +192,11 @@ pub const ImportEntry = struct {
     order: u32 = 0,
 };
 
+/// One `import * as <local> from "<spec>"` / `import <local> =
+/// require("<spec>")` binding, in SOURCE order, with the section it was
+/// declared in. See `Checker.namespaceImportSpecAt`.
+const NsImportDecl = struct { name: []const u8, spec: []const u8, sec_start: u32, pos: u32 };
+
 /// Returns true when a module specifier is a relative path that lacks an explicit
 /// node-resolution extension (.js/.mjs/.cjs/.ts/.tsx/.mts/.cts).
 /// In node16/nodenext mode tsc requires the extension; omitting it means the
@@ -353,6 +358,59 @@ fn lineStartsTopLevelDecl(src: []const u8, at: usize) bool {
         if (std.mem.startsWith(u8, rest, kw)) return true;
     }
     return false;
+}
+
+/// The index of `s[open]`'s matching `}`, skipping over quoted-string
+/// content (so a brace inside a JSON string value doesn't miscount), or null
+/// when unbalanced. `s[open]` must be `{`.
+fn matchingBrace(s: []const u8, open: usize) ?usize {
+    var depth: i32 = 0;
+    var in_str = false;
+    var i = open;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (in_str) {
+            if (c == '\\') {
+                i += 1;
+            } else if (c == '"') {
+                in_str = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// Rewrites a package.json `exports` RUNTIME target (`.mjs`/`.cjs`/`.js`) to
+/// its declaration-file companion (`.d.mts`/`.d.cts`/`.d.ts`) — this checker
+/// resolves types, and a target named by its compiled-output extension is
+/// only type-checkable through the co-located declaration file Node's own
+/// convention pairs it with. A target that's already a `.d.*` path (resolved
+/// via an explicit `"types"` condition) passes through unchanged, since none
+/// of the three suffixes below match a `.d.mts`/`.d.cts`/`.d.ts` ending.
+fn applyDeclCompanion(buf: *[300]u8, target: []const u8) []const u8 {
+    const Sub = struct { ext: []const u8, decl: []const u8 };
+    const subs = [_]Sub{
+        .{ .ext = ".mjs", .decl = ".d.mts" },
+        .{ .ext = ".cjs", .decl = ".d.cts" },
+        .{ .ext = ".js", .decl = ".d.ts" },
+    };
+    for (subs) |s| {
+        if (std.mem.endsWith(u8, target, s.ext)) {
+            const stem = target[0 .. target.len - s.ext.len];
+            return std.fmt.bufPrint(buf, "{s}{s}", .{ stem, s.decl }) catch target;
+        }
+    }
+    return target;
 }
 
 /// The extensionless target a relative specifier written in `from_path`
@@ -948,8 +1006,22 @@ pub const Checker = struct {
 
     /// Maps `import * as NS` local binding name → module_specifier.
     /// Used by `inferMemberOnNamespace` to resolve `NS.Member` lookups
-    /// through the module's exported types.
+    /// through the module's exported types. Whole-program, keyed by bare
+    /// name only: the LAST `import * as X`/`import X = require(...)` scanned
+    /// wins for every earlier use of that name too. Fine for the common case
+    /// (no cross-section name reuse), but a node16-style multi-file oracle
+    /// unit routinely concatenates several importer sections that each bind
+    /// the SAME local name (`m1`.."m45" per format-variant section is a
+    /// recurring corpus shape) to DIFFERENT specifiers — `namespaceImportSpecAt`
+    /// disambiguates those via `ns_import_decls` below; prefer it at any call
+    /// site that has a use-site node to hand.
     namespace_import_map: std.StringHashMapUnmanaged([]const u8) = .empty,
+
+    /// One `import * as <local> from "<spec>"` / `import <local> =
+    /// require("<spec>")` binding, in SOURCE order, with the section it was
+    /// declared in — the disambiguating data `namespace_import_map` itself
+    /// doesn't carry. See `namespaceImportSpecAt`.
+    ns_import_decls: std.ArrayListUnmanaged(NsImportDecl) = .empty,
 
     /// Evolving-any support.  An untyped `var`/`let` (no annotation, no
     /// initializer) is typed at each *use* as the union of the assigned
@@ -1219,6 +1291,7 @@ pub const Checker = struct {
         self.natively_bound_type_ids.deinit(self.gpa);
         self.import_map.deinit(self.gpa);
         self.namespace_import_map.deinit(self.gpa);
+        self.ns_import_decls.deinit(self.gpa);
         {
             var eit = self.evolving_assign_index.valueIterator();
             while (eit.next()) |list| list.deinit(self.gpa);
@@ -3005,8 +3078,8 @@ pub const Checker = struct {
             if (p == @intFromEnum(NodeIndex.none)) break :ns_decl;
             if (self.ast_ref.nodeTag(@enumFromInt(p)) != .import_namespace_specifier) break :ns_decl;
             const ns_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
-            const spec = self.namespace_import_map.get(ns_name) orelse break :ns_decl;
-            if (self.namespaceImportBindingType(ns_name, spec)) |t| return t;
+            const spec = self.namespaceImportSpecAt(ns_name, node) orelse break :ns_decl;
+            if (self.namespaceImportBindingType(ns_name, spec, node)) |t| return t;
         }
         // An in-body REFERENCE to a class EXPRESSION's own name
         // (`(class C { … C … })`): the name is in scope only inside the class body
@@ -3185,13 +3258,27 @@ pub const Checker = struct {
             if (bkind == .import_binding and !self.identifierInTypePosition(node)) {
                 const tok = self.ast_ref.nodeMainToken(node);
                 const ns_name = self.ast_ref.tokenText(tok);
-                if (self.namespace_import_map.get(ns_name)) |mod_spec| {
+                if (self.namespaceImportSpecAt(ns_name, node)) |mod_spec| {
                     if (self.checker_opts.isNode16Style() and
                         node16UnresolvableSpec(mod_spec))
                     {
                         return tymod.ID_ANY;
                     }
-                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return tymod.ID_ANY;
+                    // Bare specifiers can ALSO be resolvable/unresolvable in ways
+                    // this function doesn't otherwise check (package.json `exports`,
+                    // `/// <reference>` libs, ambient globals) — unlike the relative
+                    // case above, don't gate success on `bareSpecResolvable` here (a
+                    // prior attempt did and cost 947 correct→gap corpus-wide, since
+                    // most bare specifiers resolve some OTHER way this function
+                    // doesn't model). Only ask whether a same-target SIBLING import
+                    // of the SAME package earns the collapsed display name —
+                    // `bareNamespaceImportDisplayName` itself falls back to `ns_name`
+                    // unchanged whenever package.json resolution doesn't apply.
+                    const disp = if (mod_spec.len > 0 and mod_spec[0] != '.') blk: {
+                        const is_require_ctx = if (self.sectionOfNode(node)) |sec| self.fileIsCjsFormat(sec.name) else false;
+                        break :blk self.bareNamespaceImportDisplayName(ns_name, mod_spec, node, is_require_ctx);
+                    } else ns_name;
+                    const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp}) catch return tymod.ID_ANY;
                     return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
                 }
                 // A named/default import of a type-entity (enum / class / namespace)
@@ -4019,7 +4106,7 @@ pub const Checker = struct {
         // declarations — a function member displays its SIGNATURE, not a
         // `typeof`, so guessing there is wrong (`exporter.createExportedWidget1`
         // wants `() => …`, not `typeof exporter.createExportedWidget1`).
-        if (self.namespace_import_map.get(recv_nm)) |spec| {
+        if (self.namespaceImportSpecAt(recv_nm, pd0.lhs)) |spec| {
             if (self.moduleSpecIsLocalSection(spec)) return base;
         }
         const prop_nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
@@ -10232,7 +10319,7 @@ pub const Checker = struct {
                 // Restricted to a two-level chain (`ns.Member`): a deeper chain
                 // (`ns.C.staticField`) resolves to the member's value type.
                 if (qd.rhs != .none and self.ast_ref.nodeTag(qd.lhs) == .identifier and
-                    self.namespace_import_map.get(self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.lhs))) != null)
+                    self.namespaceImportSpecAt(self.ast_ref.tokenText(self.ast_ref.nodeMainToken(qd.lhs)), qd.lhs) != null)
                 {
                     const root_tok = self.ast_ref.nodeMainToken(qd.lhs);
                     const rhs_tok = self.ast_ref.nodeMainToken(qd.rhs);
@@ -14861,6 +14948,7 @@ pub const Checker = struct {
                                     }
                                     try self.known_type_names.put(self.gpa, local_name, {});
                                     try self.namespace_import_map.put(self.gpa, local_name, spec);
+                                    self.recordNsImportDecl(local_name, spec, ni);
                                 }
                             }
                         } else if (data.rhs != .none) {
@@ -14932,6 +15020,7 @@ pub const Checker = struct {
                                     );
                                     try self.known_type_names.put(self.gpa, local_name, {});
                                     try self.namespace_import_map.put(self.gpa, local_name, module_spec);
+                                    self.recordNsImportDecl(local_name, module_spec, ni);
                                 },
                                 else => {},
                             }
@@ -15885,7 +15974,7 @@ pub const Checker = struct {
         // preserve the full qualified display.
         {
             const qd2 = self.ast_ref.nodeData(ty_node);
-            if (self.namespace_import_map.get(name) != null and
+            if (self.namespaceImportSpecAt(name, ty_node) != null and
                 qd2.lhs != .none and self.ast_ref.nodeTag(qd2.lhs) == .member_expr)
             {
                 const md2 = self.ast_ref.nodeData(qd2.lhs);
@@ -22719,7 +22808,7 @@ pub const Checker = struct {
         if (data.lhs == .none or data.rhs == .none) return null;
         if (self.ast_ref.nodeTag(data.lhs) != .identifier) return null;
         const root_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
-        if (self.namespace_import_map.get(root_name) == null) return null;
+        if (self.namespaceImportSpecAt(root_name, data.lhs) == null) return null;
         const parents = self.semantic.parent_indices;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         var p = if (member_node.toInt() < parents.len) parents[member_node.toInt()] else NONE;
@@ -22881,7 +22970,7 @@ pub const Checker = struct {
             const obj_tag = self.ast_ref.nodeTag(obj_node);
             if (obj_tag == .identifier) {
                 const obj_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(obj_node));
-                if (self.namespace_import_map.get(obj_name)) |mod_spec| {
+                if (self.namespaceImportSpecAt(obj_name, obj_node)) |mod_spec| {
                     if (self.inferMemberOnNamespace(mod_spec, prop_name, obj_node)) |resolved| {
                         return self.maybeAddOptionalUndefined(resolved, nullcheck_ty, in_chain);
                     }
@@ -23197,6 +23286,36 @@ pub const Checker = struct {
         return null;
     }
 
+    /// Record one `import * as <name>`/`import <name> = require(...)` binding
+    /// into `ns_import_decls`, tagged with the section `decl_node` lives in.
+    /// Best-effort: an append failure just means that binding won't be
+    /// disambiguated by `namespaceImportSpecAt` (it still lives in the flat
+    /// `namespace_import_map`, matching pre-existing behavior).
+    fn recordNsImportDecl(self: *Checker, name: []const u8, spec: []const u8, decl_node: NodeIndex) void {
+        const sec_start: u32 = if (self.sectionOfNode(decl_node)) |mf| mf.start else 0;
+        const pos = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(decl_node));
+        self.ns_import_decls.append(self.gpa, .{ .name = name, .spec = spec, .sec_start = sec_start, .pos = pos }) catch {};
+    }
+
+    /// The module specifier the namespace-import binding named `name` uses,
+    /// AS SEEN FROM `use_site`. `namespace_import_map` itself is a flat,
+    /// whole-program name->spec map — the LAST `import * as X`/`import X =
+    /// require(...)` scanned wins for every earlier use of that name too,
+    /// which silently corrupts node16-style multi-file units where several
+    /// concatenated importer sections reuse the same local names (`m1`.."m45"
+    /// per format-variant section is a recurring corpus shape). Prefer the
+    /// `ns_import_decls` entry in the SAME section as `use_site`; fall back to
+    /// the flat map when nothing section-local matches (single-file sweep,
+    /// or `use_site` carries no section info).
+    fn namespaceImportSpecAt(self: *Checker, name: []const u8, use_site: NodeIndex) ?[]const u8 {
+        if (self.sectionOfNode(use_site)) |sec| {
+            for (self.ns_import_decls.items) |d| {
+                if (d.sec_start == sec.start and std.mem.eql(u8, d.name, name)) return d.spec;
+            }
+        }
+        return self.namespace_import_map.get(name);
+    }
+
     /// Every named `type_ref` reachable in `id`, capped in both breadth and depth.
     fn collectTypeRefNames(self: *Checker, id: TypeId, out: *[8][]const u8, n: *usize, depth: u8) void {
         if (depth > 6 or n.* >= out.len) return;
@@ -23409,7 +23528,7 @@ pub const Checker = struct {
         // is genuinely external (stays any).  Skip when the member name is
         // itself an import binding (avoid resolving `b.b` to the alias `b`).
         if ((self.moduleSpecIsLocalSection(module_spec) or self.ambientModuleDeclared(module_spec, use_site)) and
-            self.namespace_import_map.get(member_name) == null)
+            self.namespaceImportSpecAt(member_name, use_site) == null)
         {
             if (self.typeOfNameByAstSearch(member_name, .none)) |t| {
                 if (!t.eq(tymod.ID_UNKNOWN) and !t.eq(tymod.ID_ANY)) return self.crossModuleResult(t, use_site, ranged);
@@ -23851,9 +23970,9 @@ pub const Checker = struct {
 
     /// Is `name` a require-alias bound to a RELATIVE sibling section?  Those are
     /// the ones whose members must stay opaque (see `memberOnApparentType`).
-    fn isLocalRequireAlias(self: *Checker, name: []const u8) bool {
+    fn isLocalRequireAlias(self: *Checker, name: []const u8, use_site: NodeIndex) bool {
         if (!self.isResolvableRequireAlias(name)) return false;
-        const spec = self.namespace_import_map.get(name) orelse return false;
+        const spec = self.namespaceImportSpecAt(name, use_site) orelse return false;
         return spec.len > 0 and spec[0] == '.';
     }
 
@@ -24264,7 +24383,7 @@ pub const Checker = struct {
         // `accessibleNameAt` alone can't see the conflict; `classNameIsUnique`'s
         // whole-program scan is still required for that), and an imported
         // binding of the same name has its own display rules.
-        if (self.import_map.get(name) != null or self.namespace_import_map.get(name) != null) return false;
+        if (self.import_map.get(name) != null or self.namespaceImportSpecAt(name, use_site) != null) return false;
         if (!self.classNameIsUnique(name)) return false;
         // ADDITIONALLY: an internal `import Y = Ns.C` alias `siblingNamespaceClass`
         // never considered before can be nearer or earlier than `C`'s own name
@@ -24500,9 +24619,8 @@ pub const Checker = struct {
         if (self.importDeclIsTypeOnly(node)) return null;
         const shown: []const u8 = switch (bk) {
             .namespace => blk: {
-                const spec = self.namespace_import_map.get(local) orelse return null;
-                if (self.namespaceImportBindingType(local, spec) == null) return null;
-                break :blk local;
+                const spec = self.namespaceImportSpecAt(local, node) orelse return null;
+                break :blk self.namespaceImportDisplayName(local, spec, node) orelse return null;
             },
             // The LOCAL name, for BOTH nodes of an aliased specifier:
             // `import { a11 as b }` types the `a11` node and the `b` node alike
@@ -24680,20 +24798,9 @@ pub const Checker = struct {
         return .{ .kind = kind, .local = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(local_node)) };
     }
 
-    fn namespaceImportBindingType(self: *Checker, ns_name: []const u8, spec: []const u8) ?TypeId {
-        // node16/nodenext requires an explicit extension on relative imports; an
-        // extensionless/directory specifier is unresolvable → tsc types it `any`.
-        if (self.checker_opts.isNode16Style() and node16UnresolvableSpec(spec)) return null;
-        if (std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../")) {
-            const sec_src = self.resolvedModuleSpecSource(spec) orelse return null;
-            if (std.mem.indexOf(u8, sec_src, "export =") != null or
-                std.mem.indexOf(u8, sec_src, "export=") != null) return null;
-        } else {
-            // Bare specifier (`package/sub`) — resolvable only when the package's
-            // package.json `exports` exposes the subpath.
-            if (!self.bareSpecResolvable(spec)) return null;
-        }
-        const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{ns_name}) catch return null;
+    fn namespaceImportBindingType(self: *Checker, ns_name: []const u8, spec: []const u8, use_site: NodeIndex) ?TypeId {
+        const disp = self.namespaceImportDisplayName(ns_name, spec, use_site) orelse return null;
+        const tn = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp}) catch return null;
         const r = self.store.typeRef(tn, &.{}) catch {
             self.gpa.free(tn);
             return null;
@@ -24702,13 +24809,33 @@ pub const Checker = struct {
         return r;
     }
 
-    /// True when a bare specifier `package/sub` resolves through the package's
-    /// package.json `exports`: the subpath key is present and maps (possibly via
-    /// `import`/`require`/`node`/`types`/`default` conditions) to a non-null
-    /// target.  Packages whose `exports` use subpath PATTERNS (`./*`) are treated
-    /// conservatively as unresolvable (pattern + exclusion resolution is TODO).
-    fn bareSpecResolvable(self: *Checker, spec: []const u8) bool {
-        // Split package name (handle `@scope/name`) from the subpath.
+    /// The name `import * as <ns_name> from "<spec>"` displays as, from
+    /// `use_site` — its own name, or (for a bare package specifier resolving
+    /// through the same conditional-exports target as an earlier sibling
+    /// import in the same section) that earlier import's name. Null when
+    /// `spec` doesn't resolve at all (tsc types the binding `any`).
+    fn namespaceImportDisplayName(self: *Checker, ns_name: []const u8, spec: []const u8, use_site: NodeIndex) ?[]const u8 {
+        // node16/nodenext requires an explicit extension on relative imports; an
+        // extensionless/directory specifier is unresolvable → tsc types it `any`.
+        if (self.checker_opts.isNode16Style() and node16UnresolvableSpec(spec)) return null;
+        if (std.mem.startsWith(u8, spec, "./") or std.mem.startsWith(u8, spec, "../")) {
+            const sec_src = self.resolvedModuleSpecSource(spec) orelse return null;
+            if (std.mem.indexOf(u8, sec_src, "export =") != null or
+                std.mem.indexOf(u8, sec_src, "export=") != null) return null;
+            return ns_name;
+        }
+        // Bare specifier (`package/sub`) — resolvable only when the package's
+        // package.json `exports` exposes the subpath. An ES `import` inside a
+        // CJS-format file resolves like `require()` does (same rule already
+        // verified for require-vs-import collisions in `requireAliasDisplayName`).
+        const is_require_ctx = if (self.sectionOfNode(use_site)) |sec| self.fileIsCjsFormat(sec.name) else false;
+        if (!self.bareSpecResolvable(spec, is_require_ctx)) return null;
+        return self.bareNamespaceImportDisplayName(ns_name, spec, use_site, is_require_ctx);
+    }
+
+    /// Split a bare module specifier into its package name (handling
+    /// `@scope/name`) and subpath (`""` for the package root).
+    fn splitPkgSpec(spec: []const u8) struct { pkg: []const u8, subpath: []const u8 } {
         var pkg_end: usize = std.mem.indexOfScalar(u8, spec, '/') orelse spec.len;
         if (spec.len > 0 and spec[0] == '@') {
             if (pkg_end < spec.len) {
@@ -24716,10 +24843,18 @@ pub const Checker = struct {
                 pkg_end = if (std.mem.indexOfScalar(u8, rest, '/')) |s| pkg_end + 1 + s else spec.len;
             }
         }
-        const pkg = spec[0..pkg_end];
-        const subpath = if (pkg_end < spec.len) spec[pkg_end + 1 ..] else "";
-        const pkg_src = self.packageJsonSource(pkg) orelse return false;
-        return self.exportsHasSubpath(pkg_src, subpath);
+        return .{ .pkg = spec[0..pkg_end], .subpath = if (pkg_end < spec.len) spec[pkg_end + 1 ..] else "" };
+    }
+
+    /// True when a bare specifier `package/sub` resolves through the package's
+    /// package.json `exports` under `is_require_ctx`'s condition set.
+    /// Packages whose `exports` use subpath PATTERNS (`./*`) are treated
+    /// conservatively as unresolvable (pattern + exclusion resolution is TODO).
+    fn bareSpecResolvable(self: *Checker, spec: []const u8, is_require_ctx: bool) bool {
+        const parts = splitPkgSpec(spec);
+        const pkg_src = self.packageJsonSource(parts.pkg) orelse return false;
+        var buf: [300]u8 = undefined;
+        return self.resolveExportsTarget(&buf, pkg_src, parts.subpath, is_require_ctx) != null;
     }
 
     /// The source text of the package.json that declares `"name": "<pkg>"`
@@ -24734,30 +24869,115 @@ pub const Checker = struct {
         return null;
     }
 
-    /// True when the `exports` object in `pkg_src` exposes `subpath` (a non-null
-    /// target).  Conservative: bails (false) when the exports use patterns.
-    fn exportsHasSubpath(self: *Checker, pkg_src: []const u8, subpath: []const u8) bool {
-        _ = self;
-        const ex_kw = std.mem.indexOf(u8, pkg_src, "\"exports\"") orelse return false;
+    /// The real target `subpath` resolves to in `pkg_src`'s `"exports"` block,
+    /// under `is_require_ctx`'s condition set — a plain string value returns
+    /// verbatim; a CONDITIONS OBJECT (`{ "import": …, "require": …, "node": …,
+    /// "types": … }`) is walked via `resolveConditionValue`. Conservative: a
+    /// pattern-based `exports` (`./*`) or no key match both return null. A
+    /// resolved RUNTIME extension (`.mjs`/`.cjs`/`.js`) is rewritten to its
+    /// declaration-file companion (`.d.mts`/`.d.cts`/`.d.ts`) via
+    /// `applyDeclCompanion` — this checker resolves TYPES, and a types-only
+    /// package (or one whose `exports` names its compiled JS) is only
+    /// type-checkable through the co-located declaration file.
+    fn resolveExportsTarget(self: *Checker, buf: *[300]u8, pkg_src: []const u8, subpath: []const u8, is_require_ctx: bool) ?[]const u8 {
+        const ex_kw = std.mem.indexOf(u8, pkg_src, "\"exports\"") orelse return null;
         const region = pkg_src[ex_kw..];
-        // Pattern-based exports need full pattern/exclusion resolution — skip.
-        if (std.mem.indexOfScalar(u8, region, '*') != null) return false;
-        // Build the subpath key: "." for the package root, else "./<subpath>".
+        if (std.mem.indexOfScalar(u8, region, '*') != null) return null; // patterns: TODO
         var key_buf: [256]u8 = undefined;
         const key = if (subpath.len == 0)
             "\".\""
         else blk: {
-            const k = std.fmt.bufPrint(&key_buf, "\"./{s}\"", .{subpath}) catch return false;
+            const k = std.fmt.bufPrint(&key_buf, "\"./{s}\"", .{subpath}) catch return null;
             break :blk k;
         };
-        const ki = std.mem.indexOf(u8, region, key) orelse return false;
-        // After the key + `:`, resolve only a plain string target.  A conditions
-        // object (`{ import: …, require: … }`) needs format-aware condition
-        // resolution (TODO) — bail conservatively so we don't emit `typeof` for a
-        // subpath that the importer's condition actually excludes.
+        const ki = std.mem.indexOf(u8, region, key) orelse return null;
         var i = ki + key.len;
         while (i < region.len and (region[i] == ' ' or region[i] == ':' or region[i] == '\t')) i += 1;
-        return i < region.len and region[i] == '"';
+        const raw = self.resolveConditionValue(region, i, is_require_ctx) orelse return null;
+        return applyDeclCompanion(buf, raw);
+    }
+
+    /// `region[at..]` starts an export target VALUE: either a plain `"…"`
+    /// string, or a `{ … }` conditions object. For an object, a `"types"` key
+    /// wins UNCONDITIONALLY regardless of its position (matching tsc's own
+    /// dedicated types-condition priority), else the first of `is_require_ctx`'s
+    /// own condition (`"require"` or `"import"`), `"node"`, `"default"` — in
+    /// that order — that the object declares. Recurses one level into a nested
+    /// conditions object (the `"./types": { "types": {"import":…,"require":…},
+    /// "node": {...} }` shape this file's corpus fixtures use).
+    fn resolveConditionValue(self: *Checker, region: []const u8, at: usize, is_require_ctx: bool) ?[]const u8 {
+        if (at >= region.len) return null;
+        if (region[at] == '"') {
+            const end = std.mem.indexOfScalarPos(u8, region, at + 1, '"') orelse return null;
+            return region[at + 1 .. end];
+        }
+        if (region[at] != '{') return null;
+        const close = matchingBrace(region, at) orelse return null;
+        const body = region[at + 1 .. close];
+        if (self.conditionValueAt(body, "types", is_require_ctx)) |v| return v;
+        if (self.conditionValueAt(body, if (is_require_ctx) "require" else "import", is_require_ctx)) |v| return v;
+        if (self.conditionValueAt(body, "node", is_require_ctx)) |v| return v;
+        if (self.conditionValueAt(body, "default", is_require_ctx)) |v| return v;
+        return null;
+    }
+
+    /// The value following `"<key>":` at the top level of `body` (a conditions
+    /// object's interior, its own braces already stripped), or null when `key`
+    /// isn't declared there.
+    fn conditionValueAt(self: *Checker, body: []const u8, key: []const u8, is_require_ctx: bool) ?[]const u8 {
+        var kb: [32]u8 = undefined;
+        const needle = std.fmt.bufPrint(&kb, "\"{s}\"", .{key}) catch return null;
+        const ki = std.mem.indexOf(u8, body, needle) orelse return null;
+        var i = ki + needle.len;
+        while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) i += 1;
+        return self.resolveConditionValue(body, i, is_require_ctx);
+    }
+
+    /// The name a bare-package namespace-import binding displays under: its OWN
+    /// local name, unless an EARLIER (by source position) namespace-import in
+    /// the SAME section, of the SAME package, resolves to the exact same real
+    /// target — then tsc names it after that earlier binding instead (the same
+    /// earliest-wins rule `requireAliasDisplayName` already applies to
+    /// require-aliases, extended here to ES namespace imports of a
+    /// conditional-exports package: `nodeModulesConditionalPackageExports.ts`'s
+    /// `cjsi`/`mjsi`/`typei`/`ts` all resolve into the same package and
+    /// collapse onto whichever of them was imported first).
+    fn bareNamespaceImportDisplayName(self: *Checker, ns_name: []const u8, spec: []const u8, use_site: NodeIndex, is_require_ctx: bool) []const u8 {
+        const sec = self.sectionOfNode(use_site) orelse return ns_name;
+        const parts = splitPkgSpec(spec);
+        const pkg_src = self.packageJsonSource(parts.pkg) orelse return ns_name;
+        var own_buf: [300]u8 = undefined;
+        const own_target = self.resolveExportsTarget(&own_buf, pkg_src, parts.subpath, is_require_ctx) orelse return ns_name;
+        // The tie-break is by DECLARATION order, not by where `use_site`
+        // happens to sit — a member-access RECEIVER referencing `ns_name`
+        // sits textually after every sibling import, so anchoring on
+        // `use_site`'s own position would always find an "earlier" sibling
+        // and misname `ns_name`'s OWN reference. Anchor on `ns_name`'s own
+        // declaration position instead (falling back to `use_site` only if,
+        // implausibly, `ns_name` has no recorded declaration).
+        var own_pos = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(use_site));
+        for (self.ns_import_decls.items) |d| {
+            if (d.sec_start == sec.start and std.mem.eql(u8, d.name, ns_name)) {
+                own_pos = d.pos;
+                break;
+            }
+        }
+        var best_name = ns_name;
+        var best_pos = own_pos;
+        for (self.ns_import_decls.items) |d| {
+            if (d.sec_start != sec.start or std.mem.eql(u8, d.name, ns_name)) continue;
+            if (d.spec.len == 0 or d.spec[0] == '.') continue; // relative: different mechanism
+            const dp = splitPkgSpec(d.spec);
+            if (!std.mem.eql(u8, dp.pkg, parts.pkg)) continue;
+            var cand_buf: [300]u8 = undefined;
+            const cand_target = self.resolveExportsTarget(&cand_buf, pkg_src, dp.subpath, is_require_ctx) orelse continue;
+            if (!std.mem.eql(u8, cand_target, own_target)) continue;
+            if (d.pos < best_pos) {
+                best_pos = d.pos;
+                best_name = d.name;
+            }
+        }
+        return best_name;
     }
 
     /// True when an import specifier refers to one of the sibling sections
@@ -25868,7 +26088,7 @@ pub const Checker = struct {
                         }
                     }
                 }
-                if (self.namespace_import_map.get(inner_name)) |mod_spec| {
+                if (self.namespaceImportSpecAt(inner_name, obj_node)) |mod_spec| {
                     // `import X = require("./sib")` alias: resolving members
                     // through it is premature.  The member's type routinely
                     // names an entity declared in a THIRD module, which tsc
@@ -25879,7 +26099,7 @@ pub const Checker = struct {
                     // qualified display lands.  ES `import * as ns` bindings are
                     // unaffected — only require-aliases are held opaque.
                     const held = self.require_alias_opaque and
-                        self.isLocalRequireAlias(inner_name);
+                        self.isLocalRequireAlias(inner_name, obj_node);
                     if (!held) {
                         if (self.inferMemberOnNamespace(mod_spec, prop_name, obj_node)) |resolved| return resolved;
                         // The receiver is OURS: an `import X = require(…)` module
