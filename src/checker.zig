@@ -357,15 +357,25 @@ fn lineStartsTopLevelDecl(src: []const u8, at: usize) bool {
 
 /// The extensionless target a relative specifier written in `from_path`
 /// resolves to (before checking it against any specific candidate list),
-/// written into `buf`. Shared by `resolveRelativeSpec` and
-/// `relativeRequireResolvesNode16`, which each then search a DIFFERENT
-/// candidate list (`ModuleFile` byte ranges vs. plain names in
-/// `available_modules`) for a match against it.
+/// written into `buf`. Shared by `resolveRelativeSpec`,
+/// `relativeRequireResolvesNode16`, and `requireTargetIsEsmDirectory`, which
+/// each then search a DIFFERENT candidate list (`ModuleFile` byte ranges vs.
+/// plain names in `available_modules` vs. a directory's nearest
+/// package.json) for a match against it.
 fn relativeSpecTarget(buf: *[1024]u8, from_path: []const u8, spec: []const u8) ?[]const u8 {
     var join_buf: [1024]u8 = undefined;
     const dir = dirOfPath(from_path);
     const joined = std.fmt.bufPrint(&join_buf, "{s}/{s}", .{ dir, stripModuleExt(spec) }) catch return null;
     return normalizePath(buf, joined);
+}
+
+/// The `<target>/index` path used for directory-import fallback, guarding
+/// the program-root case (`target == ""`) where `"{s}/index"` would
+/// otherwise produce a bogus leading-slash "/index" that never matches a
+/// real (slash-less) module name.
+fn targetIndexPath(buf: *[1024]u8, target: []const u8) ?[]const u8 {
+    if (target.len == 0) return "index";
+    return std.fmt.bufPrint(buf, "{s}/index", .{target}) catch null;
 }
 
 /// Resolve a RELATIVE module specifier (`./x`, `../y/z`) written in `from_path`
@@ -23575,14 +23585,16 @@ pub const Checker = struct {
     ///     = require(...);` inside one section both display `typeof m4`) —
     ///     but ONLY among require-aliases. A require-alias competing with an
     ///     `import * as ns` binding of the SAME module is a genuine,
-    ///     unresolved ambiguity: `importsImplicitlyReadonly` (`import * as
-    ///     a1 from "./a"; import a2 = require("./a")`) types `a2` as `typeof
-    ///     a1` (the namespace-import wins), while the identical shape in
-    ///     `unusedImports11` (`import * as ns from './b'; import r =
-    ///     require('./b')`) types `r` as `typeof r` (the require-alias wins)
-    ///     — no discriminator recovers which. Mixed-kind competition
-    ///     therefore still declines entirely; only same-kind (require vs.
-    ///     require) ordering is resolved.
+    ///     unresolved ambiguity in general: `importsImplicitlyReadonly`
+    ///     (`import * as a1 from "./a"; import a2 = require("./a")`) types
+    ///     `a2` as `typeof a1` (the namespace-import wins), while the
+    ///     identical shape in `unusedImports11` (`import * as ns from './b';
+    ///     import r = require('./b')`) types `r` as `typeof r` (the
+    ///     require-alias wins) — no discriminator recovers which under
+    ///     non-node16 resolution, so mixed-kind competition still declines
+    ///     entirely there. Under node16/nodenext, two verified cases DO
+    ///     recover a genuine cross-reference instead of declining — see the
+    ///     `saw_other_kind` branch below.
     fn requireAliasDisplayName(self: *Checker, name: []const u8) ?[]const u8 {
         if (name.len == 0) return null;
         if (!self.require_alias_built) {
@@ -23642,7 +23654,8 @@ pub const Checker = struct {
                 if (!self.requireSpecResolves(b.spec, ni)) continue;
                 var disp = b.name;
                 if (self.resolvedModuleSpecSource(b.spec)) |src| {
-                    const sec: u32 = if (self.sectionOfNode(ni)) |mf| mf.start else 0;
+                    const from = self.sectionOfNode(ni);
+                    const sec: u32 = if (from) |mf| mf.start else 0;
                     if (binds.get(SecMod{ .sec = sec, .mod = @intFromPtr(src.ptr) })) |info| {
                         // The coarse `(section, resolved-pointer)` proxy can
                         // conflate an ES import and an UNRELATED require()
@@ -23675,20 +23688,20 @@ pub const Checker = struct {
                         // ignore it and fall back to the ordinary same-KIND
                         // (require vs. require) tie-break instead of
                         // self-naming outright.
-                        if (info.saw_other_kind and !self.checker_opts.isNode16Style()) {
-                            continue; // non-node16: genuine mixed-kind ambiguity
+                        var cross_reference = false;
+                        if (info.saw_other_kind) {
+                            if (!self.checker_opts.isNode16Style()) {
+                                continue; // non-node16: genuine mixed-kind ambiguity
+                            }
+                            if (from) |mf| {
+                                cross_reference = self.fileIsCjsFormat(mf.name) or
+                                    self.requireTargetIsEsmDirectory(mf.name, b.spec);
+                            }
                         }
-                        const importer_is_cjs = if (self.sectionOfNode(ni)) |from|
-                            self.fileIsCjsFormat(from.name)
+                        disp = if (cross_reference)
+                            info.first_any_name orelse b.name
                         else
-                            false;
-                        if (info.saw_other_kind and self.checker_opts.isNode16Style() and
-                            (importer_is_cjs or self.requireTargetIsEsmDirectory(ni, b.spec)))
-                        {
-                            disp = info.first_any_name orelse b.name;
-                        } else {
-                            disp = info.first_require_name orelse b.name;
-                        }
+                            info.first_require_name orelse b.name;
                     }
                 }
                 self.require_aliases.put(self.gpa, b.name, disp) catch {};
@@ -23701,15 +23714,11 @@ pub const Checker = struct {
     /// target live in a directory whose nearest package.json declares
     /// `"type": "module"`? See `requireAliasDisplayName`'s node16
     /// cross-reference branch for why this matters.
-    fn requireTargetIsEsmDirectory(self: *Checker, ni: NodeIndex, spec: []const u8) bool {
-        const from = self.sectionOfNode(ni) orelse return false;
+    fn requireTargetIsEsmDirectory(self: *Checker, from_path: []const u8, spec: []const u8) bool {
         var buf: [1024]u8 = undefined;
-        const target = relativeSpecTarget(&buf, from.name, spec) orelse return false;
+        const target = relativeSpecTarget(&buf, from_path, spec) orelse return false;
         var idx_buf: [1024]u8 = undefined;
-        const target_index = if (target.len == 0)
-            "index"
-        else
-            std.fmt.bufPrint(&idx_buf, "{s}/index", .{target}) catch return false;
+        const target_index = targetIndexPath(&idx_buf, target) orelse return false;
         return self.nearestPackageJsonIsEsm(target_index);
     }
 
@@ -23794,14 +23803,7 @@ pub const Checker = struct {
         var norm_buf: [1024]u8 = undefined;
         const target = relativeSpecTarget(&norm_buf, from_path, spec) orelse return false;
         var idx_buf: [1024]u8 = undefined;
-        // `target` is "" at the program root (e.g. `require("./")` from a
-        // top-level file) — "{s}/index" would then wrongly produce a
-        // leading-slash "/index" that never matches a real (slash-less)
-        // module name.
-        const target_index = if (target.len == 0)
-            "index"
-        else
-            std.fmt.bufPrint(&idx_buf, "{s}/index", .{target}) catch return false;
+        const target_index = targetIndexPath(&idx_buf, target) orelse return false;
         for (self.checker_opts.available_modules) |name| {
             var mfn_buf: [1024]u8 = undefined;
             const mfn = normalizePath(&mfn_buf, stripModuleExt(name)) orelse continue;
