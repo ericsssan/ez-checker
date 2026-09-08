@@ -1116,6 +1116,12 @@ pub const Checker = struct {
     /// section it was declared in — the disambiguating data `require_aliases`
     /// itself doesn't carry. See `requireAliasDisplayNameAt`.
     require_alias_decls: std.ArrayListUnmanaged(ReqAliasDecl) = .empty,
+    /// Memoizes `nameHasCircularInitializer` per name — its own scan is
+    /// O(references in file) per matching declarator, and (unlike most of
+    /// this file's per-symbol caches) it's queried from `declaredTypeAtBinding`,
+    /// which runs for EVERY declaration-site identifier, not just once per
+    /// symbol via `sym_types`.
+    circular_init_cache: std.StringHashMapUnmanaged(bool) = .empty,
     /// Guard: while a require-alias is being displayed as `typeof X`, member
     /// lookups through it must NOT resolve into the target module (see
     /// `memberOnApparentType`).
@@ -1341,6 +1347,7 @@ pub const Checker = struct {
             while (it.next()) |v| self.gpa.free(v.*);
             self.require_aliases.deinit(self.gpa);
             self.require_alias_decls.deinit(self.gpa);
+            self.circular_init_cache.deinit(self.gpa);
         self.tp_owner_map.deinit(self.gpa);
         self.sig_type_params.deinit(self.gpa);
         }
@@ -5099,6 +5106,139 @@ pub const Checker = struct {
         return .none;
     }
 
+    /// Does `decl`'s own initializer (`data.rhs`) contain a reference back to
+    /// the SAME variable `decl` declares (`var x = (x, 3)`, `var y = y || 1`,
+    /// `var z = z ? 0 : 1`, ...)? tsc's circularity witness: resolving
+    /// `decl`'s type needs its own initializer's type, which needs `decl`'s
+    /// type — tsc breaks the cycle by typing the WHOLE variable `any`, at
+    /// EVERY occurrence (not just the one inside the initializer, and not
+    /// overridden by a separately-declared explicit annotation on a merged
+    /// re-declaration — verified against `witness.ts`'s ~15 forms: comma,
+    /// assignment, conditional, `||`, `&&`). Symbol-based, not scope-based:
+    /// a same-named PARAMETER or nested declaration shadowing `x` inside a
+    /// nested function body within the initializer resolves to a DIFFERENT
+    /// symbol, so it's correctly not flagged — a namespace-scope-key walk
+    /// (like `scopeLocalValueDecl`'s) would miss that distinction, since it's
+    /// deliberately transparent to function/block scope.
+    fn initializerSelfReferences(self: *Checker, decl: NodeIndex) bool {
+        const data = self.ast_ref.nodeData(decl);
+        if (data.lhs == .none or data.rhs == .none) return false;
+        const sym = self.symbolForIdentRef(data.lhs) orelse return false;
+        const refs = &self.semantic.references;
+        const total = refs.count();
+        var ri: u32 = 0;
+        while (ri < total) : (ri += 1) {
+            const rid = parser.reference.ReferenceId.fromInt(ri);
+            if (!refs.isResolved(rid)) continue;
+            if (refs.getSymbol(rid).toInt() != sym.toInt()) continue;
+            if (self.selfReferenceIsSynchronous(refs.getNode(rid), data.rhs)) return true;
+        }
+        return false;
+    }
+
+    /// Like `nodeIsInside(node, ancestor)`, but false when the walk from
+    /// `node` up to `ancestor` crosses a function/method/getter-setter/class
+    /// boundary first — a reference nested inside a CLOSURE defined by the
+    /// initializer (`const a = { get foo() { return a.foo; } }`, or `var f =
+    /// function() { return f(); }`) is deferred, not evaluated synchronously
+    /// while computing the initializer's own value, so it is NOT a genuine
+    /// circularity witness the way a direct comma/assignment/conditional/
+    /// `||`/`&&` self-reference is (verified: `circularObjectLiteralAccessors`
+    /// wants `a.foo`'s getter return type `string`, not `any`, despite `a`
+    /// referencing itself inside its own initializer's getter body).
+    fn selfReferenceIsSynchronous(self: *Checker, node: NodeIndex, ancestor: NodeIndex) bool {
+        const parents = self.semantic.parent_indices;
+        var cur = node.toInt();
+        var guard: u16 = 0;
+        while (guard < 256) : (guard += 1) {
+            if (cur >= parents.len) return false;
+            // Checked BEFORE the ancestor-equality test below: when `ancestor`
+            // itself IS a function/method/class (e.g. `var f = (x) => f(x)`,
+            // where `ancestor` is the whole arrow function), the walk reaching
+            // `ancestor` must still count as crossing the boundary, not as
+            // "found it" — the initializer's OWN body never executes at
+            // declaration time either way (verified: recursiveInitializer.ts's
+            // `f` wants its function SIGNATURE `(x: string) => any`, not a
+            // total collapse to bare `any`).
+            switch (self.ast_ref.nodeTag(@enumFromInt(cur))) {
+                .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
+                .arrow_fn, .async_arrow_fn, .fn_decl, .async_fn_decl,
+                .generator_fn_decl, .async_generator_fn_decl,
+                .method_def, .computed_method_def, .getter_def, .setter_def,
+                .constructor_def, .class_decl, .class_expr => return false,
+                // A `typeof x` TYPE QUERY doesn't evaluate `x` as a value at
+                // all — it's a syntactic name lookup preserved verbatim in
+                // the type, never eagerly resolved — so a self-reference
+                // reached only through one is never a value-circularity
+                // witness (verified: noUsedBeforeDefinedErrorInTypeContext's
+                // `var foo = { one: {} as IThing<typeof foo> }` wants
+                // `IThing<typeof foo>` kept literally, not collapsed to
+                // `IThing<any>`).
+                .ts_typeof_type => return false,
+                else => {},
+            }
+            if (cur == ancestor.toInt()) return true;
+            const p = parents[cur];
+            if (p == @intFromEnum(NodeIndex.none)) return false;
+            cur = p;
+        }
+        return false;
+    }
+
+    /// Does `name`'s merged `var` group collapse to `any` under tsc's
+    /// circularity witness? tsc resolves a merged group from its FIRST
+    /// declaration ONLY (by source order): an annotation there settles the
+    /// type immediately, no matter what ANY later declaration in the same
+    /// group contains (even a later self-referencing initializer); only when
+    /// the FIRST declaration itself has NO annotation does tsc infer from
+    /// ITS OWN initializer, and only THAT specific inference can be circular
+    /// — verified against two contrasting fixtures:
+    ///   - witness.ts: `var co1 = (co1, 3); var co1: number;` — the FIRST
+    ///     declaration has no annotation and IS circular → `any`, even
+    ///     though a later declaration in the group is annotated `number`.
+    ///   - TwoInternalModulesThatMergeEachWith...SameName.ts: `var o: {x,y};
+    ///     var o: A.Point; var o = A.Origin; var o = A.Utils.mirror(o);` —
+    ///     the FIRST declaration IS annotated (`{x,y}`) → that wins outright,
+    ///     even though the LAST declaration's initializer self-references
+    ///     `o` (as a call argument to `mirror`).
+    /// So only the FIRST matching declarator is ever inspected, not "any
+    /// declarator in the group" like an earlier version of this function did
+    /// (which wrongly flagged `o` above as circular too).
+    fn nameHasCircularInitializer(self: *Checker, name: []const u8) bool {
+        if (self.circular_init_cache.get(name)) |cached| return cached;
+        var found = false;
+        first: {
+            const list = self.decl_index.valueDecls(name) orelse break :first;
+            for (list.items) |ni| {
+                if (self.ast_ref.nodeTag(ni) != .declarator) continue;
+                const data = self.ast_ref.nodeData(ni);
+                if (data.lhs == .none) continue;
+                if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs)), name)) continue;
+                // Found the first matching declarator — this is the ONLY one
+                // that can ever make `name` circular; stop here regardless
+                // of the outcome below.
+                const id_data = self.ast_ref.nodeData(data.lhs);
+                if (id_data.rhs != .none and self.ast_ref.nodeTag(id_data.rhs) == .ts_type_annotation) break :first;
+                // A `var` legally re-declaring a same-named PARAMETER
+                // (`constructor(options?: number) { var options = (options
+                // || 0); }`) merges into that SAME binding, but the
+                // parameter's own annotation is settled independently and
+                // unconditionally before the function body's `var`
+                // statement is ever considered — never subject to the var's
+                // own circularity witness. `is_parameter` on the
+                // declarator's resolved symbol (shared with the parameter
+                // once merged) detects this.
+                if (self.symbolForIdentRef(data.lhs)) |sym| {
+                    if (self.semantic.symbols.getFlags(sym).is_parameter) break :first;
+                }
+                found = self.initializerSelfReferences(ni);
+                break :first;
+            }
+        }
+        self.circular_init_cache.put(self.gpa, name, found) catch {};
+        return found;
+    }
+
     pub fn typeOfNameByAstSearch(self: *Checker, name: []const u8, use_site: NodeIndex) ?TypeId {
         // Scope-aware variable resolution: when `name` has declarators in several
         // namespace scopes, resolve the one lexically nearest the use site, not
@@ -5117,6 +5257,14 @@ pub const Checker = struct {
         var fn_decl_fallback: NodeIndex = .none; // first no-body signature
         var fn_impl: NodeIndex = .none; // implementation (with body)
         const list = self.decl_index.valueDecls(name) orelse return null;
+        // Circular self-reference (`var x = (x, 3)`): tsc's circularity
+        // witness types the WHOLE variable `any`, overriding even an
+        // explicit type annotation on a separately merged re-declaration
+        // (`var x = (x, 3); var x: number;` types BOTH "x"s `any`, not
+        // `number`). Must run before the annotation branch below, which
+        // would otherwise win for whichever co-declared declarator the main
+        // loop reaches first. See `nameHasCircularInitializer`.
+        if (self.nameHasCircularInitializer(name)) return tymod.ID_ANY;
         for (list.items) |ni| {
             const t = self.ast_ref.nodeTag(ni);
             switch (t) {
@@ -7478,6 +7626,18 @@ pub const Checker = struct {
                 break;
             }
         }
+        // Circular self-reference (`var x = (x, 3)`): tsc's circularity
+        // witness types the WHOLE variable `any`, overriding even an
+        // explicit annotation on a separately merged re-declaration
+        // (`var x = (x, 3); var x: number;` types BOTH "x"s `any`, not
+        // `number` — verified against witness.ts's ~15 forms: comma,
+        // assignment, conditional, `||`, `&&`). Must run before the direct-
+        // annotation check just below, which would otherwise win outright
+        // for an annotated binding. See `nameHasCircularInitializer`.
+        if (node != .none and self.ast_ref.nodeTag(node) == .identifier) {
+            const bn = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
+            if (bn.len > 0 and self.nameHasCircularInitializer(bn)) return tymod.ID_ANY;
+        }
         // Check the final node for a direct annotation
         if (node != .none) {
             const bd = self.ast_ref.nodeData(node);
@@ -7590,6 +7750,9 @@ pub const Checker = struct {
                 const data = self.ast_ref.nodeData(parent);
                 // Check if the identifier has a type annotation first.
                 // If it does, the declared type takes precedence over the initializer type.
+                // (Circularity is already checked once, right after the peeling
+                // loop above, on the SAME identifier this `parent` wraps — see
+                // `nameHasCircularInitializer`.)
                 if (data.lhs != .none) {
                     const id_data = self.ast_ref.nodeData(data.lhs);
                     if (id_data.rhs != .none and self.ast_ref.nodeTag(id_data.rhs) == .ts_type_annotation) {
