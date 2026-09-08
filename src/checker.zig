@@ -355,6 +355,19 @@ fn lineStartsTopLevelDecl(src: []const u8, at: usize) bool {
     return false;
 }
 
+/// The extensionless target a relative specifier written in `from_path`
+/// resolves to (before checking it against any specific candidate list),
+/// written into `buf`. Shared by `resolveRelativeSpec` and
+/// `relativeRequireResolvesNode16`, which each then search a DIFFERENT
+/// candidate list (`ModuleFile` byte ranges vs. plain names in
+/// `available_modules`) for a match against it.
+fn relativeSpecTarget(buf: *[1024]u8, from_path: []const u8, spec: []const u8) ?[]const u8 {
+    var join_buf: [1024]u8 = undefined;
+    const dir = dirOfPath(from_path);
+    const joined = std.fmt.bufPrint(&join_buf, "{s}/{s}", .{ dir, stripModuleExt(spec) }) catch return null;
+    return normalizePath(buf, joined);
+}
+
 /// Resolve a RELATIVE module specifier (`./x`, `../y/z`) written in `from_path`
 /// to one of `module_files`, applying Node-style extension and `/index`
 /// resolution.  Returns the matched ModuleFile, or null.  Bare specifiers are
@@ -363,11 +376,8 @@ fn lineStartsTopLevelDecl(src: []const u8, at: usize) bool {
 /// importer path, which the per-module (isolated) evaluation provides.
 pub fn resolveRelativeSpec(from_path: []const u8, spec: []const u8, module_files: []const ModuleFile) ?ModuleFile {
     if (!std.mem.startsWith(u8, spec, "./") and !std.mem.startsWith(u8, spec, "../")) return null;
-    var join_buf: [1024]u8 = undefined;
-    const dir = dirOfPath(from_path);
-    const joined = std.fmt.bufPrint(&join_buf, "{s}/{s}", .{ dir, stripModuleExt(spec) }) catch return null;
     var norm_buf: [1024]u8 = undefined;
-    const target = normalizePath(&norm_buf, joined) orelse return null;
+    const target = relativeSpecTarget(&norm_buf, from_path, spec) orelse return null;
 
     // Exact file match: module_file path (sans extension) equals the target.
     for (module_files) |mf| {
@@ -23696,16 +23706,6 @@ pub const Checker = struct {
         }
     }
 
-    /// The first CJS-viable module `require("<spec>")` resolves to from
-    /// `from_path`, under Node's classic (extension + directory-index)
-    /// resolution — unlike a plain `import`, `require()` never needs an
-    /// explicit extension, even under node16/nodenext (that "must be
-    /// explicit" rule belongs to the ESM resolver a plain `import` uses).
-    /// Exact-file candidates are preferred over a directory's `/index`
-    /// fallback, mirroring `resolveRelativeSpec`'s own priority. A
-    /// candidate whose OWN format is ESM (`.mts`/`.mjs`, or an ambiguous
-    /// extension under a `"type": "module"` package.json) is skipped —
-    /// Node's require() cannot load an ESM module.
     /// Does SOME CJS-viable sibling module NAME exist for `spec`, under
     /// Node's classic (extension + directory-index) resolution — unlike a
     /// plain `import`, `require()` never needs an explicit extension, even
@@ -23722,11 +23722,8 @@ pub const Checker = struct {
     /// extension under a `"type": "module"` package.json) is skipped —
     /// Node's require() cannot load an ESM module.
     fn relativeRequireResolvesNode16(self: *Checker, from_path: []const u8, spec: []const u8) bool {
-        var join_buf: [1024]u8 = undefined;
-        const dir = dirOfPath(from_path);
-        const joined = std.fmt.bufPrint(&join_buf, "{s}/{s}", .{ dir, stripModuleExt(spec) }) catch return false;
         var norm_buf: [1024]u8 = undefined;
-        const target = normalizePath(&norm_buf, joined) orelse return false;
+        const target = relativeSpecTarget(&norm_buf, from_path, spec) orelse return false;
         var idx_buf: [1024]u8 = undefined;
         // `target` is "" at the program root (e.g. `require("./")` from a
         // top-level file) — "{s}/index" would then wrongly produce a
@@ -23760,13 +23757,16 @@ pub const Checker = struct {
             const from = self.sectionOfNode(at) orelse return false;
             if (!self.relativeRequireResolvesNode16(from.name, spec)) return false;
             // The CJS-viability check above only confirms SOME candidate
-            // resolves; the actual content fetched here (via the same
-            // resolver/module_files path the non-node16 branch below uses)
-            // may come from a same-basename sibling rather than the exact
-            // candidate just validated when several share one extensionless
-            // path (verified harmless for this project's corpus: sibling
-            // format variants of one logical module carry the same export
-            // shape in every case measured).
+            // resolves; the actual content fetched here goes through the
+            // SAME resolver/`moduleFileForSpec` path the non-node16 branch
+            // below already relies on — which matches by BASENAME alone,
+            // ignoring directory, so it can return a different same-named
+            // file anywhere in the corpus, not just a same-directory format
+            // variant of the one just validated (a pre-existing imprecision
+            // this shares with every other `resolvedModuleSpecSource`
+            // caller, not something new here). Verified harmless for this
+            // project's corpus: every case measured has one logical module
+            // whose format variants carry the same export shape.
             const sec_src = self.resolvedModuleSpecSource(spec) orelse return false;
             return sectionAllowsRequireAliasBinding(sec_src);
         }
