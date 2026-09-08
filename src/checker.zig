@@ -1147,15 +1147,14 @@ pub const Checker = struct {
     util_expand_depth: u8 = 0,
 
     /// Transient, printer-scoped anchor state for tsc's overload-rename rule
-    /// (see `SigTpInfo`): the AST node of the signature currently anchoring a
-    /// multi-signature print (0 = no anchor — print everyone verbatim) and
-    /// that signature's own declared type-parameter names. Set by
+    /// (see `SigTpInfo`): the signature currently anchoring a multi-signature
+    /// print (`.owner == 0` — no anchor, print everyone verbatim) and that
+    /// signature's own declared type-parameter names. Set by
     /// `typeToStringInner` around a multi-sig print group (save/restore, like
-    /// `render_location`); consulted by sibling signatures' `<T>` prefixes and
-    /// by `.type_param` rendering to rename a colliding name to `name_1`.
-    render_tp_anchor_owner: u32 = 0,
-    render_tp_anchor_names: [4][]const u8 = undefined,
-    render_tp_anchor_count: u8 = 0,
+    /// `render_location`, via `pushTpAnchor`); consulted by sibling
+    /// signatures' `<T>` prefixes and by `.type_param` rendering to rename a
+    /// colliding name to `name_1`.
+    render_tp_anchor: SigTpInfo = .{},
 
     /// Recursion counter for resolveConditionalTypeWithSubst / distributeConditional.
     /// Prevents stack overflow on deeply nested generic conditional types.
@@ -10889,15 +10888,36 @@ pub const Checker = struct {
         self.sig_type_params.put(self.gpa, sig_pool_idx, s) catch self.gpa.free(s);
     }
 
-    /// Companion to `registerSigTypeParams`: record the OWNING declaration and
-    /// declared names of this signature's own `<...>` type parameters, keyed
-    /// by the same signature pool index — see `SigTpInfo`. The owner is read
-    /// off live `.type_param` occurrences in `sig`'s already-built params and
-    /// return type, rather than independently re-derived from the declaration
-    /// node — see `consistentTypeParamOwner`'s doc comment for why, and why
-    /// EVERY occurrence must agree before it's trusted.
+    /// Companion to `registerSigTypeParams`, called right after it: record the
+    /// OWNING declaration and declared names of this signature's own `<...>`
+    /// type parameters, keyed by the same signature pool index — see
+    /// `SigTpInfo`. Names are read straight off the `ts_type_parameter` AST
+    /// nodes, NOT via `extractTpNames` on the cached prefix string: a `const`
+    /// type parameter (`<const T>`) renders its modifier keyword INTO that
+    /// string, and `extractTpNames`'s "name ends at the first space" parse
+    /// (correct for the constraint/default text it's built for) extracts
+    /// "const" instead of "T" there — verified regression:
+    /// typeParameterConstModifiersReturnsAndYields.ts.
+    /// The owner is read off live `.type_param` occurrences in `sig`'s
+    /// already-built params and return type, rather than independently
+    /// re-derived from the declaration node — see `consistentTypeParamOwner`'s
+    /// doc comment for why, and why EVERY occurrence must agree before it's
+    /// trusted.
     fn registerSigTypeParamOwner(self: *Checker, sig_pool_idx: u32, tp_start: u32, tp_end: u32, sig: tymod.Signature) void {
-        if (self.sig_tp_info.contains(sig_pool_idx)) return;
+        // Unlike `registerSigTypeParams`'s "first writer wins" (safe there —
+        // a `<T>` prefix is plain text, harmless if reused from an unrelated
+        // but textually-identical signature), `sig_tp_info` must NOT skip on
+        // `contains()`: `store.add`'s intern-driven pool-watermark rollback
+        // (see `mergeFunctionTypesD`'s own comment on the same hazard) can
+        // hand this exact `sig_pool_idx` to a LATER, structurally UNRELATED
+        // signature after an earlier one's pool space was reclaimed — an
+        // owner AST-node index is not interchangeable the way prefix text
+        // is, so trusting a stale entry here renders the wrong anchor
+        // (verified regression: genericCallToOverloadedMethodWithOverloadedArguments.ts,
+        // where a later interface's own registration was silently dropped
+        // because an earlier, unrelated interface's rolled-back slot number
+        // happened to land on the same index). Always recompute and
+        // overwrite — cheap, and self-correcting on every call.
         if (tp_start >= tp_end) return;
         const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
         if (tp_end > ext_len) return;
@@ -10996,6 +11016,19 @@ pub const Checker = struct {
         return .{};
     }
 
+    /// Enter a multi-signature print group: computes the anchor for
+    /// `[sig_start, sig_start+sig_count)` and returns the PREVIOUS
+    /// `render_tp_anchor` for the caller to restore (`defer c.render_tp_anchor
+    /// = prev;`) once the group is done printing — the same save/restore
+    /// shape as `render_location`'s own, so nested multi-sig groups (a
+    /// signature whose return type is itself an overloaded property) nest
+    /// correctly.
+    pub fn pushTpAnchor(self: *Checker, sig_start: u32, sig_count: usize) SigTpInfo {
+        const prev = self.render_tp_anchor;
+        self.render_tp_anchor = self.computeTpAnchor(sig_start, sig_count);
+        return prev;
+    }
+
     /// Rewrite `s` (a cached `<T, U extends V>`-style prefix), replacing every
     /// WHOLE-WORD occurrence of a name in `names[0..count]` with `<name>_1` —
     /// including inside constraints/defaults that reference the same renamed
@@ -11008,9 +11041,9 @@ pub const Checker = struct {
         var i: usize = 0;
         while (i < s.len) {
             const c = s[i];
-            if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
+            if (isIdentChar(c)) {
                 var j = i + 1;
-                while (j < s.len and (std.ascii.isAlphanumeric(s[j]) or s[j] == '_' or s[j] == '$')) j += 1;
+                while (j < s.len and isIdentChar(s[j])) j += 1;
                 const word = s[i..j];
                 const hit = for (names) |n| { if (std.mem.eql(u8, n, word)) break true; } else false;
                 out.appendSlice(self.gpa, word) catch { out.deinit(self.gpa); return null; };
@@ -11029,14 +11062,14 @@ pub const Checker = struct {
     }
 
     /// The `<...>` prefix to print for `sig_pool_idx`, given the current
-    /// render-time anchor (`render_tp_anchor_*`): the cached original unless
+    /// render-time anchor (`render_tp_anchor`): the cached original unless
     /// this signature is a NON-anchor whose own declared names collide with
     /// the anchor's, in which case a renamed copy (owned, caller must free).
     pub fn renderTpPrefix(self: *Checker, sig_pool_idx: u32, prefix: []const u8) ?[]const u8 {
-        if (self.render_tp_anchor_owner == 0) return null;
+        if (self.render_tp_anchor.owner == 0) return null;
         const info = self.sig_tp_info.get(sig_pool_idx) orelse return null;
-        if (info.owner == self.render_tp_anchor_owner) return null; // this IS the anchor
-        const anchor_names = self.render_tp_anchor_names[0..self.render_tp_anchor_count];
+        if (info.owner == self.render_tp_anchor.owner) return null; // this IS the anchor
+        const anchor_names = self.render_tp_anchor.names[0..self.render_tp_anchor.count];
         const collides = collides: {
             for (info.names[0..info.count]) |n| {
                 for (anchor_names) |an| {
@@ -11798,7 +11831,11 @@ pub const Checker = struct {
             if (tp.start < tp.end) {
                 const pool_idx: u32 = sig_list.start + @as(u32, @intCast(i));
                 self.registerSigTypeParams(pool_idx, tp.start, tp.end);
-                self.registerSigTypeParamOwner(pool_idx, tp.start, tp.end, sig_buf[i]);
+                // Anchor rename-collision info is only ever consulted for a
+                // MULTI-signature print (`sig_type_params` alone answers the
+                // single-sig `fn_type_params` render path) — skip the extra
+                // consistency-check scan when there's nothing to collide with.
+                if (sig_count > 1) self.registerSigTypeParamOwner(pool_idx, tp.start, tp.end, sig_buf[i]);
             }
         }
         // Mark as overload-set (renders as `{ ... }` object form) only when there are
@@ -11863,7 +11900,7 @@ pub const Checker = struct {
             if (tp.start < tp.end) {
                 const pool_idx: u32 = sig_list.start + @as(u32, @intCast(i));
                 self.registerSigTypeParams(pool_idx, tp.start, tp.end);
-                self.registerSigTypeParamOwner(pool_idx, tp.start, tp.end, sig_buf[i]);
+                if (sig_count > 1) self.registerSigTypeParamOwner(pool_idx, tp.start, tp.end, sig_buf[i]);
             }
         }
         const fn_ty = self.store.add(.{ .kind = .function_t, .signatures = sig_list, .is_overload_set = sig_count > 1 }) catch return null;
@@ -27022,14 +27059,25 @@ pub const Checker = struct {
                 if (!changed) return id;
                 const sl = self.store.appendSignatures(new_sigs_buf[0..sigs.len]) catch return id;
                 // Carry per-signature type-param prefixes (`<U>`) to the new
-                // pool slots — the registry is keyed by pool index.
+                // pool slots — the registry is keyed by pool index. Carry the
+                // overload-rename anchor info (`sig_tp_info`) the same way —
+                // POD, no allocation needed — else an instantiated generic
+                // overload set would silently lose its anchor/collision data.
                 for (0..sigs.len) |k| {
-                    if (self.sig_type_params.get(old_list.start + @as(u32, @intCast(k)))) |prefix| {
-                        const dst = sl.start + @as(u32, @intCast(k));
+                    const src = old_list.start + @as(u32, @intCast(k));
+                    const dst = sl.start + @as(u32, @intCast(k));
+                    if (self.sig_type_params.get(src)) |prefix| {
                         if (!self.sig_type_params.contains(dst)) {
                             const dup = self.gpa.dupe(u8, prefix) catch break;
                             self.sig_type_params.put(self.gpa, dst, dup) catch self.gpa.free(dup);
                         }
+                    }
+                    // Unconditional overwrite, not `!contains(dst)` — dst may
+                    // hold a stale entry from an unrelated signature that
+                    // rolled back into this pool slot (see
+                    // `registerSigTypeParamOwner`'s doc comment).
+                    if (self.sig_tp_info.get(src)) |info| {
+                        self.sig_tp_info.put(self.gpa, dst, info) catch {};
                     }
                 }
                 const subst_result = self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = was_overload_set }) catch id;
