@@ -197,10 +197,12 @@ pub const ImportEntry = struct {
 /// declared in. See `Checker.namespaceImportSpecAt`.
 const NsImportDecl = struct { name: []const u8, spec: []const u8, sec_start: u32, pos: u32 };
 
-/// One `import <local> = require("<spec>")` binding's resolved display name
-/// (see `requireAliasDisplayName`), tagged with the section it was declared
-/// in. See `Checker.requireAliasDisplayNameAt`.
-const ReqAliasDecl = struct { name: []const u8, disp: []const u8, sec_start: u32 };
+/// One `import <local> = require("<spec>")` binding, tagged with the section
+/// it was declared in — recorded for EVERY require-alias binding, whether it
+/// resolves or not, so a query can tell "declared here but unresolved" (disp
+/// null) apart from "not declared in this section at all" (no entry). See
+/// `Checker.requireAliasDisplayNameAt`.
+const ReqAliasDecl = struct { name: []const u8, disp: ?[]const u8, sec_start: u32 };
 
 /// Returns true when a module specifier is a relative path that lacks an explicit
 /// node-resolution extension (.js/.mjs/.cjs/.ts/.tsx/.mts/.cts).
@@ -3779,7 +3781,7 @@ pub const Checker = struct {
         // — a value import would need the other module's inferred type.
         // `import X = require("mod")` (resolvable) in VALUE position → `typeof X`.
         if (!self.identifierInTypePosition(node) and !self.identifierInBareNamePosition(node) and
-            self.isResolvableRequireAlias(name))
+            self.requireAliasIsResolvableAt(name, node))
         {
             const disp_nm = self.requireAliasDisplayNameAt(name, node) orelse name;
             const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp_nm}) catch return tymod.ID_ANY;
@@ -4110,7 +4112,7 @@ pub const Checker = struct {
         if (pd0.rhs != node or pd0.lhs == .none) return base;
         if (self.ast_ref.nodeTag(pd0.lhs) != .identifier) return base;
         const recv_nm = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(pd0.lhs));
-        if (!self.isResolvableRequireAlias(recv_nm)) return base;
+        if (!self.requireAliasIsResolvableAt(recv_nm, pd0.lhs)) return base;
         // Only for modules we have NO declarations for (a `/// <reference>` lib
         // such as `react`), where `typeof X.Member` is the only display we can
         // produce.  When the target is a local section its members are real
@@ -23674,24 +23676,6 @@ pub const Checker = struct {
 
     /// Find the inner declaration node for an exported member named `name` in a
     /// namespace/module body.  Unwraps `export class/enum/namespace` wrappers.
-    /// True when `name` is bound by `import <name> = require("<spec>")` for a
-    /// module this file can actually be expected to RESOLVE (see
-    /// `requireSpecResolves`).
-    ///
-    /// The resolvability test is the whole point.  tsc displays such a binding by
-    /// its LOCAL name (`typeof React`) only when the module resolves; when it does
-    /// not, tsc prints `any` — so a blanket syntactic rule costs far more than it
-    /// gains (measured: +295 correct / +1335 wrong — privacyImportParseErrors's
-    /// `require("m1_M3_public")` resolves to nothing and every alias it binds is
-    /// `any`).
-    ///
-    /// The form is invisible to the import machinery: the parser emits an
-    /// `import_decl` with `lhs == .none` and the `require(…)` CALL in `rhs`, and
-    /// registers no specifier, so `import_map` / `namespace_import_map` never see it.
-    fn isResolvableRequireAlias(self: *Checker, name: []const u8) bool {
-        return self.requireAliasDisplayName(name) != null;
-    }
-
     /// The name tsc displays for a resolvable require-alias's module — the
     /// EARLIEST require-alias's own local name, among every require-alias of
     /// that module WITHIN ITS OWN SECTION.
@@ -23790,60 +23774,69 @@ pub const Checker = struct {
                 if (self.ast_ref.nodeTag(ni) != .import_decl) continue;
                 const b = self.importDeclBinding(ni) orelse continue;
                 if (!b.is_require) continue;
-                if (!self.requireSpecResolves(b.spec, ni)) continue;
-                var disp = b.name;
                 const from = self.sectionOfNode(ni);
                 const sec: u32 = if (from) |mf| mf.start else 0;
-                if (self.resolvedModuleSpecSource(b.spec)) |src| {
-                    if (binds.get(SecMod{ .sec = sec, .mod = @intFromPtr(src.ptr) })) |info| {
-                        // The coarse `(section, resolved-pointer)` proxy can
-                        // conflate an ES import and an UNRELATED require()
-                        // that happen to share a first-match target under
-                        // node16's simplified resolution (verified:
-                        // nodeModules1.ts's `m7`/`m29`) — but it can ALSO
-                        // correctly identify a genuine same-symbol
-                        // coincidence, in TWO cases verified against all
-                        // three of nodeModules1.ts's importer sections
-                        // (index.mts, index.cts, index.ts) crossed with all
-                        // four target directories (root, subfolder,
-                        // subfolder2, subfolder2/another):
-                        //   1. The IMPORTING file is itself CJS-format
-                        //      (index.cts): an ES `import` there resolves
-                        //      like require() does (CJS-style), so it
-                        //      ALWAYS coincides with a require() of the same
-                        //      target — cross-reference unconditionally.
-                        //   2. The importing file is ESM-format (index.mts,
-                        //      or index.ts under a `"type": "module"`
-                        //      package.json), but the TARGET directory is
-                        //      ALSO `"type": "module"` there: an ambiguous
-                        //      `.ts`/`.js` extension is ESM, leaving `.cts`
-                        //      as the ONLY CJS-viable file require() can
-                        //      reach, which happens to be the same "there is
-                        //      exactly one real answer" file the strict ESM
-                        //      resolver settles on too.
-                        // Neither holds (ESM importer, CJS-default target,
-                        // e.g. `subfolder`/`subfolder2` from index.mts or
-                        // index.ts) → the collision is a false positive;
-                        // ignore it and fall back to the ordinary same-KIND
-                        // (require vs. require) tie-break instead of
-                        // self-naming outright.
-                        var cross_reference = false;
-                        if (info.saw_other_kind) {
-                            if (!self.checker_opts.isNode16Style()) {
-                                continue; // non-node16: genuine mixed-kind ambiguity
+                // `disp` stays null for every DECLINED binding (unresolvable
+                // spec, or a genuine mixed-kind ambiguity below) — recorded
+                // into `require_alias_decls` regardless, so a query at THIS
+                // section can tell "declared here but declined" apart from
+                // "not declared here at all" instead of falling through to
+                // a DIFFERENT section's answer (see `requireAliasDisplayNameAt`).
+                var disp: ?[]const u8 = null;
+                if (self.requireSpecResolves(b.spec, ni)) resolve: {
+                    var d: []const u8 = b.name;
+                    if (self.resolvedModuleSpecSource(b.spec)) |src| {
+                        if (binds.get(SecMod{ .sec = sec, .mod = @intFromPtr(src.ptr) })) |info| {
+                            // The coarse `(section, resolved-pointer)` proxy can
+                            // conflate an ES import and an UNRELATED require()
+                            // that happen to share a first-match target under
+                            // node16's simplified resolution (verified:
+                            // nodeModules1.ts's `m7`/`m29`) — but it can ALSO
+                            // correctly identify a genuine same-symbol
+                            // coincidence, in TWO cases verified against all
+                            // three of nodeModules1.ts's importer sections
+                            // (index.mts, index.cts, index.ts) crossed with all
+                            // four target directories (root, subfolder,
+                            // subfolder2, subfolder2/another):
+                            //   1. The IMPORTING file is itself CJS-format
+                            //      (index.cts): an ES `import` there resolves
+                            //      like require() does (CJS-style), so it
+                            //      ALWAYS coincides with a require() of the same
+                            //      target — cross-reference unconditionally.
+                            //   2. The importing file is ESM-format (index.mts,
+                            //      or index.ts under a `"type": "module"`
+                            //      package.json), but the TARGET directory is
+                            //      ALSO `"type": "module"` there: an ambiguous
+                            //      `.ts`/`.js` extension is ESM, leaving `.cts`
+                            //      as the ONLY CJS-viable file require() can
+                            //      reach, which happens to be the same "there is
+                            //      exactly one real answer" file the strict ESM
+                            //      resolver settles on too.
+                            // Neither holds (ESM importer, CJS-default target,
+                            // e.g. `subfolder`/`subfolder2` from index.mts or
+                            // index.ts) → the collision is a false positive;
+                            // ignore it and fall back to the ordinary same-KIND
+                            // (require vs. require) tie-break instead of
+                            // self-naming outright.
+                            var cross_reference = false;
+                            if (info.saw_other_kind) {
+                                if (!self.checker_opts.isNode16Style()) {
+                                    break :resolve; // non-node16: genuine mixed-kind ambiguity, disp stays null
+                                }
+                                if (from) |mf| {
+                                    cross_reference = self.fileIsCjsFormat(mf.name) or
+                                        self.requireTargetIsEsmDirectory(mf.name, b.spec);
+                                }
                             }
-                            if (from) |mf| {
-                                cross_reference = self.fileIsCjsFormat(mf.name) or
-                                    self.requireTargetIsEsmDirectory(mf.name, b.spec);
-                            }
+                            d = if (cross_reference)
+                                info.first_any_name orelse b.name
+                            else
+                                info.first_require_name orelse b.name;
                         }
-                        disp = if (cross_reference)
-                            info.first_any_name orelse b.name
-                        else
-                            info.first_require_name orelse b.name;
                     }
+                    disp = d;
                 }
-                self.require_aliases.put(self.gpa, b.name, disp) catch {};
+                if (disp) |d| self.require_aliases.put(self.gpa, b.name, d) catch {};
                 self.require_alias_decls.append(self.gpa, .{ .name = b.name, .disp = disp, .sec_start = sec }) catch {};
             }
         }
@@ -23858,17 +23851,46 @@ pub const Checker = struct {
     /// `m1`..`m45`-per-section corpus shape recurs for require-aliases too,
     /// see `importDecl.types`'s `m4`/`multiImport_m4`) silently let the
     /// LAST-scanned section's display win for every earlier section's use of
-    /// that name too. Prefers a same-section entry in `require_alias_decls`;
-    /// falls back to the flat map when nothing section-local matches (a
-    /// single-file sweep, or `use_site` carries no section info).
+    /// that name too. Prefers a same-section entry in `require_alias_decls` —
+    /// which, since it now records EVERY require-alias binding whether it
+    /// resolves or not, correctly answers null for a name that's declared but
+    /// declined in THIS section even when some OTHER section's same-named
+    /// binding resolves fine. Falls back to the flat map only when `use_site`
+    /// carries no section info at all (a single-file sweep).
     fn requireAliasDisplayNameAt(self: *Checker, name: []const u8, use_site: NodeIndex) ?[]const u8 {
         self.buildRequireAliases();
         if (self.sectionOfNode(use_site)) |sec| {
             for (self.require_alias_decls.items) |d| {
                 if (d.sec_start == sec.start and std.mem.eql(u8, d.name, name)) return d.disp;
             }
+            return null; // section tracked, but `name` isn't a require-alias declared there
         }
         return self.require_aliases.get(name);
+    }
+
+    /// True when `name` is bound by `import <name> = require("<spec>")` for a
+    /// module this file can actually be expected to RESOLVE, AS SEEN FROM
+    /// `use_site` (see `requireSpecResolves`).
+    ///
+    /// The resolvability test is the whole point.  tsc displays such a binding by
+    /// its LOCAL name (`typeof React`) only when the module resolves; when it does
+    /// not, tsc prints `any` — so a blanket syntactic rule costs far more than it
+    /// gains (measured: +295 correct / +1335 wrong — privacyImportParseErrors's
+    /// `require("m1_M3_public")` resolves to nothing and every alias it binds is
+    /// `any`). The form is invisible to the import machinery: the parser emits
+    /// an `import_decl` with `lhs == .none` and the `require(…)` CALL in `rhs`,
+    /// and registers no specifier, so `import_map` / `namespace_import_map`
+    /// never see it.
+    ///
+    /// Section-aware for the same reason `requireAliasDisplayNameAt` is: a
+    /// flat, whole-program answer can be true at `use_site` purely because a
+    /// DIFFERENT section's same-named binding resolves, even when `use_site`'s
+    /// own section either doesn't declare that name or declined it — silently
+    /// reproducing the cross-section wrong-answer bug `requireAliasDisplayNameAt`
+    /// fixes, one layer up (a caller that gates a display attempt on this check
+    /// first would still fall through to the flat map's answer otherwise).
+    fn requireAliasIsResolvableAt(self: *Checker, name: []const u8, use_site: NodeIndex) bool {
+        return self.requireAliasDisplayNameAt(name, use_site) != null;
     }
 
     /// Does `require(spec)`'s (extensionless, index-fallback-resolved)
@@ -24013,7 +24035,7 @@ pub const Checker = struct {
     /// Is `name` a require-alias bound to a RELATIVE sibling section?  Those are
     /// the ones whose members must stay opaque (see `memberOnApparentType`).
     fn isLocalRequireAlias(self: *Checker, name: []const u8, use_site: NodeIndex) bool {
-        if (!self.isResolvableRequireAlias(name)) return false;
+        if (!self.requireAliasIsResolvableAt(name, use_site)) return false;
         const spec = self.namespaceImportSpecAt(name, use_site) orelse return false;
         return spec.len > 0 and spec[0] == '.';
     }
@@ -24048,6 +24070,12 @@ pub const Checker = struct {
             const raw = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(ni) + 1);
             if (raw.len < 2 or (raw[0] != '\'' and raw[0] != '"')) continue;
             if (!std.mem.eql(u8, raw[1 .. raw.len - 1], spec)) continue;
+            // A body-less `declare module "spec";` shorthand declares that the
+            // module EXISTS but says nothing about its shape — tsc types an
+            // import from it `any` (esModuleInteropTslibHelpers's `declare
+            // module "path";`), unlike a real `declare module "spec" { ... }`
+            // body, which supplies a genuine shape.
+            if (self.ast_ref.nodeData(ni).rhs == .none) continue;
             const off = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(ni));
             const c = cur orelse return false; // no section info: can't tell it apart
             if (off >= c.start and off < c.end) continue; // same file → augmentation
@@ -24998,20 +25026,32 @@ pub const Checker = struct {
     }
 
     /// The name a bare-package namespace-import binding displays under, or
-    /// null when `spec`'s package/subpath doesn't resolve through package.json
-    /// `exports` at all (patterns, no match, or no matching package.json —
-    /// tsc types the binding `any`). When it DOES resolve: its OWN local
-    /// name, unless an EARLIER (by source position) namespace-import in the
-    /// SAME section, of the SAME package, resolves to the exact same real
-    /// target — then tsc names it after that earlier binding instead (the same
-    /// earliest-wins rule `requireAliasDisplayName` already applies to
-    /// require-aliases, extended here to ES namespace imports of a
-    /// conditional-exports package: `nodeModulesConditionalPackageExports.ts`'s
-    /// `cjsi`/`mjsi`/`typei`/`ts` all resolve into the same package and
-    /// collapse onto whichever of them was imported first).
+    /// null when `spec` doesn't resolve at all. Two DIFFERENT unresolvable
+    /// shapes, both null: (1) a package.json exists for this package but its
+    /// `exports` doesn't cover this subpath (a pattern, or no key match); (2)
+    /// no package.json AND no ambient `declare module "spec"` / `///
+    /// <reference>`-provided lib names it either (a bare Node builtin like
+    /// `path` with no `@types` package in this corpus, e.g.
+    /// `esModuleInteropTslibHelpers.ts` — verified: tsc types that binding
+    /// `any`). A package.json miss that IS covered by one of those two other
+    /// mechanisms (the same test `requireSpecResolves`'s bare branch already
+    /// uses) resolves under its OWN name — nothing about `exports` conditions
+    /// applies to an ambient module, so there's nothing to decline. When it
+    /// DOES resolve via package.json: its OWN local name, unless an EARLIER
+    /// (by source position) namespace-import in the SAME section, of the SAME
+    /// package, resolves to the exact same real target — then tsc names it
+    /// after that earlier binding instead (the same earliest-wins rule
+    /// `requireAliasDisplayName` already applies to require-aliases, extended
+    /// here to ES namespace imports of a conditional-exports package:
+    /// `nodeModulesConditionalPackageExports.ts`'s `cjsi`/`mjsi`/`typei`/`ts`
+    /// all resolve into the same package and collapse onto whichever of them
+    /// was imported first).
     fn bareNamespaceImportDisplayName(self: *Checker, ns_name: []const u8, spec: []const u8, use_site: NodeIndex, is_require_ctx: bool) ?[]const u8 {
         const parts = splitPkgSpec(spec);
-        const pkg_src = self.packageJsonSource(parts.pkg) orelse return null;
+        const pkg_src = self.packageJsonSource(parts.pkg) orelse {
+            if (self.sourceReferencesLib(spec) or self.ambientModuleDeclared(spec, use_site)) return ns_name;
+            return null;
+        };
         var own_buf: [300]u8 = undefined;
         const own_target = self.resolveExportsTarget(&own_buf, pkg_src, parts.subpath, is_require_ctx) orelse return null;
         // Resolvability (above) doesn't need section info; the collapsing scan
@@ -26178,7 +26218,7 @@ pub const Checker = struct {
                         // are guessing at a name they cannot see (importDecl's
                         // `glo_m4.d` came out as a bare `d`), so stop here — an
                         // honest gap beats an invented name.
-                        if (self.isResolvableRequireAlias(inner_name)) return tymod.ID_ANY;
+                        if (self.requireAliasIsResolvableAt(inner_name, obj_node)) return tymod.ID_ANY;
                     }
                 }
                 // `typeof LocalNamespace` — scan exported var/let/const members only.
