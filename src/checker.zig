@@ -197,6 +197,11 @@ pub const ImportEntry = struct {
 /// declared in. See `Checker.namespaceImportSpecAt`.
 const NsImportDecl = struct { name: []const u8, spec: []const u8, sec_start: u32, pos: u32 };
 
+/// One `import <local> = require("<spec>")` binding's resolved display name
+/// (see `requireAliasDisplayName`), tagged with the section it was declared
+/// in. See `Checker.requireAliasDisplayNameAt`.
+const ReqAliasDecl = struct { name: []const u8, disp: []const u8, sec_start: u32 };
+
 /// Returns true when a module specifier is a relative path that lacks an explicit
 /// node-resolution extension (.js/.mjs/.cjs/.ts/.tsx/.mts/.cts).
 /// In node16/nodenext mode tsc requires the extension; omitting it means the
@@ -1101,8 +1106,14 @@ pub const Checker = struct {
 
     /// Local names bound by a RESOLVABLE `import X = require("...")`, mapped to
     /// the name tsc displays for the module (see `requireAliasDisplayName`).
+    /// Whole-program, keyed by bare name only — see `requireAliasDisplayNameAt`
+    /// for why a section-aware query is needed on top of this.
     require_aliases: std.StringHashMapUnmanaged([]const u8) = .empty,
     require_alias_built: bool = false,
+    /// One require-alias binding's resolved display name, tagged with the
+    /// section it was declared in — the disambiguating data `require_aliases`
+    /// itself doesn't carry. See `requireAliasDisplayNameAt`.
+    require_alias_decls: std.ArrayListUnmanaged(ReqAliasDecl) = .empty,
     /// Guard: while a require-alias is being displayed as `typeof X`, member
     /// lookups through it must NOT resolve into the target module (see
     /// `memberOnApparentType`).
@@ -1327,6 +1338,7 @@ pub const Checker = struct {
             var it = self.sig_type_params.valueIterator();
             while (it.next()) |v| self.gpa.free(v.*);
             self.require_aliases.deinit(self.gpa);
+            self.require_alias_decls.deinit(self.gpa);
         self.tp_owner_map.deinit(self.gpa);
         self.sig_type_params.deinit(self.gpa);
         }
@@ -3769,7 +3781,7 @@ pub const Checker = struct {
         if (!self.identifierInTypePosition(node) and !self.identifierInBareNamePosition(node) and
             self.isResolvableRequireAlias(name))
         {
-            const disp_nm = self.requireAliasDisplayName(name) orelse name;
+            const disp_nm = self.requireAliasDisplayNameAt(name, node) orelse name;
             const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp_nm}) catch return tymod.ID_ANY;
             // Pool BEFORE interning: `typeRef` retains the slice, so freeing it
             // afterwards would leave the stored type pointing at freed memory.
@@ -4114,7 +4126,7 @@ pub const Checker = struct {
         // module (see requireAliasDisplayName) — use that name, not the raw
         // receiver token, or a second alias's member access would print the
         // wrong prefix once the identifier lever starts doing so too.
-        const recv_disp = self.requireAliasDisplayName(recv_nm) orelse recv_nm;
+        const recv_disp = self.requireAliasDisplayNameAt(recv_nm, pd0.lhs) orelse recv_nm;
         const disp = std.fmt.allocPrint(self.gpa, "typeof {s}.{s}", .{ recv_disp, prop_nm }) catch return base;
         const r = self.store.typeRef(disp, &.{}) catch {
             self.gpa.free(disp);
@@ -23771,9 +23783,9 @@ pub const Checker = struct {
                 if (!b.is_require) continue;
                 if (!self.requireSpecResolves(b.spec, ni)) continue;
                 var disp = b.name;
+                const from = self.sectionOfNode(ni);
+                const sec: u32 = if (from) |mf| mf.start else 0;
                 if (self.resolvedModuleSpecSource(b.spec)) |src| {
-                    const from = self.sectionOfNode(ni);
-                    const sec: u32 = if (from) |mf| mf.start else 0;
                     if (binds.get(SecMod{ .sec = sec, .mod = @intFromPtr(src.ptr) })) |info| {
                         // The coarse `(section, resolved-pointer)` proxy can
                         // conflate an ES import and an UNRELATED require()
@@ -23823,6 +23835,29 @@ pub const Checker = struct {
                     }
                 }
                 self.require_aliases.put(self.gpa, b.name, disp) catch {};
+                self.require_alias_decls.append(self.gpa, .{ .name = b.name, .disp = disp, .sec_start = sec }) catch {};
+            }
+        }
+        return self.require_aliases.get(name);
+    }
+
+    /// The `requireAliasDisplayName` answer for `name`, AS SEEN FROM
+    /// `use_site`. `require_aliases` itself is a flat, whole-program
+    /// name->display map (`.put()`-overwritten per binding scanned) — the
+    /// exact same collision class `namespace_import_map`/`namespaceImportSpecAt`
+    /// were fixed for on the ES-namespace-import side: two DIFFERENT sections
+    /// binding a require-alias under the SAME local name (this file's own
+    /// `m1`..`m45`-per-section corpus shape recurs for require-aliases too,
+    /// see `importDecl.types`'s `m4`/`multiImport_m4`) silently let the
+    /// LAST-scanned section's display win for every earlier section's use of
+    /// that name too. Prefers a same-section entry in `require_alias_decls`;
+    /// falls back to the flat map when nothing section-local matches (a
+    /// single-file sweep, or `use_site` carries no section info).
+    fn requireAliasDisplayNameAt(self: *Checker, name: []const u8, use_site: NodeIndex) ?[]const u8 {
+        _ = self.requireAliasDisplayName(name); // ensure require_alias_decls is built
+        if (self.sectionOfNode(use_site)) |sec| {
+            for (self.require_alias_decls.items) |d| {
+                if (d.sec_start == sec.start and std.mem.eql(u8, d.name, name)) return d.disp;
             }
         }
         return self.require_aliases.get(name);
