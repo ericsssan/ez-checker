@@ -39,10 +39,11 @@ pub fn typeToStringAt(c: *Checker, id: TypeId, location: NodeIndex) ![]const u8 
     return typeToString(c, id);
 }
 
-/// Append the `<T, U>` prefix for signature `sig_pool_idx`: `tp_prefix`
+/// Append signature `sig_pool_idx`'s `<T, U>` prefix, if it has one:
 /// verbatim, unless it's a non-anchor signature colliding with the current
 /// `render_tp_anchor` (see `SigTpInfo`), in which case a renamed copy.
-fn appendTpPrefix(c: *Checker, buf: *std.ArrayList(u8), sig_pool_idx: u32, tp_prefix: []const u8) !void {
+fn appendTpPrefix(c: *Checker, buf: *std.ArrayList(u8), sig_pool_idx: u32) !void {
+    const tp_prefix = c.sig_type_params.get(sig_pool_idx) orelse return;
     if (c.renderTpPrefix(sig_pool_idx, tp_prefix)) |renamed| {
         defer c.gpa.free(renamed);
         try buf.appendSlice(c.gpa, renamed);
@@ -135,7 +136,7 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
             // one currently anchoring this print, whose name collides with
             // the anchor's own, renders suffixed (`U` → `U_1`).
             if (c.render_tp_anchor.owner != 0 and t.tp_owner != c.render_tp_anchor.owner) {
-                for (c.render_tp_anchor.names[0..c.render_tp_anchor.count]) |an| {
+                for (c.render_tp_anchor.namesSlice()) |an| {
                     if (std.mem.eql(u8, an, t.name)) {
                         try buf.appendSlice(gpa, t.name);
                         try buf.appendSlice(gpa, "_1");
@@ -359,9 +360,7 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                     const names = c.store.signatureParamNamesOf(sig);
                     const opts = c.store.signatureParamOptionalsOf(sig);
                     const sig_pool_idx: u32 = t.signatures.start + @as(u32, @intCast(si));
-                    if (c.sig_type_params.get(sig_pool_idx)) |tp_prefix| {
-                        try appendTpPrefix(c, buf, sig_pool_idx, tp_prefix);
-                    }
+                    try appendTpPrefix(c, buf, sig_pool_idx);
                     try buf.append(gpa, '(');
                     for (params, 0..) |param_ty, pi| {
                         if (pi > 0) try buf.appendSlice(gpa, ", ");
@@ -443,9 +442,7 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                     const sopts = c.store.signatureParamOptionalsOf(sig);
                     if (sig.is_construct) try buf.appendSlice(gpa, "new ");
                     const pool_idx: u32 = t.signatures.start + @as(u32, @intCast(csi));
-                    if (c.sig_type_params.get(pool_idx)) |tp_prefix| {
-                        try appendTpPrefix(c, buf, pool_idx, tp_prefix);
-                    }
+                    try appendTpPrefix(c, buf, pool_idx);
                     try buf.append(gpa, '(');
                     for (sparams, 0..) |sp, si| {
                         if (si > 0) try buf.appendSlice(gpa, ", ");
@@ -564,9 +561,7 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                                     }
                                 }
                                 const sig_pool_idx_m: u32 = pv.signatures.start + @as(u32, @intCast(msi));
-                                if (c.sig_type_params.get(sig_pool_idx_m)) |tp_prefix| {
-                                    try appendTpPrefix(c, buf, sig_pool_idx_m, tp_prefix);
-                                }
+                                try appendTpPrefix(c, buf, sig_pool_idx_m);
                                 try buf.append(gpa, '(');
                                 const mparams = c.store.signatureParamsOf(msig);
                                 const mnames = c.store.signatureParamNamesOf(msig);

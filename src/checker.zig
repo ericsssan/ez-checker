@@ -1254,6 +1254,10 @@ pub const Checker = struct {
         owner: u32 = 0,
         names: [4][]const u8 = undefined,
         count: u8 = 0,
+
+        pub fn namesSlice(self: *const SigTpInfo) []const []const u8 {
+            return self.names[0..self.count];
+        }
     };
 
     pub fn init(
@@ -1384,7 +1388,11 @@ pub const Checker = struct {
         self.tp_owner_map.deinit(self.gpa);
         self.sig_type_params.deinit(self.gpa);
         }
-        self.sig_tp_info.deinit(self.gpa);
+        {
+            var it = self.sig_tp_info.valueIterator();
+            while (it.next()) |v| for (v.names[0..v.count]) |n| self.gpa.free(n);
+            self.sig_tp_info.deinit(self.gpa);
+        }
         self.overload_fn_types.deinit(self.gpa);
     }
 
@@ -10926,13 +10934,53 @@ pub const Checker = struct {
             const tp: NodeIndex = @enumFromInt(raw);
             if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) continue;
             if (info.count < info.names.len) {
-                info.names[info.count] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+                // Owned copy, not a borrowed `tokenText` slice: `sig_tp_info`
+                // (unlike `sig_type_params`, which already dupes its cached
+                // prefix strings) can outlive whatever this AST/source
+                // belongs to once a pool slot gets reused by a later,
+                // unrelated build — a borrowed slice there is a genuine
+                // dangling-memory hazard, not just a stale-but-valid string.
+                info.names[info.count] = self.gpa.dupe(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp))) catch return;
                 info.count += 1;
             }
         }
         if (info.count == 0) return;
-        info.owner = self.consistentTypeParamOwner(sig, info.names[0..info.count]) orelse return;
-        self.sig_tp_info.put(self.gpa, sig_pool_idx, info) catch {};
+        info.owner = self.consistentTypeParamOwner(sig, info.namesSlice()) orelse {
+            for (info.names[0..info.count]) |n| self.gpa.free(n);
+            return;
+        };
+        // Deliberately NOT freeing whatever this overwrites: `render_tp_anchor`
+        // (see `pushTpAnchor`) can hold a COPY of the value currently at
+        // `sig_pool_idx` for the ENTIRE duration of a multi-signature print —
+        // including through recursive `typeToStringInner` calls on nested
+        // param/return types, which can reach back into THIS same function
+        // for an unrelated signature that reuses this exact pool slot (the
+        // same rollback hazard `SigTpInfo` is already documented to have).
+        // Freeing here would free strings a live, in-progress print still
+        // reads — a real regression this caused once already (verified via
+        // functionOverloadsRecursiveGenericReturnType.ts). Stale entries are
+        // reclaimed once, in `deinit`, not on every overwrite.
+        self.sig_tp_info.put(self.gpa, sig_pool_idx, info) catch {
+            for (info.names[0..info.count]) |n| self.gpa.free(n);
+        };
+    }
+
+    /// Deep-copy `info`'s owned name strings into a fresh allocation — needed
+    /// whenever a `SigTpInfo` travels into a NEW hashmap slot (carrying it
+    /// forward across a signature-pool rebuild): the source slot keeps its
+    /// own strings, and whatever occupies the destination slot afterward
+    /// must be independently freeable, or freeing one entry in `deinit`
+    /// would double-free the other's.
+    fn dupeSigTpInfo(self: *Checker, info: SigTpInfo) ?SigTpInfo {
+        var out = info;
+        var i: u8 = 0;
+        while (i < out.count) : (i += 1) {
+            out.names[i] = self.gpa.dupe(u8, info.names[i]) catch {
+                for (out.names[0..i]) |n| self.gpa.free(n);
+                return null;
+            };
+        }
+        return out;
     }
 
     /// The single, mutually-consistent `tp_owner` for every live `.type_param`
@@ -10950,11 +10998,18 @@ pub const Checker = struct {
     /// anchoring or colliding, which is exactly today's (pre-feature) result.
     fn consistentTypeParamOwner(self: *Checker, sig: tymod.Signature, names: []const []const u8) ?u32 {
         var owner: u32 = 0;
-        for (self.store.signatureParamsOf(sig)) |p| {
-            if (!self.collectTypeParamOwner(p, names, &owner, 0)) return null;
-        }
-        if (!self.collectTypeParamOwner(sig.return_type, names, &owner, 0)) return null;
+        if (!self.collectTypeParamOwnerInSig(sig, names, &owner, 0)) return null;
         return if (owner != 0) owner else null;
+    }
+
+    /// Shared by `consistentTypeParamOwner` (top-level entry) and
+    /// `collectTypeParamOwner`'s `.function_t` arm (nested signatures): visit
+    /// one signature's params then its return type.
+    fn collectTypeParamOwnerInSig(self: *Checker, sig: tymod.Signature, names: []const []const u8, owner: *u32, depth: u8) bool {
+        for (self.store.signatureParamsOf(sig)) |p| {
+            if (!self.collectTypeParamOwner(p, names, owner, depth)) return false;
+        }
+        return self.collectTypeParamOwner(sig.return_type, names, owner, depth);
     }
 
     /// Visits every live `.type_param` occurrence in `ty` (params/return/
@@ -10982,10 +11037,7 @@ pub const Checker = struct {
             },
             .function_t => {
                 for (self.store.signaturesOf(t.signatures)) |s| {
-                    for (self.store.signatureParamsOf(s)) |p| {
-                        if (!self.collectTypeParamOwner(p, names, owner, depth + 1)) return false;
-                    }
-                    if (!self.collectTypeParamOwner(s.return_type, names, owner, depth + 1)) return false;
+                    if (!self.collectTypeParamOwnerInSig(s, names, owner, depth + 1)) return false;
                 }
                 return true;
             },
@@ -11069,9 +11121,9 @@ pub const Checker = struct {
         if (self.render_tp_anchor.owner == 0) return null;
         const info = self.sig_tp_info.get(sig_pool_idx) orelse return null;
         if (info.owner == self.render_tp_anchor.owner) return null; // this IS the anchor
-        const anchor_names = self.render_tp_anchor.names[0..self.render_tp_anchor.count];
+        const anchor_names = self.render_tp_anchor.namesSlice();
         const collides = collides: {
-            for (info.names[0..info.count]) |n| {
+            for (info.namesSlice()) |n| {
                 for (anchor_names) |an| {
                     if (std.mem.eql(u8, n, an)) break :collides true;
                 }
@@ -12979,7 +13031,11 @@ pub const Checker = struct {
                 if (tp.start < tp.end) {
                     const pool_idx: u32 = sl.start + @as(u32, @intCast(i));
                     self.registerSigTypeParams(pool_idx, tp.start, tp.end);
-                    self.registerSigTypeParamOwner(pool_idx, tp.start, tp.end, sig_buf[i]);
+                    // A type literal's own call/construct signatures are
+                    // never joined with another literal's later — same
+                    // no-sibling-to-collide-with reasoning as the other two
+                    // gated sites.
+                    if (sig_count > 1) self.registerSigTypeParamOwner(pool_idx, tp.start, tp.end, sig_buf[i]);
                 }
             }
             break :blk sl;
@@ -18819,7 +18875,12 @@ pub const Checker = struct {
         for (0..@min(n, tp_owned.len)) |k| {
             const info = tp_owned[k] orelse continue;
             const dst = rstart + @as(u32, @intCast(k));
-            self.sig_tp_info.put(self.gpa, dst, info) catch {};
+            const dup = self.dupeSigTpInfo(info) orelse continue;
+            // Not freeing whatever this overwrites — see
+            // `registerSigTypeParamOwner`'s doc comment on why.
+            self.sig_tp_info.put(self.gpa, dst, dup) catch {
+                for (dup.names[0..dup.count]) |on| self.gpa.free(on);
+            };
         }
         return result;
     }
@@ -27075,9 +27136,19 @@ pub const Checker = struct {
                     // Unconditional overwrite, not `!contains(dst)` — dst may
                     // hold a stale entry from an unrelated signature that
                     // rolled back into this pool slot (see
-                    // `registerSigTypeParamOwner`'s doc comment).
+                    // `registerSigTypeParamOwner`'s doc comment). Deep-copy
+                    // via `dupeSigTpInfo`, not a shallow struct copy — `src`
+                    // keeps its own owned name strings; `dst` needs its own,
+                    // independently freeable, not an aliased second owner of
+                    // the same allocation.
                     if (self.sig_tp_info.get(src)) |info| {
-                        self.sig_tp_info.put(self.gpa, dst, info) catch {};
+                        // Not freeing whatever this overwrites — see
+                        // `registerSigTypeParamOwner`'s doc comment on why.
+                        if (self.dupeSigTpInfo(info)) |dup| {
+                            self.sig_tp_info.put(self.gpa, dst, dup) catch {
+                                for (dup.names[0..dup.count]) |on| self.gpa.free(on);
+                            };
+                        }
                     }
                 }
                 const subst_result = self.store.add(.{ .kind = .function_t, .signatures = sl, .is_overload_set = was_overload_set }) catch id;
