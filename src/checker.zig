@@ -23598,6 +23598,12 @@ pub const Checker = struct {
             const Info = struct {
                 first_require_name: ?[]const u8 = null,
                 first_require_pos: u32 = std.math.maxInt(u32),
+                // Earliest binding of EITHER kind — only consulted under
+                // node16 (see the ESM-directory branch below); the
+                // non-node16 path still declines outright on any mixed-kind
+                // collision, exactly as before.
+                first_any_name: ?[]const u8 = null,
+                first_any_pos: u32 = std.math.maxInt(u32),
                 saw_other_kind: bool = false,
             };
             var binds: std.AutoHashMapUnmanaged(SecMod, Info) = .empty;
@@ -23613,11 +23619,15 @@ pub const Checker = struct {
                 const key = SecMod{ .sec = sec, .mod = @intFromPtr(src.ptr) };
                 const gop = binds.getOrPut(self.gpa, key) catch continue;
                 if (!gop.found_existing) gop.value_ptr.* = .{};
+                const pos = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(ni));
+                if (pos < gop.value_ptr.first_any_pos) {
+                    gop.value_ptr.first_any_pos = pos;
+                    gop.value_ptr.first_any_name = b.name;
+                }
                 if (!b.is_require) {
                     gop.value_ptr.saw_other_kind = true;
                     continue;
                 }
-                const pos = self.ast_ref.tokenStart(self.ast_ref.nodeMainToken(ni));
                 if (pos < gop.value_ptr.first_require_pos) {
                     gop.value_ptr.first_require_pos = pos;
                     gop.value_ptr.first_require_name = b.name;
@@ -23634,14 +23644,73 @@ pub const Checker = struct {
                 if (self.resolvedModuleSpecSource(b.spec)) |src| {
                     const sec: u32 = if (self.sectionOfNode(ni)) |mf| mf.start else 0;
                     if (binds.get(SecMod{ .sec = sec, .mod = @intFromPtr(src.ptr) })) |info| {
-                        if (info.saw_other_kind) continue; // genuine mixed-kind ambiguity
-                        disp = info.first_require_name orelse b.name;
+                        // The coarse `(section, resolved-pointer)` proxy can
+                        // conflate an ES import and an UNRELATED require()
+                        // that happen to share a first-match target under
+                        // node16's simplified resolution (verified:
+                        // nodeModules1.ts's `m7`/`m29`) — but it can ALSO
+                        // correctly identify a genuine same-symbol
+                        // coincidence, in TWO cases verified against all
+                        // three of nodeModules1.ts's importer sections
+                        // (index.mts, index.cts, index.ts) crossed with all
+                        // four target directories (root, subfolder,
+                        // subfolder2, subfolder2/another):
+                        //   1. The IMPORTING file is itself CJS-format
+                        //      (index.cts): an ES `import` there resolves
+                        //      like require() does (CJS-style), so it
+                        //      ALWAYS coincides with a require() of the same
+                        //      target — cross-reference unconditionally.
+                        //   2. The importing file is ESM-format (index.mts,
+                        //      or index.ts under a `"type": "module"`
+                        //      package.json), but the TARGET directory is
+                        //      ALSO `"type": "module"` there: an ambiguous
+                        //      `.ts`/`.js` extension is ESM, leaving `.cts`
+                        //      as the ONLY CJS-viable file require() can
+                        //      reach, which happens to be the same "there is
+                        //      exactly one real answer" file the strict ESM
+                        //      resolver settles on too.
+                        // Neither holds (ESM importer, CJS-default target,
+                        // e.g. `subfolder`/`subfolder2` from index.mts or
+                        // index.ts) → the collision is a false positive;
+                        // ignore it and fall back to the ordinary same-KIND
+                        // (require vs. require) tie-break instead of
+                        // self-naming outright.
+                        if (info.saw_other_kind and !self.checker_opts.isNode16Style()) {
+                            continue; // non-node16: genuine mixed-kind ambiguity
+                        }
+                        const importer_is_cjs = if (self.sectionOfNode(ni)) |from|
+                            self.fileIsCjsFormat(from.name)
+                        else
+                            false;
+                        if (info.saw_other_kind and self.checker_opts.isNode16Style() and
+                            (importer_is_cjs or self.requireTargetIsEsmDirectory(ni, b.spec)))
+                        {
+                            disp = info.first_any_name orelse b.name;
+                        } else {
+                            disp = info.first_require_name orelse b.name;
+                        }
                     }
                 }
                 self.require_aliases.put(self.gpa, b.name, disp) catch {};
             }
         }
         return self.require_aliases.get(name);
+    }
+
+    /// Does `require(spec)`'s (extensionless, index-fallback-resolved)
+    /// target live in a directory whose nearest package.json declares
+    /// `"type": "module"`? See `requireAliasDisplayName`'s node16
+    /// cross-reference branch for why this matters.
+    fn requireTargetIsEsmDirectory(self: *Checker, ni: NodeIndex, spec: []const u8) bool {
+        const from = self.sectionOfNode(ni) orelse return false;
+        var buf: [1024]u8 = undefined;
+        const target = relativeSpecTarget(&buf, from.name, spec) orelse return false;
+        var idx_buf: [1024]u8 = undefined;
+        const target_index = if (target.len == 0)
+            "index"
+        else
+            std.fmt.bufPrint(&idx_buf, "{s}/index", .{target}) catch return false;
+        return self.nearestPackageJsonIsEsm(target_index);
     }
 
     const ImportBinding = struct { name: []const u8, spec: []const u8, is_require: bool };
