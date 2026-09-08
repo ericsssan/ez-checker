@@ -23727,6 +23727,15 @@ pub const Checker = struct {
     ///     `saw_other_kind` branch below.
     fn requireAliasDisplayName(self: *Checker, name: []const u8) ?[]const u8 {
         if (name.len == 0) return null;
+        self.buildRequireAliases();
+        return self.require_aliases.get(name);
+    }
+
+    /// Populate `require_aliases`/`require_alias_decls` from a single
+    /// whole-AST scan, once per `Checker` instance. Idempotent — safe to call
+    /// from anywhere that needs either populated (`requireAliasDisplayName`
+    /// and `requireAliasDisplayNameAt` both do), not just from a name lookup.
+    fn buildRequireAliases(self: *Checker) void {
         if (!self.require_alias_built) {
             self.require_alias_built = true;
             // Module identity is `(section, resolved source SLICE pointer)`:
@@ -23838,7 +23847,6 @@ pub const Checker = struct {
                 self.require_alias_decls.append(self.gpa, .{ .name = b.name, .disp = disp, .sec_start = sec }) catch {};
             }
         }
-        return self.require_aliases.get(name);
     }
 
     /// The `requireAliasDisplayName` answer for `name`, AS SEEN FROM
@@ -23854,7 +23862,7 @@ pub const Checker = struct {
     /// falls back to the flat map when nothing section-local matches (a
     /// single-file sweep, or `use_site` carries no section info).
     fn requireAliasDisplayNameAt(self: *Checker, name: []const u8, use_site: NodeIndex) ?[]const u8 {
-        _ = self.requireAliasDisplayName(name); // ensure require_alias_decls is built
+        self.buildRequireAliases();
         if (self.sectionOfNode(use_site)) |sec| {
             for (self.require_alias_decls.items) |d| {
                 if (d.sec_start == sec.start and std.mem.eql(u8, d.name, name)) return d.disp;
