@@ -118,6 +118,19 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
             }
         },
         .type_param  => {
+            // tsc's overload-rename rule (see `SigTpInfo`): a reference to a
+            // type parameter that belongs to a DIFFERENT signature than the
+            // one currently anchoring this print, whose name collides with
+            // the anchor's own, renders suffixed (`U` → `U_1`).
+            if (c.render_tp_anchor_owner != 0 and t.tp_owner != c.render_tp_anchor_owner) {
+                for (c.render_tp_anchor_names[0..c.render_tp_anchor_count]) |an| {
+                    if (std.mem.eql(u8, an, t.name)) {
+                        try buf.appendSlice(gpa, t.name);
+                        try buf.appendSlice(gpa, "_1");
+                        return;
+                    }
+                }
+            }
             if (t.alias_name.len > 0) {
                 try buf.appendSlice(gpa, t.alias_name);
             } else {
@@ -325,6 +338,18 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                 }
             } else {
                 // Multi-signature (overloads) — tsc renders as { (p): T; (p): T; }
+                const prev_owner = c.render_tp_anchor_owner;
+                const prev_names = c.render_tp_anchor_names;
+                const prev_count = c.render_tp_anchor_count;
+                const anchor = c.computeTpAnchor(t.signatures.start, sigs.len);
+                c.render_tp_anchor_owner = anchor.owner;
+                c.render_tp_anchor_names = anchor.names;
+                c.render_tp_anchor_count = anchor.count;
+                defer {
+                    c.render_tp_anchor_owner = prev_owner;
+                    c.render_tp_anchor_names = prev_names;
+                    c.render_tp_anchor_count = prev_count;
+                }
                 try buf.appendSlice(gpa, "{ ");
                 for (sigs, 0..) |sig, si| {
                     if (si > 0) try buf.appendSlice(gpa, "; ");
@@ -333,7 +358,12 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                     const opts = c.store.signatureParamOptionalsOf(sig);
                     const sig_pool_idx: u32 = t.signatures.start + @as(u32, @intCast(si));
                     if (c.sig_type_params.get(sig_pool_idx)) |tp_prefix| {
-                        try buf.appendSlice(gpa, tp_prefix);
+                        if (c.renderTpPrefix(sig_pool_idx, tp_prefix)) |renamed| {
+                            defer gpa.free(renamed);
+                            try buf.appendSlice(gpa, renamed);
+                        } else {
+                            try buf.appendSlice(gpa, tp_prefix);
+                        }
                     }
                     try buf.append(gpa, '(');
                     for (params, 0..) |param_ty, pi| {
@@ -406,6 +436,18 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                 try buf.appendSlice(gpa, "{ ");
                 var first = true;
                 // Render call/construct signatures in object form.
+                const prev_owner = c.render_tp_anchor_owner;
+                const prev_names = c.render_tp_anchor_names;
+                const prev_count = c.render_tp_anchor_count;
+                const anchor = c.computeTpAnchor(t.signatures.start, call_sigs.len);
+                c.render_tp_anchor_owner = anchor.owner;
+                c.render_tp_anchor_names = anchor.names;
+                c.render_tp_anchor_count = anchor.count;
+                defer {
+                    c.render_tp_anchor_owner = prev_owner;
+                    c.render_tp_anchor_names = prev_names;
+                    c.render_tp_anchor_count = prev_count;
+                }
                 for (call_sigs, 0..) |sig, csi| {
                     if (!first) try buf.appendSlice(gpa, "; ");
                     first = false;
@@ -415,7 +457,12 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                     if (sig.is_construct) try buf.appendSlice(gpa, "new ");
                     const pool_idx: u32 = t.signatures.start + @as(u32, @intCast(csi));
                     if (c.sig_type_params.get(pool_idx)) |tp_prefix| {
-                        try buf.appendSlice(gpa, tp_prefix);
+                        if (c.renderTpPrefix(pool_idx, tp_prefix)) |renamed| {
+                            defer gpa.free(renamed);
+                            try buf.appendSlice(gpa, renamed);
+                        } else {
+                            try buf.appendSlice(gpa, tp_prefix);
+                        }
                     }
                     try buf.append(gpa, '(');
                     for (sparams, 0..) |sp, si| {
@@ -519,6 +566,18 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                         } else {
                             // Multi-sig overloaded method: render each sig separately.
                             // The name + optional '?' for the first sig were already written.
+                            const mprev_owner = c.render_tp_anchor_owner;
+                            const mprev_names = c.render_tp_anchor_names;
+                            const mprev_count = c.render_tp_anchor_count;
+                            const manchor = c.computeTpAnchor(pv.signatures.start, msigs.len);
+                            c.render_tp_anchor_owner = manchor.owner;
+                            c.render_tp_anchor_names = manchor.names;
+                            c.render_tp_anchor_count = manchor.count;
+                            defer {
+                                c.render_tp_anchor_owner = mprev_owner;
+                                c.render_tp_anchor_names = mprev_names;
+                                c.render_tp_anchor_count = mprev_count;
+                            }
                             for (msigs, 0..) |msig, msi| {
                                 if (msi > 0) {
                                     try buf.appendSlice(gpa, "; ");
@@ -533,8 +592,14 @@ fn typeToStringInner(c: *Checker, id: TypeId, buf: *std.ArrayList(u8), depth: u8
                                     }
                                 }
                                 const sig_pool_idx_m: u32 = pv.signatures.start + @as(u32, @intCast(msi));
-                                if (c.sig_type_params.get(sig_pool_idx_m)) |tp_prefix|
-                                    try buf.appendSlice(gpa, tp_prefix);
+                                if (c.sig_type_params.get(sig_pool_idx_m)) |tp_prefix| {
+                                    if (c.renderTpPrefix(sig_pool_idx_m, tp_prefix)) |renamed| {
+                                        defer gpa.free(renamed);
+                                        try buf.appendSlice(gpa, renamed);
+                                    } else {
+                                        try buf.appendSlice(gpa, tp_prefix);
+                                    }
+                                }
                                 try buf.append(gpa, '(');
                                 const mparams = c.store.signatureParamsOf(msig);
                                 const mnames = c.store.signatureParamNamesOf(msig);

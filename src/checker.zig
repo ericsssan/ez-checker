@@ -1106,6 +1106,12 @@ pub const Checker = struct {
     /// rendering `{ <T>(…): R; <U>(…): R; }` overload sets.
     sig_type_params: std.AutoHashMapUnmanaged(u32, []const u8) = .empty,
 
+    /// The AST node owning a signature's own `<...>` type parameters, plus
+    /// their declared names — keyed by signature pool index, populated
+    /// alongside `sig_type_params`. See `SigTpInfo`'s own doc comment (below
+    /// the field block, where Zig requires type declarations to live).
+    sig_tp_info: std.AutoHashMapUnmanaged(u32, SigTpInfo) = .empty,
+
     /// Local names bound by a RESOLVABLE `import X = require("...")`, mapped to
     /// the name tsc displays for the module (see `requireAliasDisplayName`).
     /// Whole-program, keyed by bare name only — see `requireAliasDisplayNameAt`
@@ -1140,10 +1146,16 @@ pub const Checker = struct {
     /// Recursion guard for `expandUtilityRef`.
     util_expand_depth: u8 = 0,
 
-    /// Temporary type-param rename table used during multi-sig overload rendering.
-    /// Maps original param name → display name (e.g. "T" → "T_1").
-    /// Set/cleared per-sig inside typeToStringInner; read by .type_param rendering.
-    tp_renames: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Transient, printer-scoped anchor state for tsc's overload-rename rule
+    /// (see `SigTpInfo`): the AST node of the signature currently anchoring a
+    /// multi-signature print (0 = no anchor — print everyone verbatim) and
+    /// that signature's own declared type-parameter names. Set by
+    /// `typeToStringInner` around a multi-sig print group (save/restore, like
+    /// `render_location`); consulted by sibling signatures' `<T>` prefixes and
+    /// by `.type_param` rendering to rename a colliding name to `name_1`.
+    render_tp_anchor_owner: u32 = 0,
+    render_tp_anchor_names: [4][]const u8 = undefined,
+    render_tp_anchor_count: u8 = 0,
 
     /// Recursion counter for resolveConditionalTypeWithSubst / distributeConditional.
     /// Prevents stack overflow on deeply nested generic conditional types.
@@ -1222,6 +1234,28 @@ pub const Checker = struct {
     /// served only by an index signature counts as "absent" (the union access
     /// then yields `any`, matching tsc's behavior for mixed index-sig unions).
     suppress_index_fallback: bool = false,
+
+    /// Per-signature-pool-slot value for `sig_tp_info`: the AST node owning
+    /// this signature's own `<...>` type parameters, plus their declared
+    /// names. tsc's overload-rename rule: when printing a merged/overloaded
+    /// signature set AT one specific declaration (each overload gets its own
+    /// hover in the .types baseline), THAT declaration's own signature is the
+    /// "anchor" and keeps its type-parameter names verbatim; every OTHER
+    /// signature in the set gets any name that collides with the anchor's
+    /// own names renamed (`U` → `U_1`) — verified against tsc's baselines for
+    /// specializationError.ts, ipromise4.ts, and twiceNestedKeyofIndexInference.ts
+    /// (each overload's own hover keeps ITS names bare while every sibling's
+    /// colliding name is suffixed; a non-declaration use site like a plain
+    /// property read has no anchor, so nothing is renamed there even though
+    /// the same textual collision exists). `owner` is the same AST node
+    /// tp_owner already carries per type-param `Type` (see `typeParamOwnerOf`),
+    /// so a print-time occurrence is trivially checked against the anchor via
+    /// that field.
+    const SigTpInfo = struct {
+        owner: u32 = 0,
+        names: [4][]const u8 = undefined,
+        count: u8 = 0,
+    };
 
     pub fn init(
         gpa: std.mem.Allocator,
@@ -1351,7 +1385,7 @@ pub const Checker = struct {
         self.tp_owner_map.deinit(self.gpa);
         self.sig_type_params.deinit(self.gpa);
         }
-        self.tp_renames.deinit(self.gpa);
+        self.sig_tp_info.deinit(self.gpa);
         self.overload_fn_types.deinit(self.gpa);
     }
 
@@ -10855,6 +10889,166 @@ pub const Checker = struct {
         self.sig_type_params.put(self.gpa, sig_pool_idx, s) catch self.gpa.free(s);
     }
 
+    /// Companion to `registerSigTypeParams`: record the OWNING declaration and
+    /// declared names of this signature's own `<...>` type parameters, keyed
+    /// by the same signature pool index — see `SigTpInfo`. The owner is read
+    /// off live `.type_param` occurrences in `sig`'s already-built params and
+    /// return type, rather than independently re-derived from the declaration
+    /// node — see `consistentTypeParamOwner`'s doc comment for why, and why
+    /// EVERY occurrence must agree before it's trusted.
+    fn registerSigTypeParamOwner(self: *Checker, sig_pool_idx: u32, tp_start: u32, tp_end: u32, sig: tymod.Signature) void {
+        if (self.sig_tp_info.contains(sig_pool_idx)) return;
+        if (tp_start >= tp_end) return;
+        const ext_len: u32 = @intCast(self.ast_ref.extra_data.len);
+        if (tp_end > ext_len) return;
+        var info: SigTpInfo = .{};
+        for (self.ast_ref.extra_data[tp_start..tp_end]) |raw| {
+            const tp: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) continue;
+            if (info.count < info.names.len) {
+                info.names[info.count] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp));
+                info.count += 1;
+            }
+        }
+        if (info.count == 0) return;
+        info.owner = self.consistentTypeParamOwner(sig, info.names[0..info.count]) orelse return;
+        self.sig_tp_info.put(self.gpa, sig_pool_idx, info) catch {};
+    }
+
+    /// The single, mutually-consistent `tp_owner` for every live `.type_param`
+    /// occurrence named in `names` found anywhere within `sig`'s params and
+    /// return type — or null when none is found, OR when two occurrences
+    /// disagree on the owner. Disagreement is real, not a bug in this scan:
+    /// the SAME declared name can carry a DIFFERENT `tp_owner` depending on
+    /// whether it's referenced directly (`context: TContext`) or through a
+    /// type alias's own argument substitution (`FilterFn<TData, TResult,
+    /// TContext>`, `FilterFn` being generic over its own same-named
+    /// parameters) — verified via contravariantInferenceAndTypeGuard.ts,
+    /// where trusting the first-found occurrence wrongly renamed a
+    /// non-colliding `TResult`. Declining outright when this happens is
+    /// safe: the caller simply never registers this signature as capable of
+    /// anchoring or colliding, which is exactly today's (pre-feature) result.
+    fn consistentTypeParamOwner(self: *Checker, sig: tymod.Signature, names: []const []const u8) ?u32 {
+        var owner: u32 = 0;
+        for (self.store.signatureParamsOf(sig)) |p| {
+            if (!self.collectTypeParamOwner(p, names, &owner, 0)) return null;
+        }
+        if (!self.collectTypeParamOwner(sig.return_type, names, &owner, 0)) return null;
+        return if (owner != 0) owner else null;
+    }
+
+    /// Visits every live `.type_param` occurrence in `ty` (params/return/
+    /// args/props, bounded depth) whose name is in `names`, folding its
+    /// owner into `owner.*` (first write wins). Returns false the moment a
+    /// DIFFERENT owner is found for one — see `consistentTypeParamOwner`.
+    fn collectTypeParamOwner(self: *Checker, ty: TypeId, names: []const []const u8, owner: *u32, depth: u8) bool {
+        if (depth > 6) return true;
+        const t = self.store.get(ty);
+        switch (t.kind) {
+            .type_param => {
+                const matches = for (names) |n| {
+                    if (std.mem.eql(u8, n, t.name)) break true;
+                } else false;
+                if (!matches) return true;
+                if (owner.* == 0) { owner.* = t.tp_owner; return true; }
+                return owner.* == t.tp_owner;
+            },
+            .array_t, .readonly_array_t, .rest_t, .type_ref,
+            .tuple_t, .union_t, .intersection_t => {
+                for (self.store.idsOf(t.list_data)) |m| {
+                    if (!self.collectTypeParamOwner(m, names, owner, depth + 1)) return false;
+                }
+                return true;
+            },
+            .function_t => {
+                for (self.store.signaturesOf(t.signatures)) |s| {
+                    for (self.store.signatureParamsOf(s)) |p| {
+                        if (!self.collectTypeParamOwner(p, names, owner, depth + 1)) return false;
+                    }
+                    if (!self.collectTypeParamOwner(s.return_type, names, owner, depth + 1)) return false;
+                }
+                return true;
+            },
+            .object_t => {
+                for (self.store.propsOf(t.object_props)) |p| {
+                    if (!self.collectTypeParamOwner(p.type_id, names, owner, depth + 1)) return false;
+                }
+                return true;
+            },
+            else => return true,
+        }
+    }
+
+    /// The signature (if any) among `[sig_start, sig_start+sig_count)` whose
+    /// own declaring node encloses `self.render_location` — the "anchor" for
+    /// tsc's overload-rename rule (see `SigTpInfo`). `.owner == 0` means no
+    /// anchor was found (print request isn't for a specific declaration, or
+    /// that declaration has no type parameters of its own): callers should
+    /// render every signature verbatim, unchanged from today.
+    pub fn computeTpAnchor(self: *Checker, sig_start: u32, sig_count: usize) SigTpInfo {
+        if (self.render_location == .none) return .{};
+        var i: usize = 0;
+        while (i < sig_count) : (i += 1) {
+            const idx = sig_start + @as(u32, @intCast(i));
+            const info = self.sig_tp_info.get(idx) orelse continue;
+            if (self.nodeIsInside(self.render_location, @enumFromInt(info.owner))) return info;
+        }
+        return .{};
+    }
+
+    /// Rewrite `s` (a cached `<T, U extends V>`-style prefix), replacing every
+    /// WHOLE-WORD occurrence of a name in `names[0..count]` with `<name>_1` —
+    /// including inside constraints/defaults that reference the same renamed
+    /// parameter (`<T, K1 extends keyof T>` → `<T_1, K1_1 extends keyof T_1>`
+    /// when both collide). Returns owned memory on any actual change, else
+    /// null (caller keeps using the original cached string).
+    fn renameCollidingTypeParamNames(self: *Checker, s: []const u8, names: []const []const u8) ?[]const u8 {
+        var out: std.ArrayList(u8) = .empty;
+        var changed = false;
+        var i: usize = 0;
+        while (i < s.len) {
+            const c = s[i];
+            if (std.ascii.isAlphabetic(c) or c == '_' or c == '$') {
+                var j = i + 1;
+                while (j < s.len and (std.ascii.isAlphanumeric(s[j]) or s[j] == '_' or s[j] == '$')) j += 1;
+                const word = s[i..j];
+                const hit = for (names) |n| { if (std.mem.eql(u8, n, word)) break true; } else false;
+                out.appendSlice(self.gpa, word) catch { out.deinit(self.gpa); return null; };
+                if (hit) {
+                    out.appendSlice(self.gpa, "_1") catch { out.deinit(self.gpa); return null; };
+                    changed = true;
+                }
+                i = j;
+                continue;
+            }
+            out.append(self.gpa, c) catch { out.deinit(self.gpa); return null; };
+            i += 1;
+        }
+        if (!changed) { out.deinit(self.gpa); return null; }
+        return out.toOwnedSlice(self.gpa) catch { out.deinit(self.gpa); return null; };
+    }
+
+    /// The `<...>` prefix to print for `sig_pool_idx`, given the current
+    /// render-time anchor (`render_tp_anchor_*`): the cached original unless
+    /// this signature is a NON-anchor whose own declared names collide with
+    /// the anchor's, in which case a renamed copy (owned, caller must free).
+    pub fn renderTpPrefix(self: *Checker, sig_pool_idx: u32, prefix: []const u8) ?[]const u8 {
+        if (self.render_tp_anchor_owner == 0) return null;
+        const info = self.sig_tp_info.get(sig_pool_idx) orelse return null;
+        if (info.owner == self.render_tp_anchor_owner) return null; // this IS the anchor
+        const anchor_names = self.render_tp_anchor_names[0..self.render_tp_anchor_count];
+        const collides = collides: {
+            for (info.names[0..info.count]) |n| {
+                for (anchor_names) |an| {
+                    if (std.mem.eql(u8, n, an)) break :collides true;
+                }
+            }
+            break :collides false;
+        };
+        if (!collides) return null;
+        return self.renameCollidingTypeParamNames(prefix, anchor_names);
+    }
+
     /// Extract type parameter names from a prefix like `"<T>"`, `"<T extends X, U>"`.
     /// Returns the count of names found; names are stored in `out[0..count]`.
     /// Handles nested `<>` correctly so commas inside constraints are ignored.
@@ -10880,101 +11074,6 @@ pub const Checker = struct {
             }
         }
         return count;
-    }
-
-    /// Build a renamed type-params prefix string for a multi-sig overload.
-    /// For each name in `original_prefix` that already appears in `seen[0..seen_len]`,
-    /// generates a fresh name (e.g. T → T_1, T_1 → T_2) and:
-    ///   - Writes the rename into `self.tp_renames` so typeToStringInner can use it.
-    ///   - Adds original and renamed names to `seen_buf[seen_len..]`, updating `seen_len.*`.
-    /// Returns an owned renamed prefix or null if no renames were needed (caller emits original).
-    /// Caller must call `self.tp_renames.clearRetainingCapacity()` before each call.
-    /// `name_pool` is caller-provided stack storage for fresh name bytes (non-owning slices).
-    fn applyTpRenames(
-        self: *Checker,
-        original_prefix: []const u8,
-        seen_buf: [][]const u8,
-        seen_len: *usize,
-        name_pool: []u8,
-        name_pool_pos: *usize,
-    ) ?[]const u8 {
-        var names_buf: [16][]const u8 = undefined;
-        const n = extractTpNames(original_prefix, &names_buf);
-        if (n == 0) return null;
-
-        var any_rename = false;
-        for (names_buf[0..n]) |name| {
-            var conflict = false;
-            for (seen_buf[0..seen_len.*]) |s| {
-                if (std.mem.eql(u8, s, name)) { conflict = true; break; }
-            }
-            if (!conflict) {
-                if (seen_len.* < seen_buf.len) { seen_buf[seen_len.*] = name; seen_len.* += 1; }
-                continue;
-            }
-            // Generate a fresh name: name_1, name_2, ...
-            any_rename = true;
-            var suffix: u32 = 1;
-            var fresh_slice: []const u8 = name;
-            var fbuf: [64]u8 = undefined;
-            while (suffix < 100) : (suffix += 1) {
-                const candidate = std.fmt.bufPrint(&fbuf, "{s}_{d}", .{ name, suffix }) catch break;
-                var taken = false;
-                for (seen_buf[0..seen_len.*]) |s| {
-                    if (std.mem.eql(u8, s, candidate)) { taken = true; break; }
-                }
-                if (!taken) {
-                    // Copy into caller-provided name_pool (stack storage, no heap alloc)
-                    if (name_pool_pos.* + candidate.len <= name_pool.len) {
-                        @memcpy(name_pool[name_pool_pos.*..][0..candidate.len], candidate);
-                        fresh_slice = name_pool[name_pool_pos.*..][0..candidate.len];
-                        name_pool_pos.* += candidate.len;
-                    }
-                    break;
-                }
-            }
-            self.tp_renames.put(self.gpa, name, fresh_slice) catch {};
-            if (seen_len.* < seen_buf.len) { seen_buf[seen_len.*] = fresh_slice; seen_len.* += 1; }
-            if (seen_len.* < seen_buf.len) { seen_buf[seen_len.*] = name; seen_len.* += 1; }
-        }
-
-        if (!any_rename) return null;
-
-        // Build the renamed prefix string from the original, substituting names.
-        var out: std.ArrayList(u8) = .empty;
-        out.append(self.gpa, '<') catch { out.deinit(self.gpa); return null; };
-        for (names_buf[0..n], 0..) |name, ni| {
-            if (ni > 0) out.appendSlice(self.gpa, ", ") catch { out.deinit(self.gpa); return null; };
-            const display = self.tp_renames.get(name) orelse name;
-            out.appendSlice(self.gpa, display) catch { out.deinit(self.gpa); return null; };
-            // Find the constraint part (everything after "name" in original_prefix segment).
-            // Re-parse original_prefix to find this segment and append the constraint.
-            const inner = original_prefix[1 .. original_prefix.len - 1];
-            var depth2: usize = 0;
-            var seg_s: usize = 0;
-            var seg_idx: usize = 0;
-            var ii: usize = 0;
-            while (ii <= inner.len) : (ii += 1) {
-                const c2: u8 = if (ii < inner.len) inner[ii] else ',';
-                if (c2 == '<') { depth2 += 1; continue; }
-                if (c2 == '>') { if (depth2 > 0) depth2 -= 1; continue; }
-                if (c2 == ',' and depth2 == 0) {
-                    if (seg_idx == ni) {
-                        // Append constraint part of this segment
-                        const seg = std.mem.trim(u8, inner[seg_s..ii], " ");
-                        const name_end2 = std.mem.indexOfScalar(u8, seg, ' ') orelse seg.len;
-                        if (name_end2 < seg.len) {
-                            out.appendSlice(self.gpa, seg[name_end2..]) catch { out.deinit(self.gpa); return null; };
-                        }
-                        break;
-                    }
-                    seg_s = ii + 1;
-                    seg_idx += 1;
-                }
-            }
-        }
-        out.append(self.gpa, '>') catch { out.deinit(self.gpa); return null; };
-        return out.toOwnedSlice(self.gpa) catch { out.deinit(self.gpa); return null; };
     }
 
     /// Build a function_t from an fn_decl / async_fn_decl / etc. node.
@@ -11699,6 +11798,7 @@ pub const Checker = struct {
             if (tp.start < tp.end) {
                 const pool_idx: u32 = sig_list.start + @as(u32, @intCast(i));
                 self.registerSigTypeParams(pool_idx, tp.start, tp.end);
+                self.registerSigTypeParamOwner(pool_idx, tp.start, tp.end, sig_buf[i]);
             }
         }
         // Mark as overload-set (renders as `{ ... }` object form) only when there are
@@ -11763,6 +11863,7 @@ pub const Checker = struct {
             if (tp.start < tp.end) {
                 const pool_idx: u32 = sig_list.start + @as(u32, @intCast(i));
                 self.registerSigTypeParams(pool_idx, tp.start, tp.end);
+                self.registerSigTypeParamOwner(pool_idx, tp.start, tp.end, sig_buf[i]);
             }
         }
         const fn_ty = self.store.add(.{ .kind = .function_t, .signatures = sig_list, .is_overload_set = sig_count > 1 }) catch return null;
@@ -12838,8 +12939,11 @@ pub const Checker = struct {
         const sig_list = if (sig_count == 0) tymod.SignatureList.empty else blk: {
             const sl = self.store.appendSignatures(sig_buf[0..sig_count]) catch break :blk tymod.SignatureList.empty;
             for (sig_tp_buf[0..sig_count], 0..) |tp, i| {
-                if (tp.start < tp.end)
-                    self.registerSigTypeParams(sl.start + @as(u32, @intCast(i)), tp.start, tp.end);
+                if (tp.start < tp.end) {
+                    const pool_idx: u32 = sl.start + @as(u32, @intCast(i));
+                    self.registerSigTypeParams(pool_idx, tp.start, tp.end);
+                    self.registerSigTypeParamOwner(pool_idx, tp.start, tp.end, sig_buf[i]);
+                }
             }
             break :blk sl;
         };
@@ -18550,8 +18654,10 @@ pub const Checker = struct {
                     const ft = self.store.get(fn_ty);
                     if (ft.kind == .function_t) {
                         const sl = ft.signatures;
-                        if (self.store.signaturesOf(sl).len == 1) {
+                        const ft_sigs = self.store.signaturesOf(sl);
+                        if (ft_sigs.len == 1) {
                             self.registerSigTypeParams(sl.start, sig_data.type_params, sig_data.type_params_end);
+                            self.registerSigTypeParamOwner(sl.start, sig_data.type_params, sig_data.type_params_end, ft_sigs[0]);
                         }
                     }
                 }
@@ -18648,11 +18754,14 @@ pub const Checker = struct {
         // be one of the sources, and the overwrite below frees what it replaces.
         var owned: [8]?[]u8 = undefined;
         for (&owned) |*slot| slot.* = null;
+        var tp_owned: [8]?SigTpInfo = undefined;
+        for (&tp_owned) |*slot| slot.* = null;
         for (0..n) |k| {
             if (k >= owned.len) break;
             if (self.sig_type_params.get(src_idx[k])) |prefix| {
                 owned[k] = self.gpa.dupe(u8, prefix) catch null;
             }
+            tp_owned[k] = self.sig_tp_info.get(src_idx[k]);
         }
         const result = self.store.add(.{ .kind = .function_t, .signatures = merged_sigs, .is_overload_set = n > 1 }) catch {
             for (owned[0..@min(n, owned.len)]) |o| if (o) |v| self.gpa.free(v);
@@ -18669,6 +18778,11 @@ pub const Checker = struct {
             const dst = rstart + @as(u32, @intCast(k));
             if (self.sig_type_params.fetchRemove(dst)) |old_kv| self.gpa.free(old_kv.value);
             self.sig_type_params.put(self.gpa, dst, dup) catch self.gpa.free(dup);
+        }
+        for (0..@min(n, tp_owned.len)) |k| {
+            const info = tp_owned[k] orelse continue;
+            const dst = rstart + @as(u32, @intCast(k));
+            self.sig_tp_info.put(self.gpa, dst, info) catch {};
         }
         return result;
     }
