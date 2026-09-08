@@ -5044,6 +5044,13 @@ pub const Checker = struct {
     fn typeOfDeclarator(self: *Checker, decl: NodeIndex) ?TypeId {
         const data = self.ast_ref.nodeData(decl);
         if (data.lhs == .none or self.ast_ref.nodeTag(data.lhs) != .identifier) return null;
+        // Must run before the annotation check just below — see
+        // `nameHasCircularInitializer`'s doc comment for the full rule.
+        // (This is the scope-aware shortcut `typeOfNameByAstSearch` takes
+        // via `scopeLocalValueDecl`, which otherwise bypasses the witness
+        // entirely by returning here before the later, name-wide check.)
+        const decl_name = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs));
+        if (decl_name.len > 0 and self.nameHasCircularInitializer(decl_name)) return tymod.ID_ANY;
         const ann = self.ast_ref.nodeData(data.lhs).rhs;
         if (ann != .none and self.ast_ref.nodeTag(ann) == .ts_type_annotation) {
             return self.resolveTypeNode(self.ast_ref.nodeData(ann).lhs);
@@ -5204,37 +5211,42 @@ pub const Checker = struct {
     /// So only the FIRST matching declarator is ever inspected, not "any
     /// declarator in the group" like an earlier version of this function did
     /// (which wrongly flagged `o` above as circular too).
+    /// The first declarator (by source order) among `name`'s value decls
+    /// whose bound identifier is literally `name` — the only one tsc's
+    /// merged-`var`-group resolution ever looks at (see
+    /// `nameHasCircularInitializer`).
+    fn firstMatchingDeclarator(self: *Checker, name: []const u8) ?NodeIndex {
+        const list = self.decl_index.valueDecls(name) orelse return null;
+        for (list.items) |ni| {
+            if (self.ast_ref.nodeTag(ni) != .declarator) continue;
+            const data = self.ast_ref.nodeData(ni);
+            if (data.lhs == .none) continue;
+            if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs)), name)) continue;
+            return ni;
+        }
+        return null;
+    }
+
     fn nameHasCircularInitializer(self: *Checker, name: []const u8) bool {
         if (self.circular_init_cache.get(name)) |cached| return cached;
-        var found = false;
-        first: {
-            const list = self.decl_index.valueDecls(name) orelse break :first;
-            for (list.items) |ni| {
-                if (self.ast_ref.nodeTag(ni) != .declarator) continue;
-                const data = self.ast_ref.nodeData(ni);
-                if (data.lhs == .none) continue;
-                if (!std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(data.lhs)), name)) continue;
-                // Found the first matching declarator — this is the ONLY one
-                // that can ever make `name` circular; stop here regardless
-                // of the outcome below.
-                const id_data = self.ast_ref.nodeData(data.lhs);
-                if (id_data.rhs != .none and self.ast_ref.nodeTag(id_data.rhs) == .ts_type_annotation) break :first;
-                // A `var` legally re-declaring a same-named PARAMETER
-                // (`constructor(options?: number) { var options = (options
-                // || 0); }`) merges into that SAME binding, but the
-                // parameter's own annotation is settled independently and
-                // unconditionally before the function body's `var`
-                // statement is ever considered — never subject to the var's
-                // own circularity witness. `is_parameter` on the
-                // declarator's resolved symbol (shared with the parameter
-                // once merged) detects this.
-                if (self.symbolForIdentRef(data.lhs)) |sym| {
-                    if (self.semantic.symbols.getFlags(sym).is_parameter) break :first;
-                }
-                found = self.initializerSelfReferences(ni);
-                break :first;
+        const found = blk: {
+            const ni = self.firstMatchingDeclarator(name) orelse break :blk false;
+            const data = self.ast_ref.nodeData(ni);
+            const id_data = self.ast_ref.nodeData(data.lhs);
+            if (id_data.rhs != .none and self.ast_ref.nodeTag(id_data.rhs) == .ts_type_annotation) break :blk false;
+            // A `var` legally re-declaring a same-named PARAMETER
+            // (`constructor(options?: number) { var options = (options ||
+            // 0); }`) merges into that SAME binding, but the parameter's own
+            // annotation is settled independently and unconditionally
+            // before the function body's `var` statement is ever
+            // considered — never subject to the var's own circularity
+            // witness. The resolved symbol's parameter binding kind (shared
+            // with the parameter once merged) detects this.
+            if (self.symbolForIdentRef(data.lhs)) |sym| {
+                if (self.semantic.symbols.getBindingKind(sym) == .parameter) break :blk false;
             }
-        }
+            break :blk self.initializerSelfReferences(ni);
+        };
         self.circular_init_cache.put(self.gpa, name, found) catch {};
         return found;
     }
@@ -5257,13 +5269,8 @@ pub const Checker = struct {
         var fn_decl_fallback: NodeIndex = .none; // first no-body signature
         var fn_impl: NodeIndex = .none; // implementation (with body)
         const list = self.decl_index.valueDecls(name) orelse return null;
-        // Circular self-reference (`var x = (x, 3)`): tsc's circularity
-        // witness types the WHOLE variable `any`, overriding even an
-        // explicit type annotation on a separately merged re-declaration
-        // (`var x = (x, 3); var x: number;` types BOTH "x"s `any`, not
-        // `number`). Must run before the annotation branch below, which
-        // would otherwise win for whichever co-declared declarator the main
-        // loop reaches first. See `nameHasCircularInitializer`.
+        // Must run before the annotation branch below — see
+        // `nameHasCircularInitializer`'s doc comment for the full rule.
         if (self.nameHasCircularInitializer(name)) return tymod.ID_ANY;
         for (list.items) |ni| {
             const t = self.ast_ref.nodeTag(ni);
@@ -7626,18 +7633,12 @@ pub const Checker = struct {
                 break;
             }
         }
-        // Circular self-reference (`var x = (x, 3)`): tsc's circularity
-        // witness types the WHOLE variable `any`, overriding even an
-        // explicit annotation on a separately merged re-declaration
-        // (`var x = (x, 3); var x: number;` types BOTH "x"s `any`, not
-        // `number` — verified against witness.ts's ~15 forms: comma,
-        // assignment, conditional, `||`, `&&`). Must run before the direct-
-        // annotation check just below, which would otherwise win outright
-        // for an annotated binding. See `nameHasCircularInitializer`.
-        if (node != .none and self.ast_ref.nodeTag(node) == .identifier) {
-            const bn = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node));
-            if (bn.len > 0 and self.nameHasCircularInitializer(bn)) return tymod.ID_ANY;
-        }
+        // Must run before the direct-annotation check just below, which
+        // would otherwise win outright for an annotated binding. See
+        // `nameHasCircularInitializer`'s doc comment for the full rule.
+        const node_is_ident = node != .none and self.ast_ref.nodeTag(node) == .identifier;
+        const node_bn: []const u8 = if (node_is_ident) self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node)) else "";
+        if (node_bn.len > 0 and self.nameHasCircularInitializer(node_bn)) return tymod.ID_ANY;
         // Check the final node for a direct annotation
         if (node != .none) {
             const bd = self.ast_ref.nodeData(node);
@@ -7659,10 +7660,7 @@ pub const Checker = struct {
                     ty_node_tag == .ts_indexed_access_type or
                     ty_node_tag == .ts_conditional_type or
                     ty_node_tag == .ts_keyof_type);
-                const bn: []const u8 = if (!ann_blocks_mark and self.ast_ref.nodeTag(node) == .identifier)
-                    self.ast_ref.tokenText(self.ast_ref.nodeMainToken(node))
-                else
-                    "";
+                const bn: []const u8 = if (!ann_blocks_mark and node_is_ident) node_bn else "";
                 if (bn.len > 0) self.typeof_building.put(self.gpa, bn, {}) catch {};
                 self.type_pos_depth += 1;
                 var ty = self.expandBindingTypeofDisplay(ty_node, self.resolveTypeNode(ty_node));
@@ -8138,15 +8136,9 @@ pub const Checker = struct {
                         return ty;
                     }
                 }
-                // No annotation, but the destructuring SOURCE (if this default
-                // sits inside one) is itself `any`/unknown/error: property
-                // access on it is always `any`, regardless of what the
-                // default literal's own type would otherwise suggest
-                // (verified: `const { a = 1 } = {} as any;` types `a` as
-                // `any`, not `number`). A plain function-parameter default
-                // (no enclosing destructuring pattern) is unaffected —
-                // `destructuringSourceIsAny` only matches an enclosing
-                // declarator reached through pattern-wrapper ancestors.
+                // A plain function-parameter default (no enclosing
+                // destructuring pattern) is unaffected — see
+                // `destructuringSourceIsAny`'s doc comment.
                 if (self.destructuringSourceIsAny(parent)) return tymod.ID_ANY;
                 // No annotation: for simple literal defaults, return the base type.
                 // Only apply this for simple identifiers (not destructuring patterns).
@@ -9627,14 +9619,7 @@ pub const Checker = struct {
                     // Function parameter with default: `[x] = default`.
                     const data = self.ast_ref.nodeData(@enumFromInt(cur));
                     if (data.lhs == pattern_node and data.rhs != .none) {
-                        // Property access on an `any`/unresolvable SOURCE is
-                        // always `any`, regardless of what the default
-                        // literal's own type would otherwise suggest
-                        // (verified: `const { a = 1 } = {} as any;` types `a`
-                        // as `any`, not `number`). Only overrides the default
-                        // when the source itself is unresolvable — a real
-                        // source object with a genuinely-optional/absent
-                        // property still gets the default's own type, unchanged.
+                        // See `destructuringSourceIsAny`'s doc comment.
                         if (self.destructuringSourceIsAny(@enumFromInt(cur))) return tymod.ID_ANY;
                         // Return the type of the default value.
                         return self.typeOf(data.rhs);
