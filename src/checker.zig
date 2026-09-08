@@ -212,7 +212,7 @@ fn node16UnresolvableSpec(spec: []const u8) bool {
 
 /// True when `pj_src` (a package.json's raw source) declares
 /// `"type": "module"`.  Simple key-then-value scan, matching this file's
-/// existing package.json parsing convention (`exportsHasSubpath`) rather
+/// existing package.json parsing convention (`resolveExportsTarget`) rather
 /// than a real JSON parser.
 fn packageJsonTypeIsModule(pj_src: []const u8) bool {
     const ki = std.mem.indexOf(u8, pj_src, "\"type\"") orelse return false;
@@ -3267,17 +3267,16 @@ pub const Checker = struct {
                     // Bare specifiers can ALSO be resolvable/unresolvable in ways
                     // this function doesn't otherwise check (package.json `exports`,
                     // `/// <reference>` libs, ambient globals) — unlike the relative
-                    // case above, don't gate success on `bareSpecResolvable` here (a
-                    // prior attempt did and cost 947 correct→gap corpus-wide, since
-                    // most bare specifiers resolve some OTHER way this function
-                    // doesn't model). Only ask whether a same-target SIBLING import
-                    // of the SAME package earns the collapsed display name —
-                    // `bareNamespaceImportDisplayName` itself falls back to `ns_name`
-                    // unchanged whenever package.json resolution doesn't apply.
-                    const disp = if (mod_spec.len > 0 and mod_spec[0] != '.') blk: {
-                        const is_require_ctx = if (self.sectionOfNode(node)) |sec| self.fileIsCjsFormat(sec.name) else false;
-                        break :blk self.bareNamespaceImportDisplayName(ns_name, mod_spec, node, is_require_ctx);
-                    } else ns_name;
+                    // case above, don't gate success on package.json resolvability
+                    // here (a prior attempt did and cost 947 correct→gap corpus-wide,
+                    // since most bare specifiers resolve some OTHER way this function
+                    // doesn't model). Only ask whether a same-target SIBLING import of
+                    // the SAME package earns the collapsed display name — `orelse
+                    // ns_name` for whenever package.json resolution doesn't apply.
+                    const disp = if (mod_spec.len > 0 and mod_spec[0] != '.')
+                        self.bareNamespaceImportDisplayName(ns_name, mod_spec, node, self.importResolvesAsRequire(node)) orelse ns_name
+                    else
+                        ns_name;
                     const typeof_name = std.fmt.allocPrint(self.gpa, "typeof {s}", .{disp}) catch return tymod.ID_ANY;
                     return self.store.typeRef(typeof_name, &.{}) catch tymod.ID_ANY;
                 }
@@ -24809,6 +24808,16 @@ pub const Checker = struct {
         return r;
     }
 
+    /// Does an ES `import` written in `use_site`'s section resolve like
+    /// `require()` does (its package.json `exports` "require" condition
+    /// active, not "import")? True exactly when the section is itself
+    /// CJS-format — a real `require()` call is always this way, but an ES
+    /// `import` only inherits it inside a CJS file (same rule already
+    /// verified for require-vs-import collisions in `requireAliasDisplayName`).
+    fn importResolvesAsRequire(self: *Checker, use_site: NodeIndex) bool {
+        return if (self.sectionOfNode(use_site)) |sec| self.fileIsCjsFormat(sec.name) else false;
+    }
+
     /// The name `import * as <ns_name> from "<spec>"` displays as, from
     /// `use_site` — its own name, or (for a bare package specifier resolving
     /// through the same conditional-exports target as an earlier sibling
@@ -24825,12 +24834,9 @@ pub const Checker = struct {
             return ns_name;
         }
         // Bare specifier (`package/sub`) — resolvable only when the package's
-        // package.json `exports` exposes the subpath. An ES `import` inside a
-        // CJS-format file resolves like `require()` does (same rule already
-        // verified for require-vs-import collisions in `requireAliasDisplayName`).
-        const is_require_ctx = if (self.sectionOfNode(use_site)) |sec| self.fileIsCjsFormat(sec.name) else false;
-        if (!self.bareSpecResolvable(spec, is_require_ctx)) return null;
-        return self.bareNamespaceImportDisplayName(ns_name, spec, use_site, is_require_ctx);
+        // package.json `exports` exposes the subpath; null propagates straight
+        // through from `bareNamespaceImportDisplayName`.
+        return self.bareNamespaceImportDisplayName(ns_name, spec, use_site, self.importResolvesAsRequire(use_site));
     }
 
     /// Split a bare module specifier into its package name (handling
@@ -24844,17 +24850,6 @@ pub const Checker = struct {
             }
         }
         return .{ .pkg = spec[0..pkg_end], .subpath = if (pkg_end < spec.len) spec[pkg_end + 1 ..] else "" };
-    }
-
-    /// True when a bare specifier `package/sub` resolves through the package's
-    /// package.json `exports` under `is_require_ctx`'s condition set.
-    /// Packages whose `exports` use subpath PATTERNS (`./*`) are treated
-    /// conservatively as unresolvable (pattern + exclusion resolution is TODO).
-    fn bareSpecResolvable(self: *Checker, spec: []const u8, is_require_ctx: bool) bool {
-        const parts = splitPkgSpec(spec);
-        const pkg_src = self.packageJsonSource(parts.pkg) orelse return false;
-        var buf: [300]u8 = undefined;
-        return self.resolveExportsTarget(&buf, pkg_src, parts.subpath, is_require_ctx) != null;
     }
 
     /// The source text of the package.json that declares `"name": "<pkg>"`
@@ -24893,7 +24888,7 @@ pub const Checker = struct {
         const ki = std.mem.indexOf(u8, region, key) orelse return null;
         var i = ki + key.len;
         while (i < region.len and (region[i] == ' ' or region[i] == ':' or region[i] == '\t')) i += 1;
-        const raw = self.resolveConditionValue(region, i, is_require_ctx) orelse return null;
+        const raw = self.resolveConditionValue(region, i, is_require_ctx, 0) orelse return null;
         return applyDeclCompanion(buf, raw);
     }
 
@@ -24902,11 +24897,12 @@ pub const Checker = struct {
     /// wins UNCONDITIONALLY regardless of its position (matching tsc's own
     /// dedicated types-condition priority), else the first of `is_require_ctx`'s
     /// own condition (`"require"` or `"import"`), `"node"`, `"default"` — in
-    /// that order — that the object declares. Recurses one level into a nested
+    /// that order — that the object declares. Recurses into a nested
     /// conditions object (the `"./types": { "types": {"import":…,"require":…},
-    /// "node": {...} }` shape this file's corpus fixtures use).
-    fn resolveConditionValue(self: *Checker, region: []const u8, at: usize, is_require_ctx: bool) ?[]const u8 {
-        if (at >= region.len) return null;
+    /// "node": {...} }` shape this file's corpus fixtures use), bounded by
+    /// `depth` like this file's other recursive tree-walkers.
+    fn resolveConditionValue(self: *Checker, region: []const u8, at: usize, is_require_ctx: bool, depth: u8) ?[]const u8 {
+        if (at >= region.len or depth > 4) return null;
         if (region[at] == '"') {
             const end = std.mem.indexOfScalarPos(u8, region, at + 1, '"') orelse return null;
             return region[at + 1 .. end];
@@ -24914,40 +24910,72 @@ pub const Checker = struct {
         if (region[at] != '{') return null;
         const close = matchingBrace(region, at) orelse return null;
         const body = region[at + 1 .. close];
-        if (self.conditionValueAt(body, "types", is_require_ctx)) |v| return v;
-        if (self.conditionValueAt(body, if (is_require_ctx) "require" else "import", is_require_ctx)) |v| return v;
-        if (self.conditionValueAt(body, "node", is_require_ctx)) |v| return v;
-        if (self.conditionValueAt(body, "default", is_require_ctx)) |v| return v;
+        if (self.conditionValueAt(body, "types", is_require_ctx, depth)) |v| return v;
+        if (self.conditionValueAt(body, if (is_require_ctx) "require" else "import", is_require_ctx, depth)) |v| return v;
+        if (self.conditionValueAt(body, "node", is_require_ctx, depth)) |v| return v;
+        if (self.conditionValueAt(body, "default", is_require_ctx, depth)) |v| return v;
         return null;
     }
 
-    /// The value following `"<key>":` at the top level of `body` (a conditions
-    /// object's interior, its own braces already stripped), or null when `key`
-    /// isn't declared there.
-    fn conditionValueAt(self: *Checker, body: []const u8, key: []const u8, is_require_ctx: bool) ?[]const u8 {
+    /// The value following `"<key>":` at the TOP LEVEL of `body` (a conditions
+    /// object's interior, its own braces already stripped) ONLY — walks
+    /// `body`'s own key/value pairs one at a time, skipping past each nested
+    /// `{…}` value (via `matchingBrace`) or quoted-string value whole, so a
+    /// same-named key inside a SIBLING branch's nested object can never be
+    /// mistaken for one of `body`'s own. This vocabulary is only five words
+    /// (`types`/`import`/`require`/`node`/`default`), so that kind of
+    /// cross-level reuse is the norm for a real `exports` block, not an edge
+    /// case — a flat substring search here would silently answer from the
+    /// wrong nesting level. Null when `key` isn't declared at `body`'s own
+    /// top level, or the value shape is anything but a string or object.
+    fn conditionValueAt(self: *Checker, body: []const u8, key: []const u8, is_require_ctx: bool, depth: u8) ?[]const u8 {
         var kb: [32]u8 = undefined;
         const needle = std.fmt.bufPrint(&kb, "\"{s}\"", .{key}) catch return null;
-        const ki = std.mem.indexOf(u8, body, needle) orelse return null;
-        var i = ki + needle.len;
-        while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) i += 1;
-        return self.resolveConditionValue(body, i, is_require_ctx);
+        var i: usize = 0;
+        while (i < body.len) {
+            if (body[i] != '"') {
+                i += 1;
+                continue;
+            }
+            const kend = std.mem.indexOfScalarPos(u8, body, i + 1, '"') orelse return null;
+            const this_key = body[i .. kend + 1];
+            var vi = kend + 1;
+            while (vi < body.len and (body[vi] == ' ' or body[vi] == ':' or body[vi] == '\t' or body[vi] == '\n' or body[vi] == '\r')) vi += 1;
+            if (vi >= body.len) return null;
+            const vend: usize = if (body[vi] == '"')
+                (std.mem.indexOfScalarPos(u8, body, vi + 1, '"') orelse return null) + 1
+            else if (body[vi] == '{')
+                (matchingBrace(body, vi) orelse return null) + 1
+            else
+                return null; // array/number/bool value: not modeled, bail conservatively
+            if (std.mem.eql(u8, this_key, needle)) return self.resolveConditionValue(body, vi, is_require_ctx, depth + 1);
+            i = vend;
+        }
+        return null;
     }
 
-    /// The name a bare-package namespace-import binding displays under: its OWN
-    /// local name, unless an EARLIER (by source position) namespace-import in
-    /// the SAME section, of the SAME package, resolves to the exact same real
+    /// The name a bare-package namespace-import binding displays under, or
+    /// null when `spec`'s package/subpath doesn't resolve through package.json
+    /// `exports` at all (patterns, no match, or no matching package.json —
+    /// tsc types the binding `any`). When it DOES resolve: its OWN local
+    /// name, unless an EARLIER (by source position) namespace-import in the
+    /// SAME section, of the SAME package, resolves to the exact same real
     /// target — then tsc names it after that earlier binding instead (the same
     /// earliest-wins rule `requireAliasDisplayName` already applies to
     /// require-aliases, extended here to ES namespace imports of a
     /// conditional-exports package: `nodeModulesConditionalPackageExports.ts`'s
     /// `cjsi`/`mjsi`/`typei`/`ts` all resolve into the same package and
     /// collapse onto whichever of them was imported first).
-    fn bareNamespaceImportDisplayName(self: *Checker, ns_name: []const u8, spec: []const u8, use_site: NodeIndex, is_require_ctx: bool) []const u8 {
-        const sec = self.sectionOfNode(use_site) orelse return ns_name;
+    fn bareNamespaceImportDisplayName(self: *Checker, ns_name: []const u8, spec: []const u8, use_site: NodeIndex, is_require_ctx: bool) ?[]const u8 {
         const parts = splitPkgSpec(spec);
-        const pkg_src = self.packageJsonSource(parts.pkg) orelse return ns_name;
+        const pkg_src = self.packageJsonSource(parts.pkg) orelse return null;
         var own_buf: [300]u8 = undefined;
-        const own_target = self.resolveExportsTarget(&own_buf, pkg_src, parts.subpath, is_require_ctx) orelse return ns_name;
+        const own_target = self.resolveExportsTarget(&own_buf, pkg_src, parts.subpath, is_require_ctx) orelse return null;
+        // Resolvability (above) doesn't need section info; the collapsing scan
+        // below does — a single-file sweep (no `module_files`) has none, so
+        // just report `ns_name` unresolved-to-a-sibling rather than declining
+        // the whole binding.
+        const sec = self.sectionOfNode(use_site) orelse return ns_name;
         // The tie-break is by DECLARATION order, not by where `use_site`
         // happens to sit — a member-access RECEIVER referencing `ns_name`
         // sits textually after every sibling import, so anchoring on
