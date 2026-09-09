@@ -1081,10 +1081,79 @@ pub const TypeStore = struct {
         if (fam_bool) fam_count += 1;
         if (fam_bigint) fam_count += 1;
         if (fam_count >= 2) return ID_NEVER;
+        // Two DIFFERENT literal values of the SAME family also have no
+        // inhabitants (`"foo" & "bar"`, `1 & 2`) — a value can't equal two
+        // distinct literals at once. The family check above only catches
+        // CROSS-family clashes (`string & number`), not this same-family case.
+        for (buf.items, 0..) |a, ai| {
+            const ta = self.get(a);
+            if (!isLiteralKind(ta.kind)) continue;
+            for (buf.items[ai + 1 ..]) |b| {
+                const tb = self.get(b);
+                if (tb.kind != ta.kind) continue;
+                if (!literalEql(ta.literal_value, tb.literal_value)) return ID_NEVER;
+            }
+        }
+        // Two object types sharing a property name with mutually-exclusive
+        // literal/primitive types also have no inhabitants (`{ type: "a" } &
+        // { type: "b" }` → never) — the common discriminated-union pattern.
+        // Checked shallowly (the property's OWN kind only, not recursing
+        // into further-nested objects) to stay simple and avoid any risk of
+        // infinite recursion through a self-referential structure.
+        for (buf.items, 0..) |a, ai| {
+            if (self.get(a).kind != .object_t) continue;
+            for (buf.items[ai + 1 ..]) |b| {
+                if (self.get(b).kind != .object_t) continue;
+                if (self.objectPropsHaveExclusiveOverlap(self.get(a).object_props, self.get(b).object_props)) return ID_NEVER;
+            }
+        }
         if (buf.items.len == 0) return ID_NEVER;
         if (buf.items.len == 1) return buf.items[0];
         const list = try self.appendTypeIds(buf.items);
         return try self.add(.{ .kind = .intersection_t, .list_data = list });
+    }
+
+    fn isLiteralKind(k: TypeKind) bool {
+        return switch (k) {
+            .string_literal, .number_literal, .boolean_literal, .bigint_literal => true,
+            else => false,
+        };
+    }
+
+    /// True when `a`/`b` (two objects' own property lists) share a property
+    /// name whose value types are BOTH literal (unit) types and mutually
+    /// exclusive: different literal families (`"x"` vs `1`) or the same
+    /// family with two different values (`"x"` vs `"y"`). This mirrors
+    /// tsc's actual discriminated-union reduction, which is specifically a
+    /// literal/discriminant heuristic — NOT a general "any two incompatible
+    /// property types make the whole object never" rule: `{ prop: string }
+    /// & { prop: number }` stays a live (if never-inhabited) intersection
+    /// type in tsc's own output (verified: intersectionTypeInference2.ts),
+    /// it does NOT collapse to bare `never` the way `{ kind: "a" } & {
+    /// kind: "b" }` does. Requiring BOTH sides to be literal (not just
+    /// "some primitive family") is what keeps that distinction.
+    fn objectPropsHaveExclusiveOverlap(self: *const TypeStore, a: ObjectPropList, b: ObjectPropList) bool {
+        for (self.propsOf(a)) |pa| {
+            for (self.propsOf(b)) |pb| {
+                if (!std.mem.eql(u8, pa.name, pb.name)) continue;
+                const ta = self.get(pa.type_id);
+                const tb = self.get(pb.type_id);
+                if (!isLiteralKind(ta.kind) or !isLiteralKind(tb.kind)) continue;
+                if (primitiveFamily(ta.kind) != primitiveFamily(tb.kind)) return true;
+                if (!literalEql(ta.literal_value, tb.literal_value)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn primitiveFamily(k: TypeKind) u8 {
+        return switch (k) {
+            .string, .string_literal => 1,
+            .number, .number_literal => 2,
+            .boolean, .boolean_literal => 3,
+            .bigint, .bigint_literal => 4,
+            else => 0,
+        };
     }
 
     pub fn objectOf(self: *TypeStore, props: []const ObjectProp) !TypeId {
