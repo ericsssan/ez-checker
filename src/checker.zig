@@ -16622,28 +16622,30 @@ pub const Checker = struct {
             if (!std.mem.eql(u8, tree.tokenText(tree.nodeMainToken(ni)), name)) continue;
             const tp_pos = tree.tokenStart(tree.nodeMainToken(ni));
             if (tp_pos >= ty_pos) continue;
-            // Determine if some ancestor of the tp is a scope that
-            // also appears in ty_node's ancestor chain.
+            // Determine if some ancestor of the tp is a scope that OWNS it —
+            // i.e. `ni` is structurally listed in that scope's own
+            // type_params..type_params_end range. NOT a main-token position
+            // comparison: that assumed a scope's main_token always precedes
+            // its type-param list, which holds for `function`/`class`-keyword
+            // scopes but not `ts_function_type` (a bare `<T>(...) => ...`
+            // annotation, whose main_token is `(`, AFTER `<T>`) — that mistake
+            // made every type param on a standalone function-type annotation
+            // "not in scope," so its constraint (and literal-preserving
+            // `const T`/discriminated-union info riding on it) was silently
+            // dropped. `typeParamsRangeOf` returning null for a non-scope tag
+            // doubles as the is_scope filter.
             var in_scope = false;
             for (anc_buf[0..nanc]) |anc_idx| {
                 const anc: NodeIndex = @enumFromInt(anc_idx);
-                const tag = tree.nodeTag(anc);
-                const is_scope = tag == .fn_decl or tag == .async_fn_decl or
-                    tag == .generator_fn_decl or tag == .async_generator_fn_decl or
-                    tag == .ts_declare_function or tag == .fn_expr or
-                    tag == .async_fn_expr or tag == .generator_fn_expr or
-                    tag == .async_generator_fn_expr or tag == .arrow_fn or
-                    tag == .async_arrow_fn or tag == .method_def or
-                    tag == .computed_method_def or tag == .class_decl or
-                    tag == .class_expr or tag == .ts_type_alias_decl or
-                    tag == .ts_interface_decl or tag == .ts_function_type or
-                    tag == .ts_constructor_type or tag == .ts_call_signature or
-                    tag == .ts_construct_signature or tag == .ts_method_signature;
-                if (!is_scope) continue;
-                const anc_pos = tree.tokenStart(tree.nodeMainToken(anc));
-                if (tp_pos < anc_pos) continue;
-                in_scope = true;
-                break;
+                const range = self.typeParamsRangeOf(anc) orelse continue;
+                if (range.start >= range.end or range.end > tree.extra_data.len) continue;
+                for (tree.extra_data[range.start..range.end]) |raw| {
+                    if (raw == ni.toInt()) {
+                        in_scope = true;
+                        break;
+                    }
+                }
+                if (in_scope) break;
             }
             if (!in_scope) continue;
             // Innermost wins — tp closer to ty_pos shadows outer ones.
@@ -17387,27 +17389,49 @@ pub const Checker = struct {
         return null;
     }
 
-    /// `[type_params, type_params_end)` extra-data range for a generic declaration.
+    /// `[type_params, type_params_end)` extra-data range for a generic
+    /// declaration — every scope kind `typeParamConstraintNode` recognizes as
+    /// an `is_scope` ancestor. `method_def`/`computed_method_def` carry their
+    /// extra-data index in `.rhs` (`.lhs` is the method's key); every other
+    /// kind here uses `.lhs`.
     fn typeParamsRangeOf(self: *Checker, decl: NodeIndex) ?struct { start: u32, end: u32 } {
         const data = self.ast_ref.nodeData(decl);
-        if (data.lhs == .none) return null;
-        const lhs = @intFromEnum(data.lhs);
         return switch (self.ast_ref.nodeTag(decl)) {
-            .fn_decl, .async_fn_decl, .generator_fn_decl,
-            .async_generator_fn_decl, .ts_declare_function => blk: {
-                const d = self.ast_ref.extraData(ast.FnData, lhs);
+            .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
+            .ts_declare_function, .fn_expr, .async_fn_expr, .generator_fn_expr,
+            .async_generator_fn_expr, .ts_function_type, .ts_constructor_type => blk: {
+                if (data.lhs == .none) break :blk null;
+                const d = self.ast_ref.extraData(ast.FnData, @intFromEnum(data.lhs));
+                break :blk .{ .start = d.type_params, .end = d.type_params_end };
+            },
+            .arrow_fn, .async_arrow_fn => blk: {
+                if (data.lhs == .none) break :blk null;
+                const d = self.ast_ref.extraData(ast.ArrowData, @intFromEnum(data.lhs));
+                break :blk .{ .start = d.type_params, .end = d.type_params_end };
+            },
+            .method_def, .computed_method_def => blk: {
+                if (data.rhs == .none) break :blk null;
+                const d = self.ast_ref.extraData(ast.MethodData, @intFromEnum(data.rhs));
                 break :blk .{ .start = d.type_params, .end = d.type_params_end };
             },
             .class_decl, .class_expr => blk: {
-                const d = self.ast_ref.extraData(ast.ClassData, lhs);
+                if (data.lhs == .none) break :blk null;
+                const d = self.ast_ref.extraData(ast.ClassData, @intFromEnum(data.lhs));
                 break :blk .{ .start = d.type_params, .end = d.type_params_end };
             },
             .ts_interface_decl => blk: {
-                const d = self.ast_ref.extraData(ast.InterfaceData, lhs);
+                if (data.lhs == .none) break :blk null;
+                const d = self.ast_ref.extraData(ast.InterfaceData, @intFromEnum(data.lhs));
                 break :blk .{ .start = d.type_params, .end = d.type_params_end };
             },
             .ts_type_alias_decl => blk: {
-                const d = self.ast_ref.extraData(ast.TypeAliasData, lhs);
+                if (data.lhs == .none) break :blk null;
+                const d = self.ast_ref.extraData(ast.TypeAliasData, @intFromEnum(data.lhs));
+                break :blk .{ .start = d.type_params, .end = d.type_params_end };
+            },
+            .ts_call_signature, .ts_construct_signature, .ts_method_signature => blk: {
+                if (data.lhs == .none) break :blk null;
+                const d = self.ast_ref.extraData(ast.InterfaceSigData, @intFromEnum(data.lhs));
                 break :blk .{ .start = d.type_params, .end = d.type_params_end };
             },
             else => null,
