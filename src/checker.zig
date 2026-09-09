@@ -6350,14 +6350,10 @@ pub const Checker = struct {
             // discriminant-prop shape isMemberAccessOfSym recognizes (computed
             // access or a call wrapping the chain), but the chain's BASE still
             // narrows the same way — if `sym` were nullish, the whole chain would
-            // short-circuit to exactly `undefined`.
-            if (self.isOptionalChainOnSym(data.lhs, sym) and
-                self.optionalChainImpliesNonNullish(data.rhs, tag, is_neq, negate))
-            {
-                return self.narrowNullish(ty, true);
-            }
-            if (self.isOptionalChainOnSym(data.rhs, sym) and
-                self.optionalChainImpliesNonNullish(data.lhs, tag, is_neq, negate))
+            // short-circuit to exactly `undefined`. Check the cheap literal
+            // classification first so the chain walk only runs when it can matter.
+            if ((self.optionalChainImpliesNonNullish(data.rhs, keep_only_disc, strict) and self.isOptionalChainOnSym(data.lhs, sym)) or
+                (self.optionalChainImpliesNonNullish(data.lhs, keep_only_disc, strict) and self.isOptionalChainOnSym(data.rhs, sym)))
             {
                 return self.narrowNullish(ty, true);
             }
@@ -6546,12 +6542,13 @@ pub const Checker = struct {
     /// `sym?.a !== null` says nothing about `sym`, since a nullish `sym` still
     /// makes the chain evaluate to `undefined`, and `undefined !== null` is true
     /// (verified: controlFlowOptionalChain.ts's `f13a`, `o?.foo !== null` does
-    /// NOT narrow `o`, marked `// Error`).
-    fn optionalChainImpliesNonNullish(self: *Checker, other_side: NodeIndex, tag: ast.Node.Tag, is_neq: bool, negate: bool) bool {
-        if (is_neq == negate) return false;
+    /// NOT narrow `o`, marked `// Error`). `keep_only_disc`/`strict` are the
+    /// same values the caller already derived from `is_neq`/`negate`/`tag`.
+    fn optionalChainImpliesNonNullish(self: *Checker, other_side: NodeIndex, keep_only_disc: bool, strict: bool) bool {
+        if (keep_only_disc) return false;
         const removed = self.narrowKindFromLiteral(other_side);
         if (removed == .undefined_t) return true;
-        if (removed == .null_t and (tag == .equal or tag == .not_equal)) return true;
+        if (removed == .null_t and !strict) return true;
         return false;
     }
 
