@@ -1134,26 +1134,18 @@ pub const TypeStore = struct {
     /// "some primitive family") is what keeps that distinction.
     fn objectPropsHaveExclusiveOverlap(self: *const TypeStore, a: ObjectPropList, b: ObjectPropList) bool {
         for (self.propsOf(a)) |pa| {
-            for (self.propsOf(b)) |pb| {
-                if (!std.mem.eql(u8, pa.name, pb.name)) continue;
-                const ta = self.get(pa.type_id);
-                const tb = self.get(pb.type_id);
-                if (!isLiteralKind(ta.kind) or !isLiteralKind(tb.kind)) continue;
-                if (primitiveFamily(ta.kind) != primitiveFamily(tb.kind)) return true;
-                if (!literalEql(ta.literal_value, tb.literal_value)) return true;
-            }
+            const pb = findProp(self.propsOf(b), pa.name) orelse continue;
+            const ta = self.get(pa.type_id);
+            const tb = self.get(pb.type_id);
+            // Both already guarded to a literal kind below, so "different
+            // family" and "different kind" coincide — no separate family
+            // classification needed (two distinct literal kinds are never
+            // the same family, and two of the same kind always are).
+            if (!isLiteralKind(ta.kind) or !isLiteralKind(tb.kind)) continue;
+            if (ta.kind != tb.kind) return true;
+            if (!literalEql(ta.literal_value, tb.literal_value)) return true;
         }
         return false;
-    }
-
-    fn primitiveFamily(k: TypeKind) u8 {
-        return switch (k) {
-            .string, .string_literal => 1,
-            .number, .number_literal => 2,
-            .boolean, .boolean_literal => 3,
-            .bigint, .bigint_literal => 4,
-            else => 0,
-        };
     }
 
     pub fn objectOf(self: *TypeStore, props: []const ObjectProp) !TypeId {
