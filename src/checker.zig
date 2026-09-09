@@ -5537,7 +5537,7 @@ pub const Checker = struct {
         }
         // `switch (x.kind) { case "A": }` — discriminated-union narrowing.
         if (self.isMemberAccessOfSym(disc, sym)) |prop_name| {
-            return self.narrowDiscriminantProp(ty, prop_name, label, true);
+            return self.narrowDiscriminantProp(ty, prop_name, label, true, true);
         }
         // `switch (x) { case 1: }` — keep the union member matching the label.
         // For fall-through stacked cases (`case "a": case "b": body`), union each label's
@@ -6324,8 +6324,9 @@ pub const Checker = struct {
         } else {
             // Try `<sym>.prop op <literal>` — discriminated union narrowing.
             const keep_only_disc = (!is_neq) != negate;
+            const strict = tag == .strict_equal or tag == .strict_not_equal;
             if (self.isMemberAccessOfSym(data.lhs, sym)) |prop_name| {
-                const result = self.narrowDiscriminantProp(ty, prop_name, data.rhs, keep_only_disc);
+                const result = self.narrowDiscriminantProp(ty, prop_name, data.rhs, keep_only_disc, strict);
                 // `sym?.prop === rhs`: in the true branch, if rhs provably can't be
                 // null/undefined, sym can't be nullish (optional chain on a nullish sym
                 // produces undefined, which can't equal a non-nullish rhs).
@@ -6337,13 +6338,28 @@ pub const Checker = struct {
                 return result;
             }
             if (self.isMemberAccessOfSym(data.rhs, sym)) |prop_name| {
-                const result = self.narrowDiscriminantProp(ty, prop_name, data.lhs, keep_only_disc);
+                const result = self.narrowDiscriminantProp(ty, prop_name, data.lhs, keep_only_disc, strict);
                 if (self.ast_ref.nodeTag(data.rhs) == .optional_member_expr and
                     keep_only_disc and !self.nodeCouldBeNullish(data.lhs))
                 {
                     return self.narrowNullish(result, true);
                 }
                 return result;
+            }
+            // `sym?.[expr] op <literal>` / `sym?.method() op <literal>`: not a
+            // discriminant-prop shape isMemberAccessOfSym recognizes (computed
+            // access or a call wrapping the chain), but the chain's BASE still
+            // narrows the same way — if `sym` were nullish, the whole chain would
+            // short-circuit to exactly `undefined`.
+            if (self.isOptionalChainOnSym(data.lhs, sym) and
+                self.optionalChainImpliesNonNullish(data.rhs, tag, is_neq, negate))
+            {
+                return self.narrowNullish(ty, true);
+            }
+            if (self.isOptionalChainOnSym(data.rhs, sym) and
+                self.optionalChainImpliesNonNullish(data.lhs, tag, is_neq, negate))
+            {
+                return self.narrowNullish(ty, true);
             }
             return ty;
         }
@@ -6499,6 +6515,44 @@ pub const Checker = struct {
         }
         if (tag == .void_expr) return .undefined_t;
         return .none;
+    }
+
+    /// `sym?.a?.b(...)`-shaped chain (member/computed-member/call links, any
+    /// mix, at least one of them optional) whose ultimate base is `sym`. Mirrors
+    /// `directChildInOptionalChain`'s walk but also checks chain identity.
+    fn isOptionalChainOnSym(self: *Checker, node: NodeIndex, sym: symbol_mod.SymbolId) bool {
+        var cur = node;
+        var saw_optional = false;
+        while (true) {
+            switch (self.ast_ref.nodeTag(cur)) {
+                .optional_member_expr, .optional_computed_member_expr, .optional_call_expr => {
+                    saw_optional = true;
+                    cur = self.ast_ref.nodeData(cur).lhs;
+                },
+                .member_expr, .computed_member_expr, .call_expr, .grouping_expr => {
+                    cur = self.ast_ref.nodeData(cur).lhs;
+                },
+                .identifier => return saw_optional and self.identifierBindsToSym(cur, sym),
+                else => return false,
+            }
+        }
+    }
+
+    /// `sym?.<chain> <op> other_side`, reached in the branch asserting the chain
+    /// result is NOT `other_side`: does that imply `sym` itself is non-nullish?
+    /// True for `undefined` in any comparison form (`!= undefined` / `!==
+    /// undefined`), since a nullish `sym` makes the whole chain short-circuit to
+    /// exactly `undefined`. True for `null` only in LOOSE form (`==`/`!=`) —
+    /// `sym?.a !== null` says nothing about `sym`, since a nullish `sym` still
+    /// makes the chain evaluate to `undefined`, and `undefined !== null` is true
+    /// (verified: controlFlowOptionalChain.ts's `f13a`, `o?.foo !== null` does
+    /// NOT narrow `o`, marked `// Error`).
+    fn optionalChainImpliesNonNullish(self: *Checker, other_side: NodeIndex, tag: ast.Node.Tag, is_neq: bool, negate: bool) bool {
+        if (is_neq == negate) return false;
+        const removed = self.narrowKindFromLiteral(other_side);
+        if (removed == .undefined_t) return true;
+        if (removed == .null_t and (tag == .equal or tag == .not_equal)) return true;
+        return false;
     }
 
     /// Loose-equality nullish narrowing: `== null` / `== undefined` treats null
@@ -6689,6 +6743,7 @@ pub const Checker = struct {
         prop_name: []const u8,
         lit_node: NodeIndex,
         keep_only: bool,
+        strict: bool,
     ) TypeId {
         const lit_id = self.literalNodeToTypeId(lit_node) orelse return ty;
         const t = self.store.get(ty);
@@ -6708,9 +6763,16 @@ pub const Checker = struct {
             const member_is_nullish = mk == .null_t or mk == .undefined_t;
             const should_keep: bool = if (prop_ty.eq(tymod.ID_UNKNOWN) and member_is_nullish) blk: {
                 // null/undefined have no own properties; via optional-chain they
-                // produce `undefined`, so they only match when the literal is also
-                // null or undefined.
-                const matches = lit_id.eq(tymod.ID_NULL) or lit_id.eq(tymod.ID_UNDEFINED);
+                // always produce exactly `undefined` (never `null`, regardless of
+                // whether this member itself is null_t or undefined_t). Strict
+                // comparison against `null` therefore never matches — verified:
+                // controlFlowOptionalChain.ts's f13a, `o?.foo !== null` does NOT
+                // narrow away the `undefined` member (marked `// Error`), while
+                // loose `!= null`/`!= undefined` both do.
+                const matches = if (strict)
+                    lit_id.eq(tymod.ID_UNDEFINED)
+                else
+                    lit_id.eq(tymod.ID_NULL) or lit_id.eq(tymod.ID_UNDEFINED);
                 break :blk keep_only == matches;
             } else if (prop_ty.eq(tymod.ID_UNKNOWN)) blk: {
                 break :blk true; // unknown prop on non-nullish: can't narrow, keep member
