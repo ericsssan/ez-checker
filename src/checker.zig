@@ -17438,6 +17438,21 @@ pub const Checker = struct {
         };
     }
 
+    /// The `ts_type_parameter` node named `name` in `decl`'s own type-param
+    /// list — the inverse of `typeParamOwnerOf` (which maps a type param node
+    /// to its owning declaration; this maps a declaration + name back to the
+    /// node, needed to inspect the node itself, e.g. via `typeParamIsConst`).
+    fn typeParamNodeByName(self: *Checker, decl: NodeIndex, name: []const u8) ?NodeIndex {
+        const range = self.typeParamsRangeOf(decl) orelse return null;
+        if (range.start >= range.end or range.end > self.ast_ref.extra_data.len) return null;
+        for (self.ast_ref.extra_data[range.start..range.end]) |raw| {
+            const tp: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(tp) != .ts_type_parameter) continue;
+            if (std.mem.eql(u8, self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp)), name)) return tp;
+        }
+        return null;
+    }
+
     /// Resolved default type of the `index`-th type parameter of the declaration
     /// named `name` (`<T = number>` → number), or null if absent / no default.
     /// Backs no-unnecessary-type-arguments (`f<number>()` where `f<T = number>`).
@@ -29701,6 +29716,12 @@ pub const Checker = struct {
         const vt = self.store.get(val_ty).kind;
         if (vt != .string_literal and vt != .number_literal and vt != .boolean_literal) return false;
         const ct = self.store.get(c);
+        // A bare (possibly `const`) type param has no known shape to look
+        // `prop_name` up in — it unifies with the WHOLE object literal
+        // structurally, so every property's own literal-ness is decided by
+        // the type param itself (typeExpectsLiteral's `.type_param` case),
+        // not by a per-property lookup.
+        if (ct.kind == .type_param) return self.typeExpectsLiteral(c, val_ty);
         if (ct.kind == .object_t) {
             for (self.store.propsOf(ct.object_props)) |p| {
                 if (!std.mem.eql(u8, p.name, prop_name)) continue;
@@ -29753,6 +29774,25 @@ pub const Checker = struct {
             // "foo" so the caller can infer `Name = "foo"` (not `string`).
             // Unconstrained T widens to string, so only gate on string-bounded params.
             .type_param => {
+                // TS 5.0 `<const T>` preserves ANY literal regardless of
+                // constraint (that's the whole point of `const` — it opts
+                // OUT of widening). The parser drops the `const` keyword
+                // without recording it on the type param node itself, but
+                // `typeParamIsConst`'s raw-token-backscan trick (already used
+                // for call-argument inference in collectCallBindings) can
+                // still find it — re-locate the `ts_type_parameter` node via
+                // `tp_owner` (the enclosing generic declaration, set by
+                // buildTypeParam) plus this param's own name.
+                if (t.tp_owner != 0) {
+                    if (self.typeParamNodeByName(@enumFromInt(t.tp_owner), t.name)) |tp_node| {
+                        if (self.typeParamIsConst(tp_node)) {
+                            return switch (self.store.get(val_ty).kind) {
+                                .string_literal, .number_literal, .boolean_literal, .bigint_literal => true,
+                                else => false,
+                            };
+                        }
+                    }
+                }
                 const constraint_ids = self.store.idsOf(t.list_data);
                 if (constraint_ids.len == 0) return false; // unconstrained — widen
                 const constraint_kind = self.store.get(constraint_ids[0]).kind;
@@ -30505,6 +30545,10 @@ pub const Checker = struct {
 
     fn arrayElementExpectedType(self: *Checker, arr_ty: TypeId, idx: usize) ?TypeId {
         const t = self.store.get(arr_ty);
+        // A bare (possibly `const`) type param unifies with the WHOLE array
+        // structurally — every element's expected type is the same type
+        // param (mirrors contextualPropExpectsLiteral's object-property case).
+        if (t.kind == .type_param) return arr_ty;
         if (t.kind == .tuple_t) {
             const elems = self.store.idsOf(t.list_data);
             if (idx < elems.len) return self.peelRestElem(elems[idx]);
