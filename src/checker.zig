@@ -20970,6 +20970,28 @@ pub const Checker = struct {
         return false;
     }
 
+    /// A literal (`"foo"`, `1`, `true`) or its base primitive (`string`,
+    /// `number`, `boolean`), or a union purely of such — the SAFE set of
+    /// constraint shapes to default an uninferable type param to. Deliberately
+    /// excludes object/array/tuple/type_ref/type_param: those have their own,
+    /// more specific inference elsewhere that a blind constraint-bind would
+    /// preempt (rest/tuple construction, mapped-type inference, a constraint
+    /// chained to another of the same call's type params).
+    fn isLiteralOrPrimitiveType(self: *Checker, ty: TypeId) bool {
+        const t = self.store.get(ty);
+        return switch (t.kind) {
+            .string_literal, .number_literal, .boolean_literal, .bigint_literal,
+            .string, .number, .boolean, .bigint => true,
+            .union_t => blk: {
+                for (self.store.idsOf(t.list_data)) |m| {
+                    if (!self.isLiteralOrPrimitiveType(m)) break :blk false;
+                }
+                break :blk true;
+            },
+            else => false,
+        };
+    }
+
     fn collectCallBindings(
         self: *Checker,
         callee: NodeIndex,
@@ -20987,6 +21009,9 @@ pub const Checker = struct {
         // unknown[]>`), strip `readonly` from the array const form (tsc gives a
         // mutable tuple); a `readonly unknown[]` constraint keeps it.
         var const_strip_ro = std.mem.zeroes([8]bool);
+        // Each param's own constraint node (or .none) — used by the
+        // uninferable-type-param fallback below, regardless of `const`.
+        var constraint_nodes: [8]NodeIndex = @splat(.none);
         if (fd.tp_end <= ext_len) {
             for (self.ast_ref.extra_data[fd.tp_start..fd.tp_end]) |raw| {
                 if (tp_count >= names.len) break;
@@ -20994,11 +21019,11 @@ pub const Checker = struct {
                 if (self.ast_ref.nodeTag(tp_node) != .ts_type_parameter) continue;
                 names[tp_count] = self.ast_ref.tokenText(self.ast_ref.nodeMainToken(tp_node));
                 const_mask[tp_count] = self.typeParamIsConst(tp_node);
-                if (const_mask[tp_count]) {
-                    // ts_type_parameter: lhs = constraint node (or .none).
-                    const cnode = self.ast_ref.nodeData(tp_node).lhs;
-                    if (cnode != .none)
-                        const_strip_ro[tp_count] = self.constraintWantsMutableArray(self.resolveTypeNode(cnode));
+                // ts_type_parameter: lhs = constraint node (or .none).
+                const cnode = self.ast_ref.nodeData(tp_node).lhs;
+                constraint_nodes[tp_count] = cnode;
+                if (const_mask[tp_count] and cnode != .none) {
+                    const_strip_ro[tp_count] = self.constraintWantsMutableArray(self.resolveTypeNode(cnode));
                 }
                 tp_count += 1;
             }
@@ -21175,6 +21200,65 @@ pub const Checker = struct {
             if (ret_node != .none) {
                 self.matchTypeParam(ret_node, call_expected.?, names[0..tp_count], bindings[0..tp_count]);
             }
+        }
+        // UNINFERABLE-PARAM CONSTRAINT FALLBACK — a param no argument or
+        // contextual type could bind (typically one that appears ONLY inside a
+        // context-sensitive callback's own signature, e.g. `foo<T extends
+        // "foo">(f: (x: T) => T)` called `foo(x => x)`: nothing else determines
+        // T) defaults to its own CONSTRAINT, matching tsc's real fallback order
+        // (inference candidates, then declared default, then constraint, then
+        // unknown/any — no default node is modeled here, only the constraint).
+        // MUST run before pass 2a/2b: those resolve a still-open param by
+        // calling `typeOf` on the deferred arrow, which — for THIS call's own
+        // still-unresolved param — recurses back into a fresh
+        // `collectCallBindings` for the SAME call node (guarded only by
+        // `cb_instantiate_depth`), and different recursion depths can cache
+        // different answers for the same query. Binding directly from the
+        // constraint (a plain, non-circular type-node resolution) sidesteps
+        // that recursion entirely, and pass 2a's existing infer_ctx substitution
+        // (not a recursive re-resolve) then lets deferred arrows see it.
+        //
+        // Narrowed to LITERAL/primitive constraints only (measured): object /
+        // array / tuple / type_ref / chained-type-param constraints have their
+        // OWN, more specific inference elsewhere (rest/tuple construction,
+        // mapped-type inference, predicate narrowing) that this early, blind
+        // bind was preempting — e.g. `foo3<T extends unknown[]>` locked to the
+        // bare `unknown[]` constraint instead of the specific tuple its rest
+        // args build, and a constraint referencing ANOTHER of this call's own
+        // type params (`C extends Foo<T>`) resolved to a bare `.type_param`
+        // display before that param had a chance to bind.
+        //
+        // ALSO gated on the name appearing ONLY inside context-sensitive
+        // callback params (measured): a name mentioned in some OTHER, DIRECT
+        // (non-callback) parameter's own annotation — e.g. a template-literal
+        // type `` s: `**${T}**` `` — signals a forward-inference shape pass 1
+        // should already own (template-literal pattern matching, here
+        // genuinely unimplemented). Guessing the bare constraint there turns
+        // an honest gap (`f2("**123**")` unresolved → any) into a confident
+        // wrong (`number`, not the extracted `123`). Only apply the fallback
+        // when NO direct param mentions the name — the callback-only case
+        // this was designed for (`f: (x: T) => T`).
+        for (0..tp_count) |i| {
+            if (!bindings[i].eq(TypeId.none)) continue;
+            const cnode = constraint_nodes[i];
+            if (cnode == .none) continue;
+            const resolved = self.resolveTypeNode(cnode);
+            if (!self.isLiteralOrPrimitiveType(resolved)) continue;
+            const single_name = names[i .. i + 1];
+            var mentioned_directly = false;
+            for (params) |praw| {
+                var pn: NodeIndex = @enumFromInt(praw);
+                if (self.ast_ref.nodeTag(pn) == .ts_parameter_property) pn = self.ast_ref.nodeData(pn).lhs;
+                if (self.ast_ref.nodeTag(pn) == .assignment_pattern) pn = self.ast_ref.nodeData(pn).lhs;
+                if (self.ast_ref.nodeTag(pn) == .rest_element) pn = self.ast_ref.nodeData(pn).lhs;
+                const ann = self.paramAnnotationNode(pn) orelse continue;
+                var an = ann;
+                while (self.ast_ref.nodeTag(an) == .ts_parenthesized_type) an = self.ast_ref.nodeData(an).lhs;
+                if (self.ast_ref.nodeTag(an) == .ts_function_type) continue; // callback — not "direct"
+                if (self.typeNodeMentionsName(an, single_name, 0)) { mentioned_directly = true; break; }
+            }
+            if (mentioned_directly) continue;
+            bindings[i] = resolved;
         }
         // PASS 2a (provisional-context fixed-point) — SOME type params are now
         // fixed (param side: pass 1 / backward) but others remain unbound
