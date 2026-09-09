@@ -3711,7 +3711,27 @@ pub const Checker = struct {
                         .fn_decl, .async_fn_decl, .generator_fn_decl, .async_generator_fn_decl,
                         .fn_expr, .async_fn_expr, .generator_fn_expr, .async_generator_fn_expr,
                         .arrow_fn, .async_arrow_fn, .ts_declare_function => {
-                            if (self.jsdocParamBindingType(node)) |ty| {
+                            // `parent_indices` doesn't distinguish which child slot
+                            // this identifier occupies — a named function's OWN
+                            // NAME, or (for an expression-bodied arrow) its RETURN
+                            // EXPRESSION, shares this identifier's parent tag with
+                            // its params. Only fire for an identifier that's
+                            // ACTUALLY one of the function's own params.
+                            if (self.identifierIsFnParam(@enumFromInt(pi2), node)) {
+                                if (self.jsdocParamBindingType(node)) |ty| {
+                                    if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
+                                }
+                                // A simple (non-rest, non-destructured, unannotated)
+                                // parameter's OWN declaration-site identifier has no
+                                // reference-table symbol, so it never reached
+                                // declaredTypeAtBinding's contextual machinery
+                                // (contextualCallbackParamType / contextualArrayPredicateParamType
+                                // / etc.) — only a REFERENCE to it inside the body did,
+                                // via symbolForIdentRef → declaredTypeForSymbol. That
+                                // split meant the same parameter could type as `number`
+                                // when read in the body but `any` in its own displayed
+                                // signature. Route through the same machinery here.
+                                const ty = self.declaredTypeAtBinding(node);
                                 if (!ty.eq(tymod.ID_UNKNOWN)) return ty;
                             }
                         },
@@ -10016,6 +10036,44 @@ pub const Checker = struct {
             }
         }
         return self.expectedTypeOf(call);
+    }
+
+    /// Is `node` one of `fn_node`'s own parameters (peeling `ts_parameter_property`
+    /// / `assignment_pattern` / `rest_element` wrappers)? `parent_indices` doesn't
+    /// distinguish which child slot an identifier occupies, so an identifier whose
+    /// immediate parent happens to BE a function node isn't necessarily one of its
+    /// params — it could be the function's own NAME, or (for an expression-bodied
+    /// arrow) its RETURN EXPRESSION. Mirrors contextualCallbackParamType's own
+    /// param-slot search.
+    fn identifierIsFnParam(self: *Checker, fn_node: NodeIndex, node: NodeIndex) bool {
+        const fn_tag = self.ast_ref.nodeTag(fn_node);
+        var pstart: u32 = 0;
+        var pend: u32 = 0;
+        switch (fn_tag) {
+            .arrow_fn, .async_arrow_fn => {
+                const fd_d = self.ast_ref.nodeData(fn_node);
+                if (fd_d.lhs == .none) return false;
+                const ad = self.ast_ref.extraData(ast.ArrowData, @intFromEnum(fd_d.lhs));
+                pstart = ad.params_start;
+                pend = ad.params_end;
+            },
+            else => {
+                const fd_d = self.ast_ref.nodeData(fn_node);
+                if (fd_d.lhs == .none) return false;
+                const fd = self.ast_ref.extraData(ast.FnData, @intFromEnum(fd_d.lhs));
+                pstart = fd.params;
+                pend = fd.params_end;
+            },
+        }
+        if (pend <= pstart or pend > self.ast_ref.extra_data.len) return false;
+        for (self.ast_ref.extra_data[pstart..pend]) |raw| {
+            var p_node: NodeIndex = @enumFromInt(raw);
+            if (self.ast_ref.nodeTag(p_node) == .ts_parameter_property) p_node = self.ast_ref.nodeData(p_node).lhs;
+            if (self.ast_ref.nodeTag(p_node) == .assignment_pattern) p_node = self.ast_ref.nodeData(p_node).lhs;
+            if (self.ast_ref.nodeTag(p_node) == .rest_element) p_node = self.ast_ref.nodeData(p_node).lhs;
+            if (p_node == node) return true;
+        }
+        return false;
     }
 
     fn contextualCallbackParamType(self: *Checker, binding: NodeIndex) ?TypeId {
