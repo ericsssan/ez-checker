@@ -5791,12 +5791,27 @@ pub const Checker = struct {
     /// keyed on an access path rather than a single symbol.
     fn narrowMemberAtUse(self: *Checker, node: NodeIndex, base: TypeId) TypeId {
         if (self.semantic.parent_indices.len == 0) return base;
-        // Only paths whose type can carry nullish are worth narrowing.
-        if (self.store.get(base).kind != .union_t) return base;
-        var ty = base;
+        // Only paths whose type can narrow are worth walking: a union (can
+        // carry nullish) or bare `boolean` (truthiness pins it to a literal —
+        // `if (o.x?.y) { o.x?.y /* true */ }`, where narrowing the base `o.x`
+        // non-nullish first leaves the leaf a plain, non-union `boolean`).
+        const base_kind = self.store.get(base).kind;
+        if (base_kind != .union_t and !base.eq(tymod.ID_BOOLEAN)) return base;
         const NONE: u32 = @intFromEnum(NodeIndex.none);
         var prev = node.toInt();
         if (prev >= self.semantic.parent_indices.len) return base;
+        // A plain-`=` write target (`this.x = true` inside `if (this.x)`)
+        // reports the declared type, not the guard-narrowed one. Compound
+        // targets (`this.z += dz`) READ first and do narrow, so only `=`.
+        {
+            const pidx = self.semantic.parent_indices[prev];
+            if (pidx != NONE) {
+                const parent: NodeIndex = @enumFromInt(pidx);
+                if (self.ast_ref.nodeTag(parent) == .assign and
+                    self.ast_ref.nodeData(parent).lhs == node) return base;
+            }
+        }
+        var ty = base;
         var p = self.semantic.parent_indices[prev];
         while (p != NONE) {
             const pn: NodeIndex = @enumFromInt(p);
@@ -5869,13 +5884,41 @@ pub const Checker = struct {
         const tag = self.ast_ref.nodeTag(t);
         switch (tag) {
             .member_expr, .optional_member_expr => {
-                if (self.accessPathsEqual(t, target)) return self.narrowTruthy(ty, neg);
+                if (self.accessPathsEqual(t, target)) {
+                    // The FALSY branch of an optional chain says nothing about a
+                    // NON-optional re-read of its leaf: `if (o4.x?.y) {} else {
+                    // o4.x.y }` — the chain may have short-circuited on `o4.x`,
+                    // and tsc leaves the (erroneous) access at its declared
+                    // `boolean`, not `false`. The optional re-read `o4.x?.y`
+                    // beside it does narrow (`false | undefined`).
+                    if (neg and self.ast_ref.nodeTag(target) == .member_expr and
+                        self.directChildInOptionalChain(t)) return ty;
+                    return self.narrowTruthy(ty, neg);
+                }
+                // `if (o.x?.y) { o.x }`: a truthy optional chain proves every
+                // base link it evaluated through is non-nullish (true branch only).
+                if (!neg and self.optionalChainBaseMatches(t, target)) return self.narrowNullish(ty, true);
+                return ty;
+            },
+            .computed_member_expr, .optional_computed_member_expr, .call_expr, .optional_call_expr => {
+                if (!neg and self.optionalChainBaseMatches(t, target)) return self.narrowNullish(ty, true);
                 return ty;
             },
             .logical_and => {
                 const data = self.ast_ref.nodeData(t);
+                if (!neg) {
+                    const lty = self.applyMemberNarrowing(data.lhs, target, ty, neg);
+                    return self.applyMemberNarrowing(data.rhs, target, lty, neg);
+                }
+                // Negated `&&` is a DISJUNCTION of negations (De Morgan): the
+                // else-branch of `!a.x && b` doesn't make `a.x` truthy — either
+                // conjunct may have failed. Narrow only when BOTH sides do, to
+                // the union of their results (mirrors the truthy `||` case).
                 const lty = self.applyMemberNarrowing(data.lhs, target, ty, neg);
-                return self.applyMemberNarrowing(data.rhs, target, lty, neg);
+                const rty = self.applyMemberNarrowing(data.rhs, target, ty, neg);
+                if (lty.eq(ty) or rty.eq(ty)) return ty;
+                if (lty.eq(rty)) return lty;
+                return self.store.unionOf(&.{ lty, rty }) catch ty;
             },
             .logical_or => {
                 if (neg) {
@@ -6080,8 +6123,23 @@ pub const Checker = struct {
                 // Both sides narrow — union their results.
                 return self.store.unionOf(&.{ lty, rty }) catch ty;
             },
-            // Type predicate calls: `isFoo(x)` → narrow x to Foo.
-            .call_expr, .optional_call_expr => return self.applyPredicateNarrowing(t, sym, ty, neg),
+            // Truthy optional chain rooted at sym: `if (o?.foo) { o }` — a
+            // truthy result proves the chain didn't short-circuit, so `o` is
+            // non-nullish. True branch only (tsc's optionalChainContainsReference
+            // under assumeTrue); the falsy branch says nothing about `o`.
+            .member_expr, .optional_member_expr,
+            .computed_member_expr, .optional_computed_member_expr => {
+                if (!neg and self.isOptionalChainOnSym(t, sym)) return self.narrowNullish(ty, true);
+                return ty;
+            },
+            // Type predicate calls: `isFoo(x)` → narrow x to Foo. A truthy
+            // optional-chain call (`if (o2?.f(x)) { o2 }`) also narrows the
+            // chain's root like the member case above.
+            .call_expr, .optional_call_expr => {
+                const pt = self.applyPredicateNarrowing(t, sym, ty, neg);
+                if (!neg and self.isOptionalChainOnSym(t, sym)) return self.narrowNullish(pt, true);
+                return pt;
+            },
             // `if (x &&= expr)` / `if (x ||= expr)` / `if (x ??= expr)`: when sym is the
             // LHS of the assignment-expression, narrow by truthiness of the
             // post-assignment type (= expression type of the operator node).
@@ -6508,6 +6566,12 @@ pub const Checker = struct {
 
     fn typeCouldBeNullish(self: *Checker, ty: TypeId) bool {
         if (tymod.isAny(&self.store, ty) or tymod.isUnknown(&self.store, ty)) return true;
+        return self.typeHasNullishMember(ty);
+    }
+
+    /// `null`/`undefined` itself, or a union with such a member — the strict
+    /// form of `typeCouldBeNullish` that does NOT count `any`/`unknown`.
+    fn typeHasNullishMember(self: *Checker, ty: TypeId) bool {
         const t = self.store.get(ty);
         if (t.kind == .null_t or t.kind == .undefined_t) return true;
         if (t.kind == .union_t) {
@@ -6553,21 +6617,39 @@ pub const Checker = struct {
         }
     }
 
-    /// `sym?.<chain> <op> other_side`, reached in the branch asserting the chain
-    /// result is NOT `other_side`: does that imply `sym` itself is non-nullish?
-    /// True for `undefined` in any comparison form (`!= undefined` / `!==
-    /// undefined`), since a nullish `sym` makes the whole chain short-circuit to
-    /// exactly `undefined`. True for `null` only in LOOSE form (`==`/`!=`) —
-    /// `sym?.a !== null` says nothing about `sym`, since a nullish `sym` still
-    /// makes the chain evaluate to `undefined`, and `undefined !== null` is true
-    /// (verified: controlFlowOptionalChain.ts's `f13a`, `o?.foo !== null` does
-    /// NOT narrow `o`, marked `// Error`). `keep_only_disc`/`strict` are the
-    /// same values the caller already derived from `is_neq`/`negate`/`tag`.
+    /// `sym?.<chain> <op> other_side`: does the taken branch imply `sym` itself
+    /// is non-nullish? A nullish `sym` makes the whole chain short-circuit to
+    /// exactly `undefined`, so:
+    /// - the EQUAL branch (`keep_only_disc`) implies it when `other_side`
+    ///   provably can't be nullish (`o?.foo === value` with `value: number`);
+    /// - the NOT-EQUAL branch implies it when `other_side` is `undefined` in
+    ///   any comparison form, or `null` in LOOSE form only — `sym?.a !== null`
+    ///   says nothing about `sym`, since `undefined !== null` is true
+    ///   (verified: controlFlowOptionalChain.ts's `f13a`, `o?.foo !== null`
+    ///   does NOT narrow `o`, marked `// Error`).
+    /// `keep_only_disc`/`strict` are the values the caller derived from
+    /// `is_neq`/`negate`/`tag`.
     fn optionalChainImpliesNonNullish(self: *Checker, other_side: NodeIndex, keep_only_disc: bool, strict: bool) bool {
-        if (keep_only_disc) return false;
+        if (keep_only_disc) return !self.nodeCouldBeNullish(other_side);
         const removed = self.narrowKindFromLiteral(other_side);
         if (removed == .undefined_t) return true;
         if (removed == .null_t and !strict) return true;
+        return false;
+    }
+
+    /// tsc's `optionalChainContainsReference`: truthiness (or a non-nullish
+    /// comparison) of an optional chain `a?.b.c?.d` proves every link the
+    /// evaluation passed through — `a`, `a?.b.c` — is non-nullish. Walks the
+    /// chain's spine from the top: while the current node is still part of
+    /// the chain (an optional link, or a plain link with an optional link
+    /// somewhere below it), step to its object and compare against `target`.
+    fn optionalChainBaseMatches(self: *Checker, chain: NodeIndex, target: NodeIndex) bool {
+        var cur = chain;
+        while (self.directChildInOptionalChain(cur)) {
+            cur = self.ast_ref.nodeData(cur).lhs;
+            if (cur == .none) return false;
+            if (self.accessPathsEqual(cur, target)) return true;
+        }
         return false;
     }
 
