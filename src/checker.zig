@@ -5910,15 +5910,14 @@ pub const Checker = struct {
                     const lty = self.applyMemberNarrowing(data.lhs, target, ty, neg);
                     return self.applyMemberNarrowing(data.rhs, target, lty, neg);
                 }
-                // Negated `&&` is a DISJUNCTION of negations (De Morgan): the
-                // else-branch of `!a.x && b` doesn't make `a.x` truthy — either
-                // conjunct may have failed. Narrow only when BOTH sides do, to
-                // the union of their results (mirrors the truthy `||` case).
-                const lty = self.applyMemberNarrowing(data.lhs, target, ty, neg);
-                const rty = self.applyMemberNarrowing(data.rhs, target, ty, neg);
-                if (lty.eq(ty) or rty.eq(ty)) return ty;
-                if (lty.eq(rty)) return lty;
-                return self.store.unionOf(&.{ lty, rty }) catch ty;
+                // Negated `&&` is a DISJUNCTION (De Morgan): either `a` failed,
+                // or `a` held and `b` failed — tsc's
+                //   union(narrow(a, false), narrow(narrow(a, true), b, false)).
+                // The else-branch of `!a.x && b` doesn't make `a.x` truthy.
+                const lty = self.applyMemberNarrowing(data.lhs, target, ty, true);
+                const l_true = self.applyMemberNarrowing(data.lhs, target, ty, false);
+                const rty = self.applyMemberNarrowing(data.rhs, target, l_true, true);
+                return self.disjunctionNarrow(ty, lty, rty);
             },
             .logical_or => {
                 if (neg) {
@@ -6102,8 +6101,21 @@ pub const Checker = struct {
             // (since all must be true for the body to run).
             .logical_and => {
                 const data = self.ast_ref.nodeData(t);
-                const lty = self.applyNarrowing(data.lhs, sym, ty, neg);
-                return self.applyNarrowing(data.rhs, sym, lty, neg);
+                if (!neg) {
+                    const lty = self.applyNarrowing(data.lhs, sym, ty, neg);
+                    return self.applyNarrowing(data.rhs, sym, lty, neg);
+                }
+                // Negated `&&` is a DISJUNCTION (De Morgan): either `a` failed,
+                // or `a` held and `b` failed. tsc's narrowTypeByBinaryExpression:
+                //   union(narrow(a, false), narrow(narrow(a, true), b, false))
+                // The second disjunct MUST start from the a-true type: for
+                // `typeof a !== "undefined" && typeof a === "boolean"` on
+                // `boolean | void`, the else is `undefined | never` = `undefined`,
+                // not `undefined | void` (typeGuardTypeOfUndefined.ts).
+                const lty = self.applyNarrowing(data.lhs, sym, ty, true);
+                const l_true = self.applyNarrowing(data.lhs, sym, ty, false);
+                const rty = self.applyNarrowing(data.rhs, sym, l_true, true);
+                return self.disjunctionNarrow(ty, lty, rty);
             },
             // Logical-or in falsy context: both sides must be falsy, narrow by each.
             // In truthy context: either side may be truthy, so the narrowed type is the
@@ -6129,8 +6141,15 @@ pub const Checker = struct {
             // under assumeTrue); the falsy branch says nothing about `o`.
             .member_expr, .optional_member_expr,
             .computed_member_expr, .optional_computed_member_expr => {
-                if (!neg and self.isOptionalChainOnSym(t, sym)) return self.narrowNullish(ty, true);
-                return ty;
+                var r = ty;
+                // Discriminant truthiness: `if (value.type)` keeps the union
+                // members whose `.type` CAN be truthy (falsy branch: can be
+                // falsy) — tsc's narrowTypeByDiscriminant under Truthy/Falsy.
+                if (self.isMemberAccessOfSym(t, sym)) |prop_name| {
+                    r = self.narrowDiscriminantTruthy(r, prop_name, neg);
+                }
+                if (!neg and self.isOptionalChainOnSym(t, sym)) return self.narrowNullish(r, true);
+                return r;
             },
             // Type predicate calls: `isFoo(x)` → narrow x to Foo. A truthy
             // optional-chain call (`if (o2?.f(x)) { o2 }`) also narrows the
@@ -6298,6 +6317,20 @@ pub const Checker = struct {
             },
             else => return false,
         }
+    }
+
+    /// The narrowed type of a DISJUNCTION whose two arms narrowed `ty` to
+    /// `a` and `b` (the else-branch of `x && y`): their union — but when
+    /// that union is just `ty` again (mutually assignable), return `ty`
+    /// itself so the declared alias identity survives (`FileMatchOrMatch`,
+    /// not a re-built `FileMatch | Match`; instanceof narrowing downstream
+    /// resolves the alias, not an ad-hoc union).
+    fn disjunctionNarrow(self: *Checker, ty: TypeId, a: TypeId, b: TypeId) TypeId {
+        if (a.eq(ty) or b.eq(ty)) return ty;
+        if (a.eq(b)) return a;
+        const u = self.store.unionOf(&.{ a, b }) catch return ty;
+        if (tymod.isAssignableTo(&self.store, ty, u) and tymod.isAssignableTo(&self.store, u, ty)) return ty;
+        return u;
     }
 
     /// Truthy guard: remove null / undefined from a union.  Keep
@@ -6831,6 +6864,79 @@ pub const Checker = struct {
             },
             else => return tymod.ID_UNKNOWN,
         }
+    }
+
+    const Truthiness = enum { truthy, falsy, either };
+
+    /// Whether a value of `ty` is always truthy, always falsy, or could be
+    /// either. Literals decide by value; object-like kinds are always truthy;
+    /// nullish kinds always falsy; base primitives (`string`, `number`,
+    /// `boolean`) and anything unmodeled could be either.
+    fn typeTruthiness(self: *Checker, ty: TypeId) Truthiness {
+        const t = self.store.get(ty);
+        return switch (t.kind) {
+            .null_t, .undefined_t, .void_t => .falsy,
+            .string_literal => switch (t.literal_value) {
+                .string => |s| if (s.len == 0) .falsy else .truthy,
+                else => .either,
+            },
+            .number_literal => switch (t.literal_value) {
+                .number => |v| if (v == 0 or std.math.isNan(v)) .falsy else .truthy,
+                else => .either,
+            },
+            .boolean_literal => switch (t.literal_value) {
+                .boolean => |b| if (b) .truthy else .falsy,
+                else => .either,
+            },
+            .bigint_literal => switch (t.literal_value) {
+                .bigint => |s| if (std.mem.eql(u8, s, "0n") or std.mem.eql(u8, s, "0")) .falsy else .truthy,
+                else => .either,
+            },
+            .object_t, .function_t, .array_t, .readonly_array_t, .tuple_t, .type_ref => .truthy,
+            .union_t => blk: {
+                var any_truthy = false;
+                var any_falsy = false;
+                for (self.store.idsOf(t.list_data)) |m| switch (self.typeTruthiness(m)) {
+                    .truthy => any_truthy = true,
+                    .falsy => any_falsy = true,
+                    .either => break :blk .either,
+                };
+                if (any_truthy and any_falsy) break :blk .either;
+                break :blk if (any_truthy) .truthy else .falsy;
+            },
+            else => .either,
+        };
+    }
+
+    /// `if (sym.prop)` on a union `sym`: keep the members whose `prop` CAN be
+    /// truthy (`negate` = falsy branch: whose `prop` CAN be falsy) — tsc's
+    /// narrowTypeByDiscriminant under the Truthy/Falsy facts.
+    fn narrowDiscriminantTruthy(self: *Checker, ty: TypeId, prop_name: []const u8, negate: bool) TypeId {
+        const t = self.store.get(ty);
+        if (t.kind != .union_t) return ty;
+        const members = self.store.idsOf(t.list_data);
+        var buf: [16]TypeId = undefined;
+        var n: usize = 0;
+        for (members) |m| {
+            const prop_ty = self.directPropOf(m, prop_name);
+            // Unknown prop on a member: can't decide, keep it.
+            const keep = prop_ty.eq(tymod.ID_UNKNOWN) or switch (self.typeTruthiness(prop_ty)) {
+                .either => true,
+                .truthy => !negate,
+                .falsy => negate,
+            };
+            if (keep) {
+                if (n >= buf.len) return ty;
+                buf[n] = m;
+                n += 1;
+            }
+        }
+        // Nothing dropped: hand back `ty` itself so a declared alias (`Item`)
+        // isn't re-rendered as its expansion (`Item1 | Item2`).
+        if (n == members.len) return ty;
+        if (n == 0) return tymod.ID_NEVER;
+        if (n == 1) return buf[0];
+        return self.store.unionOf(buf[0..n]) catch ty;
     }
 
     /// Narrow a union type by testing `sym.propName === litNode`.
